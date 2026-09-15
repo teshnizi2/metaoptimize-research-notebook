@@ -1,11 +1,14 @@
 import type { ActivityEvent, Experiment, Outcome, ResearchData } from '../types';
 import { formatDateFact } from './artifact-dates';
-import { outcomeCounts } from './research';
+import { isMethodCheck, isResearch, outcomeCounts } from './research';
 
 export interface AreaOutcomeSummary {
   label: string;
+  /** Research questions in the area; equals the sum of the four outcome counts. */
   total: number;
   counts: Record<Outcome, number>;
+  /** Method checks are listed separately and never enter the outcome counts. */
+  methodChecks: number;
 }
 
 export function areaOutcomeCounts(experiments: Experiment[], areas: ResearchData['areas']): AreaOutcomeSummary[] {
@@ -14,7 +17,9 @@ export function areaOutcomeCounts(experiments: Experiment[], areas: ResearchData
     if (!groups.has(experiment.area)) groups.set(experiment.area, []);
     groups.get(experiment.area)!.push(experiment);
   }
-  return [...groups].map(([label, entries]) => ({ label, total: entries.length, counts: outcomeCounts(entries) }));
+  return [...groups].map(([label, entries]) => ({
+    label, total: entries.filter(isResearch).length, counts: outcomeCounts(entries), methodChecks: entries.filter(isMethodCheck).length,
+  }));
 }
 
 export function recentNotebookUpdates(activity: ActivityEvent[], limit = 4): ActivityEvent[] {

@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""cT211 -- independent re-derivation of the count-matched partition audit (cycles 75-104)
+for docs/MASTER-TABLE.md section 10 (CORRECTIONS 211, Track T).  ZERO GPU.  READ-ONLY.
+
+WHY A NEW PARSER.  Section 10's numbers must be RE-DERIVED, not quoted from prose, and
+must not be re-derived by the code that produced them.  This file therefore:
+  * reads the RAW `.out` epoch series (`Epoch N, Train Accuracy: x %, Test Accuracy: y %`)
+    from the local mirrors ../runs and ../runs_cluster_b -- it imports NOTHING from analysis/
+    and does not use the csv module;
+  * computes plateau5 = mean TEST accuracy over the run's OWN last 5 epochs (and the same
+    reduction on TRAIN, printed beside it);  a run counts only if its `.out` carries
+    RUN_DONE and every epoch 0..E-1 with E = its own --num-epochs;
+  * takes each run's design from ITS OWN `ARGS:` / `ENV:` lines (STANDING RULE 20), with
+    argparse's last-wins semantics, and reports every run whose ARGS line repeats a flag;
+  * collapses byte-identical configurations (same ARGS+ENV apart from run name, save
+    directory and probe dir) to one value before any standard error -- the rule that
+    makes `ml2` a 3 v 3 cell rather than 6 v 6;
+  * cross-checks every run's plateau5 against results/all_runs.csv with a hand-rolled
+    RFC4180 splitter.
+
+WHAT IT DOES NOT DO.  It reads no probe.jsonl (the local mirror carries none), so it
+re-derives no box occupancy and no field statistic; those are QUOTED in section 10 with
+their CORRECTIONS number.  It does not re-derive the simulation-calibrated interval
+(+-0.121) or the null median (9.4) -- those come from c99_qcalibration via
+c98_reproduce.py.  It registers nothing and scores nothing.
+
+Run:   python3 analysis/cT211_partition_audit_rederive.py            # report
+       python3 analysis/cT211_partition_audit_rederive.py --check    # assert section 10's numerals
+       python3 analysis/cT211_partition_audit_rederive.py --selftest
+"""
+import math
+import os
+import re
+import statistics as st
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+MIRRORS = [os.path.join(REPO, "..", "runs"), os.path.join(REPO, "..", "runs_cluster_b")]
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+EPOCH = re.compile(r"^Epoch (\d+), Train Accuracy: ([\d.]+) %, Test Accuracy: ([\d.]+) %")
+VOLATILE_ARGS = {"--run-name", "--save-directory"}
+VOLATILE_ENV = {"PROBE_DIR"}
+
+
+# ----------------------------------------------------------------------------- parsing
+def parse_args_line(s):
+    """--flag value pairs, argparse last-wins; returns (dict, [repeated flags])."""
+    toks = s.split()
+    out, rep, i = {}, [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("--"):
+            v = toks[i + 1] if i + 1 < len(toks) and not toks[i + 1].startswith("--") else ""
+            if t in out:
+                rep.append(t)
+            out[t] = v
+            i += 2 if v != "" else 1
+        else:
+            i += 1
+    return out, rep
+
+
+def parse_out(path):
+    args = env = None
+    ep, done = {}, False
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith("ARGS: ") and args is None:
+                args = line[6:]
+            elif line.startswith("ENV: ") and env is None:
+                env = line[5:]
+            elif line.strip() == "RUN_DONE":
+                done = True
+            else:
+                m = EPOCH.match(line)
+                if m:
+                    ep[int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+    if args is None:
+        return None
+    a, rep = parse_args_line(args)
+    e = dict(kv.split("=", 1) for kv in (env or "").split() if "=" in kv)
+    try:
+        E = int(a.get("--num-epochs", "0"))
+    except ValueError:
+        E = 0
+    ok = done and E >= 5 and set(ep) == set(range(E))
+    last = [ep[k] for k in range(E - 5, E)] if ok else []
+    key = tuple(sorted((k, v) for k, v in a.items() if k not in VOLATILE_ARGS)) + \
+        tuple(sorted((k, v) for k, v in e.items() if k not in VOLATILE_ENV))
+    return dict(path=path, run=a.get("--run-name"), args=a, env=e, repeated=rep, E=E, ok=ok,
+                p5=st.mean(t for _, t in last) if ok else None,
+                tr5=st.mean(r for r, _ in last) if ok else None, key=key,
+                gran=a.get("--stepsize-groups"), base=a.get("--alg-base"),
+                meta=a.get("--alg-meta"), ms=a.get("--meta-stepsize"),
+                net=a.get("--NN-name"), box=e.get("BETA_CLIP"), seed=a.get("--seed"))
+
+
+def load(prefixes, mirrors=None):
+    runs = {}
+    for d in (mirrors or MIRRORS):
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if not fn.endswith(".out") or not any(fn.startswith(p) for p in prefixes):
+                continue
+            r = parse_out(os.path.join(d, fn))
+            if r is None or r["run"] is None:
+                continue
+            runs.setdefault(r["run"], []).append(r)
+    out = []
+    for name, lst in runs.items():
+        good = [r for r in lst if r["ok"]]
+        if len(good) > 1:
+            good.sort(key=lambda r: int((re.search(r"-(\d+)\.out$", r["path"]) or
+                                         re.search(r"()$", "0")).group(1) or 0))
+            sys.stderr.write("NOTE %s has %d complete .out; using the last job id\n"
+                             % (name, len(good)))
+        if good:
+            out.append(good[-1])
+    return out
+
+
+def arm(runs, prefix, **want):
+    """plateau5 (TEST) and TRAIN values of one arm, byte-identical configs collapsed."""
+    sel = [r for r in runs if r["run"].startswith(prefix) and r["ok"] and
+           all(r[k] == v for k, v in want.items())]
+    groups = {}
+    for r in sel:
+        groups.setdefault(r["key"], []).append(r)
+    te = [st.mean(x["p5"] for x in g) for g in groups.values()]
+    tr = [st.mean(x["tr5"] for x in g) for g in groups.values()]
+    return te, tr, sel
+
+
+def welch(a, b):
+    d = st.mean(a) - st.mean(b)
+    se = math.sqrt(st.variance(a) / len(a) + st.variance(b) / len(b))
+    return d, se, d / se
+
+
+def pool(items):
+    """Fixed-effect inverse-variance pool + Cochran Q + DerSimonian-Laird tau."""
+    w = [1 / s ** 2 for _, s in items]
+    W = sum(w)
+    m = sum(wi * y for wi, (y, _) in zip(w, items)) / W
+    Q = sum(wi * (y - m) ** 2 for wi, (y, _) in zip(w, items))
+    k = len(items)
+    den = W - sum(wi ** 2 for wi in w) / W
+    tau = math.sqrt(max(0.0, (Q - (k - 1)) / den)) if den > 0 else 0.0
+    return m, 1 / math.sqrt(W), Q, k - 1, tau
+
+
+def csv_rows(path):
+    """Hand-rolled RFC4180 splitter -- no csv module."""
+    txt = open(path, newline="").read()
+    rows, row, cell, q, i = [], [], [], False, 0
+    while i < len(txt):
+        c = txt[i]
+        if q:
+            if c == '"':
+                if i + 1 < len(txt) and txt[i + 1] == '"':
+                    cell.append('"')
+                    i += 1
+                else:
+                    q = False
+            else:
+                cell.append(c)
+        elif c == '"':
+            q = True
+        elif c == ',':
+            row.append("".join(cell))
+            cell = []
+        elif c == '\n':
+            row.append("".join(cell))
+            rows.append(row)
+            row, cell = [], []
+        elif c != '\r':
+            cell.append(c)
+        i += 1
+    if cell or row:
+        row.append("".join(cell))
+        rows.append(row)
+    hdr = rows[0]
+    return [dict(zip(hdr, r)) for r in rows[1:] if len(r) == len(hdr)]
+
+
+# ----------------------------------------------------------------------------- the cells
+# (label, run-name prefix, D arms (uniform, aligned), G arms or None, selector, level)
+CELLS = [
+    ("cc1", "cc1-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "SGDm"),
+    ("mm1", "mm1-", ("chunk777", "nodewise"), None, {}, "SGDm"),
+    ("pp1", "pp1-", ("chunk777", "nodewise"), None, {}, "SGDm"),
+    ("gn1 (BN)", "gn1-", ("chunk777", "nodewise"), None, {"net": "ResNet18"}, "SGDm"),
+    ("ml2", "ml2-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "SGDm (ml2)"),
+    ("rl3 @1e-4", "rl3-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {"ms": "1e-4"}, "SGDm"),
+    ("rl3 @3e-4", "rl3-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {"ms": "3e-4"}, "SGDm"),
+    ("fa1", "fa1-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "SGDm"),
+    ("hz3", "hz3-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "SGDm"),
+    ("aw1", "aw1-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "AdamW"),
+    ("nl1 (SGD)", "nl1-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {"base": "SGD"}, "SGD"),
+    ("nl1 (RMSProp)", "nl1-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {"base": "RMSProp"}, "RMSProp"),
+    ("g3m", "g3m-", ("chunk835", "nodewise"), ("chunk2500", "nodewise1d"), {}, "SGDm R34"),
+    ("r50", "r50-", ("chunk295", "nodewise"), ("chunk884", "nodewise1d"), {}, "SGDm R50"),
+    ("gc1", "gc1-", ("chunk771", "nodewise"), None, {}, "SGDm C100"),
+    ("gm2", "gm2-", ("chunk771", "nodewise"), ("chunk2293", "nodewise1d"), {}, "SGDm C100"),
+    ("bm2 (SGD)", "bm2-", ("chunk777", "nodewise"), None, {"base": "SGD"}, "SGD"),
+    ("bm2 (RMSProp)", "bm2-", ("chunk777", "nodewise"), None, {"base": "RMSProp"}, "RMSProp"),
+    ("sm3", "sm3-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "AdamW"),
+    ("sm4", "sm4-", ("chunk777", "nodewise"), ("chunk2325", "nodewise1d"), {}, "AdamW+RMSProp-meta"),
+]
+SGDM8 = ["cc1", "mm1", "pp1", "gn1 (BN)", "rl3 @1e-4", "rl3 @3e-4", "fa1", "hz3"]
+POOL14 = SGDM8 + ["aw1", "nl1 (SGD)", "nl1 (RMSProp)", "bm2 (SGD)", "bm2 (RMSProp)", "sm3"]
+EXTRA_PREFIXES = ["tw0-", "at1-", "ck1-", "cx2-", "bn1-", "ar1-", "rp1-", "gf2-"]
+
+# The numerals docs/MASTER-TABLE.md section 10 prints from THIS parser, asserted by --check
+# at the precision section 10 prints them.  (label, value, printed-precision)
+EXPECT = [
+    ("cells", 20, 0), ("cells with D > 0", 20, 0), ("cells with t >= 3.0", 18, 0),
+    ("SGDm-8 pool", 0.5556, 4), ("SGDm-8 se", 0.0448, 4), ("SGDm-8 Q", 4.21, 2),
+    ("POOL14 pool", 0.5297, 4), ("POOL14 se", 0.0294, 4), ("POOL14 Q", 102.47, 2),
+    ("POOL14 tau", 0.2948, 4),
+    ("pp1 A", -0.0093, 4), ("pp1 A se", 0.1569, 4), ("rp1 A paired", -0.0184, 4),
+    ("rp1 A paired se", 0.0791, 4), ("max CSV plateau5 mismatch", 0.0, 6),
+    ("D cc1", 0.727, 3), ("D mm1", 0.485, 3), ("D pp1", 0.581, 3), ("D gn1 (BN)", 0.587, 3),
+    ("D ml2", 0.456, 3), ("D rl3 @1e-4", 0.681, 3), ("D rl3 @3e-4", 0.591, 3), ("D fa1", 0.629, 3),
+    ("D hz3", 0.428, 3), ("D aw1", 0.279, 3), ("D nl1 (SGD)", 1.035, 3),
+    ("D nl1 (RMSProp)", 0.973, 3), ("D g3m", 0.666, 3), ("D r50", 0.881, 3), ("D gc1", 1.640, 3),
+    ("D gm2", 1.485, 3), ("D bm2 (SGD)", 0.978, 3), ("D bm2 (RMSProp)", 0.631, 3),
+    ("D sm3", 0.141, 3), ("D sm4", 0.889, 3),
+    ("bn1 G", 0.295, 3), ("ar1 D'", 0.697, 3), ("ar1 G'", -0.139, 3), ("pp1 B", 0.590, 3),
+    ("ck1 chunk2-chunk1", 0.115, 3), ("ck1 K1", -0.255, 3), ("ck1 K2 cross-batch", 0.565, 3),
+    ("cx2 within", 0.095, 3), ("fa1-ar1 nodewise1d", -0.177, 3), ("gn1 GN D", 0.202, 3),
+    ("gn1 level diff", -2.862, 3), ("level SGD", 1.000, 3), ("level RMSProp", 0.720, 3),
+    ("level AdamW", 0.189, 3), ("M6 RMSProp-AdamW", 0.531, 3), ("ml2 repeated-flag runs", 24, 0),
+    ("sm3 repeated-flag runs", 12, 0), ("gf2 runs", 0, 0),
+]
+
+
+def compute(runs=None, verbose=True):
+    P = print if verbose else (lambda *a, **k: None)
+    if runs is None:
+        runs = load(sorted({c[1] for c in CELLS} | set(EXTRA_PREFIXES)))
+    got = {}
+    P("runs parsed (complete, deduplicated by run name): %d" % len(runs))
+    rep = [r for r in runs if r["repeated"]]
+    for pre in ("ml2-", "sm3-"):
+        got["%s repeated-flag runs" % pre[:-1]] = sum(1 for r in rep if r["run"].startswith(pre))
+    P("runs whose OWN ARGS line repeats a flag: %d %s" %
+      (len(rep), sorted({r["run"].split("-")[0] for r in rep})))
+    got["gf2 runs"] = sum(1 for r in runs if r["run"].startswith("gf2-"))
+    csvr = {r["run"]: r for r in csv_rows(CSV)}
+    diffs = [abs(float(csvr[r["run"]]["plateau5"]) - r["p5"]) for r in runs
+             if r["run"] in csvr and csvr[r["run"]].get("plateau5")]
+    got["max CSV plateau5 mismatch"] = max(diffs) if diffs else float("nan")
+    P("CSV cross-check: %d runs, max |plateau5(.out) - plateau5(CSV)| = %.6f"
+      % (len(diffs), got["max CSV plateau5 mismatch"]))
+    res = {}
+    P("\n%-14s %-19s %8s %7s %6s %5s | %8s | %8s %7s | %8s  box" %
+      ("cell", "level", "D", "se", "t", "n", "D_train", "G", "seG", "D-G"))
+    for lab, pre, (u, a), gp, sel, lev in CELLS:
+        uv, utr, us = arm(runs, pre, gran=u, **sel)
+        av, atr, as_ = arm(runs, pre, gran=a, **sel)
+        d, se, t = welch(uv, av)
+        g = None
+        if gp:
+            gv = arm(runs, pre, gran=gp[0], **sel)[0]
+            hv = arm(runs, pre, gran=gp[1], **sel)[0]
+            if gv and hv:
+                g = welch(gv, hv)
+        res[lab] = dict(D=d, se=se, t=t, G=g, n=(len(uv), len(av)))
+        got["D " + lab] = d
+        P("%-14s %-19s %+8.3f %7.3f %6.2f %2dv%-2d | %+8.3f | %s | %s  %s" % (
+            lab, lev, d, se, t, len(uv), len(av), st.mean(utr) - st.mean(atr),
+            ("%+8.3f %7.3f" % g[:2]) if g else "%8s %7s" % ("-", "-"),
+            ("%+8.3f" % (d - g[0])) if g else "%8s" % "-",
+            ",".join(sorted({x["box"] for x in us + as_}))))
+    got["cells"] = len(res)
+    got["cells with D > 0"] = sum(1 for v in res.values() if v["D"] > 0)
+    got["cells with t >= 3.0"] = sum(1 for v in res.values() if v["t"] >= 3.0)
+    P("\ncells %d | D > 0 in %d | t >= 3.0 in %d" %
+      (got["cells"], got["cells with D > 0"], got["cells with t >= 3.0"]))
+    for tag, members in (("SGDm-8", SGDM8), ("POOL14", POOL14)):
+        m, s, Q, df, tau = pool([(res[k]["D"], res[k]["se"]) for k in members])
+        got.update({tag + " pool": m, tag + " se": s, tag + " Q": Q, tag + " tau": tau})
+        P("%-7s k=%2d  fixed-effect pool %+.4f +- %.4f  Q %.2f on %d df  tau %.4f"
+          % (tag, len(members), m, s, Q, df, tau))
+    lv = {}
+    for name, members in (("SGD", ["nl1 (SGD)", "bm2 (SGD)"]),
+                          ("RMSProp", ["nl1 (RMSProp)", "bm2 (RMSProp)"]),
+                          ("AdamW", ["aw1", "sm3"])):
+        lv[name] = pool([(res[k]["D"], res[k]["se"]) for k in members])
+        got["level " + name] = lv[name][0]
+        P("level %-8s %+.3f +- %.3f  Q %.2f" % (name, lv[name][0], lv[name][1], lv[name][2]))
+    dm = lv["RMSProp"][0] - lv["AdamW"][0]
+    sm = math.hypot(lv["RMSProp"][1], lv["AdamW"][1])
+    got["M6 RMSProp-AdamW"] = dm
+    P("M6  RMSProp level - AdamW level %+.3f se %.3f t %.2f" % (dm, sm, dm / sm))
+
+    def c(pre, u, a, **sel):
+        return welch(arm(runs, pre, gran=u, **sel)[0], arm(runs, pre, gran=a, **sel)[0])
+    nv = arm(runs, "pp1-", gran="nodewise")[0]
+    pv = sum((arm(runs, "pp1-", gran=g)[0] for g in ("permnode0", "permnode1", "permnode2")), [])
+    got["pp1 A"], got["pp1 A se"], tA = welch(pv, nv)
+    got["pp1 B"] = welch(arm(runs, "pp1-", gran="chunk777")[0], pv)[0]
+    P("\npp1  A = permnode - nodewise %+.4f se %.4f t %.2f (n %d v %d)"
+      % (got["pp1 A"], got["pp1 A se"], tA, len(pv), len(nv)))
+    rn = {r["seed"]: r["p5"] for r in runs if r["run"].startswith("rp1-") and r["gran"] == "nodewise"}
+    rpd = {}
+    for r in runs:
+        if r["run"].startswith("rp1-") and r["gran"].startswith("permnode"):
+            rpd.setdefault(r["seed"], []).append(r["p5"])
+    dd = [st.mean(rpd[s]) - rn[s] for s in sorted(rn, key=int) if s in rpd]
+    got["rp1 A paired"] = st.mean(dd)
+    got["rp1 A paired se"] = st.stdev(dd) / math.sqrt(len(dd))
+    P("rp1  A = permnode - nodewise, paired on run seed %+.4f se %.4f t %.2f on %d df"
+      % (got["rp1 A paired"], got["rp1 A paired se"],
+         got["rp1 A paired"] / got["rp1 A paired se"], len(dd) - 1))
+    got["bn1 G"] = c("bn1-", "chunk2325", "nodewise1d")[0]
+    got["ar1 D'"] = c("ar1-", "chunk777", "nodewise")[0]
+    got["ar1 G'"] = c("ar1-", "chunk2325", "nodewise1d")[0]
+    got["ck1 chunk2-chunk1"] = c("ck1-", "chunk2", "chunk1")[0]
+    got["ck1 K1"] = welch(arm(runs, "ck1-", gran="chunk1")[0], arm(runs, "tw0-", gran="weightwise")[0])[0]
+    got["ck1 K2 cross-batch"] = welch(arm(runs, "ck1-", gran="chunk1024")[0],
+                                      arm(runs, "tw0-", gran="nodewise")[0])[0]
+    got["cx2 within"] = c("cx2-", "chunk65536", "chunk8192")[0]
+    got["fa1-ar1 nodewise1d"] = welch(arm(runs, "fa1-", gran="nodewise1d")[0],
+                                      arm(runs, "ar1-", gran="nodewise1d")[0])[0]
+    gv = arm(runs, "gn1-", gran="chunk777", net="ResNet18_gn")[0]
+    hv = arm(runs, "gn1-", gran="nodewise", net="ResNet18_gn")[0]
+    got["gn1 GN D"] = welch(gv, hv)[0]
+    bv = arm(runs, "gn1-", gran="chunk777", net="ResNet18")[0] + \
+        arm(runs, "gn1-", gran="nodewise", net="ResNet18")[0]
+    got["gn1 level diff"] = st.mean(gv + hv) - st.mean(bv)
+    for k in ("bn1 G", "ar1 D'", "ar1 G'", "pp1 B", "ck1 chunk2-chunk1", "ck1 K1",
+              "ck1 K2 cross-batch", "cx2 within", "fa1-ar1 nodewise1d", "gn1 GN D",
+              "gn1 level diff"):
+        P("  %-22s %+.3f" % (k, got[k]))
+    return got
+
+
+def check(got):
+    bad = []
+    for lab, want, prec in EXPECT:
+        v = got.get(lab)
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            bad.append("%s: not computed" % lab)
+            continue
+        tol = 0.5 * 10 ** (-prec) + 1e-12 if prec else 0
+        if abs(v - want) > tol:
+            bad.append("%s: derived %.6f vs section 10 %s" % (lab, v, want))
+    print("\n--check: %d numerals asserted, %d mismatches" % (len(EXPECT), len(bad)))
+    for b in bad:
+        print("  MISMATCH", b)
+    return not bad
+
+
+def selftest():
+    p = n = 0
+
+    def ck(name, cond):
+        nonlocal p, n
+        n += 1
+        if cond:
+            p += 1
+        else:
+            print("  FAIL:", name)
+    a, rep = parse_args_line("--alg-meta Adam --seed 1 --alg-meta Lion --flag")
+    ck("last-wins", a["--alg-meta"] == "Lion" and a["--seed"] == "1")
+    ck("repeat detected", rep == ["--alg-meta"])
+    ck("valueless flag kept", "--flag" in a)
+    d, se, t = welch([1.0, 2.0, 3.0], [0.0, 1.0, 2.0])
+    ck("welch D", abs(d - 1.0) < 1e-12)
+    ck("welch se", abs(se - math.sqrt(2 / 3)) < 1e-12)
+    m, s, Q, df, tau = pool([(1.0, 1.0), (3.0, 1.0)])
+    ck("pool mean", abs(m - 2.0) < 1e-12 and abs(s - 1 / math.sqrt(2)) < 1e-12)
+    ck("pool Q", abs(Q - 2.0) < 1e-12 and df == 1)
+    ck("DL tau", abs(tau - 1.0) < 1e-12)
+    with tempfile.TemporaryDirectory() as td:
+        def mk(name, run, seed, gran, E, n_ep, done, extra=""):
+            with open(os.path.join(td, name), "w") as f:
+                f.write("ARGS: --optimizer HF --stepsize-groups %s --seed %d --num-epochs %d "
+                        "--run-name %s --save-directory /x/%s %s\n" % (gran, seed, E, run, run, extra))
+                f.write("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 PROBE_DIR=/p/%s\n" % run)
+                for k in range(n_ep):
+                    f.write("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%\n"
+                            % (k, 50 + k, 40 + k))
+                if done:
+                    f.write("RUN_DONE\n")
+        mk("zz-a-s0-1.out", "zz-a-s0", 0, "chunk777", 10, 10, True)
+        mk("zz-a-s0b-2.out", "zz-a-s0b", 0, "chunk777", 10, 10, True)   # same config, renamed
+        mk("zz-a-s1-3.out", "zz-a-s1", 1, "chunk777", 10, 10, True)
+        mk("zz-b-s0-4.out", "zz-b-s0", 0, "nodewise", 10, 9, True)       # truncated
+        mk("zz-b-s1-5.out", "zz-b-s1", 1, "nodewise", 10, 10, False)     # no RUN_DONE
+        mk("zz-b-s2-6.out", "zz-b-s2", 2, "nodewise", 10, 10, True)
+        rs = load(["zz-"], mirrors=[td])
+        ok = {r["run"]: r for r in rs}
+        ck("complete run parsed", "zz-a-s0" in ok)
+        ck("plateau5 = mean of own last 5 TEST epochs", abs(ok["zz-a-s0"]["p5"] - 47.0) < 1e-12)
+        ck("TRAIN reduced the same way", abs(ok["zz-a-s0"]["tr5"] - 57.0) < 1e-12)
+        ck("truncated run refused", "zz-b-s0" not in ok)
+        ck("run without RUN_DONE refused", "zz-b-s1" not in ok)
+        te, _, sel = arm(rs, "zz-a-", gran="chunk777")
+        ck("byte-identical configs collapse (3 runs -> 2 seed groups)", len(sel) == 3 and len(te) == 2)
+        te2, _, _ = arm(rs, "zz-b-", gran="nodewise")
+        ck("dropped runs never enter an arm", len(te2) == 1)
+        with open(os.path.join(td, "c.csv"), "w") as f:
+            f.write('run,plateau5,note\nr1,91.5,"a, ""quoted"" cell"\nr2,90.0,plain\n')
+        rows = csv_rows(os.path.join(td, "c.csv"))
+        ck("csv splitter: quoted comma kept in one cell", rows[0]["note"] == 'a, "quoted" cell')
+        ck("csv splitter: row count", len(rows) == 2 and rows[1]["plateau5"] == "90.0")
+    ck("EXPECT covers the headline", {"cells", "SGDm-8 pool", "rp1 A paired"} <= {e[0] for e in EXPECT})
+    print("selftest: %d/%d passed" % (p, n))
+    return p == n
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(0 if selftest() else 1)
+    got = compute()
+    if "--check" in sys.argv:
+        sys.exit(0 if check(got) else 1)

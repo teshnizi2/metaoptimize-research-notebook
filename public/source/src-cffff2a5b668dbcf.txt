@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""cau1_cvk1_env_audit.py -- RULE 20 separate ENV/ARGS/witness audit for the cau1 + cvk1 landing (CORRECTIONS 209/210).
+
+Imports NOTHING from any scorer, launcher or argsline_guard.  Reads ONLY the
+NODE / ARGS / ENV header lines of each .out (never an Epoch line, never a number
+of accuracy) plus, for cau1, the runtime-environ witness files.
+
+Usage: python3 analysis/cau1_cvk1_env_audit.py <runsdir> <witnessdir>
+Exit 0 iff both batches are 27/27 and 0 violations.
+"""
+import os
+import sys
+
+RUNS, WIT = sys.argv[1], sys.argv[2]
+bad = []
+
+
+def hdr(path):
+    node, args, env, ptens = [], [], [], []
+    with open(path, errors="replace") as fh:
+        for ln in fh:
+            ln = ln.rstrip("\n")
+            if ln.startswith("NODE="):
+                node.append(ln)
+            elif ln.startswith("ARGS:"):
+                args.append(ln)
+            elif ln.startswith("ENV:"):
+                env.append(ln)
+            elif ln.startswith("PROBE_TENSOR:"):
+                ptens.append(ln)
+    return node, args, env, ptens
+
+
+def kv_env(line):
+    d = {}
+    for t in line.split()[1:]:
+        k, _, v = t.partition("=")
+        if k in d:
+            bad.append("ENV repeated key %s" % k)
+        d[k] = v
+    return d
+
+
+def kv_args(line, tag):
+    toks = line.split()[1:]
+    d, i = {}, 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("--"):
+            bad.append("%s stray token %r" % (tag, t))
+            i += 1
+            continue
+        v = None
+        if i + 1 < len(toks) and not toks[i + 1].startswith("--"):
+            v = toks[i + 1]
+            i += 1
+        if t in d:
+            bad.append("%s REPEATED FLAG %s" % (tag, t))
+        d[t] = v
+        i += 1
+    return d
+
+
+def files(prefix):
+    out = {}
+    for fn in sorted(os.listdir(RUNS)):
+        if fn.startswith(prefix) and fn.endswith(".out"):
+            stem, _, jid = fn[:-4].rpartition("-")
+            out.setdefault(stem, []).append((int(jid), fn))
+    return out
+
+
+def audit(batch, arms, seeds, env_want, args_common, arm_args):
+    fs = files(batch + "-")
+    want = ["%s-%s-s%d" % (batch, a, s) for a in arms for s in seeds]
+    extra = sorted(set(fs) - set(want))
+    if extra:
+        bad.append("%s unexpected stems %s" % (batch, extra))
+    distinct_env = {}
+    distinct_masked_args = {}
+    n = 0
+    recs = {}
+    for a in arms:
+        for s in seeds:
+            stem = "%s-%s-s%d" % (batch, a, s)
+            if stem not in fs:
+                bad.append("MISSING " + stem)
+                continue
+            if len(fs[stem]) != 1:
+                bad.append("%s has %d files" % (stem, len(fs[stem])))
+            jid, fn = fs[stem][-1]
+            node, args, env, pt = hdr(os.path.join(RUNS, fn))
+            tag = fn
+            if (len(node), len(args), len(env)) != (1, 1, 1):
+                bad.append("%s NODE/ARGS/ENV counts %d/%d/%d" % (tag, len(node), len(args), len(env)))
+                continue
+            n += 1
+            recs[(a, s)] = jid
+            e = kv_env(env[0])
+            d = kv_args(args[0], tag)
+            # ENV: every key, exact
+            ew = env_want(a, s)
+            for k in sorted(set(e) | set(ew)):
+                if k not in ew:
+                    bad.append("%s ENV has unexpected key %s=%s" % (tag, k, e[k]))
+                elif ew[k] != e.get(k):
+                    bad.append("%s ENV %s=%s want %s" % (tag, k, e.get(k), ew[k]))
+            if any(k.startswith("SGD_") for k in e):
+                bad.append("%s ENV carries SGD_*" % tag)
+            aug = ew["AUGMENT"]
+            if ("AUGMENT=%s" % aug) not in node[0]:
+                bad.append("%s NODE header lacks AUGMENT=%s: %s" % (tag, aug, node[0]))
+            if any("on" in p.split() for p in pt):
+                bad.append("%s PROBE_TENSOR on" % tag)
+            # ARGS: axes, then every other flag exact
+            if d.get("--seed") != str(s):
+                bad.append("%s --seed %s" % (tag, d.get("--seed")))
+            if d.get("--run-name") != stem:
+                bad.append("%s --run-name %s" % (tag, d.get("--run-name")))
+            if not (d.get("--save-directory") or "").endswith("/runs/" + batch):
+                bad.append("%s --save-directory %s" % (tag, d.get("--save-directory")))
+            aw = dict(args_common)
+            aw.update(arm_args(a))
+            rest = {k: v for k, v in d.items() if k not in ("--seed", "--run-name", "--save-directory")}
+            for k in sorted(set(rest) | set(aw)):
+                if rest.get(k, "<absent>") != aw.get(k, "<absent>"):
+                    bad.append("%s ARGS %s=%s want %s" % (tag, k, rest.get(k, "<absent>"), aw.get(k, "<absent>")))
+            fam = "lr" if a.startswith("lr") else a
+            ev = " ".join("%s=%s" % kv for kv in sorted(e.items()) if kv[0] != "PROBE_DIR")
+            distinct_env.setdefault(fam if batch == "cau1" else "all", set()).add(ev)
+            ma = tuple(sorted((k, v) for k, v in rest.items() if k not in ("--alpha0", "--stepsize-groups")))
+            distinct_masked_args.setdefault(fam if batch == "cau1" else "all", set()).add(ma)
+    print("== %s: %d/%d runs audited (NODE/ARGS/ENV headers only)" % (batch, n, len(want)))
+    for k in sorted(distinct_env):
+        print("   family %-4s distinct ENV (PROBE_DIR masked) %d | distinct ARGS (axes masked) %d"
+              % (k, len(distinct_env[k]), len(distinct_masked_args[k])))
+        for x in sorted(distinct_env[k]):
+            print("      ENV " + x)
+    return recs, n
+
+
+# ---------------- cau1 (CORRECTIONS 202.4 / launcher text) ----------------
+LR = {"lr0005": "0.005", "lr001": "0.01", "lr002": "0.02", "lr005": "0.05",
+      "lr01": "0.1", "lr02": "0.2", "lr04": "0.4"}
+META = {"m6": ("1e-6", "-60:6.0"), "m6t": ("3e-4", "-15:-2.3026")}
+CAU_ARMS = list(LR) + list(META)
+BASE_ENV = {"LAM": "na", "ETA_RATIO": "na", "SCHED": "none", "SCHED_TOTAL": "none",
+            "SCHED_WARMUP": "none", "SCHED_MIN": "none", "HIER": "none", "EB_RHO": "na", "EB_LOG": "0"}
+
+
+def cau_env(a, s):
+    d = dict(BASE_ENV)
+    if a in LR:
+        d.update({"AUGMENT": "0", "BETA_CLIP": "none", "COS_TOTAL": "50000", "COS_WARMUP": "1000",
+                  "PROBE": "0", "PROBE_DIR": "none"})
+    else:
+        d.update({"AUGMENT": "0", "BETA_CLIP": META[a][1], "COS_TOTAL": "default", "COS_WARMUP": "default",
+                  "PROBE": "5", "PROBE_DIR": "/cluster/account_b/metaopt/runs/cau1/probe_cau1-%s-s%d" % (a, s)})
+    return d
+
+
+# the m6/m6t ARGS are the ub9-b6 / i3b-3e4 lines; typed from the .out of the
+# first m6 run AFTER this script checked they are identical across all 6 (below).
+def cau_arm_args(a):
+    if a in LR:
+        return {"--optimizer": "SGD", "--alpha0": LR[a]}
+    return {"--alpha0": META[a][0]}
+
+
+def cau_common_for(a):
+    return None
+
+
+# ---------------- cvk1 (CORRECTIONS 201 / 208.6 / cVK2 launcher text) ----------------
+# typed from CORRECTIONS 201's registered grid (k -> [k, 26-k]); the scorer's
+# SPEC literal was READ, not imported, to confirm the string form.
+SPEC = {"k01": "scalar", "kL": "layerwise"}
+SPEC.update({"k%d" % k: "[%d,%d]" % (k, 26 - k) for k in (13, 16, 19, 20, 21, 22, 23)})
+CVK_ARMS = ["k01", "kL", "k13", "k16", "k19", "k20", "k21", "k22", "k23"]
+CVK_COMMON = {"--optimizer": "HF", "--alg-base": "SGDm", "--momentum-param-base": "0.99",
+              "--weight-decay-base": "0.1", "--alg-meta": "Lion", "--momentum-param-meta": "0.99",
+              "--Lion-beta2-meta": "0.9", "--weight-decay-meta": "0", "--dataset": "CIFAR100",
+              "--NN-name": "VGG11_bn_c100", "--batch-size": "100", "--max-time": "999:00:00",
+              "--gamma": "1", "--meta-stepsize": "1e-3", "--alpha0": "1e-6", "--num-epochs": "100"}
+
+
+def cvk_env(a, s):
+    d = dict(BASE_ENV)
+    d.update({"AUGMENT": "1", "BETA_CLIP": "-15:-2.3026", "COS_TOTAL": "default", "COS_WARMUP": "default",
+              "PROBE": "0", "PROBE_DIR": "none"})
+    return d
+
+
+def main():
+    # cau1: learn the m6 common flags from ONE file, then require every m6/m6t file to match it
+    m6f = sorted(f for f in os.listdir(RUNS) if f.startswith("cau1-m6-s50-") and f.endswith(".out"))[0]
+    _, a6, _, _ = hdr(os.path.join(RUNS, m6f))
+    m6_common = {k: v for k, v in kv_args(a6[0], m6f).items()
+                 if k not in ("--seed", "--run-name", "--save-directory", "--alpha0")}
+    lr0 = sorted(f for f in os.listdir(RUNS) if f.startswith("cau1-lr01-s50-") and f.endswith(".out"))[0]
+    _, al, _, _ = hdr(os.path.join(RUNS, lr0))
+    print("reference ARGS (verbatim, RULE 20 quote):")
+    print("   " + al[0])
+    print("   " + a6[0])
+    lr_want = {"--dataset": "CIFAR10", "--NN-name": "ResNet18", "--batch-size": "100",
+               "--max-time": "999:00:00", "--num-epochs": "100"}
+    # m6 common must be the AdamW+Adam blk6 parent config: check the load-bearing flags by value
+    for k, v in [("--optimizer", "HF"), ("--alg-base", "AdamW"), ("--alg-meta", "Adam"),
+                 ("--dataset", "CIFAR10"), ("--NN-name", "ResNet18"), ("--num-epochs", "100"),
+                 ("--batch-size", "100"), ("--meta-stepsize", "1e-3"), ("--gamma", "1")]:
+        if m6_common.get(k) != v:
+            bad.append("m6 reference %s=%s want %s" % (k, m6_common.get(k), v))
+    print("   m6/m6t --stepsize-groups = %s" % m6_common.get("--stepsize-groups"))
+
+    def cau_args(a):
+        if a in LR:
+            d = dict(lr_want)
+            d.update(cau_arm_args(a))
+            return d
+        d = dict(m6_common)
+        d.update(cau_arm_args(a))
+        return d
+
+    cau_recs, ncau = audit("cau1", CAU_ARMS, [50, 51, 52], cau_env, {}, cau_args)
+    cvk_recs, ncvk = audit("cvk1", CVK_ARMS, [55, 56, 57], cvk_env, CVK_COMMON,
+                           lambda a: {"--stepsize-groups": SPEC[a]})
+    print("   cvk1 --stepsize-groups per arm: %s" % SPEC)
+
+    # cau1 runtime environ witness
+    cov = zero = ctl = 0
+    for (a, s), jid in sorted(cau_recs.items()):
+        fn = os.path.join(WIT, "cau1-%s-s%d-%d.txt" % (a, s, jid))
+        if not os.path.exists(fn):
+            bad.append("NO WITNESS " + os.path.basename(fn))
+            continue
+        cov += 1
+        kv, sgd = {}, []
+        for ln in open(fn):
+            ln = ln.strip()
+            if ln.startswith("SGD_VAR "):
+                sgd.append(ln)
+            elif "=" in ln and " " not in ln:
+                k, _, v = ln.partition("=")
+                kv[k] = v
+        if kv.get("SGD_count") == "0" and not sgd:
+            zero += 1
+        else:
+            bad.append("WITNESS %s SGD_count=%s %s" % (fn, kv.get("SGD_count"), sgd))
+        pc = (kv.get("AUGMENT") == "0" and kv.get("SLURM_JOB_ID") == str(jid)
+              and kv.get("SLURM_JOB_NAME") == "cau1-%s-s%d" % (a, s)
+              and (kv.get("COS_TOTAL") == "50000" and kv.get("COS_WARMUP") == "1000" if a in LR
+                   else kv.get("PROBE") == "5" and kv.get("BETA_CLIP") == META[a][1]))
+        ctl += pc
+        if not pc:
+            bad.append("WITNESS positive control fails " + os.path.basename(fn))
+    print("== cau1 runtime environ witness: coverage %d/27, SGD_count=0 on %d, positive control on %d"
+          % (cov, zero, ctl))
+
+    print("\nVIOLATIONS: %d" % len(bad))
+    for b in bad:
+        print("   " + b)
+    ok = not bad and ncau == 27 and ncvk == 27 and cov == 27
+    print("L1 ENV/ARGS/WITNESS AUDIT: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

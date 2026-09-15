@@ -1,0 +1,382 @@
+r"""PATCH_CHUNKVEC -- a PER-TENSOR chunk-size VECTOR, so the singleton count can be
+varied independently of the ndim>=2 partition.  Written for `bin/c84_singleton_ladder.sh`
+(`sl1`), which was KILLED PRE-DATA and DELETED at cycle-84 review -- SEE THE OPERATOR NOTE
+BELOW BEFORE APPLYING THIS TO ANYTHING.
+
+WHY THIS PATCH HAS TO EXIST AT ALL
+----------------------------------
+The campaign's tail result is that the whole matched-count partition gap lives in the
+degenerate size-1 groups:
+
+    D = chunk777 - nodewise      (m 14,421 vs 14,420)   +0.485 / +0.581 / +0.697 / +0.727
+    G = chunk2325 - nodewise1d   (m = 4,851 EXACT)      +0.295 (UND) / +0.011 / -0.001
+
+Two endpoints are not a dose-response.  The obvious ladder -- keep k of ResNet18's 41
+one-dimensional tensors per-channel and collapse the other 41-k -- is DEAD ON ARRIVAL,
+and the reason is arithmetic rather than statistical: with the ndim>=2 side left at
+nodewise, m(k) = 4,851 + S_k - k, so m - S_k is trapped in [4,810, 4,851] and
+corr(S, m) = 0.9999991 over all 42 rungs.  That ladder measures COUNT, not singletons.
+It is the defect that got `sf1` withdrawn (docs/CORRECTIONS.md 111.2, defect 3).
+
+THE FIXED-m LADDER, WHICH IS WHAT THIS PATCH MAKES EXPRESSIBLE
+--------------------------------------------------------------
+Hold m at ~14,420 by chunking the ndim>=2 tensors at a PER-RUNG K2 while injecting
+singletons on the one-D side:
+
+    rung Lk = { contiguous chunks of K2 weights on every ndim>=2 tensor }
+            + { per-channel (size-1) groups on k of the 41 one-D tensors }
+            + { ONE group on each of the remaining 41-k }
+
+    m(k, K2) = G2(K2) + S_k + (41 - k),   G2(K2) = sum_{ndim>=2} ceil(numel / K2)
+
+Recomputed from the built ResNet18's real shape list (62 tensors, 11,173,962 weights,
+41 one-D tensors holding 9,610 scalars, 21 ndim>=2 tensors giving 4,810 nodewise groups),
+with K2 the argmin of |m - 14,420| over K2 in [512, 4000]:
+
+    L0  k= 0  K2= 777  G2=14,380  m=14,421 (+1)  S=    0  f=0.00000
+    L1  k= 7  K2= 802  G2=13,927  m=14,409 (-11) S=  448  f=0.03109
+    L2  k=14  K2= 844  G2=13,237  m=14,416 (-4)  S=1,152  f=0.07991
+    L3  k=21  K2= 914  G2=12,226  m=14,422 (+2)  S=2,176  f=0.15088
+    L4  k=28  K2=1070  G2=10,442  m=14,423 (+3)  S=3,968  f=0.27512
+    L5  k=34  K2=1417  G2= 7,893  m=14,428 (+8)  S=6,528  f=0.45245
+    L6  k=41  K2=2325  G2= 4,810  m=14,420 (+0)  S=9,610  f=0.66644
+    C3  deep subset (4 x 512 + 2 x 64 = 2,176 singletons at k=6), K2=915,
+        G2=12,213, m=14,424 (+4), f=0.15086 -- the ORDERING CONTROL for L3.
+
+m varies by 19 groups = 0.13% while the singleton fraction f = S/m sweeps 0 -> 0.666.
+
+WHY PATCH_CHUNKWISE CANNOT DO THIS, CHECKED AGAINST THE LIVE FILE RATHER THAN ASSUMED
+--------------------------------------------------------------------------------------
+`chunkwise` stores ONE GLOBAL INTEGER (`self.chunk_size = int(_cm.group(1))`) and applies
+it uniformly to all 62 tensors in all three of its branches (init, beta_to_alpha,
+block_product).  There is no per-tensor granularity construct anywhere in HF.py --
+nodewise, nodewise1d, permnode and chunkwise are each all-or-nothing over the whole net.
+"chunk the ndim>=2 tensors at K2 while giving k of the one-D tensors per-channel
+treatment" is therefore NOT EXPRESSIBLE.  `grep -i nodewisep` over the live cluster file
+returns nothing; CORRECTIONS 111.2 records the same blocker.
+
+WHAT THIS PATCH ADDS
+--------------------
+`--stepsize-groups chunkvec<ND><MODE><ARG>`, matched by `^chunkvec(\d+|n|w)(s|r|x)([0-9.]*)$`:
+
+    <ND>    the chunk size applied to every tensor with ndim >= 2:
+              <digits>  that literal K2
+              n         numel // shape[0], i.e. NODEWISE on that tensor
+              w         1, i.e. WEIGHTWISE on that tensor
+    <MODE>  which of the one-D tensors get size-1 (per-channel) groups; the rest get
+            exactly ONE group each (chunk size = numel):
+              s<k>      SHALLOW-FIRST: the first k one-D tensors in named_parameters order
+              r<k>      REVERSE-DEPTH: the last k one-D tensors in that order
+              x<i.j.k>  an EXPLICIT dot-separated list of 0-based ranks into the one-D
+                        tensor list (empty list allowed, and equals s0)
+
+The ladder's eight arms are then `chunkvec777s0`, `chunkvec802s7`, `chunkvec844s14`,
+`chunkvec914s21`, `chunkvec1070s28`, `chunkvec1417s34`, `chunkvec2325s41` and the
+ordering control `chunkvec915x36.37.38.39.8.9`.
+
+WHY THIS IS THE LOW-RISK SHAPE OF THE CHANGE
+--------------------------------------------
+A per-tensor chunk vector SUBSUMES FOUR EXISTING CODE PATHS, so the test suite asserts
+BITWISE EQUIVALENCE AGAINST UNPATCHED BEHAVIOUR rather than against my expectation:
+
+    chunkvecns41   ==  nodewise      EXACTLY   (ndim>=2 at numel//shape[0]; all 41
+                                                one-D tensors at chunk size 1, which
+                                                for a 1-D tensor IS per-channel)
+    chunkvecns0    ==  nodewise1d    EXACTLY   (the same, with every one-D tensor
+                                                collapsed to a single group)
+    chunkvec777s0  ==  chunk777      EXACTLY   (every one-D numel <= 512 < 777, so
+                                                chunk777 already gives those tensors
+                                                one group each -- this is why ladder
+                                                rung L0 IS an already-run arm and
+                                                doubles as the instrument check)
+    chunkvecws41   ==  weightwise    EXACTLY   (every tensor at chunk size 1)
+
+Those are the boundaries the task names -- k=41 must be plain nodewise, k=0 must be
+nodewise1d -- and they are asserted numerically in `tests/test_chunkvec.py`, on CPU,
+against the UNPATCHED code paths.  They are exact, not approximate: `Lion_meta_update`
+is `beta <- (1-ms*wd)*beta - ms*sign(.)` applied elementwise with no norm and no
+cross-element reduction, so holding beta in a different list shape cannot change an
+update, and for a row-major tensor of shape (d0, d1, ...) group g of the nodewise
+partition IS the flat slice [g*gs, (g+1)*gs) -- the identity PATCH_NODEBN's own suite
+already established and tested.
+
+INERTNESS
+---------
+Four additions, three of them guarded by `self.stepsize_type == 'chunkvec'`, a type
+reachable only when `--stepsize-groups` matches the chunkvec regex.  `^chunk(\d+)$`
+cannot match a chunkvec string (the character after `chunk` is `v`, not a digit) and the
+chunkvec regex cannot match a chunk string, so the two dispatches are disjoint by
+construction; the chunkvec test is placed FIRST anyway so the disjointness is not
+load-bearing.  Every prior batch used a granularity string that fails the chunkvec
+regex, so no existing configuration can enter any new branch and every earlier run stays
+reproducible.  'chunkvec' is a substring of neither 'scalar' nor 'blockwise', which
+matters because HF.py really does contain two REVERSED substring dispatches
+(`self.stepsize_type in 'scalar'`, `... in 'blockwise'`); that is asserted below rather
+than trusted.  Every other dispatch is `in (...)` on a TUPLE or an exact `==`.
+
+THE PROBE COMES FOR FREE, AND THAT IS CHECKED, NOT ASSUMED.  `_probe` branches on
+`stepsize_type in ('scalar','layerwise','blockwise')` -> beta is a single tensor, else ->
+beta is a per-layer LIST.  'chunkvec' takes the LIST branch, the same one nodewise,
+nodewise1d, permnode and chunkwise take, so `n_beta`, `beta_true_min/max`, `n_at_lo/hi`,
+`frac_neg` and the PROBE5 sign counter all read the chunkvec partition unchanged.
+
+MEMORY.  Nothing per-weight is stored: three small python lists of per-tensor ints
+(cvec_K, cvec_counts, cvec_numel) plus the shape list.  Unlike PATCH_PERMNODE this adds
+no index tensors and no resident memory.
+
+OPERATOR NOTE
+-------------
+**DO NOT APPLY THIS PATCH YET.  AS OF CYCLE 84 IT HAS NO CONSUMER.**  It was written
+for `sl1`, the fixed-m singleton ladder, and sl1 was KILLED PRE-DATA at cycle-84 review
+(CORRECTIONS 114): holding m fixed does not remove the naive ladder's collinearity, it
+RELOCATES it to the ndim>=2 chunk count (corr(S, G2) = -0.9999975 over the 7 rungs),
+and the registered OLS primary scored CONFIRMED for a pure step (b = -0.688) and for a
+non-monotone zigzag (b = -0.565) while FAILING a genuine saturating dose-response
+(b = -0.379).  `bin/c84_singleton_ladder.sh` and `analysis/c84_sl1_score.py` are
+DELETED.
+
+THIS FILE AND `tests/test_chunkvec.py` ARE RETAINED DELIBERATELY, as validated
+infrastructure for the REGISTERED SUCCESSOR: the 2x2 factorial in (singleton count S)
+x (ndim>=2 chunk count G2) with m FLOATING and its slope measured in-batch, specified
+in docs/REGISTER-ideas-ABC.md section 5.4.  That design needs exactly this patch --
+`chunkvec777s21` and `chunkvec2325s21` are not expressible with PATCH_CHUNKWISE, which
+stores ONE GLOBAL int.  Applying the patch to the live tree before that successor is
+registered and built would put an unused code path in front of every future run for no
+benefit, so: apply it when the successor batch exists, not before.
+
+WHEN THAT DAY COMES, on cluster_a (this family is cluster_a-only; cluster_b lacks PATCH_CHUNKWISE
+and PATCH_NODEBN), and NOT before:
+
+    1. back up  .../cifar10/Optimizers/HF.py
+    2. python3 patches/patch_chunkvec.py            # HF_PATH= to target a scratch copy
+    3. NODEBN_TEST_DEVICE=cpu python3 tests/test_chunkvec.py     # must be 0 FAIL
+    4. re-run tests/test_nodebn.py, tests/test_chunkwise.py AND tests/test_permnode.py.
+       **test_permnode.py is NOT optional and was missing from this list until cycle-84
+       review.**  Edit 2 of this patch rewrites permnode's `if _pm:` into `elif _pm:`,
+       demoting it from the first dispatch position to the second -- permnode is the
+       ONE existing code path whose control flow this patch touches, so re-verifying
+       every untouched path and skipping the touched one is the wrong way round.
+       Export PERM_TEST_DEVICE=cpu.  (A real regression is close to impossible --
+       `^permnode(\d+)$` cannot match a chunkvec string, and the patch asserts
+       permnode's branch and assignment counts are undisturbed -- but the campaign's
+       standard is bitwise re-verification, not an argument that a regression is
+       unlikely.)
+    5. only then run the successor batch, whose guard 1e must re-run ALL FOUR suites on
+       the live tree and whose guard 4 must MEASURE m per arm from the ALLOCATED beta
+       on the real built network.
+"""
+import sys, os
+
+P = os.environ.get(
+    "HF_PATH",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/"
+    "MetaOptimize/cifar10/Optimizers/HF.py")
+src = open(P).read()
+
+if "PATCH_CHUNKVEC" in src:
+    print("ALREADY_PATCHED")
+    sys.exit(0)
+
+assert "PATCH_GRANULARITY" in src, "PATCH_GRANULARITY must be applied before PATCH_CHUNKVEC"
+assert "PATCH_CHUNKWISE" in src, "PATCH_CHUNKWISE must be applied before PATCH_CHUNKVEC"
+assert "PATCH_PERMNODE" in src, "PATCH_PERMNODE must be applied before PATCH_CHUNKVEC"
+assert "PATCH_NODEBN" in src, "PATCH_NODEBN must be applied before PATCH_CHUNKVEC"
+
+# THE SUBSTRING HAZARD, CHECKED BEFORE ANYTHING IS WRITTEN.  A new type is only safe if
+# no dispatch tests it as a SUBSTRING, in either direction.  Assert, do not assume.
+assert "'chunkwise' in self.stepsize_type" not in src, "forward substring dispatch on chunkwise"
+assert "'chunk' in self.stepsize_type" not in src, "forward substring dispatch on chunk"
+import re as _re0
+_rev = _re0.findall(r"self\.stepsize_type\s+in\s+'([^']*)'", src)
+assert all("chunkvec" not in lit for lit in _rev), \
+    "a REVERSED substring dispatch could capture chunkvec: %r" % _rev
+assert src.count("self.stepsize_type == 'chunkwise'") == 3, \
+    "expected exactly 3 chunkwise branches before patching"
+assert src.count("self.stepsize_type == 'nodewise'") == 3, \
+    "expected exactly 3 nodewise branches before patching"
+assert src.count("self.stepsize_type == 'nodewise1d'") == 3, \
+    "expected exactly 3 nodewise1d branches before patching"
+
+# --- 1. THE REGEX ----------------------------------------------------------------------
+a1 = ("        _pm = _re.match(r'^permnode(\\d+)$', stepsize_groups) "
+      "if isinstance(stepsize_groups, str) else None\n")
+assert src.count(a1) == 1, f"anchor 1 count={src.count(a1)} -- refusing to patch"
+n1 = a1 + (
+    "        # --- PATCH_CHUNKVEC: `chunkvec<ND><MODE><ARG>` = a PER-TENSOR chunk size.\n"
+    "        # <ND> in {digits, 'n' = numel//shape[0] i.e. nodewise, 'w' = 1 i.e. weightwise}\n"
+    "        # applies to every tensor with ndim >= 2.  <MODE><ARG> selects which one-D\n"
+    "        # tensors get size-1 (per-channel) groups: s<k> shallow-first, r<k> reverse\n"
+    "        # depth, x<i.j.k> an explicit list of 0-based ranks.  The rest get ONE group.\n"
+    "        _vm = _re.match(r'^chunkvec(\\d+|n|w)(s|r|x)([0-9.]*)$', stepsize_groups) "
+    "if isinstance(stepsize_groups, str) else None\n")
+src = src.replace(a1, n1, 1)
+
+# --- 2. TYPE DISPATCH ------------------------------------------------------------------
+# Tested FIRST so the disjointness of the two regexes is not load-bearing.
+a2 = """        if _pm:
+            self.stepsize_type = 'permnode'
+            self.perm_seed = int(_pm.group(1))
+"""
+assert src.count(a2) == 1, f"anchor 2 count={src.count(a2)} -- refusing to patch"
+n2 = """        if _vm:
+            # --- PATCH_CHUNKVEC ---
+            self.stepsize_type = 'chunkvec'
+            self.cvec_nd = _vm.group(1)
+            self.cvec_mode = _vm.group(2)
+            self.cvec_arg = _vm.group(3)
+        elif _pm:
+            self.stepsize_type = 'permnode'
+            self.perm_seed = int(_pm.group(1))
+"""
+src = src.replace(a2, n2, 1)
+
+# --- 3. BETA INITIALISATION ------------------------------------------------------------
+a3 = """        # --- PATCH_CHUNKWISE ---
+        elif self.stepsize_type == 'chunkwise':
+            _K = self.chunk_size
+            _lb = torch.log(torch.tensor(alpha0, dtype=torch.float32, device=self._device))
+            self.chunk_numel = [int(np.prod(list(p_size))) for (_n, p_size) in net_param_names_and_size]
+            self.chunk_shape = [tuple(p_size) for (_n, p_size) in net_param_names_and_size]
+            self.chunk_counts = [(_n2 + _K - 1) // _K for _n2 in self.chunk_numel]
+            self.beta = [_lb * torch.ones(_c, dtype=torch.float32, device=self._device)
+                         for _c in self.chunk_counts]
+"""
+assert src.count(a3) == 1, f"anchor 3 count={src.count(a3)} -- refusing to patch"
+n3 = a3 + """        # --- PATCH_CHUNKVEC: one chunk size PER TENSOR.  The ndim>=2 tensors take the
+        # <ND> spec; each one-D tensor takes chunk size 1 (per-channel, i.e. singletons)
+        # if its rank is selected and numel (ONE group) if it is not.  Every group size
+        # is therefore an explicit, per-tensor decision and the total count m is the sum
+        # of ceil(numel/K_i), which any consuming batch's beta-allocation guard must
+        # MEASURE from this allocated beta rather than predict.
+        elif self.stepsize_type == 'chunkvec':
+            _lb = torch.log(torch.tensor(alpha0, dtype=torch.float32, device=self._device))
+            self.cvec_shape = [tuple(p_size) for (_n, p_size) in net_param_names_and_size]
+            self.cvec_numel = [int(np.prod(list(p_size))) for (_n, p_size) in net_param_names_and_size]
+            self.cvec_oned = [_i4 for _i4, _s4 in enumerate(self.cvec_shape) if len(_s4) == 1]
+            _rank4 = {_t4: _r4 for _r4, _t4 in enumerate(self.cvec_oned)}
+            _nd4 = len(self.cvec_oned)
+            if self.cvec_mode == 'x':
+                _sel4 = [int(_z4) for _z4 in self.cvec_arg.split('.') if _z4 != '']
+            else:
+                if self.cvec_arg == '':
+                    raise ValueError('chunkvec: mode %r needs an integer k' % self.cvec_mode)
+                _k4 = int(self.cvec_arg)
+                if _k4 < 0 or _k4 > _nd4:
+                    raise ValueError('chunkvec: k=%d outside [0, %d]' % (_k4, _nd4))
+                _sel4 = (list(range(_k4)) if self.cvec_mode == 's'
+                         else list(range(_nd4 - _k4, _nd4)))
+            for _z4 in _sel4:
+                if _z4 < 0 or _z4 >= _nd4:
+                    raise ValueError('chunkvec: one-D rank %d outside [0, %d)' % (_z4, _nd4))
+            if len(set(_sel4)) != len(_sel4):
+                raise ValueError('chunkvec: duplicate one-D rank in %r' % (_sel4,))
+            self.cvec_sel = sorted(_sel4)
+            _selset4 = set(self.cvec_sel)
+            self.cvec_K = []
+            for _i4, (_s4, _ne4) in enumerate(zip(self.cvec_shape, self.cvec_numel)):
+                if len(_s4) == 1:
+                    _Kx = 1 if _rank4[_i4] in _selset4 else _ne4
+                elif self.cvec_nd == 'n':
+                    _Kx = _ne4 // int(_s4[0])
+                elif self.cvec_nd == 'w':
+                    _Kx = 1
+                else:
+                    _Kx = int(self.cvec_nd)
+                if _Kx < 1:
+                    raise ValueError('chunkvec: tensor %d got chunk size %d' % (_i4, _Kx))
+                self.cvec_K.append(int(_Kx))
+            self.cvec_counts = [(_ne4 + _Kx - 1) // _Kx
+                                for _ne4, _Kx in zip(self.cvec_numel, self.cvec_K)]
+            self.beta = [_lb * torch.ones(_c4, dtype=torch.float32, device=self._device)
+                         for _c4 in self.cvec_counts]
+"""
+src = src.replace(a3, n3, 1)
+
+# --- 4. beta_to_alpha ------------------------------------------------------------------
+a4 = """        # --- PATCH_CHUNKWISE: one alpha per contiguous chunk of K weights ---
+        if self.stepsize_type == 'chunkwise':
+            _K = self.chunk_size
+            alphas = [torch.exp(b).repeat_interleave(_K)[:_n].view(_s)
+                      for b, _n, _s in zip(beta, self.chunk_numel, self.chunk_shape)]
+            self.alpha_for_printing = alphas
+            return alphas
+"""
+assert src.count(a4) == 1, f"anchor 4 count={src.count(a4)} -- refusing to patch"
+n4 = a4 + """        # --- PATCH_CHUNKVEC: one alpha per chunk, with K read PER TENSOR.  When
+        # K_i == numel_i // shape_i[0] this is nodewise's broadcast expressed densely
+        # (row-major: group g IS the flat slice [g*K, (g+1)*K)); when K_i == 1 it is
+        # weightwise on that tensor; when K_i == numel_i it is one alpha for the tensor.
+        if self.stepsize_type == 'chunkvec':
+            alphas = [torch.exp(b).repeat_interleave(_Kx)[:_ne4].view(_s4)
+                      for b, _Kx, _ne4, _s4 in zip(beta, self.cvec_K, self.cvec_numel,
+                                                   self.cvec_shape)]
+            self.alpha_for_printing = alphas
+            return alphas
+"""
+src = src.replace(a4, n4, 1)
+
+# --- 5. block_product ------------------------------------------------------------------
+a5 = """        # --- PATCH_CHUNKWISE: per-chunk sums, zero-padded to a whole number of chunks.
+        # The pad contributes exactly 0 to its chunk's sum, so a ragged final chunk is
+        # summed over its REAL members only and is not silently scaled.
+        if self.stepsize_type == 'chunkwise':
+            _K = self.chunk_size
+            _out = []
+            for i in range(self.num_layers):
+                _p = (u[i]*v[i]).reshape(-1)
+                _n3 = _p.numel()
+                _c = (_n3 + _K - 1) // _K
+                _pad = _c * _K - _n3
+                if _pad:
+                    _p = torch.cat([_p, _p.new_zeros(_pad)])
+                _out.append(_p.view(_c, _K).sum(dim=1))
+            return _out
+"""
+assert src.count(a5) == 1, f"anchor 5 count={src.count(a5)} -- refusing to patch"
+n5 = a5 + """        # --- PATCH_CHUNKVEC: per-chunk sums with K read PER TENSOR, zero-padded to a
+        # whole number of chunks.  The pad contributes exactly 0 to its chunk's sum, so a
+        # ragged final chunk is summed over its REAL members only and is never rescaled.
+        # On the ladder's own K2 values no pad of length 1 is ever produced (the minimum
+        # ragged tail over K2 in {777,802,844,914,915,1070,1417,2325} is 22 weights), so
+        # every size-1 group on every rung is one that was DELIBERATELY injected.
+        if self.stepsize_type == 'chunkvec':
+            _out = []
+            for i in range(self.num_layers):
+                _Kx = self.cvec_K[i]
+                _p = (u[i]*v[i]).reshape(-1)
+                _n5 = _p.numel()
+                _c5 = (_n5 + _Kx - 1) // _Kx
+                _pad5 = _c5 * _Kx - _n5
+                if _pad5:
+                    _p = torch.cat([_p, _p.new_zeros(_pad5)])
+                _out.append(_p.view(_c5, _Kx).sum(dim=1))
+            return _out
+"""
+src = src.replace(a5, n5, 1)
+
+# --- structural assertions on the RESULT ------------------------------------------------
+assert "import numpy as np" in src, "expected numpy imported in HF.py"
+assert "import torch" in src, "expected torch imported in HF.py"
+# HF.py's REVERSED `in`-on-a-STRING dispatches; 'chunkvec' must fall into neither.
+assert "chunkvec" not in "scalar" and "chunkvec" not in "blockwise"
+# Every new branch must be guarded by the new type and nothing else.
+assert src.count("self.stepsize_type == 'chunkvec'") == 3, "expected 3 chunkvec branches"
+assert src.count("'chunkvec'") == 4, "expected 4 mentions: 3 branches + 1 assignment"
+assert src.count("PATCH_CHUNKVEC") == 5, "expected 5 PATCH_CHUNKVEC markers"
+# The branches this patch must NOT disturb.
+assert src.count("self.stepsize_type == 'nodewise'") == 3, "nodewise branches disturbed"
+assert src.count("self.stepsize_type == 'nodewise1d'") == 3, "nodewise1d branches disturbed"
+assert src.count("self.stepsize_type == 'permnode'") == 3, "permnode branches disturbed"
+assert src.count("self.stepsize_type == 'chunkwise'") == 3, "chunkwise branches disturbed"
+assert src.count("self.stepsize_type = 'chunkwise'") == 1, "chunkwise assignment disturbed"
+assert src.count("self.stepsize_type = 'permnode'") == 1, "permnode assignment disturbed"
+# The two regexes must be disjoint by construction, and chunkvec must be tested first.
+assert src.index("if _vm:") < src.index("elif _pm:") < src.index("elif _cm:"), \
+    "chunkvec must be dispatched before permnode and chunkwise"
+assert _re0.match(r'^chunk(\d+)$', 'chunkvec777s0') is None, \
+    "the chunk regex would capture a chunkvec string"
+assert _re0.match(r'^chunkvec(\d+|n|w)(s|r|x)([0-9.]*)$', 'chunk777') is None, \
+    "the chunkvec regex would capture a chunk string"
+
+open(P, "w").write(src)
+print("PATCHED PATCH_CHUNKVEC ->", P)

@@ -1,0 +1,698 @@
+#!/usr/bin/env bash
+# =============================================================================
+# c98_hz3_s5_box30.sh -- R2.  THE hz3 SEED-5 TRIO, RE-RUN IN THE BATCH'S OWN BOX.
+#
+# 3 jobs: hz3-{ch,c23,n1d}-s5, ResNet18 / CIFAR-10 / 300 ep / SGDm+Lion,
+# ms=1e-4, alpha0=1e-3, AUGMENT=1, PROBE=5, BETA_CLIP=-30:9.0, seed 5,
+# partition gpu-2080ti-11g.  cluster_a ONLY.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS.  RE-DERIVED, NOT QUOTED.
+# -----------------------------------------------------------------------------
+# `hz3` is the campaign's ONLY budget-generalisation result.  It is reported as
+# ONE batch of 4 arms x 6 seeds in ONE box.  It is not.  Read off the runs' OWN
+# ENV lines (STANDING RULE 20), 21 of the 24 runs carry
+#     BETA_CLIP=-30:9.0
+# and exactly three -- hz3-ch-s5, hz3-c23-s5, hz3-n1d-s5, job ids 4814293/95/94,
+# a separate submission 32,266-32,288 job ids after the main one -- carry
+#     BETA_CLIP=-15:-2.3026
+# while their own seed-5 comparator hz3-node-s5 (4782027) carries -30:9.0.
+# So D(s5) = chunk777(-15:-2.3026) - nodewise(-30:9.0) is a CROSS-BOX contrast,
+# and section 4.8's "the pairing cancels seed, run, batch, box" is false.
+#
+# **AND THE BOX IS NOT COSMETIC: THE THREE RUNS ARE ACTIVELY FLOOR-BOUND.**
+# Re-derived from their own probe.jsonl over the plateau5 window (epochs
+# 295-299 = steps 147,500-149,999), coordinate fraction n_at_lo / n_beta:
+#     hz3-ch-s5   coord_lo 0.008765   beta_min EXACTLY -15.0000   <- PINNED
+#     hz3-c23-s5  coord_lo 0.008900   beta_min EXACTLY -15.0000   <- PINNED
+#     hz3-n1d-s5  coord_lo 0.018323   beta_min EXACTLY -15.0000   <- PINNED
+#     hz3-node-s5 coord_lo 0.000000   beta_min       -21.7468     <- FREE
+#     hz3-ch-s0   coord_lo 0.000000   beta_min       -21.8570     <- FREE
+# 0.9-1.8% of the chunk/1-D arms' step-size coordinates sit ON the floor for
+# every record of the reading window, while the arm they are subtracted from is
+# 6.75 nats clear of its own floor.  This is ARM-ASYMMETRIC CLIPPING -- the
+# exact failure mode `fa1` exhibited (CORRECTIONS 117.1) and the reason hz3's
+# floor was moved -15 -> -30 in the first place (117.2: at 300 ep ms*T = 15.0
+# nats, so -15 IS REACHABLE FROM EPOCH 161.8 and -30 is not reachable at all).
+# The re-submission silently undid the correction the batch was built around.
+#
+# It shows up exactly where clipping the aligned-comparator arms would put it.
+# Per-seed D at plateau5, re-derived from the 24 raw .out series:
+#     seed   0      1      2      3      4      5
+#     D(100) +0.586 +0.564 +0.622 +0.990 +0.548 **+0.148**
+#     D(300) +0.432 +0.476 +0.168 +0.550 +0.650 **+0.290**
+# Seed 5 is the minimum at BOTH readings and the only seed below +0.50 at 100.
+#
+# WHAT DEPENDS ON IT.  The live headline is 123.2's replacement: "D is FLAT from
+# 100 to 300 epochs".  Re-derived within-run, per-seed paired, plateau5:
+#     6 seeds   D(100) +0.576  D(300) +0.428  delta -0.149 se 0.105 **t -1.42**
+#     drop s5   D(100) +0.662  D(300) +0.455  delta -0.207 se 0.107 **t -1.94**
+# The verdict "flat" survives at |t| 1.42 and does NOT survive at |t| 1.94.
+# **The published verdict currently DEPENDS on keeping the contaminated pair.**
+# (w=5 is the house primary.  The scorer's own w=50 primary reads +0.229/t 5.11
+# with all six and +0.244/t 4.72 without s5 -- 123.2 withdrew that window.)
+# D(300) itself, 6v6 unpaired plateau5, re-derives to +0.428 se 0.086 t 4.94,
+# reproducing the STATUS master-table row exactly.  That is the check that this
+# reader is the campaign's reader.
+#
+# A SECOND, INDEPENDENT CONFOUND IN THE SAME THREE RUNS, not previously
+# recorded anywhere: **THE GPU CLASS ALSO DIFFERS.**  hz3's design assigns GPU
+# class BY SEED so all four arms of a seed share it (SEED_PARTS in
+# bin/c87_horizon_300ep.sh; SEED_CLASS in analysis/c87_hz3_score.py both put
+# seed 5 on gpu-2080ti-11g).  Read off the runs' own headers:
+#     hz3-node-s5  [HOST_e5f7f0d5f9]  NVIDIA GeForce RTX 2080 Ti   <- as designed
+#     hz3-ch-s5    [HOST_668d417035]  NVIDIA A100 80GB PCIe        <- NOT as designed
+#     hz3-c23-s5   [HOST_fd0c0ddbe6]  NVIDIA A100 80GB PCIe        <- NOT as designed
+#     hz3-n1d-s5   [HOST_af5f3a3791]  NVIDIA A100 80GB PCIe        <- NOT as designed
+# The scorer PRINTS SEED_CLASS[5] = "gpu-2080ti-11g" for all four, because it is
+# a declared constant and not a measurement.  This batch fixes both confounds at
+# once by pinning --partition=gpu-2080ti-11g.
+#
+# WHY THE EXISTING GUARDS DID NOT CATCH IT.  c87_hz3_score.py's H0 gate is the
+# coordinate fraction against BOX_GATE = 0.05 and the arm asymmetry against
+# BOX_ASYM = 0.10.  The realised numbers are 0.0088-0.0183 and an asymmetry of
+# 0.018 -- under both thresholds.  The gate is doing what it was registered to
+# do; the thresholds were set for a batch in ONE box and cannot see a run whose
+# floor is 15 nats higher than the registration.  **NOTHING IS EDITED HERE.**
+# The scorer is re-run UNEDITED (STANDING RULE 16); this batch changes the DATA
+# it reads, not the reader.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  EVERY FLAG IS COPIED FROM THE RUNS' OWN ARGS LINE, NOT FROM THE
+# SCRIPT HEADER THAT PRODUCED THEM (STANDING RULE 20).
+# -----------------------------------------------------------------------------
+# hz3-ch-s5-4814293.out, verbatim:
+#   ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99
+#   --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99
+#   --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset CIFAR10
+#   --NN-name ResNet18 --batch-size 100 --max-time 999:00:00 --gamma 1
+#   --meta-stepsize 1e-4 --alpha0 1e-3 --num-epochs 300 --stepsize-groups
+#   chunk777 --seed 5 --save-directory /cluster/account_a/metaopt/runs/hz3
+#   --run-name hz3-ch-s5
+# EVERY ONE of those flags is reproduced here unchanged.  The ONLY difference
+# between this batch and the runs it supersedes is the ENV line's BETA_CLIP
+# (-15:-2.3026 -> -30:9.0) and the SLURM partition (A100 -> gpu-2080ti-11g).
+# Note the header of bin/c87_horizon_300ep.sh claims BETA_CLIP=-30:-2.3026;
+# its own CLIP constant and every run it launched say -30:9.0.  The RUNS win.
+#
+# -----------------------------------------------------------------------------
+# WHY THE RUN NAMES ARE REUSED, AND WHAT THAT COSTS
+# -----------------------------------------------------------------------------
+# analysis/c87_hz3_score.py is the REGISTERED scorer and must be re-run UNEDITED.
+# It builds each run name as TAG-SHORT-sSEED, globs "<name>-*.out" in --runs,
+# and takes sorted(cands)[-1].  Slurm job ids on cluster_a are 7 digits and
+# monotone, so a NEW run written as hz3-ch-s5-<newer id>.out SUPERSEDES
+# hz3-ch-s5-4814293.out automatically, with no edit and no staging directory.
+# GUARD 9 asserts that ordering on the ids sbatch actually returned; if a new id
+# were ever LOWER the batch is scancelled, because the scorer would silently
+# read the old box.
+#
+# It also globs the probe dir by name: probe_<short>_hz3_s<seed>.  HF.py opens
+# probe.jsonl in APPEND mode ('a', HF.py:605 on the live tree), so a re-run
+# pointed at the existing directory would INTERLEAVE two boxes in one file and
+# make every occupancy number a fiction.  GUARD 8 therefore ARCHIVES the three
+# existing directories to
+#     probe_<short>_hz3_s5.box-15_-2.3026
+# before submitting.  Nothing is deleted, the rename is idempotent and refuses
+# to clobber, and the local mirror at cluster_a-backup/runs/hz3 holds an independent
+# untouched copy of all three (332/236/237 MB of probe.jsonl, verified present).
+#
+# COST, STATED PLAINLY.  analysis/aggregate.py resolves a duplicated run name by
+#     best = max(group, key=lambda r: int(r["epochs_done"]))
+# Both the old and the new run finish 300 epochs, so that is a TIE and Python's
+# max() keeps whichever glob order yielded first -- ARBITRARY.  **THE CSV INGEST
+# OF THIS BATCH MUST NOT RELY ON IT.**  The rule for these three names is:
+#     dup_group = "hz3-<short>-s5",  superseded = 1 on the LOWER job_id.
+# aggregate.py is NOT edited here (it is not this task's file); this is recorded
+# so the ingest step applies the rule explicitly.
+#
+# -----------------------------------------------------------------------------
+# THE WALL
+# -----------------------------------------------------------------------------
+# WALL=10:00:00, the value hz3 registered.  Observed 300-epoch wallclock for the
+# chunk/1-D arms ON gpu-2080ti-11g (seeds 3 and 4, the other 2080ti seeds):
+# ch 341/347 min, c23 342 min, n1d 333/334 min -> 5.8 h, i.e. 1.72x headroom.
+# The 2.5 h the superseded A100 runs took is NOT the relevant number.
+# Expect ~17 GPU-h, not the ~9 estimated from the A100 timings.
+#
+# USAGE
+#   bash bin/c98_hz3_s5_box30.sh              # dry run: guards + composed lines
+#   bash bin/c98_hz3_s5_box30.sh --submit     # guards, archive probes, sbatch
+# =============================================================================
+set -u
+
+SUBMIT=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit) SUBMIT=1 ;;
+    *) echo "unknown argument $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+GUARD_FAILS=0
+guard_fail() {
+  GUARD_FAILS=$((GUARD_FAILS + 1))
+  echo "!!! GUARD FAIL: $1"
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! SUBMIT ABORTED -- nothing was submitted."
+    exit 1
+  fi
+  echo "    (dry run: continuing so the emitter can be validated.  THIS BATCH"
+  echo "     MUST NOT BE SUBMITTED UNTIL THIS GUARD PASSES ON cluster_a.)"
+}
+
+# ---- venv preamble (house rules; guards that import torch fail without it) ---
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+if [ -f "$REPO/bin/_lib_guards.sh" ]; then
+  . "$REPO/bin/_lib_guards.sh"
+  HAVE_LIB=1
+else
+  HAVE_LIB=0
+fi
+
+RUNNER=$WS/jobs/run_cifar.sh
+RUNROOT=$WS/runs                 # where the runner's --output %x-%j.out lands
+SAVE=$WS/runs/hz3                # IDENTICAL to the runs being superseded
+SCORER="$REPO/analysis/c87_hz3_score.py"
+ARCHIVE_SUFFIX=".box-15_-2.3026"
+
+# ---- THE REGISTERED CONSTANTS ------------------------------------------------
+TAG=hz3
+SEED=5
+CLIP=-30:9.0                   # the batch's own box (c87_horizon_300ep.sh:CLIP,
+                               # c87_hz3_score.py:CLIP, and 21 of 24 hz3 ENV lines)
+OLDCLIP=-15:-2.3026            # the box the three superseded runs actually used
+PART=gpu-2080ti-11g            # SEED_CLASS[5] -- all four arms of seed 5 share it
+WALL=7:00:00                   # 300ep observed 155-342 min; 10h was unschedulable (24 pending in this partition)
+MST=1e-4
+ALPHA0=1e-3
+GAMMA=1
+EPOCHS=300
+BATCH=100
+STEPS_PER_EPOCH=500
+PROBE_EVERY=5
+NET=ResNet18
+DSET=CIFAR10
+HF_MD5=d3202635c3fcef09387a316b73f2bb3f     # CORRECTIONS 117.9's pin
+
+# the three arms that must be re-run, and the one that must NOT be
+ARMS="chunk777:ch:14421 chunk2325:c23:4851 nodewise1d:n1d:4851"
+COMPARATOR="nodewise:node:14420"            # already in the right box; untouched
+M_NODE=14420
+N_TENSORS=62
+N_1D=41
+MAX_1D_NUMEL=512
+SINGLETONS=9610
+NPARAM=11173962
+
+echo "=============================================================="
+echo "  R2 -- hz3 SEED-5 TRIO, RE-RUN IN BOX $CLIP"
+echo "  $NET / $DSET / bs $BATCH / $EPOCHS ep / AUGMENT=1 / SGDm+Lion"
+echo "  ms=$MST alpha0=$ALPHA0 PROBE=$PROBE_EVERY seed=$SEED partition=$PART"
+echo "  3 jobs: hz3-ch-s5 hz3-c23-s5 hz3-n1d-s5   (~5.8 h each on 2080ti)"
+echo "  SUPERSEDES job ids 4814293 / 4814295 / 4814294, which ran in $OLDCLIP"
+echo "  and are FLOOR-BOUND (coord_lo 0.0088-0.0183, beta pinned at -15.0000)"
+echo "  against a comparator arm 6.75 nats clear of its floor."
+echo "  RESTORES: a box-matched AND GPU-class-matched 6v6 at every reading."
+echo "  SCORED BY: analysis/c87_hz3_score.py, UNEDITED (STANDING RULE 16)."
+echo "  NOTHING ELSE IN hz3 IS TOUCHED.  hz3-node-s5 is already in $CLIP."
+echo "=============================================================="
+
+# =============================================================================
+# GUARD 1 -- STANDING RULE 21.  THE SCORER EXISTS BEFORE ANY RUN DOES.
+# hz3's registered scorer already exists and is REUSED, not rewritten: this
+# batch replaces three inputs to an existing registration, so writing a second
+# scorer would be a second registration for one question.
+# =============================================================================
+if [ "$HAVE_LIB" = 1 ]; then
+  guard_scorer_registered "$SCORER" || guard_fail "guard 1: STANDING RULE 21"
+else
+  [ -f "$SCORER" ] || guard_fail "guard 1: STANDING RULE 21 -- no scorer at $SCORER"
+  echo "guard 1: (no _lib_guards.sh) scorer present at $SCORER"
+fi
+if [ -f "$SCORER" ]; then
+  OUT="$(cd "$REPO" && python3 "$SCORER" --selftest 2>&1 | tail -1)"
+  case "$OUT" in
+    *PASS*) echo "guard 1b: scorer selftest -- $OUT" ;;
+    *) guard_fail "guard 1b: the registered scorer's selftest did not pass: $OUT" ;;
+  esac
+fi
+
+# =============================================================================
+# GUARD 2 -- THE PREMISE, MEASURED ON THE CLUSTER'S OWN .out FILES.
+# Do not re-run three jobs on the strength of a briefing.  Read all 24 hz3 ENV
+# lines and assert EXACTLY the three named runs are in the wrong box.
+# =============================================================================
+python3 - "$RUNROOT" "$TAG" "$CLIP" "$OLDCLIP" "$SEED" <<'PYEOF' || guard_fail "guard 2: the premise"
+import os, re, sys, glob
+runroot, tag, clip, oldclip, seed = sys.argv[1:6]
+files = sorted(glob.glob(os.path.join(runroot, tag + "-*.out")))
+if not files:
+    sys.exit("GUARD FAIL: no %s-*.out under %s -- cannot verify the premise" % (tag, runroot))
+env_re = re.compile(r"BETA_CLIP=(\S+)")
+seen = {}
+for f in files:
+    box = args = None
+    with open(f, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("ENV:"):
+                m = env_re.search(line)
+                box = m.group(1) if m else None
+            elif line.startswith("ARGS:"):
+                args = line.strip()
+            if box and args:
+                break
+    name = os.path.basename(f).rsplit("-", 1)[0]
+    jid = os.path.basename(f).rsplit("-", 1)[1][:-4]
+    seen.setdefault(name, []).append((int(jid), box, args))
+wrong = sorted(n for n, v in seen.items() if sorted(v)[-1][1] == oldclip)
+right = sorted(n for n, v in seen.items() if sorted(v)[-1][1] == clip)
+other = sorted(n for n, v in seen.items() if sorted(v)[-1][1] not in (clip, oldclip))
+expect_wrong = ["%s-%s-s%s" % (tag, s, seed) for s in ("c23", "ch", "n1d")]
+print("guard 2: %d %s runs on disk -- %d in %s, %d in %s, %d elsewhere"
+      % (len(seen), tag, len(right), clip, len(wrong), oldclip, len(other)))
+if other:
+    sys.exit("GUARD FAIL: %d run(s) in an UNREGISTERED box: %s" % (len(other), other))
+if wrong != expect_wrong:
+    sys.exit("GUARD FAIL: the runs in %s are %s, not the registered trio %s.  The "
+             "premise of this batch is not what is on disk -- DO NOT SUBMIT."
+             % (oldclip, wrong, expect_wrong))
+comp = "%s-node-s%s" % (tag, seed)
+if comp not in right:
+    sys.exit("GUARD FAIL: the seed-%s comparator %s is not in %s, so re-running the "
+             "trio would NOT make the pair box-matched" % (seed, comp, clip))
+print("guard 2: EXACTLY %s are in %s; their comparator %s is already in %s"
+      % (", ".join(wrong), oldclip, comp, clip))
+# RULE 13 -- the same test in the failing direction.
+if sorted(seen) == sorted(right):
+    sys.exit("GUARD FAIL (RULE 13): the box test found NO mismatched run at all, so "
+             "it cannot have discriminated -- the guard is decoration")
+print("guard 2 (RULE 13): the test discriminates -- it separated %d from %d on the "
+      "SAME parse" % (len(wrong), len(right)))
+PYEOF
+
+# =============================================================================
+# GUARD 3 -- THE BOX ITSELF.  COLON SEPARATOR, ORDERED, AND PROVABLY UNREACHABLE
+# AT THIS BUDGET.  This is the arithmetic the superseded runs violated.
+# =============================================================================
+python3 - "$CLIP" "$OLDCLIP" "$MST" "$EPOCHS" "$STEPS_PER_EPOCH" "$ALPHA0" "$SCORER" \
+  <<'PYEOF' || guard_fail "guard 3: box arithmetic"
+import math, re, sys
+clip, oldclip, mst, ep, spe, a0, scorer = sys.argv[1:8]
+if ":" not in clip:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r has NO COLON -- the runner would not parse a "
+             "box and every occupancy number would be a fiction" % clip)
+lo, hi = (float(x) for x in clip.split(":"))
+if not lo < hi:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r is not ordered lo<hi" % clip)
+b0 = math.log(float(a0))
+travel = float(mst) * int(ep) * int(spe)          # Lion's |update| is ms per step
+blo, bhi = b0 - travel, b0 + travel
+print("guard 3a: BETA_CLIP=%s parses ordered (%.4f, %.4f); beta_0 = ln(%s) = %.6f; "
+      "ms*T = %.4f*%d*%d = %.1f nats, so beta CANNOT leave [%.4f, %.4f]"
+      % (clip, lo, hi, a0, b0, float(mst), int(ep), int(spe), travel, blo, bhi))
+if blo <= lo or bhi >= hi:
+    sys.exit("GUARD FAIL: a rail of %s IS REACHABLE at this budget (beta range "
+             "[%.4f, %.4f]) -- occupancy would be arm-asymmetric by construction" % (clip, blo, bhi))
+print("guard 3b: BOTH RAILS PROVABLY UNREACHABLE -- floor clears by %.2f nats, "
+      "ceiling by %.2f nats" % (blo - lo, hi - bhi))
+olo, ohi = (float(x) for x in oldclip.split(":"))
+reach = []
+if blo <= olo: reach.append("floor %.4f reachable from epoch %.1f"
+                            % (olo, (b0 - olo) / (float(mst) * int(spe))))
+if bhi >= ohi: reach.append("ceiling %.4f reachable from epoch %.1f"
+                            % (ohi, (ohi - b0) / (float(mst) * int(spe))))
+if not reach:
+    sys.exit("GUARD FAIL (RULE 13): the same arithmetic says the SUPERSEDED box %s is "
+             "also unreachable, so it cannot have detected the defect this batch "
+             "repairs -- the guard is decoration" % oldclip)
+print("guard 3c (RULE 13): the identical arithmetic CONDEMNS the superseded box %s -- "
+      "%s.  The guard cuts in both directions." % (oldclip, "; ".join(reach)))
+src = open(scorer).read()
+m = re.search(r'^CLIP\s*=\s*"([^"]+)"', src, re.M)
+if not m:
+    sys.exit("GUARD FAIL: cannot find the registered CLIP in %s" % scorer)
+if m.group(1) != clip:
+    sys.exit("GUARD FAIL: the scorer registers CLIP=%r, this batch would submit %r"
+             % (m.group(1), clip))
+print("guard 3d: the registered scorer's own CLIP is %s -- this batch matches it" % clip)
+PYEOF
+
+# =============================================================================
+# GUARD 4 -- THE LIVE TREE.  HF.py's md5 AND ITS probe.jsonl WIRING.
+# =============================================================================
+HFPY="$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py"
+if [ ! -f "$HFPY" ]; then
+  guard_fail "guard 4: no HF.py at $HFPY (run this on cluster_a)"
+else
+  GOT="$( (md5sum "$HFPY" 2>/dev/null || md5 -q "$HFPY" 2>/dev/null) | awk '{print $1}')"
+  if [ "$GOT" != "$HF_MD5" ]; then
+    guard_fail "guard 4a: HF.py md5 is $GOT, not the pinned $HF_MD5 -- the tree that
+    produced hz3 seeds 0-4 is NOT the tree this batch would run on, so the new seed 5
+    would not be comparable to them"
+  else
+    echo "guard 4a: HF.py md5 $GOT matches the hz3 pin"
+  fi
+  if grep -q "probe.jsonl" "$HFPY"; then
+    echo "guard 4b: HF.py writes probe.jsonl -- box occupancy is MEASURABLE"
+    if grep -q "probe.jsonl'), 'a')" "$HFPY" || grep -q "probe.jsonl\"), \"a\")" "$HFPY"; then
+      echo "guard 4c: probe.jsonl is opened in APPEND mode -- guard 8's archive step is"
+      echo "          MANDATORY, not hygiene: reusing the directory would interleave boxes"
+    fi
+  else
+    guard_fail "guard 4b: HF.py does not write probe.jsonl -- occupancy UNMEASURABLE"
+  fi
+fi
+[ -f "$RUNNER" ] || guard_fail "guard 4d: no runner at $RUNNER"
+
+# =============================================================================
+# GUARD 5 -- m IS MEASURED ON THE LIVE TREE, NEVER ASSERTED.  RULE 13 BOTH WAYS.
+# =============================================================================
+python3 - "$WS" "$NET" "$M_NODE" "$N_TENSORS" "$N_1D" "$MAX_1D_NUMEL" "$SINGLETONS" \
+    "$NPARAM" "$ALPHA0" "$MST" "$ARMS" "$COMPARATOR" \
+  <<'PYEOF' || guard_fail "guard 5: beta allocation"
+import os, sys, math
+(ws, net, m_node, n_ten, n_1d, max1d, singles, nparam, a0, mst, arms, comp) = sys.argv[1:13]
+m_node, n_ten, n_1d, max1d, singles, nparam = (int(m_node), int(n_ten), int(n_1d),
+                                               int(max1d), int(singles), int(nparam))
+want = {}
+for spec in (arms + " " + comp).split():
+    g, short, m = spec.split(":")
+    want[g] = int(m)
+base = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                    "cifar10")
+sys.path.insert(0, base)
+sys.path.insert(0, os.path.join(base, "Optimizers"))
+try:
+    import torch                                                   # noqa: F401
+    from build_network import build_network                        # type: ignore
+    from HF import HF                                              # type: ignore
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE build_network/HF on this host (%s).  "
+             "This guard MUST run on cluster_a inside the venv before submission." % ex)
+net_obj = build_network(net, "cpu")          # signature is (network_name, device)
+shapes = [tuple(p.shape) for p in net_obj.parameters()]
+tot = sum(int(math.prod(s)) for s in shapes)
+ones = [s for s in shapes if len(s) == 1]
+if len(shapes) != n_ten:
+    sys.exit("GUARD FAIL: %s has %d tensors, not the %d registered" % (net, len(shapes), n_ten))
+if len(ones) != n_1d:
+    sys.exit("GUARD FAIL: %s has %d 1-D tensors, not the %d registered" % (net, len(ones), n_1d))
+mx = max(s[0] for s in ones)
+if mx != max1d:
+    sys.exit("GUARD FAIL: largest 1-D tensor is %d, not the %d registered" % (mx, max1d))
+if tot != nparam:
+    sys.exit("GUARD FAIL: %s has %d parameters, not the %d registered" % (net, tot, nparam))
+print("guard 5a: %s -- %d tensors, %d of them 1-D, largest 1-D numel %d, %d parameters"
+      % (net, len(shapes), len(ones), mx, tot))
+for g in want:
+    if g.startswith("chunk"):
+        K = int(g[5:])
+        if K <= mx:
+            sys.exit("GUARD FAIL: chunk K=%d is NOT greater than the largest 1-D tensor "
+                     "(%d); the chunk arm would SPLIT the very tensors whose merging is "
+                     "the prescription" % (K, mx))
+print("guard 5b: every chunk K exceeds %d, so all %d 1-D tensors get EXACTLY ONE chunk" % (mx, len(ones)))
+
+
+class _NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+_BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+_META = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+         "Lion_beta2": 0.9, "weight_decay": 0}
+
+
+def m_of(gran):
+    torch.manual_seed(0)
+    fresh = build_network(net, "cpu")
+    opt = HF(fresh, stepsize_groups=gran, alpha0=float(a0), args_base=dict(_BASE),
+             args_meta=dict(_META), gamma=1, writer=_NullWriter())
+    return sum(int(b.numel()) for b in opt.beta)
+
+
+got = {}
+for g in sorted(want):
+    got[g] = m_of(g)
+    if got[g] != want[g]:
+        sys.exit("GUARD FAIL: m(%s) is %d, not the %d registered" % (g, got[g], want[g]))
+    print("guard 5c: %-12s ALLOCATED beta m=%d (registered %d)" % (g, got[g], want[g]))
+if got["chunk2325"] != got["nodewise1d"]:
+    sys.exit("GUARD FAIL: the G leg is registered as an EXACT count match and is not")
+print("guard 5c: G leg EXACT (%d == %d); D leg is %+d group on %d"
+      % (got["chunk2325"], got["nodewise1d"], got["chunk777"] - got["nodewise"], got["nodewise"]))
+sz1 = sum(s[0] for s in ones)
+if sz1 != singles:
+    sys.exit("GUARD FAIL: %s has %d size-1 nodewise groups, not the %d registered"
+             % (net, sz1, singles))
+print("guard 5d: the degenerate tail is %d size-1 groups = %.2f%% of m(nodewise)"
+      % (sz1, 100.0 * sz1 / m_node))
+bad = {g: v + 1 for g, v in want.items()}
+for g, v in bad.items():
+    if got[g] == v:
+        sys.exit("GUARD FAIL (RULE 13): the m check does NOT refuse a registration "
+                 "perturbed by one group on %s -- the guard is decoration" % g)
+print("guard 5e (RULE 13): the same equality REFUSES all %d registrations perturbed by "
+      "one group.  The guard cuts in both directions." % len(bad))
+PYEOF
+
+# =============================================================================
+# THE EMITTER.  ONE PLACE COMPOSES THE COMMAND LINE; THE GUARDS READ IT.
+# =============================================================================
+DESIGN=(optimizer=HF alg-base=SGDm momentum-param-base=0.99 weight-decay-base=0.1
+        alg-meta=Lion momentum-param-meta=0.99 Lion-beta2-meta=0.9 weight-decay-meta=0
+        dataset="$DSET" NN-name="$NET" batch-size="$BATCH" gamma="$GAMMA"
+        meta-stepsize="$MST" alpha0="$ALPHA0" num-epochs="$EPOCHS" seed="$SEED")
+
+compose() {   # compose <granularity> <short>  -> the exact sbatch line, one string
+  local GRAN="$1" SHORT="$2" RN="$TAG-$2-s$SEED"
+  printf '%s' "sbatch --job-name=$RN --partition=$PART --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL --nice=0 \
+--export=ALL,AUGMENT=1,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=$PROBE_EVERY,PROBE_DIR=$SAVE/probe_${SHORT}_${TAG}_s${SEED} \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 \
+--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 \
+--dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 --gamma $GAMMA \
+--meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS --stepsize-groups $GRAN \
+--seed $SEED --save-directory $SAVE --run-name $RN"
+}
+
+# =============================================================================
+# GUARD 6 -- STANDING RULE 20, BEFORE sbatch.  NO FLAG MAY APPEAR TWICE.
+# This is the guard ml2 and sm3 did not have.  It reads the string that will be
+# eval'd, not the script header.
+# =============================================================================
+echo "--------------------------------------------------------------"
+echo "  THE COMPOSED COMMAND LINES, VERBATIM.  DRY RUN PRINTS THESE."
+echo "--------------------------------------------------------------"
+for SPEC in $ARMS; do
+  GRAN="${SPEC%%:*}"; REST="${SPEC#*:}"; SHORT="${REST%%:*}"
+  CMD="$(compose "$GRAN" "$SHORT")"
+  echo
+  printf '%s\n' "$CMD"
+  echo
+  if [ "$HAVE_LIB" = 1 ]; then
+    guard_presubmit "$CMD" "${DESIGN[@]}" stepsize-groups="$GRAN" \
+      run-name="$TAG-$SHORT-s$SEED" \
+      || guard_fail "guard 6: STANDING RULE 20 on $TAG-$SHORT-s$SEED"
+  else
+    DUP="$(printf '%s\n' "$CMD" | tr ' ' '\n' | grep '^--' | sort | uniq -d)"
+    if [ -n "$DUP" ]; then
+      guard_fail "guard 6 (fallback): repeated flag(s) on $TAG-$SHORT-s$SEED: $DUP"
+    else
+      echo "guard 6 (fallback, no _lib_guards.sh): no repeated flag on $TAG-$SHORT-s$SEED"
+    fi
+  fi
+done
+
+# GUARD 6b -- RULE 13 on the duplicate detector itself.  Feed it a line that IS
+# duplicated and require a refusal.  A guard only ever seen to pass is untested.
+if [ "$HAVE_LIB" = 1 ]; then
+  POISON="$(compose chunk777 ch) --alg-meta RMSProp"
+  if guard_presubmit "$POISON" "${DESIGN[@]}" >/dev/null 2>&1; then
+    guard_fail "guard 6b (RULE 13): guard_presubmit ACCEPTED a line carrying two
+    --alg-meta -- it would not have caught ml2 or sm3.  DO NOT SUBMIT."
+  else
+    echo "guard 6b (RULE 13): guard_presubmit REFUSES the ml2/sm3 shape"
+    echo "                    (\"... --alg-meta Lion ... --alg-meta RMSProp\").  The"
+    echo "                    duplicate detector is live, not decoration."
+  fi
+fi
+
+# =============================================================================
+# GUARD 7 -- THE QUEUE.  Do not add to someone else's batch by accident.
+# =============================================================================
+if command -v squeue >/dev/null 2>&1; then
+  NQ="$(squeue -h -u "${USER:-$(whoami)}" 2>/dev/null | wc -l | tr -d ' ')"
+  echo "guard 7: ${USER:-$(whoami)} currently has $NQ job(s) queued/running on cluster_a"
+  CLASH="$(squeue -h -u "${USER:-$(whoami)}" -o %j 2>/dev/null | grep -c "^$TAG-" || true)"
+  [ "${CLASH:-0}" != 0 ] && guard_fail "guard 7: $CLASH $TAG-* job(s) are ALREADY in the
+  queue.  Another agent may own them.  DO NOT double-submit; nothing is scancelled here."
+else
+  echo "guard 7: no squeue on this host (off-cluster dry run)"
+fi
+
+if [ "$GUARD_FAILS" != 0 ]; then
+  echo
+  echo "=============================================================="
+  echo "  $GUARD_FAILS GUARD FAILURE(S).  NOTHING SUBMITTED."
+  echo "=============================================================="
+  exit 1
+fi
+
+if [ "$SUBMIT" != "1" ]; then
+  echo
+  echo "=============================================================="
+  echo "  DRY RUN COMPLETE -- ALL GUARDS GREEN, 3 job(s) composed."
+  echo "  Re-run with --submit to archive the old probes and submit."
+  echo "=============================================================="
+  exit 0
+fi
+
+# =============================================================================
+# GUARD 8 -- ARCHIVE THE SUPERSEDED PROBE DIRECTORIES.  NOTHING IS DELETED.
+# HF.py appends to probe.jsonl, so a re-run into the existing directory would
+# interleave two boxes in one file.  Rename, refuse to clobber, verify.
+# =============================================================================
+echo
+echo "--- guard 8: archiving the superseded probe directories -------------"
+for SPEC in $ARMS; do
+  REST="${SPEC#*:}"; SHORT="${REST%%:*}"
+  SRC="$SAVE/probe_${SHORT}_${TAG}_s${SEED}"
+  DST="$SRC$ARCHIVE_SUFFIX"
+  if [ -e "$DST" ]; then
+    echo "guard 8: $DST already exists -- previously archived, leaving it alone"
+  elif [ -d "$SRC" ]; then
+    mv "$SRC" "$DST" || { echo "!!! GUARD FAIL: could not archive $SRC"; exit 1; }
+    echo "guard 8: $SRC -> $DST  ($(du -sh "$DST" 2>/dev/null | awk '{print $1}'))"
+  else
+    echo "guard 8: $SRC does not exist -- nothing to archive"
+  fi
+  if [ -e "$SRC" ]; then
+    echo "!!! GUARD FAIL: $SRC still exists after the archive step.  A re-run would"
+    echo "!!! APPEND a second box into the same probe.jsonl.  NOTHING SUBMITTED."
+    exit 1
+  fi
+done
+echo "guard 8: all three canonical probe directories are clear; the local mirror at"
+echo "         cluster_a-backup/runs/hz3 retains an independent untouched copy."
+
+# =============================================================================
+# SUBMIT.  COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+# =============================================================================
+echo
+echo "--- submitting -------------------------------------------------------"
+N=0; FAIL=0; JOBIDS=""; JOBMAP=""
+for SPEC in $ARMS; do
+  GRAN="${SPEC%%:*}"; REST="${SPEC#*:}"; SHORT="${REST%%:*}"
+  RN="$TAG-$SHORT-s$SEED"
+  CMD="$(compose "$GRAN" "$SHORT")"
+  OUT="$(eval "$CMD" 2>&1)" || { echo "!!! sbatch FAILED for $RN: $OUT"; FAIL=$((FAIL+1)); continue; }
+  JID="$(printf '%s' "$OUT" | awk '{print $NF}')"
+  case "$JID" in
+    ''|*[!0-9]*) echo "!!! sbatch returned no job id for $RN: $OUT"; FAIL=$((FAIL+1)); continue ;;
+  esac
+  N=$((N+1)); JOBIDS="$JOBIDS $JID"; JOBMAP="$JOBMAP $RN:$JID"
+  echo "  submitted $RN -> job $JID"
+done
+echo "--- slurm ACCEPTED $N job(s), $FAIL failure(s) ------------------------"
+[ "$N" = 0 ] && { echo "!!! nothing was accepted"; exit 1; }
+
+# =============================================================================
+# GUARD 9 -- THE SUPERSESSION ORDERING.  The registered scorer takes
+# sorted(glob("<run>-*.out"))[-1].  Assert each new job id sorts ABOVE the id it
+# supersedes, or the scorer would silently keep reading the OLD box.
+# =============================================================================
+echo
+python3 - "$JOBMAP" <<'PYEOF' || { echo "!!! GUARD 9 FAILED -- cancelling$JOBIDS"; scancel $JOBIDS; exit 1; }
+import sys
+OLD = {"hz3-ch-s5": 4814293, "hz3-c23-s5": 4814295, "hz3-n1d-s5": 4814294}
+bad = []
+for pair in sys.argv[1].split():
+    rn, jid = pair.rsplit(":", 1)
+    old = OLD.get(rn)
+    if old is None:
+        bad.append("%s is not one of the three registered names" % rn)
+        continue
+    new = int(jid)
+    # the scorer sorts FILE NAMES lexicographically, so equal width matters too
+    if len(str(new)) != len(str(old)):
+        bad.append("%s: new id %d and old id %d have different digit counts, so the "
+                   "scorer's lexicographic sort is NOT the numeric one" % (rn, new, old))
+    elif new <= old:
+        bad.append("%s: new id %d does NOT sort above the superseded %d" % (rn, new, old))
+    else:
+        print("guard 9: %-12s %d supersedes %d (lexicographic == numeric, 7 digits)"
+              % (rn, new, old))
+if bad:
+    sys.exit("GUARD FAIL:\n  " + "\n  ".join(bad))
+print("guard 9: every new run will be the one analysis/c87_hz3_score.py reads.")
+PYEOF
+
+# =============================================================================
+# GUARD 10 -- STANDING RULE 20, AFTER LAUNCH.  Read the FIRST launched job's own
+# ARGS and ENV lines off the cluster and abort the whole batch if they differ
+# from the design.  Keyed on the job ids sbatch returned, never on "newest .out"
+# (hz3-*.out from the superseded submissions are still on disk).
+# =============================================================================
+echo
+echo "--- guard 10: waiting for the first launched job's OWN ARGS line ------"
+WAITED=0; LIMIT=${ARGSGUARD_WAIT:-900}; POLL=${ARGSGUARD_POLL:-20}; FIRST=""
+while [ "$WAITED" -lt "$LIMIT" ]; do
+  for JID in $JOBIDS; do
+    for F in "$RUNROOT"/*-"$JID".out; do
+      [ -f "$F" ] && grep -q '^ARGS:' "$F" 2>/dev/null && { FIRST="$F"; break 3; }
+    done
+  done
+  sleep "$POLL"; WAITED=$((WAITED + POLL))
+done
+if [ -z "$FIRST" ]; then
+  echo "!!! guard 10: no ARGS line under $RUNROOT for job(s)$JOBIDS after ${LIMIT}s."
+  echo "!!! The batch is UNVERIFIED.  Audit BEFORE quoting any number from it:"
+  echo "!!!   for J in$JOBIDS; do grep -m1 '^ARGS:' $RUNROOT/*-\$J.out; done"
+  echo "!!!   python3 analysis/argsline_guard.py $RUNROOT --name $TAG-"
+  exit 2
+fi
+echo "guard 10: auditing $FIRST"
+echo "--- the run's OWN ARGS line, verbatim ---"
+grep -m1 '^ARGS:' "$FIRST"
+echo "--- the run's OWN ENV line, verbatim ----"
+grep -m1 '^ENV:' "$FIRST"
+echo "-----------------------------------------"
+RC=0
+if [ -f "$REPO/analysis/argsline_guard.py" ]; then
+  EXP=""
+  for E in "${DESIGN[@]}"; do EXP="$EXP --expect $E"; done
+  # shellcheck disable=SC2086
+  python3 "$REPO/analysis/argsline_guard.py" "$FIRST" $EXP || RC=1
+fi
+grep -m1 '^ENV:' "$FIRST" | grep -q "BETA_CLIP=$CLIP" \
+  || { echo "!!! guard 10: the launched run's ENV line does NOT read BETA_CLIP=$CLIP"; RC=1; }
+grep -m1 '^ENV:' "$FIRST" | grep -q "PROBE=$PROBE_EVERY" \
+  || { echo "!!! guard 10: the launched run's ENV line does NOT read PROBE=$PROBE_EVERY"; RC=1; }
+if [ "$RC" != 0 ]; then
+  echo "!!! GUARD FAIL (STANDING RULE 20): the LAUNCHED batch does not match the"
+  echo "!!! declared design.  IT IS VOID AS DESIGNED.  Cancelling$JOBIDS now."
+  scancel $JOBIDS
+  exit 1
+fi
+echo "guard 10: PASS -- the launched run's own ARGS and ENV lines match the design."
+
+echo
+echo "=============================================================="
+echo "  R2 SUBMITTED.  $N job(s):$JOBMAP"
+echo "  WHEN THEY FINISH:"
+echo "    1. sync $RUNROOT/hz3-*-s5-*.out and $SAVE/probe_*_hz3_s5 to the mirror"
+echo "    2. RUN THE REGISTERED SCORER UNEDITED (STANDING RULE 16):"
+echo "         python3 analysis/c87_hz3_score.py --runs runs --probes runs/hz3"
+echo "    3. INGEST: dup_group=hz3-<short>-s5, superseded=1 on the LOWER job id."
+echo "       aggregate.py's max-by-epochs_done tie-break CANNOT decide this."
+echo "=============================================================="

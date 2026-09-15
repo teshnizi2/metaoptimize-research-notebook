@@ -40,8 +40,8 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   const rows = researchTimeline(data.activity, data.experiments);
   const phaseIds = new Set(rows.flatMap(row => row.experiments.map(entry => entry.id)));
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 32);
-  assert.equal(phaseIds.size, 31);
+  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 69);
+  assert.equal(phaseIds.size, 68);
   assert.equal(unlinked.length, 80);
   assert.ok(unlinked.every(entry => !phaseIds.has(entry.id)));
   assert.equal(phaseIds.size + unlinked.length, data.experiments.length);
@@ -52,8 +52,8 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
 test('current verdict counts remain separate from favorable descriptive observations', async () => {
   const { researchTimeline } = await helpers();
   const rows = researchTimeline(data.activity, data.experiments);
-  assert.deepEqual(rows.find(row => row.id === 'phase-03')!.counts, { success: 0, fail: 1, mixed: 0, unresolved: 0, correction: 0 });
-  assert.deepEqual(rows.find(row => row.id === 'phase-06')!.counts, { success: 1, fail: 0, mixed: 1, unresolved: 1, correction: 0 });
+  assert.deepEqual(rows.find(row => row.id === 'phase-06')!.counts, { success: 1, fail: 0, mixed: 1, unresolved: 1 });
+  assert.deepEqual(rows.find(row => row.id === 'phase-01')!.counts, { success: 1, fail: 5, mixed: 0, unresolved: 0 }, 'MT071 and MT074 now count as Goal missed, with the Corrected badge');
   assert.equal(rows.find(row => row.id === 'phase-08')!.counts.unresolved, 1);
   assert.equal(rows.find(row => row.id === 'phase-08')!.counts.success, 0);
 });
@@ -120,4 +120,21 @@ test('explicit phase links remain stable as the log grows and honor excluding fi
   assert.equal(resolvePhaseDetail(phases, [note], 'phase-08', 'phase'), undefined);
   assert.equal(resolvePhaseDetail(phases, [{ ...event, kind: 'note' }], 'phase-08', 'phase'), undefined);
   assert.equal(resolvePhaseDetail([], [event], 'phase-08', 'phase'), undefined);
+});
+
+test('the Partition tests phase links the count-matched partition audit, not only MT098', async () => {
+  const { researchTimeline, filterByResearchPhase } = await helpers();
+  const phase = researchTimeline(data.activity, data.experiments).find(row => row.id === 'phase-03')!;
+  assert.equal(phase.title, 'Partition tests');
+  const audit = Array.from({ length: 37 }, (_, i) => `MT${175 + i}`);
+  const ids = phase.experiments.map(entry => entry.id);
+  assert.deepEqual([...ids].sort(), ['MT098', ...audit].sort());
+  assert.ok(audit.every(id => data.experiments.find(e => e.id === id)?.eventIds.includes('phase-03')), 'reverse links');
+  assert.deepEqual(phase.counts, { success: 12, fail: 6, mixed: 4, unresolved: 13 }, 'research outcomes only; MT098 is the sixth Goal missed');
+  assert.equal(phase.methodChecks, 3);
+  assert.equal(filterByResearchPhase(data.experiments, data.activity, 'phase-03').length, 38);
+  const headline = data.experiments.find(e => e.id === 'MT175')!;
+  assert.equal(headline.outcome, 'success');
+  assert.match(headline.result, /20 of 20 cells/);
+  assert.match(headline.result, /\+0\.5556 ± 0\.0448/);
 });

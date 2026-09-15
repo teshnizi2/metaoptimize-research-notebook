@@ -24,6 +24,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import register_model  # noqa: E402  (four-outcome model and pinned partition-audit import)
+
 
 PORTAL = Path(__file__).resolve().parents[1]
 DEFAULT_WORKSPACE = PORTAL.parents[1]
@@ -36,7 +39,9 @@ HOST_RE = re.compile(r"\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A
 SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,})\b")
 PRIVATE_HINT_RE = re.compile(r"/Users/|/home/|/data1/|/scratch/|/zfsstore/|/private/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|@|\bsk-|\bgh[pousr]_|api[_-]?key|access[_-]?token|auth[_-]?token|password|secret", re.I)
 ID_RE = re.compile(r"\b(?:MT\d{3}|CVK2)\b")
-OUTCOMES = {"success", "fail", "mixed", "unresolved", "correction"}
+OUTCOMES = set(register_model.OUTCOMES)  # "Corrected" is a badge, never an outcome.
+KINDS = set(register_model.KINDS)
+PARTITION_IDS = [register_model.partition_id(line) for line in range(register_model.FIRST_ROW, register_model.LAST_ROW + 1)]
 PORTFOLIO_LINKS = {
     "alpha0_robustness": ["MT047", "MT048", "MT049", "MT051"],
     "alpha0_300_extremes": ["MT050"],
@@ -70,7 +75,7 @@ TOP_TABLE_LINKS = {
 PHASE_LINKS = [
     ["MT069", "MT071", "MT072", "MT073", "MT074", "MT075"],
     ["MT026", "MT086", "MT087", "MT088", "MT089", "MT093", "MT098"],
-    ["MT098"], ["MT132", "MT133", "MT134"],
+    ["MT098", *PARTITION_IDS], ["MT132", "MT133", "MT134"],  # phase-03 Partition tests: MASTER-TABLE section 10
     ["MT141", "MT142", "MT145", "MT146", "MT147", "MT149", "MT157"],
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
@@ -186,18 +191,26 @@ def make_figures(rows):
 
 
 def warning_for(experiment):
+    """Verdict warning for the current outcome, plus the retained correction history."""
     outcome = experiment["outcome"]
-    severity, title, status = {
-        "success": ("limitation", "Scope of the supported result", "documented"),
-        "fail": ("caution", "The tested goal was not supported", "documented"),
-        "mixed": ("limitation", "The result depends on scope", "documented"),
-        "unresolved": ("open", "The question remains unresolved", "open"),
-        "correction": ("correction", "A historical claim was corrected", "resolved"),
-    }[outcome]
+    if experiment["kind"] == "method-check":
+        severity, title, status = ("correction", "A method check corrected the campaign's own process", "resolved")
+    else:
+        severity, title, status = {
+            "success": ("limitation", "Scope of the supported result", "documented"),
+            "fail": ("caution", "The tested goal was not supported", "documented"),
+            "mixed": ("limitation", "The result depends on scope", "documented"),
+            "unresolved": ("open", "The question remains unresolved", "open"),
+        }[outcome]
     detail = " ".join(dict.fromkeys([experiment["result"], experiment["reason"], experiment["scope"]]))
     if outcome == "fail":
         detail += " This is a scientific verdict about the tested goal, not a runtime-failure classification."
-    return {"id": f"warning-{experiment['id']}-verdict", "experimentId": experiment["id"], "severity": severity, "title": title, "detail": detail, "status": status}
+    warnings = [{"id": f"warning-{experiment['id']}-verdict", "experimentId": experiment["id"], "severity": severity, "title": title, "detail": detail, "status": status}]
+    if experiment["corrected"] and experiment["kind"] == "research":
+        warnings.append({"id": f"warning-{experiment['id']}-correction", "experimentId": experiment["id"], "severity": "correction",
+                         "title": "A historical claim was corrected", "status": "resolved",
+                         "detail": experiment["correction"]["note"] + " Correction record: " + experiment["correction"]["source"] + "."})
+    return warnings
 
 
 def build_experiments(register, source_links):
@@ -212,13 +225,15 @@ def build_experiments(register, source_links):
         experiment = {
             "id": eid, "section": int(row["section"]), "area": row["area"],
             "title": row["original_question"] or row["goal"],
-            **{key: row[key] for key in ["goal", "comparison", "why", "result", "outcome", "reason", "scope"]},
+            **{key: row[key] for key in ["goal", "comparison", "why", "result", "reason", "scope"]},
+            "kind": row["kind"], "outcome": row["outcome"] or None,
+            "corrected": row["corrected"] == "1", "correction": json.loads(row["correction"]) if row["correction"] else None,
             "batches": json.loads(row["batches"]), "figureIds": [], "codeIds": linkage["codeIds"],
             "tableIds": [], "warningIds": [], "eventIds": [], "runIds": [], "sourceRefs": linkage["sourceRefs"],
         }
-        warning = warning_for(experiment)
-        experiment["warningIds"].append(warning["id"])
-        warnings.append(warning)
+        for warning in warning_for(experiment):
+            experiment["warningIds"].append(warning["id"])
+            warnings.append(warning)
         for index, missing in enumerate(linkage.get("missing", []), 1):
             warning = {"id": f"warning-{eid}-source-{index}", "experimentId": eid, "severity": "limitation", "title": "An archived source is unavailable", "detail": str(missing), "status": "open"}
             warnings.append(warning)
@@ -270,7 +285,7 @@ def table_contexts(table_root, experiments):
             linked = portfolio_union
             scope = "Portfolio data/provenance catalog. Use panel_id, occurrence_id, and source pointers to locate each experiment's actual subset; this catalog does not make every row evidence for every linked question."
         elif rel.startswith("measurement_and_mechanism/"):
-            linked = [e["id"] for e in experiments if e["section"] >= 7 and e["id"] != "CVK2"]
+            linked = [e["id"] for e in experiments if 7 <= e["section"] <= 9 and e["id"] != "CVK2"]
             scope = "Measurement and mechanism catalog. Dataset IDs and the panel index identify the relevant subset; this is a catalog-level link."
         else:
             linked = sorted(ids)
@@ -436,7 +451,7 @@ def make_runs(inventory, experiments, evidence, public, workspace):
     return runs, log_receipts
 
 
-def make_activity(timeline, snapshot_date):
+def make_activity(timeline, snapshot_date, experiments):
     activity = []
     for index, row in enumerate(timeline):
         phase, _, label = row["phase"].partition("\n")
@@ -448,7 +463,7 @@ def make_activity(timeline, snapshot_date):
         })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": "Public snapshot assembled from the 111-question register, 2,863-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]}), the 2,863-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -542,17 +557,31 @@ def validate(data, runs, public):
         if not value:
             errors.append(message)
 
-    expected = {"experiments": 111, "runs": 2863, "figures": 54, "areas": 9}
+    expected = {"experiments": 148, "researchQuestions": 130, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10}
     verify(data["meta"]["stats"] == expected, "Incorrect snapshot totals")
-    verify(len(data["experiments"]) == 111, "Experiment count")
+    verify(len(data["experiments"]) == 148, "Experiment count")
     verify(len(runs) == 2863 and len({r["id"] for r in runs}) == 2863, "Run count or duplicate identifiers")
     verify({f["id"] for f in data["figures"]} == {f"page-{p}" for p in range(1, 55)}, "Figure page coverage")
     verify(len(data["tables"]) == 201, "CSV table coverage")
-    verify(sum(a["count"] for a in data["areas"]) == 111, "Area totals")
+    verify(sum(a["count"] for a in data["areas"]) == 148, "Area totals")
+    by_id = {e["id"]: e for e in data["experiments"]}
+    for eid, (kind, outcome, _) in register_model.CORRECTION_REMAP.items():
+        row = by_id.get(eid, {})
+        verify(row.get("kind") == kind and row.get("outcome") == outcome and row.get("corrected") is True, f"Approved correction mapping not applied: {eid}")
+    phase = next((e for e in data["activity"] if e["id"] == register_model.PHASE_ID), {})
+    for eid in PARTITION_IDS:
+        row = by_id.get(eid, {})
+        verify(row.get("section") == register_model.SECTION and row.get("area") == register_model.AREA, f"Partition-audit record missing: {eid}")
+        verify(eid in phase.get("experimentIds", []), f"Partition-audit record not linked to the Partition tests phase: {eid}")
     catalogs = {"figureIds": {r["id"]: r for r in data["figures"]}, "tableIds": {r["id"]: r for r in data["tables"]}, "codeIds": {r["id"]: r for r in data["sources"]}, "runIds": {r["id"]: r for r in runs}, "warningIds": {r["id"]: r for r in data["warnings"]}, "eventIds": {r["id"]: r for r in data["activity"]}}
     for experiment in data["experiments"]:
         eid = experiment["id"]
-        verify(experiment["outcome"] in OUTCOMES, f"Unknown outcome: {eid}")
+        verify(experiment["kind"] in KINDS, f"Unknown record kind: {eid}")
+        if experiment["kind"] == "research":
+            verify(experiment["outcome"] in OUTCOMES, f"Research question needs one of the four outcomes: {eid}")
+        else:
+            verify(experiment["outcome"] is None, f"Method checks carry no research outcome: {eid}")
+        verify(isinstance(experiment["corrected"], bool) and bool(experiment["corrected"]) == bool(experiment["correction"] and experiment["correction"].get("note")), f"Corrected badge needs its correction history: {eid}")
         verify(bool(experiment["figureIds"] and experiment["tableIds"] and experiment["sourceRefs"] and experiment["eventIds"]), f"Missing experiment evidence/provenance links: {eid}")
         for field, catalog in catalogs.items():
             for ident in experiment[field]:
@@ -595,12 +624,13 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
-def export(workspace, public, snapshot_date):
+def export(workspace, public, snapshot_date, audit_path=None):
     workspace, public = Path(workspace).resolve(), Path(public).resolve()
     sources, source_links = load_source_catalog(public)  # Fail before publishing partial data.
     evidence = read_evidence(workspace)
     table_root = workspace / "outputs/tables"
-    register = read_csv(table_root / "complete_experiment_register.csv")
+    repository_path = Path(evidence["full_portfolio_evidence"]["repository"])
+    register = register_model.load_register(workspace, repository_path)
     inventory = read_csv(table_root / "complete_run_inventory.csv")
     figures = make_figures(read_csv(table_root / "complete_figure_index.csv"))
     experiments, warnings = build_experiments(register, source_links)
@@ -608,16 +638,21 @@ def export(workspace, public, snapshot_date):
     attach_latest_warnings(experiments, warnings, cvk)
     tables, table_receipts = publish_tables(workspace, public, experiments)
     runs, log_receipts = make_runs(inventory, experiments, evidence, public, workspace)
-    activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date)
+    for figure in figures:
+        if figure["id"] in register_model.FIGURE_IDS:
+            figure["experimentIds"] = list(dict.fromkeys([*figure["experimentIds"], *PARTITION_IDS]))
+    activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date, experiments)
     attach_relationships(experiments, figures, tables, runs, activity)
     attach_snapshot_import(experiments, activity, snapshot_date)
     areas = [{"id": section, "label": next(e["area"] for e in experiments if e["section"] == section), "count": sum(e["section"] == section for e in experiments)} for section in sorted({e["section"] for e in experiments})]
     repository = Path(evidence["full_portfolio_evidence"]["repository"])
     commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
     input_paths = [table_root / name for name in ["complete_experiment_register.csv", "complete_run_inventory.csv", "complete_figure_index.csv"]]
-    fingerprint = hashlib.sha256("".join(digest(path) for path in input_paths).encode()).hexdigest()[:16]
+    # The pinned MASTER-TABLE bytes and the mapping module are inputs too.
+    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
     data = {
-        "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"}},
+        "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "researchQuestions": sum(e["kind"] == "research" for e in experiments), "methodChecks": sum(e["kind"] == "method-check" for e in experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"},
+                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256}},
         "areas": areas, "experiments": experiments, "figures": figures, "sources": sources,
         "tables": tables, "warnings": warnings, "activity": activity,
         "latest": {"experimentId": "CVK2", "peakSet": cvk["peak_cuts"], "predictedCut": cvk["predicted_peak_cut"], "bestCut": cvk["best_mean_cut"], "bar": cvk["peak_bar_pp"], "cells": [{key: row[key] for key in ["arm", "cut", "mean", "sem", "n"]} for row in cvk["cells"]]},
@@ -640,7 +675,7 @@ def export(workspace, public, snapshot_date):
     })
     atomic_json(public / "data/research.json", data)
     atomic_json(public / "data/runs.json", runs)
-    atomic_json(workspace / "work/portal_data_audit.json", audit)
+    atomic_json(Path(audit_path) if audit_path else workspace / "work/portal_data_audit.json", audit)
     return audit
 
 
@@ -650,6 +685,7 @@ def main():
     parser.add_argument("--public-dir", type=Path, default=PORTAL / "public")
     parser.add_argument("--as-of", default="2026-09-15", help="Documented publication-snapshot date, YYYY-MM-DD")
     parser.add_argument("--check", action="store_true", help="Validate existing public JSON and links without regenerating assets")
+    parser.add_argument("--audit", type=Path, help="Where to write the export audit receipt (default: <workspace>/work/portal_data_audit.json)")
     args = parser.parse_args()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.as_of):
         parser.error("--as-of must be YYYY-MM-DD")
@@ -664,7 +700,7 @@ def main():
             if bundled.is_file() and Path(sys.executable).resolve() != bundled.resolve():
                 os.execv(str(bundled), [str(bundled), str(Path(__file__).resolve()), *sys.argv[1:]])
             raise RuntimeError("Pillow and pypdf are required to verify lossless public figure assets and PDF privacy")
-        audit = export(args.workspace, args.public_dir, args.as_of)
+        audit = export(args.workspace, args.public_dir, args.as_of, args.audit)
     print(json.dumps({key: audit[key] for key in ["status", "coverage", "tables", "sources", "warnings", "activity_events", "published_raw_logs"]}, indent=2))
 
 

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Download, History, Search, Terminal, TriangleAlert, X } from 'lucide-react';
 import { useResearch, useRuns } from '../data';
-import { CopyLink, Empty, ExperimentChips, PageHeading, Status } from '../components/common';
+import { CopyLink, Empty, ExperimentChips, ExperimentStatus, PageHeading, Status } from '../components/common';
 import { compactDate, safeHref } from '../lib/research';
 import { ArtifactDates } from '../components/ArtifactDates';
 import { ResearchPhaseDetail } from '../components/ResearchPhaseDetail';
@@ -110,7 +110,7 @@ export function RunDetailPage() {
       <div className="metric-card"><span className="eyebrow">Completed epochs</span><strong>{run.epochs ?? '—'}</strong><span className="small muted">Requested budget is recorded below</span></div></div>
     <p className="notice">A completed job does not establish a successful research result. Accuracy is reported as stored; validity and comparison limits belong to the experiment.</p>
     <section><div className="section-title"><h2>Connected experiments</h2><span className="muted small">{connected.length} questions</span></div>
-      {connected.length ? <div className="warning-list">{connected.map(e => <article className="warning-card" key={e.id}><div><Link className="text-link" to={`/experiments/${e.id}`}><span className="mono">{e.id}</span>{e.goal}<ArrowUpRight size={15}/></Link><p>{e.result}</p></div><Status outcome={e.outcome}/></article>)}</div>
+      {connected.length ? <div className="warning-list">{connected.map(e => <article className="warning-card" key={e.id}><div><Link className="text-link" to={`/experiments/${e.id}`}><span className="mono">{e.id}</span>{e.goal}<ArrowUpRight size={15}/></Link><p>{e.result}</p></div><ExperimentStatus experiment={e}/></article>)}</div>
         : <Empty title="No experiment association recorded" detail="The job remains in the ledger without an invented experiment link."/>}</section>
     <section><div className="section-title"><h2>Recorded parameters</h2><span className="small muted">{Object.keys(run.parameters).length} fields</span></div>
       <Query value={parameterQuery} onChange={setParameterQuery} placeholder="Find a parameter or value…"/>

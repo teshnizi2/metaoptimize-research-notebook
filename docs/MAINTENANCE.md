@@ -6,7 +6,7 @@ Run the commands below from the website project directory. Use Node.js 22.12 or 
 
 ## Append a note, correction, or warning
 
-Use the experiment IDs shown in the experiment register. The current snapshot contains 111 IDs. The command validates against the actual imported register, including `CVK2`, rather than a hard-coded count.
+Use the experiment IDs shown in the experiment register. The current snapshot contains 148 IDs (130 research questions and 18 method checks). The command validates against the actual imported register, including `CVK2`, rather than a hard-coded count.
 
 ```sh
 npm run log -- --type note --title "Interpretation note" --text "Describe the observation and its evidence here." --experiments CVK2
@@ -60,7 +60,18 @@ The source import must run first because evidence export validates its source ca
 
 Record the evidence update with a separate `npm run log` entry linked to the affected experiments, then repeat journal synchronization, source packaging, and the final build after appending it. Import regenerates the base publication history, while `content/journal.json` preserves maintainer history. Do not remove old experiment IDs that existing journal entries reference; a removed ID will block synchronization until the historical reference is restored in the evidence index.
 
-The current validation checks the established 111-experiment, 2,863-run snapshot and its registered CVK2 result. If a later campaign changes the evidence schema or coverage, update the importer and its tests deliberately from verified source evidence before publishing. Do not bypass failed validation to make an import pass.
+The current validation checks the established 148-record, 2,863-run snapshot (130 research questions, 18 method checks, 10 areas) and its registered CVK2 result. If a later campaign changes the evidence schema or coverage, update the importer and its tests deliberately from verified source evidence before publishing. Do not bypass failed validation to make an import pass.
+
+## Outcome model and the partition audit
+
+`scripts/register_model.py` is the single, reviewable place where register rows become published outcomes. Both exporters import it.
+
+- Research questions carry one of four outcomes: `success` (Goal met), `fail` (Goal missed), `mixed` (Mixed) or `unresolved` (Open). `corrected` is a separate badge with a `correction` record (note and source); it never replaces the outcome.
+- `CORRECTION_REMAP` maps each of the 23 rows the register exported with outcome `correction`: eight research questions get a real outcome, and fifteen process checks become `method-check` records with no research outcome. An unmapped `correction` row stops the export.
+- `PARTITION_AUDIT` imports MASTER-TABLE section 10 (lines 175-211) from the pinned campaign commit `d69b23a`, whose file hash is checked. Each row has an explicit rule, outcome, batches, optional correction note and one-line reason. New IDs are `MT<line>` in that commit (MT175-MT211); existing IDs are never renumbered.
+- MASTER-TABLE source anchors are resolved by row content. The original IDs came from an uncommitted MASTER-TABLE snapshot that was one line longer from line 20 on, so anchoring by line number alone would point most records at their neighbouring row.
+
+Run the source export before the research export (the research export requires a source link for every record). `export_research.py --audit PATH` writes its receipt outside the campaign workspace when that workspace must stay read only. The Python data tests accept `NOTEBOOK_WORKSPACE`, `NOTEBOOK_RESEARCH_REPO` and `NOTEBOOK_DATA_AUDIT` when the portal is not checked out inside the campaign workspace.
 
 ## Review and deploy
 

@@ -1,0 +1,1015 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cGN1_gn_gap_score.py -- THE REGISTERED SCORER FOR `cgn1`: IS THE
+#   SCALAR -> LAYERWISE GAP A BATCHNORM PHENOMENON?  (CORRECTIONS 212)
+#   ONE SUBMISSION, 6 JOBS (2 arms x 3 seeds), 100 EPOCHS, SEEDS {60,61,62},
+#   ResNet18_gn_c100 / CIFAR-100, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#
+# Committed BEFORE any cgn1 run exists (STANDING RULE 21).  RUN IT UNEDITED
+# (RULE 16).  The documented invocation takes ONE argument:
+#
+#     python3 analysis/cGN1_gn_gap_score.py <runsdir>
+#
+# =============================================================================
+# WHY THIS BATCH
+# =============================================================================
+# Every scalar->layerwise gap the campaign owns was measured on a BatchNorm
+# network, and every isolation result is about BatchNorm SCALES (ResNet18_c100
+# indices 50/53/59, CORRECTIONS 187; VGG11_bn_c100 `bn8.weight`, cvi1).
+# Re-derived at registration from results/all_runs.csv (2,863 rows, sha256
+# 870c4003...4a3a, `cgn1-` excluded): the in-batch gap D = plateau5(layerwise)
+# - plateau5(scalar) at the standard CIFAR-100 cell is +45.75 .. +46.99 pp on
+# ResNet18_c100 (9 batches, median +46.548667) and +30.74 .. +31.27 on
+# VGG11_bn_c100 (3 batches, median +30.828).  The corpus's ONLY non-BatchNorm
+# network is `ResNet18_gn` (17 rows: CIFAR-10, chunk777 / nodewise only; no
+# scalar or layerwise arm ever ran on it).  cgn1 asks the cheapest question
+# that separates the gap from batch statistics: does the gap EXIST on
+# ResNet18_c100 with every BatchNorm2d(C) replaced by GroupNorm(32, C)?
+#
+# THE NETWORK.  `ResNet18_gn_c100`, added by patches/patch_resnet_gn_c100.py
+# (ONE inserted dispatch region; tests/test_resnet_gn_c100.py).  Proved on the
+# built models: its ordered (name, shape) list is ELEMENTWISE EQUAL to
+# ResNet18_c100's -- 62 tensors, 11,220,132 parameters, the (conv, norm.weight,
+# norm.bias) triple at every 1-based index 1..60 (class == index mod 3, every
+# 1-D tensor there OWNED by a GroupNorm), then linear.weight / linear.bias --
+# and its initial parameters under a fixed seed are BITWISE EQUAL to
+# ResNet18_c100's.  So HF.init_meta receives the IDENTICAL partition object and
+# the IDENTICAL starting point; the 512-wide scales sit at the same 47/50/53/
+# 56/59 with the same names.  What differs is the normaliser: 20 GroupNorm vs
+# 20 BatchNorm2d, and BN's 60 running-stat BUFFERS (never parameters).
+#
+# =============================================================================
+# THE ACCOUNTS AND THEIR PREDICTIONS, FROZEN
+# =============================================================================
+# (A) NOT-BATCH-STATISTICS.  The gap is a property of sharing ONE step size
+#     across this tensor list (62 tensors, the same scale/shift tensors in the
+#     same positions) under a per-feature affine normaliser; batch statistics
+#     are not needed.  PREDICTS k01 in [18, 32] (the BN scalar arm is 22.95),
+#     kL in [55, 70], D in [+25, +50].
+# (B) BATCH-STATISTICS.  The gap needs BatchNorm's batch statistics (or the
+#     per-channel scale invariance BN gives and GN(32) only partly keeps);
+#     GroupNorm removes it.  PREDICTS k01 ~ kL ~ L with L in [50, 68], |D| <= 2.
+# (C) ATTENUATED.  GN keeps part of the mechanism (per-GROUP invariance, 16
+#     channels to a group in layer4).  PREDICTS k01 in (32, 55), kL in [55, 70],
+#     D in (+2, +25).
+#
+# =============================================================================
+# THE FLOOR GATE (164.6), EVERY ARM UNDER EVERY ACCOUNT
+# =============================================================================
+#   floor references (frozen, corpus, cgn1 excluded): chance 1.00 pp; the BN
+#   scalar floor band at this cell [21.694, 24.174] (38 rows, mean 22.948632).
+#   (A) k01 18-32: IT IS THE IN-BATCH FLOOR ANCHOR BY CONSTRUCTION -- the same
+#       disclosed role k01 plays in cvg1 / cdep1 / ciso1; D is the gap BETWEEN
+#       the anchor and a free arm, not a censored contrast.  kL 55-70: >= 30.83
+#       pp above the band top, >= 30 pp below the ceiling.
+#   (B) both arms 50-68: >= 25.83 pp above the band top.  NO arm near the floor.
+#   (C) k01 > 32 (>= 7.83 above the band top); kL 55-70 as in (A).
+#   The primary D is bounded in NEITHER direction under any account: kL is free
+#   (>= 30 pp from both floor and ceiling in every prediction).  The ONE route to
+#   a floor-bounded D is kL itself collapsing -- which H-TRAINS (kL >= 40.0)
+#   catches as HARNESS-UNSOUND before any branch is read.  So GAP-ABSENT can
+#   never be issued with k01 below 38 pp: a null can never be two dead arms.
+#
+# =============================================================================
+# THE NOISE FLOOR, RE-DERIVED AT REGISTRATION, cgn1 EXCLUDED, THEN FROZEN (O2)
+# =============================================================================
+#   SIGMA_NARROW_PIN 0.5862321062215915  ResNet18_c100/CIFAR100 standard cell,
+#                                        df 77, 11 cells, 88 members
+#   SIGMA_GN_PIN     0.2731176486424861  ResNet18_gn/CIFAR10 (gn1: ms 1e-4,
+#                                        alpha0 1e-3), df 14, 2 cells, 16 members
+#                                        -- the corpus's only GN seed noise
+#   SIGMA_PRIOR := max(the two pins) = 0.5862321062215915   (a LITERAL)
+#   At score time:  SIGMA_USED = max(SIGMA_PRIOR, SIGMA_INBATCH)
+#   SIGMA_INBATCH is the pooled within-arm SD of cgn1's OWN 6 runs (df 4).
+#   NOTHING read from results/all_runs.csv enters any bar, SE, sigma or
+#   threshold (CORRECTIONS 207/208, O2).  --selftest proves it: the SAME
+#   synthetic runs give an IDENTICAL FINAL line against the real corpus, no
+#   corpus, the corpus plus invented rows AT THIS BATCH's CELLS, and a corpus of
+#   invented rows only.
+#   SE_ARM_DIFF = SIGMA_USED * sqrt(2/3);  at the prior, 0.478657 pp.
+#
+# =============================================================================
+# THE BARS, FROZEN
+# =============================================================================
+#   D = plateau5(kL) - plateau5(k01), in-batch 3-seed means, pp scale (the scale
+#   is PRE-REGISTERED here -- the 118(b) lesson; a budget-relative D_rel is
+#   printed as a SECONDARY, descriptive statistic and moves no branch).
+#   GAP_BAR   10.0 pp  (= 20.89 SE at the prior; 21.5 % of the BN in-batch
+#                       median +46.548667, 32.4 % of VGG's +30.828)
+#   NULL_BAR   2.0 pp  (= 4.18 SE at the prior; 4.3 % of the BN gap)
+#   K_SE       3.0     the gap and reversal bars are max(literal, 3 * SE_USED),
+#                      so only cgn1's OWN noise can widen them
+#   DIVERGED_BAR 5.0 pp within-arm seed range
+#   KL_MIN    40.0 pp  H-TRAINS: the GN net must train under layerwise
+#   CEIL_MAX  90.0 pp  H-CEIL: no CIFAR-100 arm this high at this cell
+#   FULLSIZE_FRAC 0.5  a REPLICATES D >= 0.5 x 46.548667 = 23.274 is stamped
+#                      FULL-SIZE, below it ATTENUATED (stamp only)
+#
+# =============================================================================
+# THE BRANCH MAP, FROZEN.  FIRST MATCH WINS.
+# =============================================================================
+#   INCOMPLETE          any of the 6 runs missing, short of 100 epoch lines, or
+#                       lacking RUN_DONE.  No branch; nothing quotable.
+#   HARNESS-UNSOUND     CHECKED FIRST among complete batches.  Any of:
+#                       H-ARGS   every run's own ARGS line: NN-name
+#                                ResNet18_gn_c100, dataset CIFAR100, the arm's
+#                                stepsize-groups, its seed, ms 1e-3, alpha0
+#                                1e-6, 100 epochs, batch 100, SGDm / Lion / HF,
+#                                run-name; no flag repeated (RULE 20)
+#                       H-ENV    one ENV line (PROBE_DIR stripped) with
+#                                AUGMENT=1, BETA_CLIP=-15:-2.3026, PROBE=100,
+#                                HIER=none, SCHED=none; each run prints
+#                                `PROBE_TENSOR: on ... type=<its spec> tensors=62`
+#                       H-STRUCT the batch's PARTITION-MANIFEST.txt: NETWORK
+#                                ResNet18_gn_c100, 62 tensors, 11,220,132
+#                                params, GroupNorm 20 / BatchNorm2d 0, every
+#                                1-D tensor at 1..60 owned by GroupNorm, the
+#                                512-wide scales at 47/50/53/56/59 by name
+#                       H-PROV   PROVENANCE.txt: MODE submit and the cgn1
+#                                tree's build_network.py sha256 == POST_SHA
+#                       H-TRAINS mean(kL) >= KL_MIN
+#                       H-CEIL   max arm mean <= CEIL_MAX
+#   UNRESOLVED-DIVERGED a within-arm seed range > DIVERGED_BAR (report, do not
+#                       average a bimodal arm)
+#   GAP-REPLICATES      D >= max(GAP_BAR, K_SE * SE_USED)
+#   GAP-REVERSED        D <= -max(NULL_BAR, K_SE * SE_USED)
+#   GAP-ABSENT          |D| <= NULL_BAR  AND  SE_USED <= NULL_BAR / 2
+#   UNRESOLVED-NOISY    |D| <= NULL_BAR but SE_USED > NULL_BAR / 2 (no power)
+#   GAP-PARTIAL         D > NULL_BAR (and below the gap bar)
+#   UNRESOLVED-SMALL-NEGATIVE   anything left (-rev bar < D < -NULL_BAR)
+#
+# =============================================================================
+# WHAT EACH BRANCH LICENSES -- AND WHAT IT DOES NOT
+# =============================================================================
+# GroupNorm(32, C) for BatchNorm2d(C) is ONE code change, but it is not one
+# mechanistic change: it removes batch statistics AND replaces per-channel with
+# per-group normalisation (2/4/8/16 channels per group at 64/128/256/512), AND
+# GN networks train differently (a different accuracy regime -- gn1's GN cell
+# sat ~2.9 pp below its BN twin on CIFAR-10).  Hence:
+#   GAP-REPLICATES  LICENSES "the scalar->layerwise gap does not need batch
+#       statistics": it exists on a network that has none, with the same tensor
+#       list and the same initial point.  Accounts (B) is refuted in its
+#       batch-statistics form.  DOES NOT license "the carriers are the same
+#       tensors on GN" (no isolation arm here -- that is the follow-on, which
+#       nominates from THIS batch's PROBE_TENSOR records at no extra GPU cost),
+#       nor anything about other normalisers (LayerNorm, no-norm).
+#   GAP-ABSENT  LICENSES "at this cell, replacing BN with GN(32) removes the
+#       gap".  DOES NOT license "batch statistics cause the gap": the swap also
+#       changes per-channel invariance and the training regime, and no argmax is
+#       located on GN (RULE 11 -- mistuning can suppress a gap; stamped
+#       MISTUNING-NOT-EXCLUDED).  It promotes (B) to the leading candidate and
+#       registers the next step: GN with num_groups == C (per-channel, no batch
+#       statistics) to split batch statistics from per-channel invariance.
+#   GAP-PARTIAL  present but attenuated: (A)/(B)/(C) not separated; mistuning
+#       not excluded; the follow-on is the same GN(C) arm plus a tuning bracket.
+#   HARNESS-UNSOUND  says nothing about the gap.  It reports on the harness (or
+#       on GN failing to train at this cell under layerwise) and stops.
+#
+# =============================================================================
+# DISCLOSURE.  Visible when this file was written: results/all_runs.csv at
+# 2,863 rows (sha 870c4003...); the cluster_b live build_network.py (sha
+# c7998883...), HF.py, train.py, load_data.py; the patched model built in a
+# scratch copy; cVG1 / cVK2 as convention templates; CORRECTIONS 118, 164.6,
+# 187, 198, 207, 208.  NO cgn1 run existed anywhere (0 in sacct all-time, 0
+# .out, 0 CSV rows; no row carries seed 60, 61 or 62).  plateau5 is PRIMARY;
+# the CSV `plateau` column is read NOWHERE; best_test is used NOWHERE; TRAIN is
+# printed beside TEST at every arm.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import io
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+PREFIX = "cgn1"
+NET = "ResNet18_gn_c100"
+REF_NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (60, 61, 62)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+SPEC = {
+    "k01": "scalar",
+    "kL": "layerwise",
+}
+ARMS = ("k01", "kL")
+
+# ---- the live model this batch assumes (tests/test_resnet_gn_c100.py R2; the
+# ---- launcher's guard 4 re-derives it on the cgn1 tree and writes the manifest)
+NTENS = 62
+TOTPAR = 11220132
+N_GROUPNORM = 20
+GN_GROUPS = 32
+W512_IDX = (47, 50, 53, 56, 59)
+W512_NAMES = ("layer4.0.bn1.weight", "layer4.0.bn2.weight", "layer4.0.shortcut.1.weight",
+              "layer4.1.bn1.weight", "layer4.1.bn2.weight")
+BN_CARRIERS = (50, 53, 59)             # CORRECTIONS 187, on ResNet18_c100 (for the follow-on)
+PRE_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+POST_SHA = "9f6e4ec97157311bb3b664509258144235319db88962b9d8c3a4484b1837c892"
+
+# ---- the noise floor, FROZEN (O2) --------------------------------------------
+SIGMA_NARROW_PIN = 0.5862321062215915  # ResNet18_c100/CIFAR100 std cell, df 77, 11 cells, 88 members
+SIGMA_GN_PIN = 0.2731176486424861      # ResNet18_gn/CIFAR10 (gn1), df 14, 2 cells, 16 members
+SIGMA_PRIOR = 0.5862321062215915       # = max(SIGMA_NARROW_PIN, SIGMA_GN_PIN)
+SE_PRIOR = 0.4786565                   # SIGMA_PRIOR * sqrt(2/3), to 1e-6
+
+# ---- the bars, FROZEN ----------------------------------------------------------
+GAP_BAR = 10.0
+NULL_BAR = 2.0
+K_SE = 3.0
+DIVERGED_BAR = 5.0
+KL_MIN = 40.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+FULLSIZE_FRAC = 0.5
+
+# ---- frozen references (DESCRIPTIVE; they enter no bar and no branch, only
+# ---- stamps computed against the literal) ---------------------------------------
+BN_D_INBATCH_MEDIAN = 46.548667        # ResNet18_c100, 9 batches, range 45.746667 .. 46.990
+BN_DREL_MEDIAN = 0.6045                # (kL-k01)/(100-k01), same 9 batches
+BN_SCALAR_BAND = (21.694, 24.174)      # 38 std-cell scalar rows
+BN_SCALAR_MEAN = 22.948632
+BN_LAYERWISE_MEAN = 69.416625          # 32 std-cell layerwise rows
+VGG_D_INBATCH_MEDIAN = 30.828          # VGG11_bn_c100, 3 batches
+
+# ---- the registration corpus (the selftest pins the literals ONLY on it) --------
+REG_CORPUS_SHA256 = "870c400319f4e00b9eee370e25e76fcb03d872362af2d98c68a99f1a48cd4a3a"
+REG_CORPUS_ROWS = 2863
+
+# ---- the accounts' predicted levels (floor-gate table) ---------------------------
+PRED = {
+    "A": {"k01": (18.0, 32.0), "kL": (55.0, 70.0)},
+    "B": {"k01": (50.0, 68.0), "kL": (50.0, 68.0)},
+    "C": {"k01": (32.0, 55.0), "kL": (55.0, 70.0)},
+}
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize",
+            "alpha0", "gamma", "augment", "beta_clip", "batch_size",
+            "epochs_requested", "hier", "lam", "eta_ratio"]
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,"
+                     r"\s*Test Accuracy:\s*([0-9.]+)")
+OUT_RE = re.compile(r"^%s-(k01|kL)-s(\d+)-(\d+)\.out$" % PREFIX)
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise) tensors=%d "
+                   % (PROBE, NTENS))
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def compose_sigma(sigma_in):
+    """O2.  The ONLY inputs are the frozen literal and cgn1's own in-batch sigma."""
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, val = max(cands, key=lambda kv: kv[1])
+    return which, val, cands
+
+
+# =============================================================================
+# the model's parameter list, composed from ResNet18's definition (no torch).
+# The launcher's guard 4d proves it BYTE-IDENTICAL to the manifest written from
+# the live model, so the synthetic manifest cannot drift from reality.
+# =============================================================================
+def resnet18_c100_tensors():
+    out = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "GroupNorm"),
+           ("bn1.bias", 64, "GroupNorm")]
+    cin = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for bi in range(2):
+            stride2 = (li > 1 and bi == 0)
+            p = "layer%d.%d." % (li, bi)
+            a = cin if bi == 0 else w
+            out += [(p + "conv1.weight", w * a * 9, "Conv2d"), (p + "bn1.weight", w, "GroupNorm"),
+                    (p + "bn1.bias", w, "GroupNorm"), (p + "conv2.weight", w * w * 9, "Conv2d"),
+                    (p + "bn2.weight", w, "GroupNorm"), (p + "bn2.bias", w, "GroupNorm")]
+            if stride2:
+                out += [(p + "shortcut.0.weight", w * a, "Conv2d"),
+                        (p + "shortcut.1.weight", w, "GroupNorm"),
+                        (p + "shortcut.1.bias", w, "GroupNorm")]
+        cin = w
+    out += [("linear.weight", 100 * 512, "Linear"), ("linear.bias", 100, "Linear")]
+    return out
+
+
+def synthetic_manifest_text():
+    t = resnet18_c100_tensors()
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t),
+             "TOTAL_PARAMS %d" % sum(q for _n, q, _o in t),
+             "NORM GroupNorm %d BatchNorm2d %d" % (N_GROUPNORM, 0),
+             "GN_GROUPS %d" % GN_GROUPS, "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS,
+             "META_STEPS %d" % (EPOCHS * (50000 // BATCH))]
+    for i, (n, q, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("W512 %s" % ",".join("%d:%s" % x for x in zip(W512_IDX, W512_NAMES)))
+    lines.append("ARMSPEC k01 SPEC scalar TYPE scalar M 1")
+    lines.append("ARMSPEC kL SPEC layerwise TYPE layerwise M %d" % len(t))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# readers
+# =============================================================================
+def read_corpus(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    return [r for r in csv.DictReader(open(csvpath))
+            if not r.get("run", "").startswith(PREFIX + "-")]
+
+
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def read_runs(runsdir):
+    """-> {(arm, seed): rec} from cgn1-<arm>-s<seed>-<jobid>.out; the LATEST job id
+    (compared as an INTEGER) wins when a run was resubmitted."""
+    got = {}
+    if not runsdir or not os.path.isdir(runsdir):
+        return got
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        txt = open(os.path.join(runsdir, fn), errors="replace").read()
+        lines = txt.splitlines()
+        eps = sorted((int(a), float(b), float(c)) for a, b, c in EPTR_RE.findall(txt))
+        rec = {"file": fn, "job": jid, "arm": arm, "seed": seed,
+               "epochs": [e[0] for e in eps],
+               "traceback": "Traceback (most recent call last)" in txt,
+               "done": any(ln.strip() == "RUN_DONE" for ln in lines),
+               "args": [ln for ln in lines if ln.startswith("ARGS:")],
+               "env": [ln for ln in lines if ln.startswith("ENV:")],
+               "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+               "plateau5": None, "train5": None}
+        tail = [e for e in eps if e[0] >= EPOCHS - 5]
+        if len(tail) == 5 and [e[0] for e in tail] == list(range(EPOCHS - 5, EPOCHS)):
+            rec["plateau5"] = mean([e[2] for e in tail])
+            rec["train5"] = mean([e[1] for e in tail])
+        prev = got.get((arm, seed))
+        if prev is None or jid > prev["job"]:
+            got[(arm, seed)] = rec
+    return got
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for cand, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                      (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(cand):
+            return cand, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    d = {"TENSOR": []}
+    if not path or not os.path.exists(path):
+        return None
+    for ln in open(path):
+        p = ln.split()
+        if not p:
+            continue
+        if p[0] == "TENSOR" and len(p) >= 4:
+            d["TENSOR"].append((int(p[1]), p[2], int(p[3]), p[4] if len(p) > 4 else None))
+        else:
+            d[p[0]] = " ".join(p[1:])
+    return d
+
+
+def is_complete(r):
+    return (r is not None and r["epochs"] == list(range(EPOCHS)) and r["done"]
+            and r["plateau5"] is not None)
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 clean branch, 1 harness-unsound, 2 incomplete."""
+    print("=" * 78)
+    print(" cgn1 -- IS THE SCALAR->LAYERWISE GAP A BATCHNORM PHENOMENON?")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    print(" arms: k01 = %s   kL = %s" % (SPEC["k01"], SPEC["kL"]))
+    print(" PRIMARY: plateau5 = mean TEST accuracy over epochs %d..%d from the runs' own"
+          % (EPOCHS - 5, EPOCHS - 1))
+    print("          .out files.  TRAIN printed beside TEST everywhere.")
+    print("=" * 78)
+    rows = read_corpus(csvpath)
+    print("corpus: %s  (DESCRIPTIVE ONLY -- no bar, sigma, branch or stamp reads it)"
+          % ("not readable" if rows is None else "%d rows, %s- excluded" % (len(rows), PREFIX)))
+
+    runs = read_runs(runsdir)
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    # ---- completeness ---------------------------------------------------------
+    print("\nCOMPLETE  6 runs, epochs 0..%d, RUN_DONE" % (EPOCHS - 1))
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = is_complete(r)
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                                           "absent" if r is None else
+                                           "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s"
+                                           % (len(r["epochs"]), r["done"], r["traceback"],
+                                              fmt(r["plateau5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/6 | missing %s" % (6 - len(missing), ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and no number here is quotable.")
+        return 2, final
+
+    # ---- HARNESS GATES, FIRST ---------------------------------------------------
+    print("\nH-ARGS    every run's OWN ARGS line")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "H-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                    "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s)}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "H-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad])
+                 if (dup or bad) else "NN-name %s, %s, seed %d" % (NET, SPEC[a], s))
+    print("\nH-ENV     the environment rode the ENV line on every run")
+    envs = sorted({re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]})
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "H-ENV one ENV line per run, one distinct across runs", "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    for tok in ("AUGMENT=%s" % AUG, "BETA_CLIP=%s" % CLIP, "PROBE=%d" % PROBE, "HIER=none", "SCHED=none"):
+        hchk(len(envs) == 1 and (" " + tok + " ") in (envs[0] + " "), "H-ENV carries %s" % tok)
+    ptbad = [k for k, r in runs.items()
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0])
+             or PT_RE.match(r["pt"][0]).group(1) != SPEC[k[0]]]
+    hchk(not ptbad, "H-ENV every run printed `PROBE_TENSOR: on every=%d type=<its spec> tensors=%d`"
+         % (PROBE, NTENS), "bad: %s" % ptbad if ptbad else "6/6")
+
+    print("\nH-STRUCT  the batch's own PARTITION-MANIFEST.txt")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    man = read_kv(mp)
+    if man is None:
+        hchk(False, "H-STRUCT manifest present", how)
+    else:
+        print("  manifest: %s (%s)" % (mp, how))
+        t = man["TENSOR"]
+        hchk(man.get("NETWORK") == NET, "H-STRUCT NETWORK %s" % NET, str(man.get("NETWORK")))
+        hchk(len(t) == NTENS and [x[0] for x in t] == list(range(1, NTENS + 1)),
+             "H-STRUCT %d tensors, 1-based" % NTENS, str(len(t)))
+        hchk(sum(x[2] for x in t) == TOTPAR, "H-STRUCT %d parameters" % TOTPAR, str(sum(x[2] for x in t)))
+        hchk(man.get("NORM") == "GroupNorm %d BatchNorm2d 0" % N_GROUPNORM,
+             "H-STRUCT NORM GroupNorm %d BatchNorm2d 0" % N_GROUPNORM, str(man.get("NORM")))
+        own_bad = [x[0] for x in t if x[0] <= 60 and x[0] % 3 != 1 and x[3] != "GroupNorm"]
+        hchk(not own_bad, "H-STRUCT every scale/shift at 1..60 is owned by GroupNorm",
+             "violations %s" % own_bad[:6])
+        w512 = tuple((x[0], x[1]) for x in t if x[2] == 512 and x[1].endswith(".weight")
+                     and x[3] == "GroupNorm")
+        hchk(w512 == tuple(zip(W512_IDX, W512_NAMES)),
+             "H-STRUCT 512-wide GN scales at %s" % ",".join(str(i) for i in W512_IDX), str(w512))
+    print("\nH-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "H-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "H-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == POST_SHA,
+             "H-PROV build_network.py sha256 == POST_SHA %s..." % POST_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+
+    # ---- the levels -------------------------------------------------------------
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, in batch")
+    arm_v = {a: [runs[(a, s)]["plateau5"] for s in SEEDS] for a in ARMS}
+    arm_t = {a: [runs[(a, s)]["train5"] for s in SEEDS] for a in ARMS}
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        print("  %-4s (%-9s) TEST %.4f  sd %s  range %.4f   TRAIN %.4f"
+              % (a, SPEC[a], mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t)))
+        print("        seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y)
+                                              for s, x, y in zip(SEEDS, v, t)))
+    kL, k01 = mean(arm_v["kL"]), mean(arm_v["k01"])
+    print("\nH-TRAINS / H-CEIL")
+    hchk(kL >= KL_MIN, "H-TRAINS mean(kL) >= %.1f pp (the GN net trains under layerwise)" % KL_MIN,
+         "%.4f" % kL)
+    hchk(max(kL, k01) <= CEIL_MAX, "H-CEIL max arm mean <= %.1f pp" % CEIL_MAX,
+         "%.4f" % max(kL, k01))
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (
+            len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        print("NO GAP CLAIM.  This batch reports on the harness (or on GN failing to")
+        print("train at this cell under layerwise) and stops.")
+        return 1, final
+
+    # ---- sigma (O2) --------------------------------------------------------------
+    ss = sum(sum((x - mean(arm_v[a])) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, _c = compose_sigma(sigma_in)
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    gap_bar = max(GAP_BAR, K_SE * se)
+    rev_bar = max(NULL_BAR, K_SE * se)
+    print("\nSIGMA     FROZEN (O2): no corpus read can move a bar")
+    print("  SIGMA_PRIOR (frozen literal) %.10f  = max(NARROW pin %.10f, GN pin %.10f)"
+          % (SIGMA_PRIOR, SIGMA_NARROW_PIN, SIGMA_GN_PIN))
+    print("  SIGMA_INBATCH                %.6f  (cgn1's own 2 arms x 3 seeds, df %d)" % (sigma_in, df))
+    print("  SIGMA_USED                   %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF                  %.6f" % se)
+    print("  bars: GAP %.4f pp | REVERSED %.4f pp | NULL %.4f pp | ABSENT needs SE <= %.4f"
+          % (gap_bar, rev_bar, NULL_BAR, NULL_BAR / 2))
+
+    # ---- the contrast --------------------------------------------------------------
+    D = kL - k01
+    Dtr = mean(arm_t["kL"]) - mean(arm_t["k01"])
+    drel = D / (100.0 - k01) if k01 < 100 else None
+    print("\nCONTRAST  D = plateau5(kL) - plateau5(k01)")
+    print("  D(TEST)  = %.4f - %.4f = %+.4f pp = %+.2f SE" % (kL, k01, D, D / se))
+    print("  D(TRAIN) = %.4f - %.4f = %+.4f pp" % (mean(arm_t["kL"]), mean(arm_t["k01"]), Dtr))
+    print("  SECONDARY (descriptive): D_rel = D / (100 - k01) = %s   (BN ref median %.4f)"
+          % (fmt(drel), BN_DREL_MEDIAN))
+    print("  frozen references: BN in-batch D median %+.6f (D/D_BN = %.4f); VGG %+.3f (D/D_VGG = %.4f)"
+          % (BN_D_INBATCH_MEDIAN, D / BN_D_INBATCH_MEDIAN, VGG_D_INBATCH_MEDIAN,
+             D / VGG_D_INBATCH_MEDIAN))
+    print("  k01 %.4f vs the BN scalar floor band [%.3f, %.3f]" % (k01, BN_SCALAR_BAND[0], BN_SCALAR_BAND[1]))
+
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    if div:
+        branch = "UNRESOLVED-DIVERGED"
+    elif D >= gap_bar:
+        branch = "GAP-REPLICATES"
+    elif D <= -rev_bar:
+        branch = "GAP-REVERSED"
+    elif abs(D) <= NULL_BAR and se <= NULL_BAR / 2:
+        branch = "GAP-ABSENT"
+    elif abs(D) <= NULL_BAR:
+        branch = "UNRESOLVED-NOISY"
+    elif D > NULL_BAR:
+        branch = "GAP-PARTIAL"
+    else:
+        branch = "UNRESOLVED-SMALL-NEGATIVE"
+
+    stamps = ["HARNESS-CLEAN"]
+    if branch == "GAP-REPLICATES":
+        stamps.append("FULL-SIZE" if D >= FULLSIZE_FRAC * BN_D_INBATCH_MEDIAN else "ATTENUATED")
+    if branch in ("GAP-ABSENT", "GAP-PARTIAL", "UNRESOLVED-NOISY"):
+        stamps.append("MISTUNING-NOT-EXCLUDED")
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    stamps.append("SIGMA-INBATCH-DOMINATES" if which == "SIGMA_INBATCH" else "SIGMA-PRIOR-FROZEN")
+    stamps.append("TRAIN-AGREES" if (Dtr > 0) == (D > 0) else "TRAIN-DISAGREES")
+    stamps.append("K01-%s-BN-FLOOR-BAND" % ("BELOW" if k01 < BN_SCALAR_BAND[0] else
+                                            "IN" if k01 <= BN_SCALAR_BAND[1] else "ABOVE"))
+    stamps.append("GN32-ALSO-CHANGES-PER-CHANNEL-INVARIANCE")
+    stamps.append("HORIZON-100-ONLY")
+    pr = [os.path.isdir(os.path.join(runsdir, PREFIX, "probe_%s-%s-s%d" % (PREFIX, a, s)))
+          and bool(os.listdir(os.path.join(runsdir, PREFIX, "probe_%s-%s-s%d" % (PREFIX, a, s))))
+          for s in SEEDS for a in ARMS]
+    stamps.append("PROBE-RECORDS-PRESENT" if all(pr) else "PROBE-RECORDS-MISSING-%d" % pr.count(False))
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+    print("\nWHAT THIS LICENSES -- as registered, before any run existed:")
+    lic = {
+        "GAP-REPLICATES": ["The gap does NOT need batch statistics: it exists on a network with",
+                           "none, the same tensor list and the same initial point.  Account (B) in",
+                           "its batch-statistics form is refuted.  NOT licensed: that GN's carriers",
+                           "are ResNet's 50/53/59 (the follow-on isolation nominates from THIS",
+                           "batch's PROBE_TENSOR records), or anything about other normalisers."],
+        "GAP-ABSENT": ["At this cell, BN -> GN(32) removes the gap.  NOT licensed: 'batch",
+                       "statistics cause the gap' -- the swap also changes per-channel",
+                       "invariance and the training regime, and no argmax is located on GN",
+                       "(RULE 11).  (B) becomes the leading candidate.  REGISTERED NEXT STEP:",
+                       "GroupNorm(num_groups == C) to split batch statistics from per-channel",
+                       "invariance, then a tuning bracket."],
+        "GAP-PARTIAL": ["Present but attenuated.  (A)/(B)/(C) not separated; mistuning not",
+                        "excluded.  Next: the GN(C) arm and a tuning bracket before any claim."],
+        "GAP-REVERSED": ["Unexpected under every registered account.  Report and stop."],
+        "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch taken."],
+        "UNRESOLVED-NOISY": ["|D| is inside the null bar but cgn1's own noise is too large to call",
+                             "it absent.  No branch taken."],
+        "UNRESOLVED-SMALL-NEGATIVE": ["A small negative D, neither absent nor reversed.  No branch taken."],
+    }
+    for ln in lic[branch]:
+        print("  " + ln)
+    return 0, final
+
+
+# =============================================================================
+# selftest helpers -- synthetic harness-format runs, driven through the REAL score()
+# =============================================================================
+ENV_TMPL = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+            "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+            "PROBE=100 PROBE_DIR=%s EB_RHO=na EB_LOG=0")
+
+
+def _mk_out(d, arm, seed, jid, level, train, n_ep=EPOCHS, net=NET, done=True, env=None, spec=None,
+            tensors=NTENS):
+    rn = "%s-%s-s%d" % (PREFIX, arm, seed)
+    spec = spec or SPEC[arm]
+    pdir = os.path.join(d, PREFIX, "probe_" + rn)
+    L = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid),
+         "ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+         "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 "
+         "--dataset CIFAR100 --NN-name %s --batch-size 100 --max-time 999:00:00 --gamma 1 "
+         "--meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups %s --seed %d "
+         "--save-directory %s --run-name %s" % (net, spec, seed, os.path.join(d, PREFIX), rn),
+         env or (ENV_TMPL % pdir), "NVIDIA L4, 23034 MiB",
+         "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 "
+         "Lion_beta2=0.9 dir=%s" % (spec, tensors, pdir)]
+    jit = (0.02, -0.01, 0.03, -0.03, -0.01)          # sums to 0: plateau5 == level exactly
+    for e in range(n_ep):
+        if e >= EPOCHS - 5:
+            te, tr = level + jit[e - (EPOCHS - 5)], train + jit[e - (EPOCHS - 5)]
+        else:
+            te, tr = level * (e + 1) / EPOCHS, train * (e + 1) / EPOCHS
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, tr, te))
+    if done:
+        L += ["44  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(L) + "\n")
+    os.makedirs(pdir, exist_ok=True)
+    open(os.path.join(pdir, "rec_000.npz"), "w").write("x")
+
+
+def _mk_batch(d, lv, manifest=None, prov_sha=POST_SHA, net=NET, env_bad=False, drop=None,
+              trunc=None, dupjob=None):
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(
+        manifest if manifest is not None else synthetic_manifest_text())
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE submit\nBUILD_NETWORK_SHA256 %s\n" % prov_sha)
+    jid = 10000
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            if drop == (a, s):
+                continue
+            env = None
+            if env_bad and (a, s) == (ARMS[0], SEEDS[0]):
+                env = ENV_TMPL.replace("AUGMENT=1", "AUGMENT=0") % "/x"
+            n_ep = 97 if trunc == (a, s) else EPOCHS
+            _mk_out(d, a, s, jid, lv[a][i], min(99.9, lv[a][i] + 20.0), n_ep=n_ep, net=net,
+                    done=(trunc != (a, s)), env=env)
+            if dupjob == (a, s):
+                _mk_out(d, a, s, 999, 1.0, 1.0)          # an OLDER job (999 < 10000 as integers)
+
+
+def _stress_csv(src, dst):
+    """src corpus + INVENTED std-cell rows (prefix zstress-) AT THIS BATCH's CELLS:
+    ResNet18_gn_c100 scalar/layerwise and ResNet18_c100 scalar/layerwise, extreme values."""
+    rows = list(csv.DictReader(open(src))) if src and os.path.exists(src) else []
+    hdr = list(rows[0].keys()) if rows else (["run", "job_id", "seed", "superseded", "collapsed",
+                                             "complete", "plateau5"] + CELLKEYS)
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0,
+            "gamma": "1", "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH),
+            "epochs_requested": str(EPOCHS), "hier": "none", "lam": "na", "eta_ratio": "na",
+            "superseded": "0", "collapsed": "0", "complete": "1"}
+    new, k = [], 0
+    for net, g, vals in ((NET, "scalar", (1.0, 1.0, 50.0)), (NET, "layerwise", (99.0, 99.0, 2.0)),
+                         (REF_NET, "scalar", (5.0, 5.0, 60.0)), (REF_NET, "layerwise", (95.0, 95.0, 3.0))):
+        for v in vals:
+            k += 1
+            r = {h: "" for h in hdr}
+            r.update(base)
+            r.update({"run": "zstress-%s-%d" % (g, k), "job_id": str(9990000 + k), "seed": str(90 + k),
+                      "network": net, "granularity": g, "plateau5": "%.4f" % v})
+            new.append({h: r.get(h, "") for h in hdr})
+    w = csv.DictWriter(open(dst, "w", newline=""), fieldnames=hdr)
+    w.writeheader()
+    for r in rows + new:
+        w.writerow({h: r.get(h, "") for h in hdr})
+
+
+def _run_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def pooled_sigma(rows, keep):
+    cells = {}
+    for r in rows:
+        if keep(r) and r.get("superseded") == "0" and r.get("collapsed") == "0" \
+                and r.get("complete") == "1" and r.get("plateau5", "").strip():
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss = df = nc = nm = 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+        nm += len(v)
+    return (math.sqrt(ss / df) if df else None), df, nc, nm
+
+
+def std_cell(r, net):
+    return (r.get("network") == net and r.get("dataset") == DSET
+            and r.get("granularity") in ("scalar", "layerwise")
+            and r.get("epochs_requested") == str(EPOCHS) and r.get("augment") == AUG
+            and r.get("beta_clip") == CLIP and r.get("meta_stepsize") == MST
+            and r.get("alpha0") == A0 and r.get("batch_size") == str(BATCH))
+
+
+def inbatch_gaps(rows, net):
+    by = {}
+    for r in rows:
+        if std_cell(r, net) and r.get("hier") in ("none", "") and r.get("superseded") == "0" \
+                and r.get("collapsed") == "0" and r.get("complete") == "1" and r.get("plateau5", "").strip():
+            by.setdefault(r["run"].split("-")[0], {}).setdefault(r["granularity"], []).append(float(r["plateau5"]))
+    out = {}
+    for b, v in by.items():
+        if len(v.get("scalar", [])) >= 3 and len(v.get("layerwise", [])) >= 3:
+            s, l = mean(v["scalar"]), mean(v["layerwise"])
+            out[b] = (s, l, l - s, (l - s) / (100 - s))
+    return out
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2)
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cGN1 --selftest: literals, O2 freeze, corpus premises, floor gate, and the REAL")
+    print("score() on synthetic harness-format runs.\n")
+    print("A. LITERALS")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6, "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)",
+        "%.7f" % (SIGMA_PRIOR * math.sqrt(2 / 3)))
+    chk(SIGMA_PRIOR == max(SIGMA_NARROW_PIN, SIGMA_GN_PIN), "SIGMA_PRIOR = max(NARROW pin, GN pin)")
+    chk(GAP_BAR > NULL_BAR > 0 and K_SE > 0, "GAP_BAR > NULL_BAR > 0")
+    chk(KL_MIN >= BN_SCALAR_BAND[1] + 15.0, "KL_MIN sits >= 15 pp above the BN floor band top",
+        "%.3f vs %.3f" % (KL_MIN, BN_SCALAR_BAND[1]))
+    chk(KL_MIN + 10.0 <= min(PRED[a]["kL"][0] for a in PRED),
+        "KL_MIN sits >= 10 pp below every account's predicted kL low end")
+    chk(NULL_BAR >= 2 * SE_PRIOR, "GAP-ABSENT is reachable at the prior (NULL_BAR >= 2 SE_PRIOR)")
+    t = resnet18_c100_tensors()
+    chk(len(t) == NTENS and sum(q for _n, q, _o in t) == TOTPAR,
+        "the composed tensor list is %d tensors / %d params" % (NTENS, TOTPAR))
+    chk(tuple((i, n) for i, (n, q, o) in enumerate(t, 1) if q == 512 and n.endswith(".weight")
+              and o == "GroupNorm") == tuple(zip(W512_IDX, W512_NAMES)),
+        "the composed list's 512-wide scales are 47/50/53/56/59 by name")
+    chk(all((i % 3 == 1) == (o == "Conv2d") for i, (n, q, o) in enumerate(t[:60], 1)),
+        "the composed list has class == index mod 3 at 1..60")
+    chk(OUT_RE.match("cgn1-k01-s60-4999999.out") is not None and OUT_RE.match("cvg1-k01-s31-1.out") is None,
+        "run-file regex matches cgn1 only")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=scalar tensors=62 meta_alg=Lion x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=scalar tensors=26 meta_alg=Lion x") is None,
+        "PROBE_TENSOR regex accepts 62 tensors, rejects 26")
+
+    print("\nB. O2 -- NO CORPUS TERM CAN REACH A BAR")
+    bad = []
+    for s_in in (0.0, 0.1, SIGMA_GN_PIN, SIGMA_PRIOR, 0.5862322, 0.9, 2.0, 7.0):
+        w, v, c = compose_sigma(s_in)
+        if not (v == max(SIGMA_PRIOR, s_in) and [n for n, _ in c] == ["SIGMA_PRIOR_frozen", "SIGMA_INBATCH"]):
+            bad.append(s_in)
+    chk(not bad, "SIGMA_USED == max(frozen literal, in-batch) over 8 values; no third input exists")
+
+    print("\nC. CORPUS PREMISES, re-derived (never quoted), cgn1 excluded")
+    rows = read_corpus(csvpath)
+    if rows is None:
+        note("corpus not readable at %s -- premises not re-derived" % csvpath)
+    else:
+        sha = hashlib.sha256(open(csvpath, "rb").read()).hexdigest()
+        reg = (sha == REG_CORPUS_SHA256)
+        note("corpus %d rows (cgn1 excluded), sha %s... -- %s" % (len(rows), sha[:12],
+             "THE REGISTRATION CORPUS: literals are PINNED against it" if reg else
+             "NOT the registration corpus: drift is NOTED, never failed (O2)"))
+        sN = pooled_sigma(rows, lambda r: std_cell(r, REF_NET))
+        sG = pooled_sigma(rows, lambda r: r.get("network") == "ResNet18_gn" and r.get("epochs_requested") == "100")
+        gB = inbatch_gaps(rows, REF_NET)
+        gV = inbatch_gaps(rows, "VGG11_bn_c100")
+        band = [float(r["plateau5"]) for r in rows if std_cell(r, REF_NET) and r["granularity"] == "scalar"
+                and r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                and r.get("plateau5", "").strip()]
+        lw = [float(r["plateau5"]) for r in rows if std_cell(r, REF_NET) and r["granularity"] == "layerwise"
+              and r.get("hier") in ("none", "") and r.get("superseded") == "0" and r.get("collapsed") == "0"
+              and r.get("complete") == "1" and r.get("plateau5", "").strip()]
+        live = {
+            "SIGMA_NARROW": (sN[0], SIGMA_NARROW_PIN, 1e-12), "SIGMA_GN": (sG[0], SIGMA_GN_PIN, 1e-12),
+            "BN_D_INBATCH_MEDIAN": (median([v[2] for v in gB.values()]), BN_D_INBATCH_MEDIAN, 5e-6),
+            "BN_DREL_MEDIAN": (median([v[3] for v in gB.values()]), BN_DREL_MEDIAN, 5e-5),
+            "BN_SCALAR_BAND_LO": (min(band) if band else None, BN_SCALAR_BAND[0], 1e-9),
+            "BN_SCALAR_BAND_HI": (max(band) if band else None, BN_SCALAR_BAND[1], 1e-9),
+            "BN_SCALAR_MEAN": (mean(band), BN_SCALAR_MEAN, 5e-7),
+            "BN_LAYERWISE_MEAN": (mean(lw), BN_LAYERWISE_MEAN, 5e-7),
+            "VGG_D_INBATCH_MEDIAN": (median([v[2] for v in gV.values()]), VGG_D_INBATCH_MEDIAN, 5e-4),
+        }
+        print("       NARROW df %s cells %s members %s | GN df %s cells %s members %s | BN batches %d | VGG batches %d"
+              % (sN[1], sN[2], sN[3], sG[1], sG[2], sG[3], len(gB), len(gV)))
+        for k, (v, lit, tol) in live.items():
+            if reg:
+                chk(v is not None and abs(v - lit) <= tol, "%s re-derives == frozen %r" % (k, lit), fmt(v, 10))
+            else:
+                note("%s live %s vs frozen %r -- feeds no bar (O2)" % (k, fmt(v, 10), lit))
+        n_new = sum(r.get("network") == NET for r in rows)
+        note("%s rows outside the cgn1 prefix: %d" % (NET, n_new))
+        used = {r.get("seed") for r in rows}
+        note("rows (outside cgn1) carrying seed 60/61/62: %d" % sum(r.get("seed") in ("60", "61", "62") for r in rows))
+        _ = used
+
+    print("\nD. THE FLOOR GATE (164.6): every arm under every account")
+    print("   floor refs: chance %.2f; BN scalar floor band [%.3f, %.3f]; ceiling 100"
+          % (CHANCE, BN_SCALAR_BAND[0], BN_SCALAR_BAND[1]))
+    print("   %-3s %-4s %-14s %-24s %-18s %s" % ("acct", "arm", "predicted", "margin over band top",
+                                                 "margin to 100", "status"))
+    for acc in ("A", "B", "C"):
+        for arm in ARMS:
+            lo, hi = PRED[acc][arm]
+            anchor = (acc == "A" and arm == "k01")
+            status = "IS THE IN-BATCH FLOOR ANCHOR (disclosed)" if anchor else \
+                ("FREE" if lo - BN_SCALAR_BAND[1] >= 7.0 else "NEAR FLOOR")
+            print("   (%s) %-4s %5.1f-%-8.1f %+8.2f .. %+8.2f      %+7.2f .. %+7.2f   %s"
+                  % (acc, arm, lo, hi, lo - BN_SCALAR_BAND[1], hi - BN_SCALAR_BAND[1],
+                     100 - hi, 100 - lo, status))
+            if not anchor:
+                chk(lo - BN_SCALAR_BAND[1] >= 7.0 and 100 - hi >= 30.0,
+                    "(%s) %s predicted >= 7 pp above the floor band and >= 30 pp below 100" % (acc, arm))
+    chk(all(PRED[a]["kL"][0] - BN_SCALAR_BAND[1] >= 25.0 for a in PRED),
+        "kL (the free arm of D) is >= 25 pp above the floor band under EVERY account -> D bounded in neither direction")
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS (invented numbers; nothing about the real batch)")
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(),
+            "E0 the synthetic manifest is BYTE-IDENTICAL to the live one guard 4 wrote (%s)" % live_man)
+    else:
+        note("E0 no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+    L = {
+        "REP": {"k01": (23.0, 23.4, 22.8), "kL": (64.0, 64.6, 63.5)},
+        "ATT": {"k01": (48.0, 48.5, 47.8), "kL": (62.0, 62.4, 61.8)},
+        "PAR": {"k01": (58.0, 58.4, 57.9), "kL": (63.0, 63.5, 62.8)},
+        "ABS": {"k01": (63.2, 63.8, 63.5), "kL": (63.9, 64.1, 63.6)},
+        "NOISY": {"k01": (61.0, 63.0, 65.5), "kL": (61.5, 63.5, 65.9)},
+        "REV": {"k01": (64.0, 64.3, 63.8), "kL": (50.0, 50.5, 49.6)},
+        "DIV": {"k01": (23.0, 23.4, 22.8), "kL": (64.0, 64.5, 56.0)},
+        "UNTRAINED": {"k01": (20.0, 20.5, 19.8), "kL": (30.0, 31.0, 30.5)},
+    }
+    bnman = synthetic_manifest_text().replace("GroupNorm", "BatchNorm2d").replace(
+        "NORM BatchNorm2d 20 BatchNorm2d 0", "NORM GroupNorm 0 BatchNorm2d 20")
+    cases = [
+        ("E1  gap replicates, full size", dict(lv=L["REP"]), "GAP-REPLICATES", "FULL-SIZE"),
+        ("E2  gap replicates, attenuated", dict(lv=L["ATT"]), "GAP-REPLICATES", "ATTENUATED"),
+        ("E3  gap partial", dict(lv=L["PAR"]), "GAP-PARTIAL", "MISTUNING-NOT-EXCLUDED"),
+        ("E4  gap absent", dict(lv=L["ABS"]), "GAP-ABSENT", "MISTUNING-NOT-EXCLUDED"),
+        ("E5  |D| small, in-batch noise large", dict(lv=L["NOISY"]), "UNRESOLVED-NOISY", "SIGMA-INBATCH-DOMINATES"),
+        ("E6  reversed", dict(lv=L["REV"]), "GAP-REVERSED", None),
+        ("E7  a diverged arm", dict(lv=L["DIV"]), "UNRESOLVED-DIVERGED", "DIVERGED-kL"),
+        ("E8  kL never trains -> harness first", dict(lv=L["UNTRAINED"]), "HARNESS-UNSOUND", "H-TRAINS"),
+        ("E9  ARGS name the BN net", dict(lv=L["REP"], net=REF_NET), "HARNESS-UNSOUND", "H-ARGS"),
+        ("E10 manifest is a BatchNorm net", dict(lv=L["REP"], manifest=bnman), "HARNESS-UNSOUND", "H-STRUCT"),
+        ("E11 provenance sha wrong", dict(lv=L["REP"], prov_sha=PRE_SHA), "HARNESS-UNSOUND", "H-PROV"),
+        ("E12 one ENV line says AUGMENT=0", dict(lv=L["REP"], env_bad=True), "HARNESS-UNSOUND", "H-ENV"),
+        ("E13 a DROPPED run", dict(lv=L["REP"], drop=("kL", 61)), "INCOMPLETE", "kL-s61"),
+        ("E14 a TRUNCATED run (97 epochs, no RUN_DONE)", dict(lv=L["REP"], trunc=("k01", 62)), "INCOMPLETE", "k01-s62"),
+        ("E15 an older duplicate job (int job-id compare)", dict(lv=L["REP"], dupjob=("k01", 60)), "GAP-REPLICATES", "FULL-SIZE"),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        corpora = [("NO corpus", os.path.join(tmp, "no_such.csv"))]
+        if csvpath and os.path.exists(csvpath):
+            corpora.insert(0, ("the corpus given", csvpath))
+            ps = os.path.join(tmp, "stress.csv")
+            _stress_csv(csvpath, ps)
+            corpora.append(("the corpus + 12 invented rows AT cgn1's cells", ps))
+        pm = os.path.join(tmp, "only_invented.csv")
+        _stress_csv(None, pm)
+        corpora.append(("a corpus of ONLY 12 invented rows", pm))
+        finals = {}
+        for i, (lab, kw, want, stamp) in enumerate(cases):
+            d = os.path.join(tmp, "case%02d" % i)
+            os.makedirs(d)
+            _mk_batch(d, **kw)
+            seen = []
+            for cname, cp in corpora:
+                rc, fin, out = _run_score(d, cp)
+                seen.append((cname, rc, fin))
+            rc0, fin0 = seen[0][1], seen[0][2]
+            ok = fin0.startswith("FINAL: %s" % want) and (stamp is None or stamp in fin0)
+            chk(ok, "%s -> %s%s" % (lab, want, (" [" + stamp + "]") if stamp else ""), fin0[:150])
+            chk(all(f == fin0 and r == rc0 for _c, r, f in seen),
+                "%s: FINAL IDENTICAL across %d corpora (O2)" % (lab.split()[0], len(seen)),
+                "; ".join("%s rc=%s" % (c.split()[0] + ("+" if "+" in c else ""), r) for c, r, _f in seen))
+            finals[lab.split()[0]] = (d, fin0)
+        # F. the documented one-argument invocation, as a subprocess
+        print("\nF. THE DOCUMENTED ONE-ARGUMENT INVOCATION: python3 %s <runsdir>" % os.path.basename(__file__))
+        for key in ("E1", "E13"):
+            d, fin0 = finals[key]
+            p = subprocess.run([sys.executable, os.path.abspath(__file__), d],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+            fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+            chk(fl and fl[-1] == fin0, "F %s: the one-argument subprocess prints the same FINAL line" % key,
+                "exit %d, %s" % (p.returncode, (fl[-1][:70] if fl else "NO FINAL LINE")))
+            chk(p.returncode == (2 if key == "E13" else 0), "F %s: exit code %d" % (key, 2 if key == "E13" else 0),
+                str(p.returncode))
+
+    print("\nRULE 21 PREMISE (binding in the launcher's guard 2; noted here)")
+    runs = read_runs(runsdir)
+    note("%d cgn1-*.out under %s" % (len(runs), runsdir))
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cgn1 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cGN1_gn_gap_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                  "results", "all_runs.csv"))
+    ap.add_argument("--manifest", default="")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

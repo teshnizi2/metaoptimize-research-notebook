@@ -1,6 +1,6 @@
 import type { ActivityEvent, Experiment, Outcome } from '../types';
 import { formatDateFact } from './artifact-dates';
-import { outcomeCounts } from './research';
+import { isMethodCheck, outcomeCounts } from './research';
 
 export interface ResearchPhase {
   id: string;
@@ -11,7 +11,10 @@ export interface ResearchPhase {
   observation: string | null;
   nextQuestion: string | null;
   experiments: Experiment[];
+  /** Research-question outcomes only. */
   counts: Record<Outcome, number>;
+  /** Linked method checks, shown beside the outcomes and never counted in them. */
+  methodChecks: number;
 }
 
 const phaseEvents = (activity: ActivityEvent[]) => activity.filter(event => event.kind === 'research-phase');
@@ -32,7 +35,7 @@ export function researchTimeline(activity: ActivityEvent[], experiments: Experim
       test: fields ? clean(fields[2]) : null,
       observation: fields ? clean(fields[3]) : null,
       nextQuestion: fields ? clean(fields[4]) : null,
-      experiments: linked, counts: outcomeCounts(linked),
+      experiments: linked, counts: outcomeCounts(linked), methodChecks: linked.filter(isMethodCheck).length,
     };
   }).sort((a, b) => (b.startDate || '').localeCompare(a.startDate || '') || a.id.localeCompare(b.id));
 }

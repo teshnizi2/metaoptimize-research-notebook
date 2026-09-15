@@ -1,0 +1,269 @@
+"""Correctness tests for PATCH_CHUNKWISE (`--stepsize-groups chunk<K>`).
+
+STRATEGY, identical in spirit to tests/test_granularity.py: validate the new partition
+against code paths that are ALREADY TRUSTED, via mathematical identities, rather than
+against my expectation of what it should do.
+
+  C1  chunk1            ==  weightwise                    (K=1 is the per-weight limit)
+  C2  chunk<huge>       ==  layerwise                     (K >= max numel is per-layer)
+  C3  m(K) = sum_layers ceil(numel/K), checked against the beta actually allocated,
+            and monotone non-increasing in K, with C1/C2's endpoints hit exactly
+  C4  meta_stepsize=0   =>  chunkK trains identically to scalar, for several K
+  C5  block_product math: each chunk's z equals the explicit sum of h*g over ITS OWN
+            members, including a RAGGED final chunk (the zero-pad must not scale it)
+  C6  the probe sees the chunk partition: n_beta == m(K), via the list branch
+  C7  chunk1 != layerwise on a real net (the test is not vacuously passing everything)
+
+C1 and C2 are EXACT equivalences, not approximations: Lion_meta_update is
+`beta - ms*sign(...)` applied elementwise with no norm and no cross-element reduction, so
+regrouping beta into a different number of list entries cannot change any update.
+
+Any failure means the chunk ladder is not measuring what it claims and every number taken
+from it is void.
+
+RUN ON THE CLUSTER (needs torch + the patched HF.py):
+  ssh cluster_a "cd /cluster/account_a/metaopt/hierarchical-metaoptimize && python3 tests/test_chunkwise.py"
+"""
+import sys, math, os
+# CIFAR10_DIR lets this run against a SCRATCH copy of the tree, so the patch can be
+# verified without editing the live HF.py that running jobs import.  Default is the
+# real tree, so the test is still a check on what actually ships.
+sys.path.insert(0, os.environ.get(
+    "CIFAR10_DIR",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10"))
+import torch
+import torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+
+# DEVICE: CPU BY DEFAULT, AND THAT IS NOT A CONVENIENCE -- IT IS THE TEST'S VALIDITY.
+# Measured on this cluster (cycle 75): running the SAME config twice on CUDA gives
+# max|dW| = 9.4e-05 and max|dbeta| = 2.2e-01, because cuDNN's conv backward is
+# nondeterministic and Lion's sign() amplifies any float-level difference into a full
+# +-2*ms beta step at whichever of 11.17M coordinates sits nearest a sign boundary.
+# That is the SAME magnitude as a real granularity difference, so an equivalence test
+# run on CUDA cannot distinguish "identical" from "completely different" -- and the
+# first version of this file duly reported C1/C2/C4 as FAILING when nothing was wrong.
+# CPU is bitwise reproducible here, so the exact equivalences are actually testable.
+# C0 below asserts determinism rather than assuming it.
+DEV = torch.device(os.environ.get("CHUNK_TEST_DEVICE", "cpu"))
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+# THE REGIME MATTERS AND THE FIRST VERSION OF THIS FILE GOT IT WRONG.
+# At alpha0=1e-6, meta_stepsize=1e-3 and k=6, beta barely moves, so EVERY granularity
+# produces the same weights to 1e-8 and C1/C2 passed VACUOUSLY -- C7 caught it.
+# alpha0=1e-3 (the campaign's value) with ms=1e-2 over k=25 steps moves beta by ~0.25 in
+# log-space, which is enough for granularities to genuinely diverge.  C7 is the guard
+# that this is still true: if it ever fails again, the equivalences below mean nothing.
+ALPHA0 = 1e-3
+STEPS = 25
+META = {"alg": "Lion", "meta_stepsize": 1e-2, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+FAILS = []
+
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+def fresh_net(seed=0):
+    torch.manual_seed(seed)
+    return build_network("ResNet18", DEV)
+
+
+def make_opt(net, groups, meta_stepsize=None):
+    meta = dict(META)
+    if meta_stepsize is not None:
+        meta["meta_stepsize"] = meta_stepsize
+    return HF(net, stepsize_groups=groups, alpha0=ALPHA0, args_base=dict(BASE),
+              args_meta=meta, gamma=1, writer=NullWriter())
+
+
+def _beta_flat(opt):
+    """beta as ONE flat vector, so partitions holding it in different list shapes are
+    still comparable.  chunk1 stores 62 flat tensors, weightwise stores 62 shaped ones,
+    layerwise stores a single length-62 tensor -- all flatten to the same thing when the
+    partitions are equivalent."""
+    return torch.cat([b.detach().float().reshape(-1).cpu() for b in opt.beta])
+
+
+def run_steps(groups, k=STEPS, seed=0, meta_stepsize=None, net_factory=fresh_net):
+    """Return (weights, flat beta).  BETA is where granularity actually lives, so the
+    equivalences are asserted on it as well as on the weights."""
+    net = net_factory(seed)
+    opt = make_opt(net, groups, meta_stepsize)
+    crit = nn.CrossEntropyLoss()
+    g = torch.Generator().manual_seed(1234)
+    for _ in range(k):
+        x = torch.randn(8, 3, 32, 32, generator=g).to(DEV)
+        y = torch.randint(0, 10, (8,), generator=g).to(DEV)
+        loss = crit(net(x), y)
+        opt.step(net, loss)
+    return ([p.detach().float().cpu().clone() for p in net.parameters()],
+            _beta_flat(opt))
+
+
+def compare(name, ra, rb, tol=1e-6, want_equal=True):
+    """Compare BOTH the weights and the flat beta of two runs."""
+    wa, ba = ra
+    wb, bb = rb
+    w_worst = max((x - y).abs().max().item() for x, y in zip(wa, wb))
+    if ba.numel() == bb.numel():
+        b_worst = (ba - bb).abs().max().item()
+    else:
+        b_worst = float("inf")          # different partition sizes are never equal
+    worst = max(w_worst, b_worst)
+    ok = (worst <= tol) if want_equal else (worst > tol)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:52s} "
+          f"w={w_worst:.3e} beta={b_worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+def compare_w(name, ra, rb, tol=1e-6, want_equal=True):
+    """WEIGHTS ONLY.  Used where the two arms hold beta in genuinely different-sized
+    partitions (C4, C7), so a beta comparison would be trivially satisfied by the size
+    mismatch rather than by the dynamics."""
+    w_worst = max((x - y).abs().max().item() for x, y in zip(ra[0], rb[0]))
+    ok = (w_worst <= tol) if want_equal else (w_worst > tol)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:52s} max|dW| = {w_worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name:56s} {detail}")
+    if not cond:
+        FAILS.append(name)
+    return cond
+
+
+print(f"device={DEV}")
+_net = fresh_net()
+NUMELS = [int(p.numel()) for p in _net.parameters()]
+NL = len(NUMELS)
+NW = sum(NUMELS)
+MAXN = max(NUMELS)
+print(f"ResNet18: {NL} param tensors, {NW} weights, largest tensor {MAXN}\n")
+
+
+def m_of(K):
+    return sum((n + K - 1) // K for n in NUMELS)
+
+
+# ---- C0: the harness is deterministic, or nothing below means anything ------
+print("C0  DETERMINISM: the same config run twice must be bitwise identical")
+for _g in ("weightwise", "chunk1", "layerwise"):
+    compare(f"{_g} == itself (re-run)", run_steps(_g), run_steps(_g), tol=0.0)
+if FAILS:
+    print("\n  C0 FAILED -- the harness is nondeterministic on this device, so the")
+    print("  equivalence tests below cannot distinguish 'identical' from 'different'.")
+    print("  Re-run with CHUNK_TEST_DEVICE=cpu.  ABORTING.")
+    sys.exit(1)
+
+# ---- C1: chunk1 == weightwise ----------------------------------------------
+print("C1  chunk1  vs  weightwise   (K=1 is the per-weight limit, EXACT)")
+compare("chunk1 == weightwise", run_steps("chunk1"), run_steps("weightwise"))
+
+# ---- C2: chunk<huge> == layerwise ------------------------------------------
+print("\nC2  chunk<huge>  vs  layerwise   (K >= max numel is per-layer, EXACT)")
+HUGE = 1 << 24
+check("chunk<huge> would give one group per layer", m_of(HUGE) == NL,
+      f"m({HUGE}) = {m_of(HUGE)}, layers = {NL}")
+compare(f"chunk{HUGE} == layerwise", run_steps(f"chunk{HUGE}"), run_steps("layerwise"))
+
+# ---- C3: m(K) against the beta actually allocated ---------------------------
+print("\nC3  m(K) = sum ceil(numel/K), read from the ALLOCATED beta, monotone in K")
+prev = None
+for K in (1, 2, 16, 128, 1024, 8192, 65536, HUGE):
+    net = fresh_net()
+    opt = make_opt(net, f"chunk{K}")
+    m_alloc = int(sum(int(b.numel()) for b in opt.beta))
+    m_pred = m_of(K)
+    check(f"m(chunk{K}) allocated == predicted", m_alloc == m_pred,
+          f"allocated {m_alloc}, predicted {m_pred}")
+    if prev is not None:
+        check(f"m(chunk{K}) <= previous", m_alloc <= prev, f"{m_alloc} <= {prev}")
+    prev = m_alloc
+check("m(chunk1) == total weights", m_of(1) == NW, f"{m_of(1)} == {NW}")
+check(f"m(chunk{HUGE}) == n_layers", m_of(HUGE) == NL, f"{m_of(HUGE)} == {NL}")
+
+# ---- C4: meta_stepsize=0 -> chunkK identical to scalar ----------------------
+print("\nC4  meta_stepsize=0  =>  chunkK must train identically to scalar (alpha frozen)")
+ref = run_steps("scalar", meta_stepsize=0.0)
+for K in (1, 128, 8192):
+    compare_w(f"chunk{K} == scalar @ meta_stepsize=0", ref,
+              run_steps(f"chunk{K}", meta_stepsize=0.0))
+
+# ---- C5: block_product math, including a RAGGED final chunk -----------------
+print("\nC5  block_product: per-chunk sums, explicitly, with a RAGGED final chunk")
+
+
+class Ragged(nn.Module):
+    """numel 10 and 7 with K=4 -> chunk counts 3 and 2, both final chunks ragged."""
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Parameter(torch.arange(10, dtype=torch.float32).clone())
+        self.b = nn.Parameter(torch.arange(7, dtype=torch.float32).clone() * 0.5)
+
+
+def ragged_net(seed=0):
+    torch.manual_seed(seed)
+    return Ragged().to(DEV)
+
+
+K = 4
+net = ragged_net()
+opt = make_opt(net, f"chunk{K}")
+u = [torch.arange(p.numel(), dtype=torch.float32, device=DEV).view_as(p) + 1.0
+     for p in net.parameters()]
+v = [torch.ones_like(p) * 2.0 for p in net.parameters()]
+got = opt.block_product(u, v)
+check("ragged chunk counts", [int(t.numel()) for t in got] == [3, 2],
+      f"got {[int(t.numel()) for t in got]}, expected [3, 2]")
+ok_all = True
+for li, (ui, vi) in enumerate(zip(u, v)):
+    flat = (ui * vi).reshape(-1)
+    n = flat.numel()
+    for ci in range(got[li].numel()):
+        lo, hi = ci * K, min((ci + 1) * K, n)      # REAL members only
+        want = float(flat[lo:hi].sum())
+        have = float(got[li][ci])
+        if abs(want - have) > 1e-5:
+            ok_all = False
+            print(f"      layer {li} chunk {ci}: got {have}, explicit sum {want}")
+check("every chunk == explicit sum over its REAL members", ok_all,
+      "(a zero-pad must contribute 0, never rescale a ragged chunk)")
+
+# ---- C6: the probe sees the chunk partition --------------------------------
+print("\nC6  the probe reads the CHUNK partition (list branch, as nodewise/weightwise do)")
+for K in (1, 1024):
+    net = fresh_net()
+    opt = make_opt(net, f"chunk{K}")
+    n_beta = int(sum(int(b.numel()) for b in opt.beta))
+    check(f"chunk{K}: n_beta == m(K)", n_beta == m_of(K), f"{n_beta} == {m_of(K)}")
+check("'chunkwise' is not a substring of 'scalar' or 'blockwise'",
+      ("chunkwise" not in "scalar") and ("chunkwise" not in "blockwise"),
+      "(HF.py tests those two with `in` on a STRING, not a tuple)")
+
+# ---- C7: the suite is not vacuously passing --------------------------------
+print("\nC7  the suite discriminates (chunk1 must NOT equal layerwise)")
+compare_w("chunk1 != layerwise", run_steps("chunk1"), run_steps("layerwise"),
+          want_equal=False)
+compare_w("chunk1 != chunk1024", run_steps("chunk1"), run_steps("chunk1024"),
+          want_equal=False)
+compare_w("chunk1024 != layerwise", run_steps("chunk1024"), run_steps("layerwise"),
+          want_equal=False)
+
+# ---- summary ---------------------------------------------------------------
+print("\n" + "=" * 66)
+if FAILS:
+    print(f"FAILED {len(FAILS)}: " + ", ".join(FAILS))
+    sys.exit(1)
+print("ALL CHUNKWISE TESTS PASS")
+print("\nm(K) ladder available for the batch:")
+for K in (1, 16, 128, 1024, 8192, 65536, HUGE):
+    print(f"   chunk{K:<8} m = {m_of(K):>10,}")
+sys.exit(0)

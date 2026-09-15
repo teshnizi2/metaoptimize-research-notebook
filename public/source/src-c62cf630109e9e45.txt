@@ -1,0 +1,483 @@
+"""Correctness tests for PATCH_RESNET_GN (`--NN-name ResNet18_gn`).
+
+STRATEGY, identical in spirit to tests/test_nodebn.py, test_chunkwise.py and
+test_permnode.py: validate the new network against code paths that are ALREADY TRUSTED,
+via identities, rather than against my expectation of what it should do.
+
+THE PATCH IS TO `build_network.py` ONLY.  `Optimizers/HF.py` IS NOT TOUCHED, so there is
+no new GRANULARITY to test.  The equivalence that has to hold is the other one, and it
+is stronger: **the new network must present the OPTIMISER with the identical partition
+under every existing granularity**, and **the old networks must be bitwise unchanged**.
+Those are this suite's two boundaries and they replace the usual "the new granularity
+reduces to an existing one at its endpoints".
+
+  G0  DETERMINISM FIRST (STANDING RULE 20).  The SAME configuration run twice must give
+      max|dW| = max|dbeta| = 0.  If this fails every equivalence below is meaningless
+      and the suite stops.  On CUDA this genuinely fails -- see the DEV note.
+  G1  **INERTNESS, BITWISE, AGAINST THE UNPATCHED TREE.**  `ResNet18` built by the
+      PATCHED build_network must be bitwise identical to `ResNet18` built by the
+      UNPATCHED one -- same names, same shapes, same initial values at the same seed,
+      and the same weights AND beta after 25 real HF steps.  Also the shape lists of
+      `ResNet34` (BasicBlock path), `ResNet50` (Bottleneck path, which the patch also
+      touches) and `ResNet18_soft` (which it must NOT touch).  This is the assertion
+      that says the patch cannot have changed any earlier run, and it is made against
+      the previous code rather than against the diff.  It is SKIPPED, loudly, only if
+      no unpatched tree is available (GN_TEST_REF_DIR); the frozen census in G2 still
+      runs in that case.
+  G2  THE FROZEN CENSUS, on the patched `ResNet18`: 62 tensors, 11,173,962 weights, 41
+      one-dimensional tensors, 9,610 size-1 nodewise groups (66.6436% of m over
+      0.086004% of the weights), m(nodewise) 14,420, m(nodewise1d) 4,851, m(chunk777)
+      14,421.  Every number MEASURED here, from the built net and the ALLOCATED beta.
+  G3  **THE IDENTITY THE BATCH RESTS ON.**  `ResNet18_gn`'s `[(name, shape)]` list from
+      `named_parameters()` is ELEMENTWISE EQUAL to `ResNet18`'s -- same names, same
+      order, same shapes.  `HF.init_meta` consumes exactly that list, positionally, so
+      this is what makes the two nets carry the SAME partition object.
+  G4  **THE ALLOCATED BETA, FOR BOTH NETS, UNDER EVERY GRANULARITY THE BATCH USES.**
+      nodewise 14,420 and chunk777 14,421 on BOTH nets, and beyond the two registered
+      arms also nodewise1d, weightwise, layerwise -- per-tensor beta length lists
+      compared elementwise, not just totals.  Measured from `opt.beta`, never a formula.
+  G5  THE NORMALISER REALLY CHANGED -- **THE ANTI-VACUITY GUARD.**  If G3/G4 pass
+      because nothing changed, the batch measures nothing.  `ResNet18_gn` must hold 20
+      `nn.GroupNorm` and ZERO `nn.BatchNorm2d`; `ResNet18` the exact reverse; every GN
+      must have num_groups == 32 over channels divisible by 32; the BN net must carry
+      60 buffers (running_mean/var/num_batches_tracked x 20) and the GN net ZERO; no
+      buffer name may appear in `named_parameters()`; and the two nets must produce
+      DIFFERENT outputs on the same input from the same seed.
+  G6  IT TRAINS AT ALL ON CPU, and the partition BITES on it: 25 HF steps on the GN net
+      give finite weights and a moved beta, and `nodewise` and `chunk777` DIVERGE there.
+      (A 25-step CPU check is not a claim about 100 epochs on a GPU -- see the note at
+      the bottom.  It is the cheapest thing that would catch a net that cannot run.)
+  G7  NOTHING REGRESSED IN THE GRANULARITY MACHINERY ON THE NEW NET: chunk1 ==
+      weightwise and chunk<K_BIG> == layerwise, BITWISE, on `ResNet18_gn` -- the same
+      endpoint identities `tests/test_chunkwise.py` asserts on `ResNet18`.  K_BIG is
+      MEASURED as max(numel), the smallest K that makes every tensor one chunk.
+  G8  THE 1-D TENSORS ARE THE SAME 41 TENSORS, BY NAME, on both nets, and they hold the
+      same 9,610 scalars.  This is the "byte-identical singleton structure" the
+      registration claims; it is asserted, not asserted-to-be-obvious.
+  G9  AN UNKNOWN `norm` RAISES.  `_norm2d(norm, c)` must not fall back to BatchNorm --
+      a typo'd norm string would otherwise silently build the CONTROL arm and the batch
+      would compare `ResNet18` with `ResNet18`.
+  G10 THE DISPATCH IS INERT: every pre-existing `--NN-name` still builds, and the only
+      new name is `ResNet18_gn`.
+
+Any failure means the `gn1` batch is not measuring what it claims and every number taken
+from it is void.
+
+WHAT THIS SUITE DOES **NOT** ESTABLISH, stated so it is not over-read:
+  * that a GroupNorm ResNet18 TRAINS TO A USABLE PLATEAU at the registered cell.  25 CPU
+    steps cannot say that.  `bin/c84_normaliser_transfer.sh` gate T0 decides it from the
+    real runs, and the registration requires a 3-epoch smoke run before the batch.
+  * anything about the ACCURACY of either net.
+  * that GroupNorm preserves BatchNorm's per-channel scale invariance.  It does not --
+    that is the declared confound, and it is a property of the mechanism, not of the code.
+
+RUN ON THE CLUSTER (needs torch + the patched build_network.py):
+  ssh cluster_a "cd /cluster/account_a/metaopt/hierarchical-metaoptimize && \
+             NODEBN_TEST_DEVICE=cpu python3 tests/test_resnet18_gn.py"
+RUN AGAINST A SCRATCH COPY, so the patch is verified without editing the live tree:
+  CIFAR10_DIR=<scratch copy> GN_TEST_REF_DIR=<live tree> \
+      NODEBN_TEST_DEVICE=cpu python3 tests/test_resnet18_gn.py
+"""
+import importlib.util
+import os
+import sys
+
+# CIFAR10_DIR lets this run against a SCRATCH copy of the tree, so the patch can be
+# verified without editing the live build_network.py that running jobs import.  Default
+# is the real tree, so the test is still a check on what actually ships.
+CIFAR10_DIR = os.environ.get(
+    "CIFAR10_DIR",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10")
+sys.path.insert(0, CIFAR10_DIR)
+import torch                                                          # noqa: E402
+import torch.nn as nn                                                 # noqa: E402
+from build_network import build_network                               # noqa: E402
+from Optimizers.HF import HF                                          # noqa: E402
+
+# DEVICE: CPU BY DEFAULT, AND THAT IS NOT A CONVENIENCE -- IT IS THE TEST'S VALIDITY.
+# Measured on this cluster (cycle 75, STANDING RULE 20): running the SAME config twice on
+# CUDA gives max|dbeta| = 2.2e-01, because cuDNN's conv backward is nondeterministic and
+# Lion's sign() amplifies any float-level difference into a full +-2*ms beta step at
+# whichever coordinate sits nearest a sign boundary.  That is the SAME magnitude as a real
+# difference, so an equivalence test run on CUDA cannot distinguish "identical" from
+# "completely different".  G0 asserts determinism rather than assuming it.
+DEV = torch.device(os.environ.get("NODEBN_TEST_DEVICE", "cpu"))
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+# THE REGIME MATTERS (test_chunkwise learned this the hard way).  At a small alpha0 and a
+# small ms, beta barely moves and every partition produces the same weights, so the
+# equivalences pass VACUOUSLY.  alpha0=1e-3 with ms=1e-2 over 25 steps moves beta enough
+# for partitions to genuinely diverge; G6 is the standing guard that this is still true.
+ALPHA0 = 1e-3
+STEPS = 25
+# G7's two endpoint identities are EXACT for any number of steps, so they are run
+# SHORT.  They are also the expensive pair: `weightwise`/`chunk1` allocate an
+# 11,173,962-element beta, and `chunk<huge>` allocates K elements per tensor inside
+# `beta_to_alpha` before slicing (a slice keeps its base storage alive, so K=99999999
+# would pin 62 x 400 MB ~= 25 GB on a shared login node).  G7 therefore uses
+# K = max numel, the SMALLEST K for which every tensor is exactly one chunk.
+STEPS_EP = 5
+META = {"alg": "Lion", "meta_stepsize": 1e-2, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+NET_BN = "ResNet18"
+NET_GN = "ResNet18_gn"
+CHUNK_K = 777                # bin/c84_normaliser_transfer.sh's comparator
+GN_GROUPS = 32               # patches/patch_resnet_gn.py's GN_GROUPS
+
+# THE FROZEN CENSUS (docs/CORRECTIONS 111.1, FINDINGS 77.6).  Asserted, never assumed.
+C_PARAMS = 11173962
+C_TENSORS = 62
+C_ONED = 41
+C_SINGLETONS = 9610
+C_M_NODE = 14420
+C_M_N1D = 4851
+C_M_CHUNK = 14421            # m(chunk777)
+C_NORM_MODULES = 20          # BN layers in ResNet18: 1 stem + 16 in blocks + 3 shortcuts
+C_BN_BUFFERS = 60            # running_mean + running_var + num_batches_tracked, x20
+
+FAILS = []
+
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+# --- the UNPATCHED reference tree, loaded WITHOUT touching sys.path ------------------
+# build_network.py imports only torch.nn, so it loads standalone from any path.
+REF_DIR = os.environ.get("GN_TEST_REF_DIR", CIFAR10_DIR)
+REF_BUILD = None
+REF_WHY = ""
+_ref_path = os.path.join(REF_DIR, "build_network.py")
+if not os.path.exists(_ref_path):
+    REF_WHY = "no build_network.py at GN_TEST_REF_DIR=%s" % REF_DIR
+elif "PATCH_RESNET_GN" in open(_ref_path).read():
+    REF_WHY = ("the reference tree at %s is ITSELF patched, so there is no unpatched "
+               "code to compare against" % REF_DIR)
+else:
+    _spec = importlib.util.spec_from_file_location("build_network_ref", _ref_path)
+    REF_BUILD = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(REF_BUILD)
+
+
+def fresh(name, seed=0, builder=None):
+    torch.manual_seed(seed)
+    b = builder if builder is not None else build_network
+    return b(name, DEV)
+
+
+def make_opt(net, groups, meta_stepsize=None):
+    meta = dict(META)
+    if meta_stepsize is not None:
+        meta["meta_stepsize"] = meta_stepsize
+    return HF(net, stepsize_groups=groups, alpha0=ALPHA0, args_base=dict(BASE),
+              args_meta=meta, gamma=1, writer=NullWriter())
+
+
+def _beta_flat(opt):
+    return torch.cat([b.detach().float().reshape(-1).cpu() for b in opt.beta])
+
+
+_RUNS = {}
+
+
+def run_steps(name, groups, k=STEPS, seed=0, builder=None, tag=""):
+    """Return (weights, flat beta).  BETA is where the partition actually lives, so the
+    equivalences are asserted on it as well as on the weights.  Memoised: several gates
+    read the same run and a ResNet18 CPU run is not free."""
+    key = (name, groups, k, seed, tag)
+    if key in _RUNS:
+        return _RUNS[key]
+    net = fresh(name, seed, builder)
+    opt = make_opt(net, groups)
+    crit = nn.CrossEntropyLoss()
+    g = torch.Generator().manual_seed(1234)
+    for _ in range(k):
+        x = torch.randn(8, 3, 32, 32, generator=g).to(DEV)
+        y = torch.randint(0, 10, (8,), generator=g).to(DEV)
+        loss = crit(net(x), y)
+        opt.step(net, loss)
+    out = ([p.detach().float().cpu().clone() for p in net.parameters()],
+           _beta_flat(opt))
+    _RUNS[key] = out
+    return out
+
+
+def compare(name, ra, rb, tol=1e-6, want_equal=True):
+    wa, ba = ra
+    wb, bb = rb
+    w_worst = max((x - y).abs().max().item() for x, y in zip(wa, wb))
+    b_worst = ((ba - bb).abs().max().item() if ba.numel() == bb.numel()
+               else float("inf"))
+    worst = max(w_worst, b_worst)
+    ok = (worst <= tol) if want_equal else (worst > tol)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:56s} "
+          f"w={w_worst:.3e} beta={b_worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name:60s} {detail}")
+    if not cond:
+        FAILS.append(name)
+    return cond
+
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+
+def beta_lens(opt):
+    return [int(b.numel()) for b in opt.beta]
+
+
+def named(net):
+    return [(n, tuple(p.shape)) for n, p in net.named_parameters()]
+
+
+def modules_of(net, cls):
+    return [m for m in net.modules() if isinstance(m, cls)]
+
+
+print(f"device={DEV}  tree={CIFAR10_DIR}")
+_bn = fresh(NET_BN)
+_gn = fresh(NET_GN)
+NAMED_BN, NAMED_GN = named(_bn), named(_gn)
+SHAPES = [s for _, s in NAMED_BN]
+NUMELS = [int(torch.Size(s).numel()) for s in SHAPES]
+print(f"{NET_BN}: {len(SHAPES)} param tensors, {sum(NUMELS)} weights, "
+      f"{sum(1 for s in SHAPES if len(s) == 1)} one-dimensional tensors")
+print(f"{NET_GN}: {len(NAMED_GN)} param tensors, "
+      f"{sum(int(torch.Size(s).numel()) for _, s in NAMED_GN)} weights\n")
+
+# --- G0  DETERMINISM FIRST (STANDING RULE 20) ---------------------------------------
+print("G0  the SAME configuration equals ITSELF (STANDING RULE 20)")
+_a = run_steps(NET_GN, "nodewise")
+_b = run_steps(NET_GN, "nodewise", tag="twin")
+_det = compare(f"{NET_GN} nodewise twice", _a, _b, tol=0.0)
+if not _det:
+    print("\n  G0 FAILED -- this device is not deterministic, so no equivalence below")
+    print("  can be tested.  Re-run with NODEBN_TEST_DEVICE=cpu.  STOPPING.")
+    sys.exit(1)
+compare(f"{NET_BN} nodewise twice", run_steps(NET_BN, "nodewise"),
+        run_steps(NET_BN, "nodewise", tag="twin"), tol=0.0)
+
+# --- G1  INERTNESS, BITWISE, AGAINST THE UNPATCHED TREE -----------------------------
+print("\nG1  the patch changed NOTHING about the pre-existing networks (BITWISE)")
+if REF_BUILD is None:
+    print(f"  SKIPPED -- {REF_WHY}.")
+    print("  Set GN_TEST_REF_DIR to an UNPATCHED tree to get this assertion.  G2's")
+    print("  frozen census below is the weaker fallback and it still runs.")
+else:
+    _ref_net = fresh(NET_BN, builder=REF_BUILD.build_network)
+    check("named_parameters() (name, shape) list is IDENTICAL to the unpatched tree's",
+          named(_ref_net) == NAMED_BN, f"{len(NAMED_BN)} tensors")
+    _p_pat = [p.detach().cpu().clone() for p in fresh(NET_BN).parameters()]
+    _p_ref = [p.detach().cpu().clone() for p in
+              fresh(NET_BN, builder=REF_BUILD.build_network).parameters()]
+    _w = max((x - y).abs().max().item() for x, y in zip(_p_pat, _p_ref))
+    check("INITIAL weights at seed 0 are BITWISE identical", _w == 0.0, f"max|dW|={_w:.3e}")
+    compare(f"{NET_BN} after {STEPS} HF steps == the unpatched tree's, BITWISE",
+            run_steps(NET_BN, "nodewise"),
+            run_steps(NET_BN, "nodewise", builder=REF_BUILD.build_network, tag="ref"),
+            tol=0.0)
+    for other in ("ResNet34", "ResNet50", "ResNet18_soft", "ResNet10", "M1"):
+        a = named(fresh(other))
+        b = named(fresh(other, builder=REF_BUILD.build_network))
+        check(f"{other}'s (name, shape) list is unchanged", a == b, f"{len(a)} tensors")
+    check("the reference tree really is UNPATCHED (else G1 is vacuous)",
+          "PATCH_RESNET_GN" not in open(_ref_path).read())
+    check(f"and the tree under test really IS patched (it builds {NET_GN})",
+          len(NAMED_GN) == len(NAMED_BN) and len(NAMED_GN) > 0)
+
+# --- G2  THE FROZEN CENSUS, MEASURED ------------------------------------------------
+print(f"\nG2  the frozen {NET_BN} census reproduces on the PATCHED tree")
+_oned = [i for i, s in enumerate(SHAPES) if len(s) == 1]
+_sing = sum(SHAPES[i][0] for i in _oned)
+_o_node, _o_n1d = make_opt(fresh(NET_BN), "nodewise"), make_opt(fresh(NET_BN), "nodewise1d")
+_o_ch = make_opt(fresh(NET_BN), f"chunk{CHUNK_K}")
+check("param tensors == 62", len(SHAPES) == C_TENSORS, f"{len(SHAPES)}")
+check("weights == 11,173,962", sum(NUMELS) == C_PARAMS, f"{sum(NUMELS)}")
+check("one-dimensional tensors == 41", len(_oned) == C_ONED, f"{len(_oned)}")
+check("size-1 nodewise groups == 9,610", _sing == C_SINGLETONS, f"{_sing}")
+check("singletons are 66.6436% of m over 0.086004% of the weights",
+      abs(100.0 * _sing / C_M_NODE - 66.6436) < 0.001
+      and abs(100.0 * _sing / sum(NUMELS) - 0.086004) < 0.0001,
+      f"{100.0*_sing/C_M_NODE:.4f}% of groups, {100.0*_sing/sum(NUMELS):.6f}% of weights")
+check("m(nodewise) == 14,420 from the ALLOCATED beta", m_of(_o_node) == C_M_NODE,
+      f"{m_of(_o_node)}")
+check("m(nodewise1d) == 4,851 from the ALLOCATED beta", m_of(_o_n1d) == C_M_N1D,
+      f"{m_of(_o_n1d)}")
+check(f"m(chunk{CHUNK_K}) == 14,421 from the ALLOCATED beta", m_of(_o_ch) == C_M_CHUNK,
+      f"{m_of(_o_ch)}")
+check("14,420 - 9,610 + 41 == 4,851 (the tail arithmetic closes)",
+      C_M_NODE - _sing + len(_oned) == C_M_N1D)
+check(f"every 1-D tensor is smaller than K={CHUNK_K}, so each gets ONE chunk",
+      max(SHAPES[i][0] for i in _oned) < CHUNK_K,
+      f"largest 1-D numel {max(SHAPES[i][0] for i in _oned)}")
+
+# --- G3  THE IDENTITY THE BATCH RESTS ON --------------------------------------------
+print(f"\nG3  {NET_GN}'s parameter list is ELEMENTWISE EQUAL to {NET_BN}'s")
+check("same number of tensors", len(NAMED_GN) == len(NAMED_BN),
+      f"{len(NAMED_GN)} vs {len(NAMED_BN)}")
+check("same NAMES in the same ORDER (HF.init_meta reads this list positionally)",
+      [n for n, _ in NAMED_GN] == [n for n, _ in NAMED_BN])
+check("same SHAPES in the same order", [s for _, s in NAMED_GN] == [s for _, s in NAMED_BN])
+check("so the (name, shape) lists are equal as objects", NAMED_GN == NAMED_BN)
+check("same total weight count",
+      sum(int(torch.Size(s).numel()) for _, s in NAMED_GN) == C_PARAMS)
+_gn_oned = [i for i, (_, s) in enumerate(NAMED_GN) if len(s) == 1]
+check("same 41 one-D tensors AT THE SAME POSITIONS", _gn_oned == _oned, f"{len(_gn_oned)}")
+
+# --- G4  THE ALLOCATED BETA, BOTH NETS, EVERY GRANULARITY THE BATCH USES ------------
+print("\nG4  the ALLOCATED beta is identical for the two nets under every granularity")
+_want_m = {"nodewise": C_M_NODE, f"chunk{CHUNK_K}": C_M_CHUNK,
+           "nodewise1d": C_M_N1D, "weightwise": C_PARAMS, "layerwise": C_TENSORS}
+for gran, want in _want_m.items():
+    ob = make_opt(fresh(NET_BN), gran)
+    og = make_opt(fresh(NET_GN), gran)
+    lb, lg = beta_lens(ob), beta_lens(og)
+    check(f"m({gran}) == {want} on {NET_BN}", m_of(ob) == want, f"{m_of(ob)}")
+    check(f"m({gran}) == {want} on {NET_GN}", m_of(og) == want, f"{m_of(og)}")
+    check(f"and the PER-TENSOR beta lengths are elementwise equal under {gran}",
+          lb == lg, f"{len(lb)} tensors")
+check("the two REGISTERED arms are 1 group apart, on BOTH nets",
+      C_M_CHUNK - C_M_NODE == 1)
+
+# --- G5  THE NORMALISER REALLY CHANGED -- ANTI-VACUITY ------------------------------
+print("\nG5  the normaliser really changed (if not, G3/G4 pass vacuously)")
+_bn_in_bn = modules_of(_bn, nn.BatchNorm2d)
+_gn_in_bn = modules_of(_bn, nn.GroupNorm)
+_bn_in_gn = modules_of(_gn, nn.BatchNorm2d)
+_gn_in_gn = modules_of(_gn, nn.GroupNorm)
+check(f"{NET_BN} holds {C_NORM_MODULES} BatchNorm2d and 0 GroupNorm",
+      len(_bn_in_bn) == C_NORM_MODULES and len(_gn_in_bn) == 0,
+      f"{len(_bn_in_bn)} BN, {len(_gn_in_bn)} GN")
+check(f"{NET_GN} holds {C_NORM_MODULES} GroupNorm and 0 BatchNorm2d",
+      len(_gn_in_gn) == C_NORM_MODULES and len(_bn_in_gn) == 0,
+      f"{len(_gn_in_gn)} GN, {len(_bn_in_gn)} BN")
+check(f"every GroupNorm has num_groups == {GN_GROUPS}",
+      all(m.num_groups == GN_GROUPS for m in _gn_in_gn),
+      f"{sorted({m.num_groups for m in _gn_in_gn})}")
+check(f"every GroupNorm's channel count is divisible by {GN_GROUPS}",
+      all(m.num_channels % GN_GROUPS == 0 for m in _gn_in_gn),
+      f"channels {sorted({m.num_channels for m in _gn_in_gn})}")
+check("every GroupNorm is affine, so weight and bias are (C,) parameters",
+      all(m.affine for m in _gn_in_gn))
+check("their weight/bias shapes match the BN modules' one-for-one",
+      [tuple(m.weight.shape) for m in _gn_in_gn] == [tuple(m.weight.shape) for m in _bn_in_bn]
+      and [tuple(m.bias.shape) for m in _gn_in_gn] == [tuple(m.bias.shape) for m in _bn_in_bn])
+_buf_bn = [n for n, _ in _bn.named_buffers()]
+_buf_gn = [n for n, _ in _gn.named_buffers()]
+check(f"{NET_BN} carries {C_BN_BUFFERS} buffers (running stats), {NET_GN} carries 0",
+      len(_buf_bn) == C_BN_BUFFERS and len(_buf_gn) == 0,
+      f"{len(_buf_bn)} vs {len(_buf_gn)}")
+check("NO buffer name appears in named_parameters() -- running stats never had a "
+      "step size under ANY granularity",
+      not (set(_buf_bn) & {n for n, _ in NAMED_BN}))
+torch.manual_seed(7)
+_x = torch.randn(4, 3, 32, 32).to(DEV)
+_bn.eval()
+_gn.eval()
+with torch.no_grad():
+    _d = (_bn(_x) - _gn(_x)).abs().max().item()
+check("the two nets are DIFFERENT FUNCTIONS on the same input", _d > 1e-6,
+      f"max|dy|={_d:.3e}")
+
+# --- G6  IT RUNS, AND THE PARTITION BITES ON IT -------------------------------------
+print(f"\nG6  {NET_GN} takes {STEPS} real HF steps, and the partition changes the result")
+_w_gn, _b_gn = run_steps(NET_GN, "nodewise")
+check("all weights finite after the run",
+      all(torch.isfinite(w).all().item() for w in _w_gn))
+check("beta is finite and MOVED off its initialisation",
+      bool(torch.isfinite(_b_gn).all().item())
+      and (_b_gn - torch.log(torch.tensor(ALPHA0))).abs().max().item() > 0,
+      f"max|dbeta|={(_b_gn - torch.log(torch.tensor(ALPHA0))).abs().max().item():.3e}")
+compare(f"nodewise != chunk{CHUNK_K} on {NET_GN} (the arms genuinely differ)",
+        run_steps(NET_GN, "nodewise"), run_steps(NET_GN, f"chunk{CHUNK_K}"),
+        tol=1e-6, want_equal=False)
+
+# --- G7  NOTHING REGRESSED IN THE GRANULARITY MACHINERY ON THE NEW NET --------------
+# K_BIG is MEASURED, not guessed: the largest tensor's numel is the smallest K for which
+# ceil(numel/K) == 1 on every tensor, i.e. the cheapest K that reproduces layerwise.
+K_BIG = max(NUMELS)
+print(f"\nG7  chunkwise's endpoint identities still hold ON {NET_GN} "
+      f"(K_BIG = {K_BIG} = max numel, {STEPS_EP} steps)")
+check("m(chunk1) is the weight count", m_of(make_opt(fresh(NET_GN), "chunk1")) == C_PARAMS)
+check(f"m(chunk{K_BIG}) is the tensor count",
+      m_of(make_opt(fresh(NET_GN), f"chunk{K_BIG}")) == C_TENSORS,
+      f"K_BIG >= every numel")
+compare("chunk1 == weightwise", run_steps(NET_GN, "chunk1", k=STEPS_EP),
+        run_steps(NET_GN, "weightwise", k=STEPS_EP), tol=0.0)
+compare(f"chunk{K_BIG} == layerwise", run_steps(NET_GN, f"chunk{K_BIG}", k=STEPS_EP),
+        run_steps(NET_GN, "layerwise", k=STEPS_EP), tol=0.0)
+
+# --- G8  THE SINGLETON STRUCTURE IS THE SAME 41 TENSORS, BY NAME --------------------
+print("\nG8  the size-1 tail is the SAME 41 tensors on both nets, by name")
+_names_1d_bn = [NAMED_BN[i][0] for i in _oned]
+_names_1d_gn = [NAMED_GN[i][0] for i in _gn_oned]
+check("the 41 one-D tensor NAMES are identical", _names_1d_bn == _names_1d_gn,
+      f"{len(_names_1d_bn)} names")
+check("they are 40 normaliser scales/shifts plus linear.bias",
+      sum(1 for n in _names_1d_bn if n.endswith(".bias") and n.startswith("linear")) == 1
+      and len(_names_1d_bn) == C_ONED)
+check("the attribute names bn1/bn2/shortcut.1 were PRESERVED by the patch",
+      all(any(k in n for k in ("bn1", "bn2", "shortcut.1", "linear.bias"))
+          for n in _names_1d_gn),
+      f"e.g. {_names_1d_gn[:3]}")
+check("they hold 9,610 scalars on BOTH nets",
+      sum(NAMED_BN[i][1][0] for i in _oned) == C_SINGLETONS
+      and sum(NAMED_GN[i][1][0] for i in _gn_oned) == C_SINGLETONS)
+_n1d_gn = make_opt(fresh(NET_GN), "nodewise1d")
+check(f"nodewise1d on {NET_GN} removes exactly the 9,569 degenerate groups",
+      C_M_NODE - m_of(_n1d_gn) == C_SINGLETONS - C_ONED,
+      f"{C_M_NODE - m_of(_n1d_gn)}")
+
+# --- G9  AN UNKNOWN norm RAISES -----------------------------------------------------
+print("\nG9  a typo'd norm RAISES instead of silently building the control arm")
+import build_network as _bnmod                                         # noqa: E402
+_raised = False
+try:
+    _bnmod._norm2d("batchnorm", 64)
+except Exception:
+    _raised = True
+check("_norm2d('batchnorm', 64) raises", _raised)
+check("_norm2d('bn', 64) is a BatchNorm2d", isinstance(_bnmod._norm2d("bn", 64), nn.BatchNorm2d))
+check(f"_norm2d('gn', 64) is a GroupNorm({GN_GROUPS}, 64)",
+      isinstance(_bnmod._norm2d("gn", 64), nn.GroupNorm)
+      and _bnmod._norm2d("gn", 64).num_groups == GN_GROUPS)
+_raised2 = False
+try:
+    build_network("ResNet18_groupnorm", DEV)
+except Exception:
+    _raised2 = True
+check("an unknown --NN-name still raises (the 0/0 fallback survives)", _raised2)
+
+# --- G10  THE DISPATCH IS INERT -----------------------------------------------------
+print("\nG10  every pre-existing --NN-name still builds; the only new one is ResNet18_gn")
+for name in ("M1", "M2", "ResNet18", "ResNet18_c100", "ResNet10", "ResNet10_c100",
+             "ResNet34", "ResNet34_c100", "ResNet18_soft"):
+    ok = True
+    try:
+        fresh(name)
+    except Exception as e:                                             # pragma: no cover
+        ok = False
+        print("   ", name, "->", e)
+    check(f"{name} builds", ok)
+check("ResNet18_soft's parameter list still matches ResNet18's shape-for-shape "
+      "(it was NOT patched, and it never needed to be)",
+      [s for _, s in named(fresh("ResNet18_soft"))] == SHAPES)
+
+# ------------------------------------------------------------------------------------
+print()
+if FAILS:
+    print(f"FAILED {len(FAILS)}: " + "; ".join(FAILS))
+    sys.exit(1)
+print(f"ALL PASS -- {NET_GN} presents the optimiser with the IDENTICAL partition to "
+      f"{NET_BN} under every granularity, the pre-existing networks are bitwise "
+      f"unchanged, and the normaliser is the only thing that differs.")
+print("NOTE: this suite says nothing about whether GroupNorm reaches a usable plateau "
+      "at the registered cell.  That is gate T0 in bin/c84_normaliser_transfer.sh, "
+      "decided from the real runs after the 3-epoch smoke run.")

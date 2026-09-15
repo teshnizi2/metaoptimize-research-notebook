@@ -3,14 +3,15 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
 PORTAL = Path(__file__).resolve().parents[1]
-WORKSPACE = PORTAL.parents[1]
-REPO = Path('/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize')
+WORKSPACE = Path(os.environ.get('NOTEBOOK_WORKSPACE', PORTAL.parents[1]))
+REPO = Path(os.environ.get('NOTEBOOK_RESEARCH_REPO', '/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize'))
 EXPORTER = PORTAL / 'scripts/export_sources.py'
 
 
@@ -207,10 +208,13 @@ class SourceExportTests(unittest.TestCase):
             self.assertIn('analysis/after_fence.py', linked)
             self.assertNotIn('analysis/outside.py', linked)
 
+    def published_rows(self):
+        return self.exporter.register_rows(REPO, WORKSPACE)
+
     def test_every_record_has_valid_document_and_code_references(self):
-        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE)
-        rows = list(csv.DictReader((WORKSPACE / 'outputs/tables/complete_experiment_register.csv').read_text().splitlines()))
-        self.assertEqual(len(rows), 111)
+        rows = self.published_rows()
+        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, rows)
+        self.assertEqual(len(rows), 148)
         self.assertEqual(set(links), {row['id'] for row in rows})
         by_id = {s['id']: s for s in index}
         self.assertEqual(len(by_id), len(index))
@@ -235,7 +239,7 @@ class SourceExportTests(unittest.TestCase):
             self.assertEqual(len(assets[source['id']].splitlines()), source['lines'])
 
     def test_cvk2_links_exact_registered_scorer_and_runtime_snapshot(self):
-        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE)
+        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, self.published_rows())
         source = next(s for s in index if s['path'] == 'analysis/cVK2_vggcut_score.py')
         self.assertEqual(source['originalSha256'],
             'aca0cdc314734ed9e8fc611ba42f774e7f76a40294df33de4883c59cd7047338')
@@ -250,9 +254,9 @@ class SourceExportTests(unittest.TestCase):
         self.assertTrue(any(s['path'].endswith('/Optimizers/build_optimizer.py') for s in shared))
 
     def test_public_content_has_no_private_accounts_home_paths_or_credentials(self):
-        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE)
+        index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, self.published_rows())
         payload = json.dumps(index) + json.dumps(links) + '\n'.join(assets.values())
-        for pattern in [r'(?i)teshnizi|salehkaleybars|s5014158|hmkhd2', r'/(?:Users|home|data1)/',
+        for pattern in [r'(?i)teshnizi|salehkaleybars|s5014158|hmkhd2', r'/(?:Users|home|data1|scratch)/',
                         r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}', r'\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{16,}',
                         r'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----']:
             self.assertIsNone(re.search(pattern, payload), pattern)
@@ -260,8 +264,9 @@ class SourceExportTests(unittest.TestCase):
     def test_export_is_deterministic_and_every_href_resolves(self):
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp) / 'a', Path(tmp) / 'b'
-            self.exporter.export_catalog(REPO, WORKSPACE, a)
-            self.exporter.export_catalog(REPO, WORKSPACE, b)
+            rows = self.published_rows()
+            self.exporter.export_catalog(REPO, WORKSPACE, a, rows)
+            self.exporter.export_catalog(REPO, WORKSPACE, b, rows)
             files_a = {p.relative_to(a): p.read_bytes() for p in a.rglob('*') if p.is_file()}
             files_b = {p.relative_to(b): p.read_bytes() for p in b.rglob('*') if p.is_file()}
             self.assertEqual(files_a, files_b)
@@ -270,6 +275,25 @@ class SourceExportTests(unittest.TestCase):
                 p = a / source['href'].lstrip('/')
                 self.assertTrue(p.is_file())
                 self.assertEqual(hashlib.sha256(p.read_bytes()).hexdigest(), source['publicSha256'])
+
+    def test_scratch_roots_are_redacted_in_place(self):
+        text = 'CIFAR10_DIR=/path/to/scratch/cifar10 python3 run.py\nROOT=/scratch/s5014158/runs\nALPHA0=1e-6\n'
+        result = self.exporter.redact(text)
+        self.assertNotIn('/scratch/', result)
+        self.assertNotIn('s5014158', result)
+        self.assertIn('ALPHA0=1e-6', result)
+        self.assertEqual(len(result.splitlines()), len(text.splitlines()))
+
+    def test_master_table_anchors_follow_row_content_not_line_numbers(self):
+        model = self.exporter.register_model
+        lines = ['# Register', '', '| Is the gap caused by the schedule? | varied |', '| Does scale matter? | varied |']
+        rows = [{'id': 'MT002', 'original_question': 'Does scale matter?', 'sources': json.dumps([{'path': '/r/docs/MASTER-TABLE.md', 'line': 3}])},
+                {'id': 'MT003', 'original_question': 'Is the gap caused by the schedule?', 'sources': json.dumps(['/r/docs/MASTER-TABLE.md:4'])}]
+        anchored = model.anchor_master_table(rows, lines)
+        self.assertEqual(json.loads(anchored[0]['sources'])[0]['line'], 4)
+        self.assertEqual(json.loads(anchored[1]['sources'])[0], '/r/docs/MASTER-TABLE.md:3')
+        with self.assertRaisesRegex(ValueError, 'not unique by content'):
+            model.anchor_master_table([{**rows[0], 'original_question': 'A question that was never in the table'}], lines)
 
 
 if __name__ == '__main__':

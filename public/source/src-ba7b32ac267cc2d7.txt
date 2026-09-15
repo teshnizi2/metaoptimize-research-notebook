@@ -1,0 +1,575 @@
+#!/bin/bash
+# =============================================================================
+# cPL1_plainnet_residual.sh -- `cpl1`: ResNet-18 WITHOUT ITS RESIDUAL ADDITIONS
+#   (`PlainNet18_c100`), THE CAMPAIGN'S FIRST ONE-VARIABLE RESIDUAL ABLATION.
+#   ONE SUBMISSION, 15 JOBS (5 arms x 3 seeds), 100 EPOCHS, SEEDS {69,70,71},
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here
+# touches `cluster_a` (Saber's shared account); every guard and scancel line below
+# is filtered on the `cpl1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cPL1_plainnet_residual_score.py, git-committed
+# BEFORE this batch is submitted (STANDING RULE 21).  Its bars are FROZEN
+# LITERALS (O2, CORRECTIONS 207/208): no corpus term can move them.
+#
+# THE DOCUMENTED SCORER INVOCATION -- no second argument to forget:
+#     python3 analysis/cPL1_plainnet_residual_score.py <runsdir>
+#
+# -----------------------------------------------------------------------------
+# THE NETWORK.  patches/patch_plainnet.py adds `PlainNet18_c100` =
+# ResNet(PlainBlock, [2,2,2,2], 100), PlainBlock = BasicBlock minus
+# `out += self.shortcut(x)`, the three projection-shortcut MODULES NOT
+# CONSTRUCTED (198).  53 tensors, 11,046,308 parameters.  ONE pure append at end
+# of build_network.py, dispatched by rebinding `build_network` -- so the
+# registered tests/test_vggbn2.py V0 still passes on the patched tree (guard 1e).
+# tests/test_plainnet.py proves additivity byte for byte, backward compatibility
+# on every corpus network (bitwise init), and the one-variable claim
+# functionally.
+#
+# THE BATCH RUNS FROM AN ISOLATED HARNESS TREE, NEVER THE LIVE ONE (the cgn1
+# convention).  bin/cPL1_stage_harness.sh --stage builds $WS/harness_cpl1/cifar10
+# (byte-identical copies of the live harness .py files, data/ symlinked,
+# PATCH_PLAINNET applied to a pinned pre-patch build_network.py) and
+# $WS/jobs/run_cifar_cpl1.sh (run_cifar.sh with EXACTLY its `cd` line changed).
+# WHY: PATCH_RESNET_GN_C100 (cgn1) inserts mid-file; on ONE shared tree whichever
+# of the two patches lands second breaks the other's byte-identity proof.
+# Isolated trees cannot collide, and the live tree stays byte-untouched.
+#
+# THE ARMS.  m = 2 group ORDER: the big group is beta[0], the isolated beta[1].
+# 1-BASED indices RE-DERIVED BY NAME AND NUMEL on the live model by guard 4.
+#   k01  scalar                                                   floor anchor
+#   kL   layerwise                                                ceiling anchor
+#   ISO  sets:1-43,45-49,51-53/layer4.0.bn2.weight,layer4.1.bn2.weight  [51,2]
+#        the two ResNet carriers that still exist (44, 50)
+#   CTL  sets:1-40,42-46,48-53/layer4.0.bn1.weight,layer4.1.bn1.weight  [51,2]
+#        their exact twin: the two ResNet non-carriers (41, 47) = cdep1 DEPTH2 by name
+#   ONE  sets:1-43,45-53/layer4.0.bn2.weight                            [52,1]
+#        the surviving carrier that fed an ADDITION on ResNet and has no conv-free
+#        path to the head = ciso1/cdep1 ONE by name (it recovered ~0.91 of the gap there)
+#
+# WHY BOTH ANCHORS ARE IN BATCH: BATCH is the unit of replication (F(62,85)=5.47).
+#
+# -----------------------------------------------------------------------------
+# WALLTIME AND PARTITIONS -- MEASURED ON THE PARENT NETWORK AT THIS CELL
+# ciso1 + cdep1 (ResNet18_c100, 100 epochs, this cell), sacct Elapsed:
+#   [HOST_e8d809bd94] (L4) 38-45 min; [HOST_3c1b003035] (2080 Ti) 1:28-1:35 (worst observed 1:35:01).
+# PlainNet18_c100 has 53 of ResNet18_c100's 62 tensors and no shortcut convs, so
+# it is no slower.  WALL=03:00:00 is 1.89x the worst observed parent run and FITS
+# gpu-short's 4:00:00 MaxTime, so _lib_guards.sh's composer ADDS gpu-short.  PARTS
+# is never hard-coded; slurm_parts_for_wall composes it and guard 5c re-checks it
+# (CORRECTIONS 178), so PARTS and WALL cannot disagree.
+# COST: 15 jobs.  median parent ~44 min -> ~11 GPU-h;  worst observed 95 min ->
+#       23.8 GPU-h;  HARD BOUND = WALL x 15 = 45 GPU-h.
+#
+# RULE 20.  Every value below is ONE shell token of [A-Za-z0-9_.,:/-].
+# analysis/argsline_guard.py IS NOT EDITED.  BETA_CLIP and PROBE ride the
+# runner's ENV line; PROBE_TENSOR rides the patch's own `PROBE_TENSOR: on` line.
+#
+# USAGE   bash bin/cPL1_plainnet_residual.sh              # DRY RUN, submits NOTHING
+#         bash bin/cPL1_plainnet_residual.sh --dry-run    # identical, explicit
+#         bash bin/cPL1_plainnet_residual.sh --submit     # the only submitting form
+# ENV     CIFAR10_DIR=<dir>  default $WS/harness_cpl1/cifar10; another copy may be
+#                            named for a scratch dry run.  --submit REFUSES unless it
+#                            is the directory the runner cd's into (guard 9).
+#         CPL1_RUNNER=<file> default $WS/jobs/run_cifar_cpl1.sh.
+#         CPL1_REGISTERED_COMMIT=<sha>  on a host with no git repo, --submit
+#                            requires the operator to declare the commit whose
+#                            tree was staged (guard 1b); it is written to
+#                            PROVENANCE.txt.
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)  SUBMIT=1 ;;
+  ""|--dry-run) SUBMIT=0 ;;
+  *) echo "usage: $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1" 2>/dev/null) | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=${CPL1_RUNNER:-$WS/jobs/run_cifar_cpl1.sh}
+SAVE=$WS/runs/cpl1
+LIVE_CIF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HARN_DEFAULT=$WS/harness_cpl1/cifar10
+CIF=${CIFAR10_DIR:-$HARN_DEFAULT}
+HFLIVE="$CIF/Optimizers/HF.py"
+BNLIVE="$CIF/build_network.py"
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=PlainNet18_c100
+PARENT=ResNet18_c100
+SEEDS="69 70 71"
+MST=1e-3
+A0=1e-6
+NTENS=53
+TOTPAR=11046308
+# ---- the registered specs, LITERAL.  The scorer holds the same five and guard
+# ---- 4c' proves the two agree so neither can drift.
+G_K01='scalar'
+G_KL='layerwise'
+G_ISO='sets:1-43,45-49,51-53/layer4.0.bn2.weight,layer4.1.bn2.weight'
+G_CTL='sets:1-40,42-46,48-53/layer4.0.bn1.weight,layer4.1.bn1.weight'
+G_ONE='sets:1-43,45-53/layer4.0.bn2.weight'
+ARMS="k01 kL ISO CTL ONE"
+NJOBS=15
+WALL=03:00:00
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+echo "=============================================================="
+echo " cpl1 -- ResNet-18 WITHOUT RESIDUAL ADDITIONS: THE ONE-VARIABLE ABLATION"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C"
+echo " ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   k01  $G_K01"
+echo "   kL   $G_KL"
+echo "   ISO  $G_ISO"
+echo "   CTL  $G_CTL"
+echo "   ONE  $G_ONE"
+echo " 5 arms x 3 seeds = $NJOBS jobs, ONE submission"
+echo " partitions $PARTS   walltime $WALL"
+echo " harness under test: $CIF"
+echo " PRIMARY: DELTA_ID = plateau5(ISO) - plateau5(CTL); KEY SECONDARY D_ONE = ONE - k01"
+echo " scorer: analysis/cPL1_plainnet_residual_score.py (registered before any run exists)"
+echo " DOCUMENTED INVOCATION: python3 analysis/cPL1_plainnet_residual_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha256 $(sha "$CSVP"))"
+
+# ---- guard 1a: EVERY file this launcher needs -------------------------------
+SC="$REPO/analysis/cPL1_plainnet_residual_score.py"
+ME="$REPO/bin/cPL1_plainnet_residual.sh"
+PATCHP="$REPO/patches/patch_plainnet.py"
+TESTP="$REPO/tests/test_plainnet.py"
+TESTBP="$REPO/tests/test_probe_tensor_blockwise_cpl1.py"
+TESTB="$REPO/tests/test_probe_tensor_blockwise.py"
+TESTT="$REPO/tests/test_probe_tensor.py"
+PATCHT="$REPO/patches/patch_probe_tensor.py"
+PATCHN="$REPO/patches/patch_namesets.py"
+TESTN="$REPO/tests/test_namesets.py"
+TESTV2="$REPO/tests/test_vggbn2.py"
+LIB="$REPO/bin/_lib_guards.sh"
+AGP="$REPO/analysis/argsline_guard.py"
+STAGEH="$REPO/bin/cPL1_stage_harness.sh"
+for f in "$SC" "$ME" "$PATCHP" "$TESTP" "$TESTBP" "$TESTB" "$TESTT" "$PATCHT" "$PATCHN" \
+         "$TESTN" "$TESTV2" "$LIB" "$AGP" "$STAGEH" "$RUNNER"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+# ---- guard 1b: the six registration files are COMMITTED (RULE 21) -----------
+NEWF="analysis/cPL1_plainnet_residual_score.py bin/cPL1_plainnet_residual.sh bin/cPL1_stage_harness.sh patches/patch_plainnet.py tests/test_plainnet.py tests/test_probe_tensor_blockwise_cpl1.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: all six registration files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+  DEL=$(git -C "$REPO" diff HEAD --numstat -- analysis/ 2>/dev/null | awk '$2+0>0{print}')
+  [ -z "$DEL" ] && echo "guard 1b2: no uncommitted DELETIONS under analysis/ (RULE 16)" \
+               || guard_fail "guard 1b2: analysis/ has uncommitted deletions: $DEL"
+else
+  if [ -n "${CPL1_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CPL1_REGISTERED_COMMIT"
+    echo "          (RULE 21 is re-verified by wall clock: that commit's %ct vs the earliest sacct Submit)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CPL1_REGISTERED_COMMIT is unset -- declare the commit whose tree was staged"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CPL1_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+
+# ---- guard 1c: the registered scorer selftests, INCLUDING its O2 proof ------
+SELF=/tmp/cpl1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELF" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELF") checks, $(grep -c '^  FAIL' "$SELF") failures, $(grep -c '^  SKIP' "$SELF") skipped)" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; grep '^  FAIL' "$SELF" | head -20; tail -5 "$SELF"; }
+grep -q "^  PASS ZERO corpus rows ANYWHERE carry seed 69, 70 or 71" "$SELF" \
+  && echo "guard 1c3: the scorer's OWN fresh-seed check ran and passed" \
+  || guard_fail "guard 1c3: the scorer's fresh-seed check did not pass"
+grep -q "^  PASS O2 real+invented" "$SELF" && grep -q "^  PASS O2 non-vacuity" "$SELF" \
+  && echo "guard 1c4: the O2 invariance proof RAN against THIS host's real corpus plus invented rows, and passed" \
+  || guard_fail "guard 1c4: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cPL1_plainnet_residual_score.py <runsdir>. exits 0" "$SELF" \
+  && echo "guard 1c5: the DOCUMENTED one-argument invocation reached a FINAL line on synthetic runs" \
+  || guard_fail "guard 1c5: the documented one-argument invocation was not exercised"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+# ---- guard 1d0: the isolated tree is what bin/cPL1_stage_harness.sh pinned ---
+if [ "$(cd "$CIF" 2>/dev/null && pwd -P)" = "$(cd "$HARN_DEFAULT" 2>/dev/null && pwd -P)" ]; then
+  if bash "$STAGEH" >/tmp/cpl1_stage.$$ 2>&1; then
+    echo "guard 1d0: bin/cPL1_stage_harness.sh VERIFIES $CIF ($(grep -c '^V-' /tmp/cpl1_stage.$$) checks)"
+  else
+    guard_fail "guard 1d0: bin/cPL1_stage_harness.sh does NOT verify $CIF"; grep 'STAGE FAIL\|^!!!' /tmp/cpl1_stage.$$ | head
+  fi
+else
+  echo "guard 1d0: NOTE -- CIFAR10_DIR=$CIF is not the registered tree $HARN_DEFAULT; stage verification not run"
+fi
+grep -q 'PATCH_PLAINNET' "$LIVE_CIF/build_network.py" 2>/dev/null \
+  && echo "guard 1f: NOTE -- the LIVE build_network.py carries PATCH_PLAINNET; the registered route never puts it there" \
+  || echo "guard 1f: the LIVE build_network.py carries no PATCH_PLAINNET (the live tree is untouched by this batch)"
+
+# ---- guard 1d: PATCH_PLAINNET present on the harness and PROVED on it -------
+if grep -q 'PATCH_PLAINNET' "$BNLIVE" 2>/dev/null; then
+  echo "guard 1d: $BNLIVE carries PATCH_PLAINNET"
+else
+  guard_fail "guard 1d: $BNLIVE lacks PATCH_PLAINNET -- apply patches/patch_plainnet.py first (its APPLY block)"
+fi
+grep -q 'PATCH_PLAINNET' "$HFLIVE" 2>/dev/null && guard_fail "guard 1d2: PATCH_PLAINNET appears in HF.py" \
+  || echo "guard 1d2: PATCH_PLAINNET appears NOWHERE in HF.py (architecture patch stays out of the optimiser)"
+BNPRE="$BNLIVE.pre_plainnet"
+if [ -f "$BNPRE" ]; then
+  echo "guard 1d3a: pre-patch backup present: $BNPRE ($(wc -c < "$BNPRE") bytes, sha256 $(sha "$BNPRE"))"
+  if python3 "$TESTP" --pre "$BNPRE" --post "$BNLIVE" --hf "$HFLIVE" --csv "$CSVP" >/tmp/cpl1_plain.$$ 2>&1; then
+    echo "guard 1d3: tests/test_plainnet.py PASSES on $CIF ($(grep -c '^  PASS' /tmp/cpl1_plain.$$) PASS, $(grep -c '^  FAIL' /tmp/cpl1_plain.$$) FAIL)"
+  else
+    guard_fail "guard 1d3: tests/test_plainnet.py FAILED on $CIF"; grep '^  FAIL' /tmp/cpl1_plain.$$ | head; tail -5 /tmp/cpl1_plain.$$
+  fi
+else
+  guard_fail "guard 1d3a: no pre-patch backup at $BNPRE -- P0's byte-identity proof cannot run"
+fi
+
+# ---- guard 1e: the patch did not disable the VGG launchers ------------------
+# PATCH_PLAINNET is an EOF append precisely so that tests/test_vggbn2.py V0 (which
+# truncates at PATCH_VGGBN's region B) still reproduces .pre_vggbn.  Informative
+# here: a failure caused by ANOTHER track's patch is not this batch's defect, but
+# it is printed so nobody launches onto a tree whose registered tests are red.
+if [ -f "$BNLIVE.pre_vggbn" ]; then
+  if python3 "$TESTV2" --pre "$BNLIVE.pre_vggbn" --post "$BNLIVE" --hf "$HFLIVE" --csv "$CSVP" >/tmp/cpl1_vgg2.$$ 2>&1; then
+    echo "guard 1e: tests/test_vggbn2.py STILL PASSES on this tree ($(grep -c '^  PASS' /tmp/cpl1_vgg2.$$) PASS) -- the VGG launchers' guard 1d3 is intact"
+  else
+    echo "!!! guard 1e: NOTE -- tests/test_vggbn2.py FAILS on this tree; read before launching:"; grep '^  FAIL' /tmp/cpl1_vgg2.$$ | head -5
+  fi
+else
+  echo "guard 1e: NOTE -- no .pre_vggbn next to $BNLIVE; VGG cross-check not run"
+fi
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^cpl1-' "$CSVP" && guard_fail "guard 2: cpl1-* already in the CSV" \
+                         || echo "guard 2: no cpl1-* name collision in the corpus"
+NOUT=$(ls "$WS/runs"/cpl1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cpl1-*.out on disk" || guard_fail "guard 2b: $NOUT cpl1-*.out files already exist"
+NSAC=$(sacct -u "$USER_NAME" -S 2026-01-01 -n -X --format=JobName%60 2>/dev/null | grep -c '^ *cpl1-')
+[ "${NSAC:-0}" = 0 ] && echo "guard 2c: ZERO cpl1-* jobs in sacct since 2026-01-01" || guard_fail "guard 2c: $NSAC cpl1-* jobs already in sacct"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (69|70|71)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 69/70/71" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 69/70/71"
+
+# ---- guard 3: the CIFAR-100 data is staged ----------------------------------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4a-c: the optimiser carries its patches, proved inert ------------
+mkdir -p "$SAVE"
+[ -f "$HFLIVE" ] || guard_fail "guard 4: no HF.py at $HFLIVE"
+HFSHA=$(sha "$HFLIVE"); BNSHA=$(sha "$BNLIVE")
+grep -q 'PATCH_NAMESETS' "$HFLIVE" && echo "guard 4a: HF.py carries PATCH_NAMESETS" \
+                                   || guard_fail "guard 4a: HF.py lacks PATCH_NAMESETS"
+NPT=$(grep -c 'PATCH_PROBE_TENSOR' "$HFLIVE" 2>/dev/null); NPT=${NPT:-0}
+[ "$NPT" = 3 ] && echo "guard 4a: HF.py carries PATCH_PROBE_TENSOR (3 markers)" \
+               || guard_fail "guard 4a: HF.py has $NPT PATCH_PROBE_TENSOR markers, the patch inserts exactly 3"
+PRE="$HFLIVE.pre_probe_tensor"
+[ -f "$PRE" ] && echo "guard 4b: pre-patch backup present: $PRE" || guard_fail "guard 4b: no pre-patch backup at $PRE"
+python3 "$TESTT" --pre "$PRE" --post "$HFLIVE" --structural-only >/tmp/cpl1_struct.$$ 2>&1 \
+   && echo "guard 4c: structural inertness R0 PASSES on $HFLIVE" \
+   || { guard_fail "guard 4c: structural inertness R0 FAILED"; tail -20 /tmp/cpl1_struct.$$; }
+
+# ---- guard 4e: BLOCKWISE inertness ON PlainNet18_c100, on THIS HF and THIS build_network
+BLOG="$SAVE/inertness_blockwise_plainnet.log"
+if [ -f "$BLOG" ] && grep -q '^ALL PASS$' "$BLOG" && grep -q "^POST_SHA256 $HFSHA" "$BLOG" \
+   && grep -q "^BN_SHA256 $BNSHA" "$BLOG"; then
+  echo "guard 4e: the BLOCKWISE inertness test ALL PASS on THIS HF sha and THIS build_network sha, on $NET"
+  for G in "$G_ISO" "$G_CTL" "$G_ONE"; do
+    grep -qF -- "$G" "$BLOG" || guard_fail "guard 4e: $BLOG does not mention the spec $G"
+  done
+  grep -q "live $NET: $NTENS parameter tensors" "$BLOG" || guard_fail "guard 4e: $BLOG not produced on a $NTENS-tensor $NET"
+  grep -q "^SCORER_SPECS_AGREE" "$BLOG" || guard_fail "guard 4e: $BLOG lacks the successor test's scorer cross-check"
+else
+  guard_fail "guard 4e: no ALL PASS blockwise-on-PlainNet inertness log for HF $HFSHA / build_network $BNSHA at $BLOG -- run:
+    mkdir -p $SAVE
+    { echo POST_SHA256 $HFSHA; echo BN_SHA256 $BNSHA; python3 $TESTBP --pre $PRE --post $HFLIVE \\
+        --cifar-dir $CIF --work /tmp/cpl1_bw; } 2>&1 | tee $BLOG"
+fi
+
+# ---- guard 4c': the launcher and the scorer agree on every design literal ----
+python3 - "$SC" "$G_K01" "$G_KL" "$G_ISO" "$G_CTL" "$G_ONE" "$NTENS" "$TOTPAR" "$SEEDS" "$NET" <<'PYEOF' \
+  || guard_fail "guard 4c': the launcher's design and the scorer's disagree"
+import sys, re, ast
+sc = open(sys.argv[1]).read()
+mine = dict(zip(("k01", "kL", "ISO", "CTL", "ONE"), sys.argv[2:7]))
+m = re.search(r"^SPEC = (\{.*?^\})", sc, re.S | re.M)
+theirs = ast.literal_eval(m.group(1)) if m else {}
+bad = [k for k in set(mine) | set(theirs) if mine.get(k) != theirs.get(k)]
+def lit(name):
+    mm = re.search(r"^%s = (.+?)(\s*#.*)?$" % name, sc, re.M)
+    return ast.literal_eval(mm.group(1)) if mm else None
+if lit("NTENS") != int(sys.argv[7]): bad.append("NTENS")
+if lit("TOTPAR") != int(sys.argv[8]): bad.append("TOTPAR")
+if tuple(lit("SEEDS") or ()) != tuple(int(x) for x in sys.argv[9].split()): bad.append("SEEDS")
+if lit("NET") != sys.argv[10]: bad.append("NET")
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': all 5 spec strings, NTENS, TOTPAR, SEEDS and NET are identical in the launcher and the scorer")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, printed per arm with tensor NAMES ----
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+MANIFEST2="$WS/runs/cpl1-PARTITION-MANIFEST.txt"
+python3 - "$CIF" "$MANIFEST" "$NTENS" "$TOTPAR" "$CLIP_C" "$EPOCHS" "$BATCH" "$NET" "$PARENT" \
+         "$G_ISO" "$G_CTL" "$G_ONE" <<'PYEOF' \
+  || guard_fail "guard 4: live partition / design / source check FAILED"
+import sys, os, inspect, re, operator
+cif, out, ntens, totpar = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+clip_c, epochs, bsz, net_name, parent = sys.argv[5], int(sys.argv[6]), int(sys.argv[7]), sys.argv[8], sys.argv[9]
+specs = dict(zip(("ISO", "CTL", "ONE"), sys.argv[10:13]))
+sys.path.insert(0, cif); os.chdir(cif)
+import torch, torch.fx
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu"); par = build_network(parent, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _, p in net.named_parameters()]
+pnames = [n for n, _ in par.named_parameters()]
+T, tot = len(nps), sum(numel)
+bad = 0
+print("guard 4: live %s -- %d parameter tensors, %d parameters (parent %s: %d)" % (net_name, T, tot, parent, len(pnames)))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar)); raise SystemExit(1)
+removed = [n for n in pnames if n not in names]
+want_rm = ["layer%d.0.shortcut.%s" % (s, k) for s in (2, 3, 4) for k in ("0.weight", "1.weight", "1.bias")]
+psh = dict((n, tuple(p.shape)) for n, p in par.named_parameters())
+same = [(n, tuple(s)) for n, s in nps] == [(n, psh[n]) for n in pnames if n not in want_rm]
+print("guard 4: removed from %s: %s" % (parent, removed))
+if removed != want_rm or not same:
+    print("!!! guard 4: PlainNet is not the parent minus exactly the 9 shortcut tensors"); bad += 1
+else:
+    print("guard 4: PlainNet's ordered (name, shape) list == %s's minus EXACTLY the 9 shortcut tensors" % parent)
+if any("shortcut" in n for n, _ in net.named_modules()):
+    print("!!! guard 4: a module is named shortcut"); bad += 1
+def adds(m):
+    g = torch.fx.symbolic_trace(m).graph
+    return sum(1 for nd in g.nodes if (nd.op == "call_function" and nd.target in (operator.add, operator.iadd, torch.add))
+               or (nd.op == "call_method" and nd.target in ("add", "add_", "__add__", "__iadd__")))
+na, nr = adds(net), adds(par)
+print("guard 4: torch.fx add ops -- %s %d, %s %d" % (net_name, na, parent, nr))
+if na != 0 or nr != 8: bad += 1
+w512 = [(i + 1, names[i]) for i in range(T) if numel[i] == 512 and names[i].endswith(".weight")]
+print("guard 4: the 512-wide BN scales on the LIVE model (1-based): %s" % w512)
+if w512 != [(41, "layer4.0.bn1.weight"), (44, "layer4.0.bn2.weight"), (47, "layer4.1.bn1.weight"), (50, "layer4.1.bn2.weight")]:
+    print("!!! guard 4: the 512-wide BN scales are not at 41/44/47/50"); bad += 1
+lines = ["NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "NETWORK %s" % net_name,
+         "PARENT %s %d" % (parent, len(pnames)), "PARENT_REMOVED %s" % " ".join(removed),
+         "CLIP_C %s" % clip_c, "EPOCHS %d" % epochs, "META_STEPS %d" % (epochs * (50000 // bsz))]
+lines += ["TENSOR %d %s %d" % (i + 1, names[i], numel[i]) for i in range(T)]
+for arm, spec, want_type, want_shape in (("k01", "scalar", "scalar", ()), ("kL", "layerwise", "layerwise", (T,))):
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    HF.init_meta(o, spec, nps, 1e-6)
+    shapes = [tuple(b.shape) for b in o.beta]
+    print("guard 4: %-4s %-10s init_meta: stepsize_type %s  beta shapes %s  rednorm %s"
+          % (arm, spec, o.stepsize_type, shapes, getattr(o, "_rednorm", None)))
+    if o.stepsize_type != want_type or shapes != [want_shape] or getattr(o, "_rednorm", False):
+        print("!!! guard 4: %s does not route to a %s beta of shape %s" % (arm, want_type, want_shape)); bad += 1
+    lines.append("ARMSPEC %s SPEC %s M %d SIZES %s PARAMS %s" % (arm, spec, 1 if arm == "k01" else T,
+                 str(T) if arm == "k01" else ",".join(["1"] * T), str(tot) if arm == "k01" else ",".join(str(x) for x in numel)))
+want = {"ISO": (["layer4.0.bn2.weight", "layer4.1.bn2.weight"], [51, 2]),
+        "CTL": (["layer4.0.bn1.weight", "layer4.1.bn1.weight"], [51, 2]),
+        "ONE": (["layer4.0.bn2.weight"], [52, 1])}
+groups = {}
+for arm in ("ISO", "CTL", "ONE"):
+    g = HF.polish_the_stepsize_groups(None, specs[arm], nps)
+    sizes = [len(x) for x in g]
+    pc = [sum(numel[names.index(n)] for n in x) for x in g]
+    idx1 = [names.index(n) + 1 for n in g[1]]
+    print("guard 4: %-4s %s" % (arm, specs[arm]))
+    print("         m=%d  sizes %s  params %s  isolated (1-based) %s  names %s" % (len(g), sizes, pc, idx1, list(g[1])))
+    print("         GROUP1 (beta[1]): %s" % " ".join(g[1]))
+    if len(g) != 2 or list(g[1]) != want[arm][0] or sizes != want[arm][1] or sorted(g[0] + g[1]) != sorted(names):
+        print("!!! guard 4: %s does not compose to the registered partition" % arm); bad += 1
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    HF.init_meta(o, specs[arm], nps, 1e-6)
+    shp = [tuple(b.shape) for b in o.beta]
+    print("         init_meta: %s  group sizes %s  beta shapes %s  rednorm %s"
+          % (o.stepsize_type, [len(x) for x in o.param_groups_indices], shp, getattr(o, "_rednorm", None)))
+    if o.stepsize_type != "blockwise" or [len(x) for x in o.param_groups_indices] != sizes or shp != [(2,)] \
+       or getattr(o, "_rednorm", False):
+        print("!!! guard 4: %s does not route to a 2-coordinate blockwise beta" % arm); bad += 1
+    groups[arm] = g
+    lines.append("ARMSPEC %s SPEC %s M %d SIZES %s PARAMS %s GROUP0 %s GROUP1 %s"
+                 % (arm, specs[arm], len(g), ",".join(str(s) for s in sizes), ",".join(str(s) for s in pc),
+                    " ".join(g[0]), " ".join(g[1])))
+    lines.append("ISOLATED %s %s" % (arm, ",".join(str(i) for i in idx1)))
+iso, ctl = groups["ISO"][1], groups["CTL"][1]
+if len(iso) == len(ctl) == 2 and all(numel[names.index(n)] == 512 for n in list(iso) + list(ctl)):
+    print("guard 4d: ISO %s vs CTL %s -- cardinality 2/2, numel 1024/1024, all layer4 BN scales: EXACT twin"
+          % (list(iso), list(ctl)))
+else:
+    print("!!! guard 4d: ISO/CTL are not a matched twin"); bad += 1
+if not set(groups["ONE"][1]) < set(iso):
+    print("!!! guard 4d: ONE's isolated tensor is not a member of ISO's"); bad += 1
+lines.append("SYMDIFF ISO CTL %s" % ",".join(sorted(set(iso) ^ set(ctl))))
+src = inspect.getsource(HF.Lion_meta_update)
+m = re.search(r"torch\.sign\(self\.args_meta\['Lion_beta2'\]\*self\.momentum_meta\[i\]\s*\+\s*"
+              r"\(1-self\.args_meta\['Lion_beta2'\]\)\*HtT_gradft\[i\]\)", src)
+print("guard 4f: Lion_meta_update subtracts ms*sign(b2*momentum_meta + (1-b2)*z): %s" % bool(m))
+if not m: bad += 1
+bw = ("return [torch.tensor([sum([(u[i]*v[i]).sum() for i in group_indices]) "
+      "for group_indices in self.param_groups_indices])]")
+print("guard 4f: block_product's blockwise branch is the UNNORMALISED per-group sum: %s" % (bw in inspect.getsource(HF.block_product)))
+if bw not in inspect.getsource(HF.block_product): bad += 1
+print("guard 4f: _rednorm is set only by a `tn:` prefix: %s" % ("startswith('tn:')" in inspect.getsource(HF.init_meta)))
+if "startswith('tn:')" not in inspect.getsource(HF.init_meta): bad += 1
+sst = inspect.getsource(HF.step)
+i_bp = sst.find("HtT_gradft = self.block_product(self.h_condenced, g)")
+i_pt = sst.find("self._pt_capture(self.h_condenced, g, HtT_gradft)")
+i_bu = sst.find("self.base_update(net,g)")
+print("guard 4f: capture sits after block_product and before base_update: %s" % (0 <= i_bp < i_pt < i_bu))
+if not (0 <= i_bp < i_pt < i_bu): bad += 1
+for tab in ("resnet18_blocks", "resnet50_blocks"):
+    try:
+        HF.polish_the_stepsize_groups(None, tab, nps)
+        print("!!! guard 4g: %s did NOT raise on a %d-tensor model" % (tab, T)); bad += 1
+    except Exception as e:
+        print("guard 4g: %s raises %s on a %d-tensor model (loud, as required)" % (tab, type(e).__name__, T))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: 3 blockwise partitions + 2 anchors verified on the LIVE model; PARTITION-MANIFEST.txt -> %s" % out)
+PYEOF
+if [ -s "$MANIFEST" ]; then
+  cp "$MANIFEST" "$MANIFEST2"
+  echo "guard 4b': manifest non-empty ($(wc -c < "$MANIFEST") bytes) -> $MANIFEST and $MANIFEST2"
+else
+  guard_fail "guard 4b': no manifest"
+fi
+
+# ---- guard 4g: provenance ----------------------------------------------------
+PROV="$SAVE/PROVENANCE.txt"
+{ echo "HF_SHA256 $HFSHA"; echo "HF_PRE_PROBE_TENSOR_SHA256 $( [ -f "$PRE" ] && sha "$PRE" || echo none)";
+  echo "BUILD_NETWORK_SHA256 $BNSHA"; echo "BUILD_NETWORK_PRE_PLAINNET_SHA256 $( [ -f "$BNPRE" ] && sha "$BNPRE" || echo none)";
+  echo "HARNESS_DIR $CIF"; echo "SCORER_SHA256 $(sha "$SC")"; echo "LAUNCHER_SHA256 $(sha "$ME")";
+  echo "REGISTERED_COMMIT ${CPL1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}";
+  echo "MODE $( [ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN )";
+  echo "STAMP_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"; } > "$PROV"
+echo "guard 4g: HF.py sha256 $HFSHA; build_network.py sha256 $BNSHA; provenance -> $PROV"
+
+# ---- guard 5: capacity, walltime and partitions -----------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  echo "guard 5b: $P timelimit $(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)   running $(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')   pending $(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')"
+done
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5c: PARTS and WALL disagree"
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest ------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cpl1", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+# ---- guard 9: the harness the guards tested IS the harness the runner runs ---
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+if [ "$(cd "$CIF" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ]; then
+  echo "guard 9: the runner cd's into $RUN_CIF -- the SAME harness guards 1d/3/4 tested"
+elif [ "$SUBMIT" = 1 ]; then
+  guard_fail "guard 9: guards ran against $CIF but the runner cd's into $RUN_CIF -- refusing to submit"
+else
+  echo "guard 9: NOTE (dry run) -- guards 1d/3/4 ran against CIFAR10_DIR=$CIF, NOT the runner's"
+  echo "         harness $RUN_CIF.  --submit REFUSES until they are the same directory."
+fi
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo
+  echo "!!! ONE OR MORE GUARDS FAILED.  This is a DRY RUN, so the composition below"
+  echo "!!! still runs, but --submit WOULD ABORT HERE.  Clear the failures first."
+  echo
+fi
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH \
+        gamma=$GAMMA dataset=$DSET NN-name=$NET weight-decay-meta=0 \
+        meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01) G=$G_K01 ;; kL) G=$G_KL ;; ISO) G=$G_ISO ;; CTL) G=$G_CTL ;; ONE) G=$G_ONE ;;
+    esac
+    RN="cpl1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    if ! guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then
+      echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if ! guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1; then
+      echo "!!! RULE 20: an axis does not round-trip for $RN"
+      guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cpl1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cpl1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cpl1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cpl1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cpl1 job started inside the window.  Re-check with:"
+       echo "         python3 $AGP $WS/runs --name cpl1- --batch-consistency \\"
+       echo "                 --vary seed --vary run-name --vary stepsize-groups --vary save-directory" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cpl1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "ENV AUDIT:"
+  echo "    grep -h '^ENV:' $WS/runs/cpl1-*.out | sed 's/ PROBE_DIR=[^ ]*//' | sort | uniq -c   # ONE line, x15"
+  echo "    grep -h '^PROBE_TENSOR:' $WS/runs/cpl1-*.out | sed 's/ dir=.*//' | sort | uniq -c   # scalar x3, layerwise x3, blockwise x9"
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 15/15 RUN_DONE):"
+  echo "    python3 $REPO/analysis/cPL1_plainnet_residual_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cPL1_plainnet_residual.sh --submit"
+  if [ "$FAIL" = 1 ]; then
+    echo "(dry run ended with guard failures -- exit 2)"; exit 2
+  fi
+fi
+exit 0

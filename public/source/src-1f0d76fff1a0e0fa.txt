@@ -1,0 +1,50 @@
+#!/bin/bash
+# =============================================================================
+# cUC1_envwitness_poll.sh -- READ-ONLY runtime witness of SGD_WD / SGD_MOM for
+# the `cuc1` batch.  The runner (jobs/run_cifar.sh) does NOT echo those two
+# variables, so no .out line can show them.  This is Track U2's cau1 poller
+# (CORRECTIONS 206.3 / 209.3, cluster_b:~/cau1_envwitness_poll_u2.sh) with the
+# prefix and output directory parameterised and PROBE5 / PROBE5_WRITE_EVERY
+# added to the recorded names (cuc1 exports neither).
+#
+# For every RUNNING job whose name starts with $PREFIX and which has no
+# witness file yet, it ssh-es into that job's own node (pam_slurm_adopt adopts
+# the session into the job: no job step, no srun, no scancel) and reads
+# /proc/<pid>/environ of the `python -u train.py` process whose cmdline carries
+# the run name.  It records the positive controls (AUGMENT, COS_*, BETA_CLIP,
+# PROBE, PROBE_DIR, SLURM_JOB_ID, SLURM_JOB_NAME) and EVERY SGD_* variable.
+# It touches no job and writes only under $OUT.
+#
+# RUN IT ON cluster_b, from the checkout, while the batch runs (every job lasts
+# >= ~25 min, so a 240 s cadence cannot miss one):
+#   nohup bash -c 'while squeue -h -u account_b -o %j | grep -q "^cuc1-"; do
+#       bash bin/cUC1_envwitness_poll.sh; sleep 240; done' > ~/cuc1_envwitness_poll.log 2>&1 &
+# AUDIT IT, at 30/30, before any number is read:
+#   bash bin/cUC1_unaug_c100_denominator.sh --witness
+# =============================================================================
+PREFIX=${PREFIX:-cuc1-}
+OUT=${OUT:-$HOME/cuc1_envwitness}
+USER_NAME=${USER:-$(whoami)}
+mkdir -p "$OUT"
+squeue -u "$USER_NAME" -h -t RUNNING -o "%i %j %N" | awk -v p="$PREFIX" 'index($2, p) == 1' |
+while read -r jid name node; do
+  f="$OUT/$name-$jid.txt"
+  if [ -s "$f" ] && grep -q '^SGD_count=' "$f"; then continue; fi
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$node" "
+    for p in \$(pgrep -u $USER_NAME -f 'python -u train.py'); do
+      c=\$(tr '\0' ' ' < /proc/\$p/cmdline)
+      if printf '%s\n' \"\$c\" | grep -q -e '--run-name $name\( \|\$\)'; then
+        echo PID \$p CMD \$(printf '%s' \"\$c\" | cut -c1-120)
+        tr '\0' '\n' < /proc/\$p/environ | grep -E '^(AUGMENT|COS_TOTAL|COS_WARMUP|HIER|PROBE|PROBE_DIR|PROBE5|PROBE5_WRITE_EVERY|BETA_CLIP|SCHED|SLURM_JOB_ID|SLURM_JOB_NAME)='
+        echo SGD_count=\$(tr '\0' '\n' < /proc/\$p/environ | grep -c '^SGD_')
+        tr '\0' '\n' < /proc/\$p/environ | grep '^SGD_' | sed 's/^/SGD_VAR /'
+      fi
+    done" > "$f.tmp" 2>&1 < /dev/null
+  if grep -q '^SGD_count=' "$f.tmp"; then
+    echo "WITNESS_UTC $(date -u +%FT%TZ) NODE $node" >> "$f.tmp"
+    mv "$f.tmp" "$f"
+  else
+    rm -f "$f.tmp"
+  fi
+done
+echo "witness files: $(ls "$OUT" | grep -c '\.txt$')"

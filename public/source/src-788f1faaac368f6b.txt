@@ -1,0 +1,1497 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cUC1_unaug_c100_score.py -- THE REGISTERED SCORER FOR `cuc1`:
+#   THE DENOMINATOR ON UNAUGMENTED CIFAR-100, WITH THE METHOD GIVEN A GRID.
+#   ONE SUBMISSION, 30 JOBS (5 SGD+cosine rungs + 5 MetaOptimize cells, x 3
+#   seeds), ResNet18_c100 / CIFAR-100 / batch 100 / 100 epochs / AUGMENT=0 on
+#   EVERY arm, SEEDS {66,67,68} (the block pre-assigned to this track).
+#
+# Committed BEFORE any cuc1 run exists (STANDING RULE 21).  RUN IT UNEDITED
+# (RULE 16).  The documented invocation takes ONE argument:
+#
+#     python3 analysis/cUC1_unaug_c100_score.py <runsdir>
+#
+# score() READS NO CORPUS.  Every bar, SE, sigma and threshold it uses is a
+# LITERAL frozen below (CORRECTIONS 207/208, operator decision O2).  The only
+# live term is the batch's OWN in-batch sigma, which enters a max() with the
+# frozen floor.  --selftest section F ASSERTS this: score() opens no .csv, and
+# its whole output is byte-identical with no corpus, the real corpus, and
+# corpora with invented rows injected at this batch's cells and at every
+# frozen pool's cells.  --selftest section E/G drive the REAL score() on
+# synthetic harness-format runs, in-process and through the documented
+# one-argument command as a subprocess (the cdn1 lesson, CORRECTIONS 171).
+#
+# =============================================================================
+# THE QUESTION
+# =============================================================================
+# MASTER-TABLE row 19 (the FAIR row) is OPEN on exactly two counts after cau1
+# (CORRECTIONS 209): (1) the unaugmented comparison was run on CIFAR-10 only --
+# cdn1's CIFAR-100 GAP_in +5.699 pp is an AUGMENT=1 number; (2) the method got
+# two alpha0 cells and one meta-stepsize, so a deficit could be blamed on
+# under-tuning the method.  cuc1 closes both at once, on ResNet18_c100.
+# The corpus holds ZERO CIFAR-100 rows at AUGMENT=0 (all 611 are AUGMENT=1).
+#
+# =============================================================================
+# THE ARMS (AUGMENT=0 everywhere; everything else a copy of a cited config)
+# =============================================================================
+#   lr{005,01,02,04,08}   plain SGD + momentum 0.9 + wd 5e-4 + cosine to zero,
+#       COS_TOTAL=50000 (500 steps x 100 epochs), COS_WARMUP=1000 -- cdn1's
+#       arm-A recipe (CORRECTIONS 175) and cau1's.  Ladder {0.05 .. 0.8},
+#       factor 2, centred on 0.2: cdn1's AUGMENT=1 CIFAR-100 argmax is 0.1 and
+#       cau1's AUGMENT=0 CIFAR-10 argmax moved UP from 0.1 to 0.2, so the
+#       unaugmented optimum is expected at 0.1-0.4 and every one of those is an
+#       INTERIOR rung here.
+#   m<ms>a<a0>  MetaOptimize, cdn1-m's spec (= gm2-ch, the corpus's best
+#       CIFAR-100 cell family): SGDm base (mom 0.99, wd 0.1) + Lion meta (mom
+#       0.99, beta2 0.9, wd 0), gamma 1, chunk771 (14,595 groups), canonical box
+#       BETA_CLIP=-15:-2.3026, PROBE=5.  A PLUS-SHAPED grid of 5 cells:
+#         m3e4a1e3   CENTER   ms 3e-4, alpha0 1e-3
+#         m1e4a1e3   REF      ms 1e-4, alpha0 1e-3 = the corpus-best cell spec
+#                             (cdn1-m / gm2-ch), i.e. the ms-LOW neighbour
+#         m1e3a1e3   ms-HIGH  ms 1e-3, alpha0 1e-3
+#         m3e4a1e4   a0-LOW   ms 3e-4, alpha0 1e-4
+#         m3e4a1e2   a0-HIGH  ms 3e-4, alpha0 1e-2
+#   WHY THE PLUS IS CENTRED HALF A DECADE ABOVE THE CORPUS-BEST ms.  The Lion
+#   meta update (HF.py line 1059) moves every beta by EXACTLY ms per step
+#   (wd_meta 0), so over 50,000 steps beta travels at most 50,000*ms nats.  At
+#   REF that is 5 nats, and cdn1-m's own probes (3 seeds, AUGMENT=1) show the
+#   REF cell IS travel-limited: beta_min falls at 98.9-99.6% of the 1e-4-per-
+#   step maximum for all 50,000 steps (-6.908 -> -11.850..-11.886 against the
+#   bound -11.907)
+#   and beta_max rides the full rate (within 0.003 at step 20,000) until step
+#   ~27-30k before settling near -4.0 (section B'' re-derives all of it).  A cell whose beta cannot reach its
+#   equilibrium in time is the mechanism behind every stuck/underfit cell on
+#   this network (layerwise ms 1e-4 a0 1e-6 = 10.96, ms 3e-5 a0 1e-3 = 53.59,
+#   ms 1e-5 a0 1e-3 = 32.32 -- section D re-derives this from the corpus).
+#   So the directions in which the method could be UNDER-TUNED are UP on both
+#   axes, and the directions DOWN from REF are travel-stuck cliffs that would be
+#   predicted AT the collapse floor (164.6 forbids that).  The plus therefore
+#   centres at ms 3e-4 and keeps REF as a member: every cell reaches beta=-4.0
+#   within <= 58% of training (section D), and the REF cell is still scored
+#   in-batch at AUGMENT=0.
+#
+# SGD_WD / SGD_MOM ARE NOT ECHOED by run_cifar.sh.  The launcher reports and
+# UNSETS them (and every echoed variable, and PROBE5*) before composing; the
+# defaults are pinned by build_optimizer.py's sha256 (25a899b3..., cdn1's and
+# cau1's pin); a read-only runtime /proc/<pid>/environ poller
+# (bin/cUC1_envwitness_poll.sh, cau1's CORRECTIONS 206/209 mechanism) is the
+# per-run witness.  cdn1-m exported PROBE5=1,PROBE5_WRITE_EVERY=500 (NOT echoed
+# by the runner, an instrument); cuc1 exports NEITHER, so every variable this
+# batch exports is one the runner echoes.
+#
+# =============================================================================
+# THE PRIMARY, AND WHY IT STAYS AN ENDPOINT AT AUGMENT=0 ON CIFAR-100
+# =============================================================================
+#   GAP_END = plateau5(S*) - plateau5(M*)             [pp, and in SE units]
+#     S* = the ladder rung with the highest 3-seed mean plateau5 (5 rungs)
+#     M* = the meta cell with the highest 3-seed mean plateau5 (5 cells),
+#          among cells that TRAIN (mean > 25 pp, no seed <= 5 pp)
+#     plateau5 = mean TEST accuracy over epochs 95..99 of the run's OWN .out.
+#   Positive = the tuned baseline beats the tuned method.
+#
+# THE MEMORISATION HAZARD.  Unaugmented nets interpolate fast; if TEST peaked
+# early and then DECAYED, an endpoint would charge the method for a decay an
+# early-stopped run would not pay.  Re-derived at registration from raw .out
+# (section B'): DECAY = PEAK5 - plateau5 (PEAK5 = best 5-epoch mean TEST):
+#   CIFAR-10 AUGMENT=0 (cau1, 27 runs): <= 0.298 pp on every one of 9 arms, TRAIN
+#     at 99.99-100.00 -- memorisation did NOT erode TEST late in training; ub9's
+#     AdamW+Adam blk6/layerwise cells 0.215/0.216, and ub9's SCALAR cell 1.151,
+#     the ONE AUGMENT=0 decay above 0.3 in the record (a granularity cuc1 does
+#     not run);
+#   CIFAR-100 AUGMENT=1: <= 0.169 pp on all 35 cells of the frozen C100_META pool
+#     (>= 60 pp, 100 raw .out), <= 0.049 on the cdn1 SGD ladder; only travel-
+#     stuck cells (cru1 ms 1e-5 / 3e-5, in no pool) decay 1.3-7.8 pp --
+#     instability, not memorisation.
+#   CIFAR-100 AUGMENT=0: NO DATA EXISTS.  UNSURE.
+# DECISION: the PRIMARY stays the endpoint, as cau1 decided, because (i) it is
+# the denominator's statistic in cdn1 and cau1 and the only one comparable
+# across them; (ii) both optimisers run a fixed 100-epoch protocol with no
+# early stopping; (iii) PEAK5 is a max over 96 windows per run, a selection
+# whose inflation depends on curve shape, so it cannot carry a frozen-bar
+# primary; (iv) where AUGMENT=0 has been measured, endpoint = peak to <= 0.30
+# on every arm but one scalar cell (1.15).
+# THE HAZARD IS REGISTERED, NOT ARGUED AWAY: a PEAK secondary (the early-
+# stopping reading) with its own frozen bar, a per-arm DECAY disclosure beside
+# TRAIN, and an ENDPOINT-PEAK-AGREE / -DISAGREE stamp on the FINAL line.  A
+# sentence built on a DISAGREE landing must quote both.
+#
+# SECONDARIES (none ever moves the primary): PEAK (above); CURVE = GAP_AUC on
+# mean TEST over all 100 epochs (the parent's evidence type, as in cau1);
+# TUNING = plateau5(M*) - plateau5(REF), whether giving the method a grid moved
+# it resolvably beyond the cell the augmented denominator used.
+#
+# =============================================================================
+# BARS -- FROZEN LITERALS (re-derived at registration, cuc1- excluded)
+# =============================================================================
+# Pooled within-cell SD, cell = 15 design columns + batch prefix, usable rows,
+# over four FROZEN families, each restricted to a FROZEN prefix set so that a
+# later ingest of another batch cannot move it (the CORRECTIONS 205 failure):
+#   C100_META  ResNet18_c100/CIFAR-100/100ep meta cells with mean >= 60
+#   C100_SGD   the same, non-meta (cdn1-lr)
+#   AUG0_META  ResNet18/CIFAR-10/100ep/batch 100 AUGMENT=0 meta (pp PP ub9 cau1)
+#   AUG0_SGD   the same, non-meta (cau1-lr)
+# each from the CSV and, on the same rows, from the raw .out (PEAK5 exists
+# only there).  EACH PRIOR = THE MAX OF EVERY POOL OF ITS STATISTIC:
+#   SIGMA_P5_PRIOR   0.572475  (raw AUG0_META, df 10 -- the noisiest pool)
+#   SIGMA_AUC_PRIOR  0.484410  (raw AUG0_META, df 10)
+#   SIGMA_PEAK_PRIOR 0.439700  (raw AUG0_META, df 10)
+# At scoring, SIGMA_USED = max(prior, this batch's own pooled within-arm SD),
+# stamped.  SE = SIGMA_USED * sqrt(2/3) (3 v 3, within batch); every boundary
+# is 2 SE (0.9349 pp at the prior).  NOTHING FROM results/all_runs.csv ENTERS.
+#
+# =============================================================================
+# THE BRANCH MAP (first match wins)
+# =============================================================================
+#   INCOMPLETE                     not all 30 (arm, seed) have a 100-epoch .out
+#                                  with RUN_DONE and no traceback
+#   GATED-ENV / GATED-ARGS         a run departs from the design (AUGMENT=0 on
+#                                  EVERY run, and on its NODE header)
+#   GATED-METHOD-AT-FLOOR          no meta cell trains -- a floored method is a
+#                                  BOUND, never a deficit (164.6); the gap is
+#                                  printed as a bound and nothing is branched on
+#   GATED-BASELINE-AT-FLOOR        the argmax rung does not train
+#   DEFICIT-HOLDS                  GAP_END >= +2 SE and the method's grid is
+#                                  NOT resolvably open at an edge (M* is the
+#                                  CENTER, or beats it by < 2 SE)
+#   DEFICIT-HOLDS-METHOD-EDGE      GAP_END >= +2 SE but an edge cell beats the
+#                                  CENTER by >= 2 SE: the method's optimum is
+#                                  not bracketed, the deficit is measured
+#                                  against the best of 5 cells, and under-
+#                                  tuning is NOT excluded in that direction
+#       (either takes "| LOWER-BOUND" when the ladder argmax is an end rung)
+#   DEFICIT-CLOSES                 |GAP_END| < 2 SE, ladder interior: at
+#                                  AUGMENT=0 the tuned method TIES a tuned
+#                                  baseline on CIFAR-100
+#   UNRESOLVED-TIE-LADDER-EDGE     |GAP_END| < 2 SE, ladder argmax at an end
+#   REVERSES-AT-REF-CELL           GAP_END <= -2 SE, ladder interior, AND the
+#                                  REF cell alone clears -2 SE: the augmented
+#                                  denominator's own meta cell beats a tuned
+#                                  baseline when augmentation is removed
+#   REVERSES-AT-TUNED-CELL-ONLY    the same, with only a grid cell clearing
+#   UNRESOLVED-REVERSAL-LADDER-EDGE  GAP_END <= -2 SE, ladder argmax at an end
+# METHOD stamp: METHOD:BRACKETED | METHOD:FLAT-TOP-<dir> | METHOD:EDGE-<dir> |
+# METHOD:CENTER-DEAD.  CURVE / PEAK tokens take the same bands on their own
+# frozen bars.  Selection: S* and M* are BOTH max-of-5, so their worst-case
+# biases (E[max of 5 N(0,1)] * sigma/sqrt(3) = 0.384 pp each at the prior)
+# push GAP_END in OPPOSITE directions and cancel in expectation; printed.
+#
+# =============================================================================
+# FLOOR GATE (164.6) -- every arm's predicted level under every account
+# =============================================================================
+# Floors: chance 1.0 pp; the network's travel-stuck collapse level ~11 pp
+# (cru1 layerwise/scalar ms 1e-4 a0 1e-6); TRAINS_MIN 25 pp sits above the
+# corpus's m=1 saturation band [21.188, 24.192] (164.6).  Two transfer models,
+# each re-derived from CIFAR-10 AUGMENT=1 -> AUGMENT=0 pairs in the corpus
+# (section C), applied to each arm's CIFAR-100 AUGMENT=1 anchor:
+#   E (error ratio: SGD 2.1299 bl-sgd-01 -> cau1 S*; meta 2.0953 i3b-3e4 -> m6t)
+#   S (subtractive: SGD -5.5091; meta -7.3193)
+# Accounts: D (the deficit is the method's) predicts GAP_END >= +2 SE;
+# A (augmentation artefact) predicts GAP_END < +2 SE; T (under-tuning)
+# predicts M* != REF with TUNING resolved.  Every level every account uses
+# lies inside the [E, S] envelope of each arm.  LOWEST PREDICTED LEVEL OF ANY
+# ARM: 33.57 pp (a0 cells, model E) = 32.6 pp = ~70 SE above chance and 8.6 pp
+# above TRAINS_MIN.  HIGHEST: 72.08 (SGD, model S), 27.9 pp under the ceiling.
+# Both DEFICIT and REVERSES lie inside the envelope (section C).
+# ADVERSE SENSITIVITY, disclosed, not an account: cau1's PARENT config (alpha0
+# 1e-6) lost error at ratio 3.03, not 2.10; applied here it predicts meta
+# cells at 4-15 pp, i.e. at the floor -- that landing is GATED-METHOD-AT-FLOOR
+# by construction, and can never be read as a deficit.  Also disclosed: cau1's
+# registered m6t prediction MISSED in the method's favour (209.1).
+#
+# =============================================================================
+# WHAT cuc1 CANNOT DO (stamped unconditionally)
+# =============================================================================
+#  * ONE baseline family (SGDm+cosine) at fixed mom 0.9 / wd 5e-4.
+#  * ONE granularity (chunk771) and ONE box; the grid is 2 axes x 5 cells, not a
+#    3x3; the PARENT'S OWN CONFIG (AdamW+Adam blk6, alpha0 1e-6) is NOT run on
+#    CIFAR-100 (traded for budget) and the fixed-step COUNTERWEIGHT is not run.
+#  * ResNet18_c100 / CIFAR-100 / 100 epochs only.  Nothing about granularity.
+#  * TRAIN is expected at its ceiling: the endpoint compares the generalisation
+#    of interpolating solutions -- the parent's regime, stated beside every
+#    number.  Cross-setting comparisons (cdn1 AUGMENT=1, cau1 CIFAR-10) are
+#    PRINTED and never tokens.
+# =============================================================================
+import argparse
+import builtins
+import contextlib
+import csv
+import io
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+PREFIX = "cuc1-"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+AUG = "0"
+SEEDS = (66, 67, 68)
+LADDER = [("0.05", "005"), ("0.1", "01"), ("0.2", "02"), ("0.4", "04"), ("0.8", "08")]
+COS_TOTAL = "50000"
+COS_WARMUP = "1000"
+STEPS_PER_EPOCH = 500
+TOTAL_STEPS = STEPS_PER_EPOCH * EPOCHS
+GRAN = "chunk771"
+CLIP = "-15:-2.3026"
+PROBE_META = "5"
+# the meta grid, in a fixed order.  (ms, alpha0, role)
+META = {
+    "m1e4a1e3": {"ms": "1e-4", "alpha0": "1e-3", "role": "REF: the corpus-best cell spec (cdn1-m / gm2-ch), ms-LOW"},
+    "m3e4a1e3": {"ms": "3e-4", "alpha0": "1e-3", "role": "CENTER"},
+    "m1e3a1e3": {"ms": "1e-3", "alpha0": "1e-3", "role": "ms-HIGH"},
+    "m3e4a1e4": {"ms": "3e-4", "alpha0": "1e-4", "role": "alpha0-LOW"},
+    "m3e4a1e2": {"ms": "3e-4", "alpha0": "1e-2", "role": "alpha0-HIGH"},
+}
+META_ARMS = ("m1e4a1e3", "m3e4a1e3", "m1e3a1e3", "m3e4a1e4", "m3e4a1e2")
+CENTER = "m3e4a1e3"
+REF = "m1e4a1e3"
+EDGES = {"m1e4a1e3": "MS-LOW", "m1e3a1e3": "MS-HIGH", "m3e4a1e4": "A0-LOW", "m3e4a1e2": "A0-HIGH"}
+LADDER_ARMS = tuple("lr" + t for _, t in LADDER)
+ARMS = LADDER_ARMS + META_ARMS
+NJOBS = len(ARMS) * len(SEEDS)
+
+# ---- the LIVE model's parameter list, re-derived on cluster_b at registration by
+# name AND numel (build_network('ResNet18_c100'), sha c7998883...).  1-based
+# indices.  The launcher's guard 4b re-derives it on the live tree and fails on
+# any difference; chunk771 groups per tensor = ceil(numel / 771).
+MANIFEST = [
+    ("conv1.weight", 1728), ("bn1.weight", 64), ("bn1.bias", 64),
+    ("layer1.0.conv1.weight", 36864), ("layer1.0.bn1.weight", 64), ("layer1.0.bn1.bias", 64),
+    ("layer1.0.conv2.weight", 36864), ("layer1.0.bn2.weight", 64), ("layer1.0.bn2.bias", 64),
+    ("layer1.1.conv1.weight", 36864), ("layer1.1.bn1.weight", 64), ("layer1.1.bn1.bias", 64),
+    ("layer1.1.conv2.weight", 36864), ("layer1.1.bn2.weight", 64), ("layer1.1.bn2.bias", 64),
+    ("layer2.0.conv1.weight", 73728), ("layer2.0.bn1.weight", 128), ("layer2.0.bn1.bias", 128),
+    ("layer2.0.conv2.weight", 147456), ("layer2.0.bn2.weight", 128), ("layer2.0.bn2.bias", 128),
+    ("layer2.0.shortcut.0.weight", 8192), ("layer2.0.shortcut.1.weight", 128),
+    ("layer2.0.shortcut.1.bias", 128),
+    ("layer2.1.conv1.weight", 147456), ("layer2.1.bn1.weight", 128), ("layer2.1.bn1.bias", 128),
+    ("layer2.1.conv2.weight", 147456), ("layer2.1.bn2.weight", 128), ("layer2.1.bn2.bias", 128),
+    ("layer3.0.conv1.weight", 294912), ("layer3.0.bn1.weight", 256), ("layer3.0.bn1.bias", 256),
+    ("layer3.0.conv2.weight", 589824), ("layer3.0.bn2.weight", 256), ("layer3.0.bn2.bias", 256),
+    ("layer3.0.shortcut.0.weight", 32768), ("layer3.0.shortcut.1.weight", 256),
+    ("layer3.0.shortcut.1.bias", 256),
+    ("layer3.1.conv1.weight", 589824), ("layer3.1.bn1.weight", 256), ("layer3.1.bn1.bias", 256),
+    ("layer3.1.conv2.weight", 589824), ("layer3.1.bn2.weight", 256), ("layer3.1.bn2.bias", 256),
+    ("layer4.0.conv1.weight", 1179648), ("layer4.0.bn1.weight", 512), ("layer4.0.bn1.bias", 512),
+    ("layer4.0.conv2.weight", 2359296), ("layer4.0.bn2.weight", 512), ("layer4.0.bn2.bias", 512),
+    ("layer4.0.shortcut.0.weight", 131072), ("layer4.0.shortcut.1.weight", 512),
+    ("layer4.0.shortcut.1.bias", 512),
+    ("layer4.1.conv1.weight", 2359296), ("layer4.1.bn1.weight", 512), ("layer4.1.bn1.bias", 512),
+    ("layer4.1.conv2.weight", 2359296), ("layer4.1.bn2.weight", 512), ("layer4.1.bn2.bias", 512),
+    ("linear.weight", 51200), ("linear.bias", 100),
+]
+MANIFEST_TENSORS = 62
+MANIFEST_PARAMS = 11220132
+MANIFEST_CHUNKS = 14595
+CHUNK = 771
+
+# ---- FROZEN NOISE FLOOR (registration, cuc1- excluded) ----------------------
+# (statistic, family, source) -> (sigma, df).  CSV pools are re-derived by
+# --selftest section A anywhere; raw-.out pools by section B' where the raw
+# files are reachable (cluster_b).
+POOL_PREFIXES = {
+    "C100_META": ("c100", "c100b", "c100f", "c1b", "cbl1", "cdep1", "cdn1", "ciso1", "cpk1",
+                  "crn1", "cru1", "ctd1", "cts1", "gc1", "gm2", "hb1", "rc100", "rc6"),
+    "C100_SGD": ("cdn1",),
+    "AUG0_META": ("PP", "cau1", "pp", "ub9"),
+    "AUG0_SGD": ("cau1",),
+}
+POOL_MINMEAN = {"C100_META": 60.0, "C100_SGD": None, "AUG0_META": None, "AUG0_SGD": None}
+POOLS = {}            # filled by the literal block below
+SIGMA_P5_PRIOR = None
+SIGMA_AUC_PRIOR = None
+SIGMA_PEAK_PRIOR = None
+# >>> FROZEN-LITERALS -- derived 2026-09-15 from the 2,863-row corpus (HEAD 5186cb8) and,
+#     for "raw", from cluster_b:/cluster/account_b/metaopt/runs with the functions below.
+POOLS = {
+    ("plateau5", "C100_META", "csv"): (0.368050, 77),   # 42 cells, 119 rows
+    ("auc", "C100_META", "csv"): (0.284735, 77),
+    ("plateau5", "C100_SGD", "csv"): (0.229665, 12),    # 6 cells, 18 rows
+    ("auc", "C100_SGD", "csv"): (0.219281, 12),
+    ("plateau5", "AUG0_META", "csv"): (0.475579, 22),   # 11 cells, 33 rows
+    ("auc", "AUG0_META", "csv"): (0.411988, 22),
+    ("plateau5", "AUG0_SGD", "csv"): (0.280836, 14),    # 7 cells, 21 rows
+    ("auc", "AUG0_SGD", "csv"): (0.265644, 14),
+    ("plateau5", "C100_META", "raw"): (0.379102, 65),   # 35 cells, 100 of 119 rows on cluster_b
+    ("auc", "C100_META", "raw"): (0.298335, 65),
+    ("peak5", "C100_META", "raw"): (0.358839, 65),
+    ("plateau5", "C100_SGD", "raw"): (0.229665, 12),    # 6 cells, 18 rows
+    ("auc", "C100_SGD", "raw"): (0.219248, 12),
+    ("peak5", "C100_SGD", "raw"): (0.228973, 12),
+    ("plateau5", "AUG0_META", "raw"): (0.572475, 10),   # 5 cells, 15 of 33 rows on cluster_b
+    ("auc", "AUG0_META", "raw"): (0.484410, 10),
+    ("peak5", "AUG0_META", "raw"): (0.439700, 10),
+    ("plateau5", "AUG0_SGD", "raw"): (0.280836, 14),    # 7 cells, 21 rows
+    ("auc", "AUG0_SGD", "raw"): (0.265543, 14),
+    ("peak5", "AUG0_SGD", "raw"): (0.271805, 14),
+}
+RAW_FOUND = {"C100_META": 100, "C100_SGD": 18, "AUG0_META": 15, "AUG0_SGD": 21}
+RAW_DECAY_MAX = {"C100_META": 0.169000, "C100_SGD": 0.048667, "AUG0_META": 1.151333,
+                 "AUG0_SGD": 0.298000}
+SIGMA_P5_PRIOR = 0.572475     # = max of the 8 plateau5 pools (raw AUG0_META)
+SIGMA_AUC_PRIOR = 0.484410    # = max of the 8 auc pools (raw AUG0_META)
+SIGMA_PEAK_PRIOR = 0.439700   # = max of the 4 peak5 pools (raw AUG0_META)
+REF_LEVELS = {
+    "cdn1-lr005": 77.1567, "cdn1-lr01": 77.5927, "cdn1-lr02": 77.0900, "cdn1-lr03": 76.3700,
+    "cdn1-m": 71.8933,
+    "c100-chunk771-ms1e-4-a1e-3": 71.9648,     # n=10 (cdn1 3, gc1 4, gm2 3)
+    "c100-layerwise-ms3e-4-a1e-3": 70.1927,    # n=3
+    "c100-layerwise-ms1e-3-a1e-3": 69.6613,    # n=11
+    "c100-layerwise-ms3e-4-a1e-6": 68.2927,    # n=3
+    "cau1-lr02": 89.6153, "cau1-m6t": 85.9980, "cau1-m6": 74.4993,
+    "bl-sgd-01": 95.1244, "i3b-3e4": 93.3173, "i3b-1e6": 91.5907,
+}
+# <<< FROZEN-LITERALS
+SE_FACTOR = math.sqrt(2.0 / 3.0)
+Z_BAR = 2.0
+SIGMA_TOL = 1e-6
+
+# ---- gates ---------------------------------------------------------------------
+CHANCE = 1.0
+STUCK_LEVEL = 11.0          # travel-stuck collapse on this network (cru1, 10.5-11.2)
+TRAINS_MIN = 25.0           # above the m=1 saturation band [21.188, 24.192] (164.6)
+DIVERGED_BAR = 5.0          # a seed at or below this has diverged
+CEIL_TRAIN = 99.5
+E_MAX = {5: 1.1630}         # E[max of 5 iid N(0,1)]
+BETA_EQ = -4.0              # REF's up-chunk equilibrium in cdn1-m's probes
+TRAVEL_FRAC_MAX = 0.60
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize",
+            "alpha0", "gamma", "augment", "beta_clip", "batch_size",
+            "epochs_requested", "hier", "lam", "eta_ratio"]
+
+DEFAULT_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "results", "all_runs.csv")
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,"
+                     r"\s*Test Accuracy:\s*([0-9.]+)")
+OUT_RE = re.compile(r"^cuc1-(lr\d+|m\de\da\de\d)-s(\d+)-(\d+)\.out$")
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+# =============================================================================
+# the design -- ONE function each, imported by the launcher
+# =============================================================================
+def run_name(arm, seed):
+    return "%s%s-s%d" % (PREFIX, arm, seed)
+
+
+def arm_names():
+    return [run_name(a, s) for s in SEEDS for a in ARMS]
+
+
+def lr_of(arm):
+    for v, t in LADDER:
+        if arm == "lr" + t:
+            return v
+    return None
+
+
+def expected_args(arm, seed):
+    """flag -> value for the train.py half.  --save-directory checked by suffix."""
+    if arm in META:
+        d = {"--optimizer": "HF", "--alg-base": "SGDm", "--momentum-param-base": "0.99",
+             "--weight-decay-base": "0.1", "--alg-meta": "Lion",
+             "--momentum-param-meta": "0.99", "--Lion-beta2-meta": "0.9",
+             "--weight-decay-meta": "0", "--dataset": DSET, "--NN-name": NET,
+             "--batch-size": str(BATCH), "--max-time": "999:00:00", "--gamma": "1",
+             "--meta-stepsize": META[arm]["ms"], "--alpha0": META[arm]["alpha0"],
+             "--num-epochs": str(EPOCHS), "--stepsize-groups": GRAN}
+    else:
+        d = {"--optimizer": "SGD", "--dataset": DSET, "--NN-name": NET,
+             "--batch-size": str(BATCH), "--max-time": "999:00:00",
+             "--num-epochs": str(EPOCHS), "--alpha0": lr_of(arm)}
+    d["--seed"] = str(seed)
+    d["--run-name"] = run_name(arm, seed)
+    d["--save-directory"] = "*/runs/cuc1"
+    return d
+
+
+def expected_env(arm, seed):
+    """KEY -> value on the runner's ENV line.  PROBE_DIR checked by suffix."""
+    d = {"AUGMENT": AUG, "HIER": "none", "LAM": "na", "ETA_RATIO": "na",
+         "SCHED": "none", "SCHED_TOTAL": "none", "SCHED_WARMUP": "none",
+         "SCHED_MIN": "none"}
+    if arm in META:
+        d.update({"BETA_CLIP": CLIP, "COS_TOTAL": "default", "COS_WARMUP": "default",
+                  "PROBE": PROBE_META, "PROBE_DIR": "*/cuc1/probe_" + run_name(arm, seed)})
+    else:
+        d.update({"BETA_CLIP": "none", "COS_TOTAL": COS_TOTAL, "COS_WARMUP": COS_WARMUP,
+                  "PROBE": "0", "PROBE_DIR": "none"})
+    return d
+
+
+OPTIONAL_ENV = {"EB_RHO": "na", "EB_LOG": "0"}   # echoed by the live runner
+
+
+def parse_args_line(line):
+    toks = line.split()[1:]
+    flags, cur, dup = {}, None, []
+    for t in toks:
+        if t.startswith("--"):
+            k, v = (t.split("=", 1) + [None])[:2] if "=" in t else (t, None)
+            if k in flags:
+                dup.append(k)
+            flags[k] = v
+            cur = k if v is None else None
+        elif cur is not None:
+            flags[cur] = t if flags[cur] is None else flags[cur] + " " + t
+    return flags, dup
+
+
+def parse_env_line(line):
+    d = {}
+    for t in line.split()[1:]:
+        if "=" in t:
+            k, v = t.split("=", 1)
+            d[k] = v
+    return d
+
+
+def _match(want, got):
+    if want.startswith("*"):
+        return got is not None and got.endswith(want[1:])
+    return got == want
+
+
+def travel(arm):
+    """Lion moves beta by exactly ms per step: steps to reach BETA_EQ from ln(a0)."""
+    ms, a0 = float(META[arm]["ms"]), float(META[arm]["alpha0"])
+    need = BETA_EQ - math.log(a0)
+    return max(0.0, need) / ms, math.log(a0) + ms * TOTAL_STEPS
+
+
+# =============================================================================
+# run readers -- the RAW .out is the only source of a cuc1 level
+# =============================================================================
+def curve_stats(eps):
+    te = [eps[e][1] for e in range(EPOCHS)]
+    tr = [eps[e][0] for e in range(EPOCHS)]
+    ma = [mean(te[i:i + 5]) for i in range(EPOCHS - 4)]
+    pk = max(ma)
+    ip = ma.index(pk)
+    return {"plateau5": mean(te[-5:]), "train5": mean(tr[-5:]), "auc": mean(te),
+            "auc_train": mean(tr), "peak5": pk, "peak_ep": ip,
+            "train_at_peak": mean(tr[ip:ip + 5]),
+            "ep_train99": next((e for e in range(EPOCHS) if tr[e] >= 99.0), None)}
+
+
+def parse_out(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"n_epochs": len(eps), "epochs": eps,
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": "RUN_DONE" in txt,
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "node": [ln for ln in lines if ln.startswith("NODE=")]}
+    if all(e in eps for e in range(EPOCHS)):
+        rec.update(curve_stats(eps))
+    return rec
+
+
+def complete(rec):
+    return (rec["n_epochs"] == EPOCHS and all(e in rec["epochs"] for e in range(EPOCHS))
+            and rec["run_done"] and not rec["traceback"])
+
+
+def read_runs(runsdir):
+    """-> ({(arm, seed): rec}, dups).  A COMPLETE file beats an incomplete one;
+    the higher job id breaks ties (149.2).  Every duplicate is reported."""
+    got, dups = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return got, dups
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        if arm not in ARMS:
+            continue
+        rec = parse_out(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        prev = got.get((arm, seed))
+        if prev is not None:
+            dups.append((arm, seed, prev["file"], fn))
+            if (complete(prev), prev["job"]) >= (complete(rec), rec["job"]):
+                continue
+        got[(arm, seed)] = rec
+    return got, dups
+
+
+_PR = {k: re.compile(r'"%s":\s*(-?[0-9.eE+-]+)' % k)
+       for k in ("step", "n_at_lo", "n_at_hi", "beta_true_min", "beta_true_max")}
+
+
+def read_probe(runsdir, rn):
+    """Wall contact and beta travel on a meta run's own probe records.  A
+    DISCLOSURE ONLY -- never a gate, never a dwell-time statistic (the ciso2
+    defect, 196).  Regex, not json: a chunk771 record carries 14,595 betas."""
+    p = os.path.join(runsdir, "cuc1", "probe_" + rn, "probe.jsonl")
+    if not os.path.exists(p):
+        return None
+    n = n_lo = n_hi = 0
+    last = {}
+    for ln in open(p):
+        if not ln.strip():
+            continue
+        r = {}
+        for k, rx in _PR.items():
+            mm = rx.search(ln)
+            if mm:
+                r[k] = float(mm.group(1))
+        n += 1
+        n_lo += r.get("n_at_lo", 0) > 0
+        n_hi += r.get("n_at_hi", 0) > 0
+        last = r
+    return {"records": n, "at_lo": n_lo, "at_hi": n_hi, "last": last}
+
+
+# =============================================================================
+# SCORING -- reads the runs directory and NOTHING ELSE
+# =============================================================================
+def _band(z):
+    return "hi" if z >= Z_BAR else ("mid" if z > -Z_BAR else "lo")
+
+
+def _side_token(z, interior, name):
+    b = _band(z)
+    if b == "hi":
+        return name + "-DEFICIT" + ("" if interior else "-LOWER-BOUND")
+    if b == "mid":
+        return name + ("-TIE" if interior else "-UNRESOLVED-TIE-EDGE")
+    return name + ("-REVERSES" if interior else "-UNRESOLVED-REVERSAL-EDGE")
+
+
+def compose_sigma(sig_in, which="p5"):
+    prior = {"p5": SIGMA_P5_PRIOR, "auc": SIGMA_AUC_PRIOR, "peak": SIGMA_PEAK_PRIOR}[which]
+    return prior, max(prior, sig_in)
+
+
+def score(runsdir, csvpath=None):
+    """csvpath is accepted for signature symmetry and IGNORED: no corpus term
+    enters any bar (O2).  --selftest section F proves the output invariant."""
+    print("=" * 78)
+    print(" cuc1 -- THE DENOMINATOR ON UNAUGMENTED CIFAR-100, THE METHOD ON A GRID")
+    print(" %s / %s / batch %d / %d epochs / AUGMENT=%s / seeds %s"
+          % (NET, DSET, BATCH, EPOCHS, AUG, ",".join(str(s) for s in SEEDS)))
+    print(" baseline: SGD+momentum 0.9+wd 5e-4+cosine, COS_TOTAL=%s COS_WARMUP=%s, lr %s"
+          % (COS_TOTAL, COS_WARMUP, "/".join(v for v, _ in LADDER)))
+    print(" method  : SGDm+Lion %s, box %s, plus-grid (ms, alpha0):" % (GRAN, CLIP))
+    for a in META_ARMS:
+        print("   %-9s ms %-5s alpha0 %-5s %s" % (a, META[a]["ms"], META[a]["alpha0"], META[a]["role"]))
+    print(" PRIMARY  GAP_END = plateau5(S*) - plateau5(M*), both max-of-5 IN-BATCH means")
+    print("          from the runs' OWN .out; plateau5 = mean TEST over epochs %d..%d."
+          % (EPOCHS - 5, EPOCHS - 1))
+    print(" BARS FROZEN: sigma priors p5 %.6f / auc %.6f / peak %.6f; no corpus is read."
+          % (SIGMA_P5_PRIOR, SIGMA_AUC_PRIOR, SIGMA_PEAK_PRIOR))
+    print("=" * 78)
+
+    runs, dups = read_runs(runsdir)
+    for d in dups:
+        note("duplicate .out for %s s%d: %s and %s -- the COMPLETE / later one is used" % d)
+
+    # ---- G0 -------------------------------------------------------------------
+    print("\nG0  COMPLETENESS (%d arms x %d seeds = %d runs)" % (len(ARMS), len(SEEDS), NJOBS))
+    missing, bad = [], []
+    for s in SEEDS:
+        for a in ARMS:
+            rec = runs.get((a, s))
+            if rec is None:
+                missing.append(run_name(a, s))
+            elif not complete(rec):
+                bad.append("%s (%d epochs, RUN_DONE %s, traceback %s)"
+                           % (rec["file"], rec["n_epochs"], rec["run_done"], rec["traceback"]))
+    print("    %d/%d complete" % (NJOBS - len(missing) - len(bad), NJOBS))
+    for m in missing:
+        print("    MISSING: %s" % m)
+    for b in bad:
+        print("    NOT COMPLETE: %s" % b)
+    if missing or bad:
+        print("\nFINAL: INCOMPLETE -- %d missing, %d not complete; NO number from this"
+              " batch may be read" % (len(missing), len(bad)))
+        return 1
+
+    # ---- G1 / G2 ----------------------------------------------------------------
+    print("\nG1  ENV LINE (AUGMENT=0 on EVERY run and its NODE header; box/schedule/probe per family)")
+    env_bad = 0
+    for (a, s), rec in sorted(runs.items()):
+        if len(rec["env"]) != 1:
+            print("    %s: %d ENV lines" % (rec["file"], len(rec["env"])))
+            env_bad += 1
+            continue
+        got = parse_env_line(rec["env"][0])
+        for k, want in expected_env(a, s).items():
+            if not _match(want, got.get(k)):
+                print("    %s: %s=%s, want %s" % (rec["file"], k, got.get(k), want))
+                env_bad += 1
+        for k, want in OPTIONAL_ENV.items():
+            if k in got and got[k] != want:
+                print("    %s: %s=%s, want %s" % (rec["file"], k, got[k], want))
+                env_bad += 1
+        if not rec["node"] or "AUGMENT=0" not in rec["node"][0]:
+            print("    %s: NODE header does not read AUGMENT=0" % rec["file"])
+            env_bad += 1
+    print("    G1: %s (%d violations)" % ("PASS" if env_bad == 0 else "FAIL", env_bad))
+    print("\nG2  ARGS LINE (no repeated flag; every declared flag, nothing else)")
+    args_bad = 0
+    for (a, s), rec in sorted(runs.items()):
+        if len(rec["args"]) != 1:
+            print("    %s: %d ARGS lines" % (rec["file"], len(rec["args"])))
+            args_bad += 1
+            continue
+        got, dup = parse_args_line(rec["args"][0])
+        if dup:
+            print("    %s: REPEATED FLAG(S) %s -- argparse keeps the LAST" % (rec["file"], dup))
+            args_bad += 1
+        want = expected_args(a, s)
+        for k, w in want.items():
+            if not _match(w, got.get(k)):
+                print("    %s: %s=%s, want %s" % (rec["file"], k, got.get(k), w))
+                args_bad += 1
+        extra = sorted(set(got) - set(want))
+        if extra:
+            print("    %s: UNDECLARED flag(s) %s" % (rec["file"], extra))
+            args_bad += 1
+    print("    G2: %s (%d violations)" % ("PASS" if args_bad == 0 else "FAIL", args_bad))
+    if env_bad or args_bad:
+        why = [w for w, n in (("ENV", env_bad), ("ARGS", args_bad)) if n]
+        print("\nFINAL: GATED-%s -- the runs are not the registered design; nothing is"
+              " branched on" % "-".join(why))
+        return 1
+
+    # ---- per-arm table -----------------------------------------------------------
+    arm = {}
+    for a in ARMS:
+        rs = [runs[(a, s)] for s in SEEDS]
+        d = {k: [r[k] for r in rs] for k in ("plateau5", "train5", "auc", "auc_train",
+                                               "peak5", "peak_ep", "train_at_peak", "ep_train99")}
+        for k in ("plateau5", "train5", "auc", "auc_train", "peak5", "train_at_peak"):
+            d["m_" + k] = mean(d[k])
+        d["sd_p5"] = sd(d["plateau5"])
+        d["decay"] = mean([p - q for p, q in zip(d["peak5"], d["plateau5"])])
+        d["div"] = any(x <= DIVERGED_BAR for x in d["plateau5"])
+        d["trains"] = d["m_plateau5"] > TRAINS_MIN and not d["div"]
+        arm[a] = d
+    print("\n    ARM        TEST p5 (sd)      PEAK5 @ep  DECAY  TEST AUC | TRAIN p5  TRAIN@pk  TRAIN AUC  ep(tr>=99)")
+    for a in ARMS:
+        r = arm[a]
+        e99 = ",".join("-" if x is None else str(x) for x in r["ep_train99"])
+        print("    %-9s %7.3f (%5.3f)  %7.3f @%4.1f  %5.3f  %7.3f | %7.3f   %7.3f   %7.3f    %s%s%s"
+              % (a, r["m_plateau5"], r["sd_p5"], r["m_peak5"], mean(r["peak_ep"]), r["decay"],
+                 r["m_auc"], r["m_train5"], r["m_train_at_peak"], r["m_auc_train"], e99,
+                 "   DIVERGED SEED" if r["div"] else "",
+                 "" if r["trains"] else "   DOES NOT TRAIN"))
+
+    # ---- sigma: FROZEN prior, max'd with the batch's own ---------------------------
+    def inbatch(key):
+        ss, df = 0.0, 0
+        for a in ARMS:
+            if not arm[a]["trains"]:
+                continue
+            v = arm[a][key]
+            m = mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+        return (math.sqrt(ss / df) if df else 0.0), df
+    s_in, df_in = inbatch("plateau5")
+    s_in_auc, _ = inbatch("auc")
+    s_in_pk, _ = inbatch("peak5")
+    prior, sig = compose_sigma(s_in, "p5")
+    _, sig_auc = compose_sigma(s_in_auc, "auc")
+    _, sig_pk = compose_sigma(s_in_pk, "peak")
+    se, se_auc, se_pk = sig * SE_FACTOR, sig_auc * SE_FACTOR, sig_pk * SE_FACTOR
+    sig_stamp = "SIGMA-PRIOR-DOMINATES" if prior >= s_in else "SIGMA-INBATCH-DOMINATES"
+    print("\nSIGMA  p5 prior %.6f (FROZEN) | in-batch %.4f (df %d, non-training arms excluded)"
+          " -> USED %.4f, SE = %.4f pp  [%s]" % (prior, s_in, df_in, sig, se, sig_stamp))
+    print("       AUC prior %.6f | in-batch %.4f -> SE_AUC %.4f;  PEAK prior %.6f | in-batch"
+          " %.4f -> SE_PEAK %.4f" % (SIGMA_AUC_PRIOR, s_in_auc, se_auc, SIGMA_PEAK_PRIOR,
+                                     s_in_pk, se_pk))
+
+    # ---- V1 trains-at-all, V2 bracketing -------------------------------------------
+    print("\nV1  TRAINS-AT-ALL (mean plateau5 > %.0f pp and no seed <= %.0f pp)" % (TRAINS_MIN, DIVERGED_BAR))
+    ok_meta = [a for a in META_ARMS if arm[a]["trains"]]
+    for a in ARMS:
+        print("    %-9s %s" % (a, "trains" if arm[a]["trains"] else "DOES NOT TRAIN"))
+    means = [arm[a]["m_plateau5"] for a in LADDER_ARMS]
+    i_star = max(range(len(LADDER_ARMS)), key=lambda i: means[i])
+    s_star = LADDER_ARMS[i_star]
+    if not ok_meta:
+        print("    (bound only) best rung %s %.3f; best meta cell %.3f -- a FLOORED method is a"
+              " BOUND, never a deficit (164.6)" % (s_star, means[i_star],
+                                                     max(arm[a]["m_plateau5"] for a in META_ARMS)))
+        print("\nFINAL: GATED-METHOD-AT-FLOOR -- no MetaOptimize cell trains.  Nothing is branched on.")
+        return 1
+    if not arm[s_star]["trains"]:
+        print("\nFINAL: GATED-BASELINE-AT-FLOOR -- the best rung (%s) does not train." % s_star)
+        return 1
+    interior = 0 < i_star < len(LADDER_ARMS) - 1
+    ladder_tok = "INTERIOR" if interior else ("EDGE-LOW" if i_star == 0 else "EDGE-HIGH")
+    print("\nV2  LADDER on plateau5: argmax %s (lr=%s) %.3f -- %s"
+          % (s_star, LADDER[i_star][0], means[i_star], ladder_tok))
+    for i, a in enumerate(LADDER_ARMS):
+        print("      %-6s lr=%-5s %.3f%s" % (a, LADDER[i][0], means[i], "   <- S*" if i == i_star else ""))
+
+    # ---- V3 the method's grid ----------------------------------------------------
+    m_star = max(ok_meta, key=lambda a: arm[a]["m_plateau5"])
+    print("\nV3  METHOD GRID on plateau5 (plus around CENTER %s)" % CENTER)
+    for a in META_ARMS:
+        ts, ra = travel(a)
+        print("      %-9s ms %-5s a0 %-5s %.3f%s   [reach beta %.1f at step %d = %.0f%% of training]"
+              % (a, META[a]["ms"], META[a]["alpha0"], arm[a]["m_plateau5"],
+                 "   <- M*" if a == m_star else ("" if arm[a]["trains"] else "   DOES NOT TRAIN"),
+                 BETA_EQ, ts, 100.0 * ts / TOTAL_STEPS))
+    if not arm[CENTER]["trains"]:
+        meth_tok, edge_open = "METHOD:CENTER-DEAD", True
+    elif m_star == CENTER:
+        meth_tok, edge_open = "METHOD:BRACKETED", False
+    else:
+        rise = arm[m_star]["m_plateau5"] - arm[CENTER]["m_plateau5"]
+        if rise / se >= Z_BAR:
+            meth_tok, edge_open = "METHOD:EDGE-" + EDGES[m_star], True
+        else:
+            meth_tok, edge_open = "METHOD:FLAT-TOP-" + EDGES[m_star], False
+        print("      M* is an edge cell: rise over CENTER %+.4f pp = %+.2f SE" % (rise, rise / se))
+    print("    %s" % meth_tok)
+
+    # ---- the PRIMARY --------------------------------------------------------------
+    gap = arm[s_star]["m_plateau5"] - arm[m_star]["m_plateau5"]
+    z = gap / se
+    print("\n" + "=" * 78)
+    print("THE PRIMARY: GAP_END = plateau5(S*) - plateau5(M*), WITHIN batch")
+    print("=" * 78)
+    print("    S*  %-9s (lr=%s)  %.4f pp" % (s_star, LADDER[i_star][0], arm[s_star]["m_plateau5"]))
+    print("    M*  %-9s            %.4f pp   (%s)" % (m_star, arm[m_star]["m_plateau5"], META[m_star]["role"]))
+    print("    GAP_END              %+.4f pp = %+.2f SE   (SE %.4f, bar +/- %.1f SE = %.4f pp)"
+          % (gap, z, se, Z_BAR, Z_BAR * se))
+    zs = {}
+    for a in META_ARMS:
+        if arm[a]["trains"]:
+            g = arm[s_star]["m_plateau5"] - arm[a]["m_plateau5"]
+            zs[a] = g / se
+            print("      vs %-9s %+.4f pp = %+.2f SE" % (a, g, zs[a]))
+        else:
+            print("      vs %-9s does not train -- excluded from M*" % a)
+    bias = E_MAX[5] * sig / math.sqrt(3.0)
+    print("    selection: S* and M* are both max-of-5; worst-case bias ~%.3f pp EACH, opposite"
+          " signs on GAP_END" % bias)
+    band = _band(z)
+    if band == "hi":
+        tok = "DEFICIT-HOLDS-METHOD-EDGE" if edge_open else "DEFICIT-HOLDS"
+        if not interior:
+            tok += " | LOWER-BOUND"
+    elif band == "mid":
+        tok = "DEFICIT-CLOSES" if interior else "UNRESOLVED-TIE-LADDER-EDGE"
+    elif not interior:
+        tok = "UNRESOLVED-REVERSAL-LADDER-EDGE"
+    else:
+        tok = ("REVERSES-AT-REF-CELL" if zs.get(REF, 0.0) <= -Z_BAR
+               else "REVERSES-AT-TUNED-CELL-ONLY")
+    print("    BRANCH: %s" % tok)
+
+    # ---- TUNING -------------------------------------------------------------------
+    if not arm[REF]["trains"]:
+        tun = "TUNING-REF-DEAD"
+    elif m_star == REF:
+        tun = "TUNING-REF-IS-BEST"
+    else:
+        gain = arm[m_star]["m_plateau5"] - arm[REF]["m_plateau5"]
+        tun = "TUNING-GAIN-RESOLVED" if gain / se >= Z_BAR else "TUNING-GAIN-UNRESOLVED"
+        print("\nTUNING  plateau5(M*) - plateau5(REF) = %+.4f pp = %+.2f SE (max-of-5 bias ~%.3f pp)"
+              % (gain, gain / se, bias))
+    print("TUNING: %s" % tun)
+
+    # ---- SECONDARIES ----------------------------------------------------------------
+    def secondary(key, se_x, name):
+        vals = [arm[a]["m_" + key] for a in LADDER_ARMS]
+        j = max(range(len(LADDER_ARMS)), key=lambda i: vals[i])
+        mm = max(ok_meta, key=lambda a: arm[a]["m_" + key])
+        g = vals[j] - arm[mm]["m_" + key]
+        g_at_s = arm[s_star]["m_" + key] - arm[mm]["m_" + key]
+        t = _side_token(g / se_x, 0 < j < len(LADDER_ARMS) - 1, name)
+        print("\n%s  %s(%s lr=%s) - %s(%s) = %+.4f pp = %+.2f SE_%s;  at S* instead %+.4f pp"
+              % (name, key, LADDER_ARMS[j], LADDER[j][0], key, mm, g, g / se_x, name, g_at_s))
+        print("%s: %s" % (name, t))
+        return t, _band(g / se_x)
+    ctok, _ = secondary("auc", se_auc, "CURVE")
+    ptok, pband = secondary("peak5", se_pk, "PEAK")
+    agree = "ENDPOINT-PEAK-AGREE" if pband == band else "ENDPOINT-PEAK-DISAGREE"
+    print("    the early-stopping reading and the endpoint %s" % agree.split("-", 2)[-1])
+    print("    DECAY (PEAK5 - plateau5): S* %+.3f pp, M* %+.3f pp (TRAIN at peak %.2f / %.2f)"
+          % (arm[s_star]["decay"], arm[m_star]["decay"], arm[s_star]["m_train_at_peak"],
+             arm[m_star]["m_train_at_peak"]))
+
+    ceil = all(arm[a]["m_train5"] >= CEIL_TRAIN for a in ARMS if arm[a]["trains"])
+    print("\nTRAIN  at ceiling (>= %.1f) on every training arm: %s -- TRAIN read as AUC,"
+          " TRAIN-at-peak and epoch-to-99%%, never as an endpoint" % (CEIL_TRAIN, ceil))
+    print("       TRAIN-AUC gap (S* - M*): %+.4f pp" % (arm[s_star]["m_auc_train"] - arm[m_star]["m_auc_train"]))
+
+    # ---- disclosures, never tokens ----------------------------------------------------
+    print("\nDISCLOSURES (none gates, none moves a token)")
+    for a in META_ARMS:
+        for s in SEEDS:
+            rn = run_name(a, s)
+            oc = read_probe(runsdir, rn)
+            if oc is None:
+                print("    probe %-19s NOT AVAILABLE -- occupancy unmeasured, not 'not binding'" % rn)
+                continue
+            ls = oc["last"]
+            lo_bound = math.log(float(META[a]["alpha0"])) - float(META[a]["ms"]) * TOTAL_STEPS
+            print("    probe %-19s %d records: floor %d, ceiling %d; last beta_min %s (travel bound %.3f)"
+                  " beta_max %s" % (rn, oc["records"], oc["at_lo"], oc["at_hi"],
+                                    ls.get("beta_true_min"), lo_bound, ls.get("beta_true_max")))
+    print("    CROSS-SETTING (printed, never a token): cdn1 AUGMENT=1 GAP_in +5.6993 (S* 77.5927,"
+          " cdn1-m 71.8933); REF here %.4f vs cdn1-m 71.8933 = %+.4f pp; cau1 CIFAR-10 GAP_END +3.6173;"
+          " this GAP_END %+.4f" % (arm[REF]["m_plateau5"], arm[REF]["m_plateau5"] - 71.8933, gap))
+
+    stamps = ["LADDER:" + ladder_tok, meth_tok, "S*=" + s_star, "M*=" + m_star, sig_stamp,
+              tun, ctok, ptok, agree]
+    if ceil:
+        stamps.append("TRAIN-AT-CEILING")
+    stamps += ["BARS-FROZEN", "ONE-BASELINE-FAMILY", "ONE-GRANULARITY-CHUNK771",
+               "PAPER-CONFIG-NOT-TESTED", "COUNTERWEIGHT-NOT-TESTED", "CIFAR100-RESNET18-ONLY"]
+    print("\n    SCOPE.  In-batch, AUGMENT=0, ResNet18_c100/CIFAR-100, 100 epochs, one baseline")
+    print("    family, one granularity.  It licenses a sentence about the DENOMINATOR in the")
+    print("    parent's unaugmented setting on CIFAR-100 and nothing about granularity.")
+    print("\nFINAL: %s | %s" % (tok, " | ".join(stamps)))
+    return 0
+
+
+# =============================================================================
+# SELFTEST, PART 1 -- synthetic harness-format runs driving the REAL score()
+# =============================================================================
+def _synth_out(d, arm, seed, jid, test, train, env_over=None, args_extra="",
+               run_done=True, n_ep=EPOCHS, node_aug="0"):
+    rn = run_name(arm, seed)
+    toks = []
+    for k, v in expected_args(arm, seed).items():
+        toks += [k, "/ws/runs/cuc1" if k == "--save-directory" else v]
+    e = expected_env(arm, seed)
+    if arm in META:
+        e["PROBE_DIR"] = "/ws/runs/cuc1/probe_" + rn
+    e.update(OPTIONAL_ENV)
+    e.update(env_over or {})
+    lines = ["NODE=nodeX | JOB=%s %d | AUGMENT=%s" % (rn, jid, node_aug),
+             "ARGS: " + " ".join(toks) + args_extra,
+             "ENV: " + " ".join("%s=%s" % kv for kv in e.items()), "NVIDIA L4, 23034 MiB"]
+    for ep in range(n_ep):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (ep, train[ep], test[ep]))
+    lines.append("51  minutes")
+    if run_done:
+        lines.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _curve_meta(level, jit, decay=0.0):
+    """fast rise to level+decay by epoch 10, then a linear decay to `level` by 95."""
+    te = []
+    for e in range(EPOCHS):
+        top = level + decay
+        if e < 10:
+            te.append(min(top, 5.0 + 6.0 * e) + jit)
+        else:
+            te.append(top - decay * min(1.0, (e - 10) / 85.0) + jit)
+    tr = [min(100.0, 20.0 + 10.0 * e) for e in range(EPOCHS)]
+    return te, tr
+
+
+def _curve_sgd(level, mid, jit):
+    te = [(mid if e < 80 else mid + (level - mid) * (e - 79) / 20.0) + jit for e in range(EPOCHS)]
+    te[-5:] = [level + jit] * 5
+    tr = [min(100.0, 20.0 + 2.0 * e) for e in range(EPOCHS)]
+    return te, tr
+
+
+def _build(d, ladder, meta, jit=(0.0, 0.2, -0.2), decay=None, mid=None, drop=None,
+           env_break=None, args_break=None, node_break=None, shadow=None):
+    jid = 6000000
+    for si, s in enumerate(SEEDS):
+        for i, a in enumerate(LADDER_ARMS + META_ARMS):
+            jid += 1
+            if drop == (a, s):
+                continue
+            if a in META:
+                te, tr = _curve_meta(meta[a], jit[si], (decay or {}).get(a, 0.0))
+            else:
+                te, tr = _curve_sgd(ladder[i], (mid[i] if mid else ladder[i] - 8.0), jit[si])
+            _synth_out(d, a, s, jid, te, tr,
+                       env_over=env_break[1] if env_break and env_break[0] == (a, s) else None,
+                       args_extra=args_break[1] if args_break and args_break[0] == (a, s) else "",
+                       node_aug="1" if node_break == (a, s) else "0")
+    if shadow:
+        te, tr = _curve_meta(10.0, 0.0)
+        _synth_out(d, shadow[0], shadow[1], 9999999, te, tr, run_done=False, n_ep=40)
+
+
+def _run_score(d, csvpath=None):
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = score(d, csvpath)
+    except Exception as ex:           # a crash is a FAIL line, never a traceback
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    out = buf.getvalue()
+    fin = [ln for ln in out.splitlines() if ln.startswith("FINAL:")]
+    return rc, (fin[-1] if fin else "(no FINAL line)"), out
+
+
+def _mk(**kw):
+    m = {"m1e4a1e3": 50.0, "m3e4a1e3": 52.0, "m1e3a1e3": 51.0, "m3e4a1e4": 49.0, "m3e4a1e2": 51.5}
+    m.update(kw)
+    return m
+
+
+L_INT = [55.0, 58.0, 60.0, 59.0, 56.0]            # argmax lr=0.2, interior
+E_CASES = [
+    ("E1 deficit, method bracketed", dict(ladder=L_INT, meta=_mk()), 0,
+     ["FINAL: DEFICIT-HOLDS |", "LADDER:INTERIOR", "METHOD:BRACKETED", "M*=m3e4a1e3",
+      "S*=lr02", "TUNING-GAIN-RESOLVED", "BARS-FROZEN", "ENDPOINT-PEAK-AGREE"]),
+    ("E2 deficit, flat top at an edge", dict(ladder=L_INT, meta=_mk(m3e4a1e2=52.4)), 0,
+     ["FINAL: DEFICIT-HOLDS |", "METHOD:FLAT-TOP-A0-HIGH", "M*=m3e4a1e2"]),
+    ("E3 deficit, method edge resolved", dict(ladder=L_INT, meta=_mk(m3e4a1e2=54.0)), 0,
+     ["FINAL: DEFICIT-HOLDS-METHOD-EDGE |", "METHOD:EDGE-A0-HIGH"]),
+    ("E4 deficit, ladder edge high", dict(ladder=[52.0, 54.0, 56.0, 58.0, 60.0], meta=_mk()), 0,
+     ["FINAL: DEFICIT-HOLDS | LOWER-BOUND |", "LADDER:EDGE-HIGH"]),
+    ("E5 tie, interior", dict(ladder=L_INT, meta=_mk(m3e4a1e3=59.8)), 0,
+     ["FINAL: DEFICIT-CLOSES |"]),
+    ("E6 tie, ladder edge", dict(ladder=[52.0, 54.0, 56.0, 58.0, 60.0], meta=_mk(m3e4a1e3=59.9)), 0,
+     ["FINAL: UNRESOLVED-TIE-LADDER-EDGE |"]),
+    ("E7 reversal at the REF cell", dict(ladder=[50.0, 52.0, 53.0, 52.5, 51.0],
+                                         meta=_mk(m1e4a1e3=56.0, m3e4a1e3=55.8)), 0,
+     ["FINAL: REVERSES-AT-REF-CELL |", "M*=m1e4a1e3", "TUNING-REF-IS-BEST", "METHOD:FLAT-TOP-MS-LOW"]),
+    ("E8 reversal at a tuned cell only", dict(ladder=[50.0, 52.0, 53.0, 52.5, 51.0],
+                                              meta=_mk(m1e4a1e3=53.2, m3e4a1e3=56.0)), 0,
+     ["FINAL: REVERSES-AT-TUNED-CELL-ONLY |", "TUNING-GAIN-RESOLVED"]),
+    ("E9 reversal, ladder edge low", dict(ladder=[53.0, 52.0, 51.0, 50.0, 49.0], meta=_mk(m3e4a1e3=56.0)), 0,
+     ["FINAL: UNRESOLVED-REVERSAL-LADDER-EDGE |", "LADDER:EDGE-LOW"]),
+    ("E10 missing run", dict(ladder=L_INT, meta=_mk(), drop=("m1e3a1e3", 67)), 1, ["FINAL: INCOMPLETE"]),
+    ("E11 AUGMENT=1 on one ENV line", dict(ladder=L_INT, meta=_mk(), env_break=(("lr04", 68), {"AUGMENT": "1"})),
+     1, ["FINAL: GATED-ENV"]),
+    ("E12 AUGMENT=1 on one NODE header", dict(ladder=L_INT, meta=_mk(), node_break=("m3e4a1e4", 66)),
+     1, ["FINAL: GATED-ENV"]),
+    ("E13 repeated flag", dict(ladder=L_INT, meta=_mk(), args_break=(("m3e4a1e3", 66), " --alg-meta Adam")),
+     1, ["FINAL: GATED-ARGS"]),
+    ("E14 method at floor", dict(ladder=L_INT, meta=dict((a, 12.0) for a in META_ARMS)), 1,
+     ["FINAL: GATED-METHOD-AT-FLOOR"]),
+    ("E15 baseline at floor", dict(ladder=[20.0, 21.0, 22.0, 21.0, 20.0], meta=_mk()), 1,
+     ["FINAL: GATED-BASELINE-AT-FLOOR"]),
+    ("E16 CENTER dead", dict(ladder=L_INT, meta=_mk(m3e4a1e3=12.0)), 0,
+     ["FINAL: DEFICIT-HOLDS-METHOD-EDGE |", "METHOD:CENTER-DEAD"]),
+    ("E17 memorisation: method peaks early and decays", dict(ladder=L_INT, meta=_mk(m3e4a1e3=59.3),
+                                                              decay={"m3e4a1e3": 3.1}), 0,
+     ["FINAL: DEFICIT-CLOSES |", "PEAK-REVERSES", "ENDPOINT-PEAK-DISAGREE"]),
+    ("E18 noisy seeds", dict(ladder=L_INT, meta=_mk(), jit=(0.0, 1.5, -1.5)), 0,
+     ["SIGMA-INBATCH-DOMINATES"]),
+    ("E19 truncated resubmit shadows a real run (149.2)", dict(ladder=L_INT, meta=_mk(), shadow=("m3e4a1e3", 67)),
+     0, ["FINAL: DEFICIT-HOLDS |", "METHOD:BRACKETED"]),
+    ("E20 endpoint deficit, curve reversal", dict(ladder=L_INT, meta=_mk(), mid=[30.0] * 5), 0,
+     ["FINAL: DEFICIT-HOLDS |", "CURVE-REVERSES"]),
+]
+# F: a NEAR-BAR landing -- GAP 1.2 pp clears the frozen 2 SE (0.935) but would NOT
+# clear a bar widened by any live corpus term above 0.735
+F_CASE = dict(ladder=L_INT, meta=_mk(m3e4a1e3=58.8))
+
+
+def _stress_csv(src, dst):
+    """the real corpus + invented rows at THIS batch's cells, at a foreign
+    prefix's CIFAR-100 AUGMENT=0 cells, and inside every frozen pool family."""
+    rows = list(csv.DictReader(open(src))) if src and os.path.exists(src) else []
+    hdr = list(rows[0].keys()) if rows else (CELLKEYS + ["run", "job_id", "seed", "plateau5",
+                                                          "auc", "superseded", "collapsed", "complete"])
+    base = dict((k, "") for k in hdr)
+    base.update({"superseded": "0", "collapsed": "0", "complete": "1", "window_ok": "1",
+                 "epochs_requested": "100", "epochs_done": "100", "batch_size": "100",
+                 "gamma": "1", "beta_clip": CLIP})
+    new, j = [], 9990000
+    fams = [("cuc1-m3e4a1e3", NET, DSET, "0", "SGDm", "Lion", "chunk771", [20.0, 60.0, 95.0]),
+            ("zstress-c100a0", NET, DSET, "0", "SGDm", "Lion", "chunk771", [5.0, 45.0, 85.0]),
+            ("zstress-c100a0sgd", NET, DSET, "0", "SGD", "?", "?", [10.0, 50.0, 90.0])]
+    for pref in POOL_PREFIXES["C100_META"][:2] + POOL_PREFIXES["AUG0_META"][:1]:
+        fams.append((pref + "-zz", NET if pref.startswith("c") else "ResNet18",
+                     DSET if pref.startswith("c") else "CIFAR10", "1" if pref.startswith("c") else "0",
+                     "SGDm", "Lion", "layerwise", [61.0, 70.0, 99.0]))
+    for pref, net, ds, aug, b, mt, g, vals in fams:
+        for i, v in enumerate(vals):
+            r = dict(base)
+            j += 1
+            r.update({"run": "%s-s%d" % (pref, 90 + i), "job_id": str(j), "seed": str(90 + i),
+                      "network": net, "dataset": ds, "augment": aug, "base": b, "meta": mt,
+                      "granularity": g, "meta_stepsize": "1e-4", "alpha0": "1e-3",
+                      "plateau5": "%.4f" % v, "auc": "%.4f" % v})
+            new.append(r)
+    w = csv.DictWriter(open(dst, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in rows + new:
+        w.writerow(r)
+    return len(new)
+
+
+def selftest_part1(csvpath, T):
+    print("\nE. score() ON SYNTHETIC RUNS (invented numbers; nothing about the real batch)")
+    for label, kw, want_rc, want_sub in E_CASES:
+        with tempfile.TemporaryDirectory() as d:
+            _build(d, **kw)
+            rc, fin, out = _run_score(d)
+            T(rc == want_rc and all(w in fin for w in want_sub),
+              "%s -> %s (rc %s)" % (label, fin[:170], rc))
+
+    print("\nF. FROZEN BARS (O2): score() READS NO CORPUS, AND ITS OUTPUT CANNOT MOVE WITH ONE")
+    with tempfile.TemporaryDirectory() as d:
+        runs = os.path.join(d, "runs")
+        os.mkdir(runs)
+        _build(runs, **F_CASE)
+        opened = []
+        real_open = builtins.open
+
+        def spy(f, *a, **k):
+            opened.append(str(f))
+            return real_open(f, *a, **k)
+        builtins.open = spy
+        try:
+            rc0, fin0, out0 = _run_score(runs, csvpath)
+        finally:
+            builtins.open = real_open
+        T(rc0 == 0 and not any(p.endswith(".csv") for p in opened),
+          "score() opened %d files, NONE a .csv (it was handed %s)" % (len(opened), csvpath))
+        T("SIGMA-PRIOR-DOMINATES" in fin0 and "FINAL: DEFICIT-HOLDS |" in fin0,
+          "near-bar case scores on the FROZEN bar: %s" % fin0[:90])
+        stress = os.path.join(d, "stress.csv")
+        nnew = _stress_csv(csvpath, stress)
+        outs = []
+        for lbl, p in (("no corpus", None), ("real corpus", csvpath), ("missing path", os.path.join(d, "nope.csv")),
+                       ("real + %d invented rows" % nnew, stress)):
+            outs.append((lbl, _run_score(runs, p)))
+        same = all(o[1][2] == out0 for o in outs)
+        T(same, "whole stdout BYTE-IDENTICAL across %s" % ", ".join(o[0] for o in outs))
+        # non-vacuity: a scorer that let a live corpus term into its bar would flip here
+        srows = list(csv.DictReader(open(stress)))
+        live = pooled_sigma([r for r in srows if not r["run"].startswith(PREFIX)],
+                            lambda r: r["network"] == NET and r["dataset"] == DSET and r["augment"] == "0")[0]
+        gap = 60.0 - 58.8
+        T(live is not None and gap / (max(SIGMA_P5_PRIOR, live) * SE_FACTOR) < Z_BAR,
+          "NOT VACUOUS: a live CIFAR-100 AUGMENT=0 pool on the stressed corpus is %.3f; max(prior,"
+          " live) would put GAP 1.2 pp at %.2f SE (DEFICIT-CLOSES) -- the frozen scorer says %s"
+          % (live or float("nan"), gap / (max(SIGMA_P5_PRIOR, live or 0) * SE_FACTOR), fin0.split(" |")[0]))
+
+    print("\nG. THE DOCUMENTED ONE-ARGUMENT INVOCATION, AS A SUBPROCESS")
+    me = os.path.abspath(__file__)
+    for label, kw, want_rc, want in (("full batch", dict(ladder=L_INT, meta=_mk()), 0, "FINAL: DEFICIT-HOLDS |"),
+                                     ("one run dropped", dict(ladder=L_INT, meta=_mk(), drop=("lr01", 66)),
+                                      1, "FINAL: INCOMPLETE")):
+        with tempfile.TemporaryDirectory() as d:
+            _build(d, **kw)
+            p = subprocess.run([sys.executable, me, d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True)
+            fin = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+            T(p.returncode == want_rc and fin and fin[-1].startswith(want) and "Traceback" not in p.stdout,
+              "python3 %s <synthetic dir> (%s) -> exit %d, %s"
+              % (os.path.basename(me), label, p.returncode, (fin[-1][:60] if fin else "NO FINAL LINE")))
+
+
+# =============================================================================
+# corpus readers -- SELFTEST ONLY.  score() never calls any of them.
+# =============================================================================
+def read_corpus(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    with open(csvpath) as fh:
+        return [r for r in csv.DictReader(fh) if not r.get("run", "").startswith(PREFIX)]
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and r.get("plateau5", "").strip() != "")
+
+
+def batch_of(r):
+    return re.split(r"[-_]", r.get("run", ""))[0]
+
+
+FAMILY_PRED = {
+    "C100_META": lambda r: (r.get("network") == NET and r.get("dataset") == DSET
+                            and r.get("epochs_requested") == "100" and r.get("meta") != "?"),
+    "C100_SGD": lambda r: (r.get("network") == NET and r.get("dataset") == DSET
+                           and r.get("epochs_requested") == "100" and r.get("meta") == "?"),
+    "AUG0_META": lambda r: (r.get("network") == "ResNet18" and r.get("dataset") == "CIFAR10"
+                            and r.get("epochs_requested") == "100" and r.get("augment") == "0"
+                            and r.get("batch_size") == "100" and r.get("meta") != "?"),
+    "AUG0_SGD": lambda r: (r.get("network") == "ResNet18" and r.get("dataset") == "CIFAR10"
+                           and r.get("epochs_requested") == "100" and r.get("augment") == "0"
+                           and r.get("batch_size") == "100" and r.get("meta") == "?"),
+}
+
+
+def pool_cells(rows, pred, prefixes=None, minmean=None):
+    cells = {}
+    for r in rows:
+        if usable(r) and pred(r) and (prefixes is None or batch_of(r) in prefixes):
+            k = tuple(r.get(c, "") for c in CELLKEYS) + (batch_of(r),)
+            cells.setdefault(k, []).append(r)
+    return dict((k, v) for k, v in cells.items() if len(v) >= 2 and
+                (minmean is None or mean([float(r["plateau5"]) for r in v]) >= minmean))
+
+
+def _pool(groups):
+    ss, df, nc, n = 0.0, 0, 0, 0
+    for v in groups:
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+        n += len(v)
+    return (math.sqrt(ss / df) if df else None), df, nc, n
+
+
+def pooled_sigma(rows, pred, field="plateau5", prefixes=None, minmean=None):
+    cells = pool_cells(rows, pred, prefixes, minmean)
+    return _pool([[float(r[field]) for r in v if r.get(field, "").strip()] for v in cells.values()])
+
+
+def family_pool(rows, fam, field):
+    return pooled_sigma(rows, FAMILY_PRED[fam], field, POOL_PREFIXES[fam], POOL_MINMEAN[fam])
+
+
+def _index_outs(runsdir):
+    idx = {}
+    roots = [runsdir] + [os.path.join(runsdir, d) for d in sorted(os.listdir(runsdir))
+                         if os.path.isdir(os.path.join(runsdir, d))]
+    for root in roots:
+        for f in os.listdir(root):
+            if f.endswith(".out"):
+                idx.setdefault(f, os.path.join(root, f))
+    return idx
+
+
+def raw_family(rows, fam, idx):
+    """the SAME cells as the CSV pool, read from each row's own raw .out"""
+    cells = pool_cells(rows, FAMILY_PRED[fam], POOL_PREFIXES[fam], POOL_MINMEAN[fam])
+    groups = {"plateau5": [], "auc": [], "peak5": []}
+    found = miss = 0
+    dcsv = 0.0
+    decays = []
+    for k, v in sorted(cells.items()):
+        st = []
+        for r in v:
+            p = idx.get("%s-%s.out" % (r["run"], r["job_id"]))
+            rec = parse_out(p) if p else None
+            if not rec or "plateau5" not in rec:
+                miss += 1
+                continue
+            found += 1
+            dcsv = max(dcsv, abs(rec["plateau5"] - float(r["plateau5"])))
+            st.append(rec)
+        if len(st) >= 2:
+            for f in groups:
+                groups[f].append([s[f] for s in st])
+            decays.append(("%s %s ms=%s a0=%s" % (k[-1], k[2], k[5], k[6]),
+                           mean([s["peak5"] - s["plateau5"] for s in st]),
+                           mean([s["plateau5"] for s in st]),
+                           mean([s["train_at_peak"] for s in st])))
+    return dict((f, _pool(g)) for f, g in groups.items()), found, miss, dcsv, decays
+
+
+def _rn(stem, **eq):
+    return lambda r: r.get("run", "").startswith(stem) and all(r.get(k) == v for k, v in eq.items())
+
+
+def _rs(prefixes, **eq):
+    return lambda r: batch_of(r) in prefixes and all(r.get(k) == v for k, v in eq.items())
+
+
+C100L = dict(network=NET, dataset=DSET, epochs_requested="100", base="SGDm", meta="Lion",
+             beta_clip=CLIP, augment="1", hier="")
+REF_SPECS = {
+    "cdn1-lr005": _rn("cdn1-lr005-"), "cdn1-lr01": _rn("cdn1-lr01-"),
+    "cdn1-lr02": _rn("cdn1-lr02-"), "cdn1-lr03": _rn("cdn1-lr03-"), "cdn1-m": _rn("cdn1-m-"),
+    "c100-chunk771-ms1e-4-a1e-3": _rs(("cdn1", "gc1", "gm2"), granularity="chunk771",
+                                      meta_stepsize="1e-4", alpha0="1e-3", **C100L),
+    "c100-layerwise-ms3e-4-a1e-3": _rs(("cru1",), granularity="layerwise", meta_stepsize="3e-4",
+                                       alpha0="1e-3", **C100L),
+    "c100-layerwise-ms1e-3-a1e-3": _rs(("c100", "c100b", "c1b", "cru1"), granularity="layerwise",
+                                       meta_stepsize="1e-3", alpha0="1e-3", **C100L),
+    "c100-layerwise-ms3e-4-a1e-6": _rs(("cru1",), granularity="layerwise", meta_stepsize="3e-4",
+                                       alpha0="1e-6", **C100L),
+    "cau1-lr02": _rn("cau1-lr02-"), "cau1-m6t": _rn("cau1-m6t-"), "cau1-m6": _rn("cau1-m6-"),
+    "bl-sgd-01": _rn("bl-sgd", alpha0="0.1"), "i3b-3e4": _rn("i3b-", alpha0="3e-4"),
+    "i3b-1e6": _rn("i3b-", alpha0="1e-6"),
+}
+# each arm's CIFAR-100 AUGMENT=1 anchor for the floor gate (section C)
+ANCHOR = {"lr005": "cdn1-lr005", "lr01": "cdn1-lr01", "lr02": "cdn1-lr02",
+          "lr04": "cdn1-lr03", "lr08": "cdn1-lr03",          # extrapolated: highest measured rung
+          "m1e4a1e3": "c100-chunk771-ms1e-4-a1e-3",
+          "m3e4a1e3": "c100-layerwise-ms3e-4-a1e-3",
+          "m1e3a1e3": "c100-layerwise-ms1e-3-a1e-3",
+          "m3e4a1e4": "c100-layerwise-ms3e-4-a1e-6",           # a lower-bound analog
+          "m3e4a1e2": "c100-layerwise-ms3e-4-a1e-6"}           # no analog: the lowest meta anchor
+
+
+def ref_level(rows, name):
+    v = [float(r["plateau5"]) for r in rows if usable(r) and REF_SPECS[name](r)]
+    return mean(v), len(v)
+
+
+def predictions():
+    L = REF_LEVELS
+    r_s = (100.0 - L["cau1-lr02"]) / (100.0 - L["bl-sgd-01"])
+    d_s = L["bl-sgd-01"] - L["cau1-lr02"]
+    r_m = (100.0 - L["cau1-m6t"]) / (100.0 - L["i3b-3e4"])
+    d_m = L["i3b-3e4"] - L["cau1-m6t"]
+    r_p = (100.0 - L["cau1-m6"]) / (100.0 - L["i3b-1e6"])
+    pred = {}
+    for a in ARMS:
+        x = L[ANCHOR[a]]
+        if a in META:
+            pred[a] = (100.0 - (100.0 - x) * r_m, x - d_m, 100.0 - (100.0 - x) * r_p)
+        else:
+            pred[a] = (100.0 - (100.0 - x) * r_s, x - d_s, None)
+    return pred, (r_s, d_s, r_m, d_m, r_p)
+
+
+def _probe_series(path):
+    out = []
+    for ln in open(path):
+        r = {}
+        for k, rx in _PR.items():
+            mm = rx.search(ln)
+            if mm:
+                r[k] = float(mm.group(1))
+        if "step" in r:
+            out.append(r)
+    return out
+
+
+# =============================================================================
+# SELFTEST, PART 2 -- premises, the memorisation evidence, floor gate, design
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cUC1_unaug_c100_score.py --selftest")
+    fails, passes, skips = [], [0], [0]
+
+    def T(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if cond:
+            passes[0] += 1
+        else:
+            fails.append(label)
+
+    def S(label):
+        print("  SKIP %s" % label)
+        skips[0] += 1
+
+    se_p = SIGMA_P5_PRIOR * SE_FACTOR
+    rows = read_corpus(csvpath)
+
+    print("\nA. FROZEN PREMISES RE-DERIVED FROM THE CORPUS (cuc1- excluded; pools on FROZEN prefix sets)")
+    for stat, key in (("plateau5", SIGMA_P5_PRIOR), ("auc", SIGMA_AUC_PRIOR), ("peak5", SIGMA_PEAK_PRIOR)):
+        vals = [v[0] for k, v in POOLS.items() if k[0] == stat]
+        T(abs(key - max(vals)) < 1e-12, "the %s prior %.6f IS the max of its %d frozen pools" % (stat, key, len(vals)))
+    if rows is None:
+        S("no corpus at %s -- sections A, B and D not run" % csvpath)
+    else:
+        allrows = list(csv.DictReader(open(csvpath)))
+        own = sum(1 for r in allrows if r.get("run", "").startswith(PREFIX))
+        note("corpus %d rows; %d are cuc1- (%s) and are excluded from every reader"
+             % (len(allrows), own, "POST-INGEST" if own else "PRE-INGEST"))
+        for fam in POOL_PREFIXES:
+            for stat in ("plateau5", "auc"):
+                s_, df_, nc_, n_ = family_pool(rows, fam, stat)
+                want = POOLS[(stat, fam, "csv")]
+                T(s_ is not None and abs(s_ - want[0]) <= SIGMA_TOL and df_ == want[1],
+                  "CSV %-9s %-8s sigma %s df %d (%d cells, %d rows); frozen %.6f df %d"
+                  % (fam, stat, "n/a" if s_ is None else "%.6f" % s_, df_, nc_, n_, want[0], want[1]))
+                lv = pooled_sigma(rows, FAMILY_PRED[fam], stat, None, POOL_MINMEAN[fam])
+                note("   live, prefix-UNRESTRICTED %s %s = %s df %d (never a bar)"
+                     % (fam, stat, "n/a" if lv[0] is None else "%.6f" % lv[0], lv[1]))
+        for name in REF_SPECS:
+            m_, n_ = ref_level(rows, name)
+            T(m_ is not None and abs(m_ - REF_LEVELS[name]) <= 5e-4,
+              "reference %-28s = %s (n=%d; frozen %.4f)" % (name, "n/a" if m_ is None else "%.4f" % m_,
+                                                            n_, REF_LEVELS[name]))
+        nseed = sum(1 for r in rows if str(r.get("seed")) in ("66", "67", "68"))
+        T(nseed == 0, "ZERO rows outside cuc1- carry seed 66-68 (the block pre-assigned to this track)",
+          "found %d" % nseed)
+        c100a0 = sum(1 for r in rows if r.get("dataset") == DSET and r.get("augment") == "0")
+        note("CIFAR-100 AUGMENT=0 rows outside cuc1-: %d (0 at registration: no prior exists)" % c100a0)
+
+        print("\nB. WHY THE PRIMARY STAYS AN ENDPOINT -- the CSV half")
+        cau = [r for r in rows if r["run"].startswith("cau1-") and usable(r)]
+        T(len(cau) == 27 and min(float(r["final_train"]) for r in cau) >= 99.9,
+          "B1 cau1 (CIFAR-10 AUGMENT=0): TRAIN at its ceiling on all %d runs (min final_train %.2f)"
+          % (len(cau), min(float(r["final_train"]) for r in cau) if cau else 0))
+        a_s = mean([float(r["auc"]) for r in cau if r["run"].startswith("cau1-lr02-")])
+        a_m = mean([float(r["auc"]) for r in cau if r["run"].startswith("cau1-m6t-")])
+        T(a_s is not None and a_m is not None and a_s < a_m and REF_LEVELS["cau1-lr02"] > REF_LEVELS["cau1-m6t"],
+          "B2 at AUGMENT=0 a curve reading can flip the endpoint's sign: cau1 S* beats m6t on plateau5"
+          " but loses on AUC (%.3f vs %.3f) -- the curve stays a secondary" % (a_s or 0, a_m or 0))
+
+    print("\nB'. THE MEMORISATION EVIDENCE FROM RAW .out (the same rows as the frozen pools)")
+    if rows is None or not runsdir or not os.path.isdir(runsdir):
+        S("B' raw .out not reachable (runsdir %s)" % runsdir)
+    else:
+        idx = _index_outs(runsdir)
+        for fam in POOL_PREFIXES:
+            res, found, miss, dcsv, decays = raw_family(rows, fam, idx)
+            if found != RAW_FOUND[fam]:
+                S("B' %s: %d raw .out found on this host, the registration found %d -- not comparable here"
+                  % (fam, found, RAW_FOUND[fam]))
+                continue
+            ok = dcsv < 1e-6
+            for stat in ("plateau5", "auc", "peak5"):
+                want = POOLS[(stat, fam, "raw")]
+                ok = ok and res[stat][0] is not None and abs(res[stat][0] - want[0]) <= SIGMA_TOL \
+                    and res[stat][1] == want[1]
+            dmax = max(d[1] for d in decays)
+            T(ok and abs(dmax - RAW_DECAY_MAX[fam]) <= 1e-6,
+              "B' %-9s %d raw .out (%d missing), plateau5 raw = CSV to %.1e; sigma p5/auc/peak %.6f/%.6f/%.6f"
+              " = frozen; max cell DECAY %.4f pp" % (fam, found, miss, dcsv, res["plateau5"][0],
+                                                     res["auc"][0], res["peak5"][0], dmax))
+            for lbl, dcy, p5, trpk in sorted(decays, key=lambda x: -x[1])[:4]:
+                note("   largest DECAY %-40s %.4f pp at plateau5 %.3f (TRAIN at peak %.2f)" % (lbl, dcy, p5, trpk))
+
+    print("\nB''. THE TRAVEL PREMISE FROM cdn1-m's OWN PROBES (REF's spec, AUGMENT=1)")
+    pdirs = [os.path.join(runsdir or "", "cdn1", "probe_m_s%d" % s, "probe.jsonl") for s in (0, 1, 2)]
+    if not all(os.path.exists(p) for p in pdirs):
+        S("B'' cdn1-m probe.jsonl not reachable under %s" % runsdir)
+    else:
+        b0 = math.log(1e-3)
+        for s, p in enumerate(pdirs):
+            ser = _probe_series(p)
+            at = dict((int(r["step"]), r) for r in ser)
+            last = ser[-1]
+            bound = b0 - 1e-4 * last["step"]
+            walls = sum(1 for r in ser if r.get("n_at_lo", 0) > 0 or r.get("n_at_hi", 0) > 0)
+            up = at[20000]["beta_true_max"] - (b0 + 1e-4 * 20000)
+            frac = (b0 - last["beta_true_min"]) / (b0 - bound)
+            T(len(ser) == 10000 and walls == 0 and abs(up) < 0.01
+              and frac >= 0.98 and abs(last["beta_true_max"] - BETA_EQ) <= 0.15,
+              "B'' cdn1-m s%d: beta_max at step 20000 is %+.4f from the full Lion rate; last beta_min %.3f"
+              " vs the travel bound %.3f (%.1f%% of it); last beta_max %.3f ~ BETA_EQ %.1f; wall records %d"
+              % (s, up, last["beta_true_min"], bound, 100.0 * (b0 - last["beta_true_min"]) / (b0 - bound),
+                 last["beta_true_max"], BETA_EQ, walls))
+
+    print("\nC. THE FLOOR GATE (164.6): EVERY ARM, EVERY MODEL, THE MARGINS")
+    pred, (r_s, d_s, r_m, d_m, r_p) = predictions()
+    print("    transfer (CIFAR-10 AUG=1 -> AUG=0): SGD ratio %.4f / drop %.4f; meta ratio %.4f / drop %.4f;"
+          " PARENT-config ratio %.4f (sensitivity only)" % (r_s, d_s, r_m, d_m, r_p))
+    for a in ARMS:
+        e, sub, adv = pred[a]
+        print("    %-9s anchor %-28s %.3f -> E %.2f  S %.2f%s" % (a, ANCHOR[a], REF_LEVELS[ANCHOR[a]], e, sub,
+                                                              "" if adv is None else "   (parent-ratio %.2f)" % adv))
+    lo = min(min(p[0], p[1]) for p in pred.values())
+    hi = max(max(p[0], p[1]) for p in pred.values())
+    T((lo - TRAINS_MIN) / se_p >= 10.0 and (lo - STUCK_LEVEL) / se_p >= 20.0 and (lo - CHANCE) / se_p >= 20.0,
+      "lowest level any account predicts for any arm %.2f pp: %.1f SE over TRAINS_MIN, %.1f SE over the"
+      " stuck level, %.1f SE over chance" % (lo, (lo - TRAINS_MIN) / se_p, (lo - STUCK_LEVEL) / se_p,
+                                             (lo - CHANCE) / se_p))
+    T((100.0 - hi) / se_p >= 20.0, "highest predicted level %.2f pp is %.1f SE under the TEST ceiling"
+      % (hi, (100.0 - hi) / se_p))
+    s_env = (max(min(pred[a][:2]) for a in LADDER_ARMS), max(max(pred[a][:2]) for a in LADDER_ARMS))
+    m_env = (max(min(pred[a][:2]) for a in META_ARMS), max(max(pred[a][:2]) for a in META_ARMS))
+    T(s_env[1] - m_env[0] >= Z_BAR * se_p and m_env[1] - s_env[0] >= Z_BAR * se_p,
+      "BOTH directions reachable: S* envelope [%.2f, %.2f], M* envelope [%.2f, %.2f] -> DEFICIT up to"
+      " %+.2f, REVERSAL down to %+.2f pp" % (s_env + m_env + (s_env[1] - m_env[0], s_env[0] - m_env[1])))
+    nadv = sum(1 for a in META_ARMS if pred[a][2] < TRAINS_MIN)
+    note("ADVERSE SENSITIVITY: at the parent-config ratio %d of 5 meta cells fall under TRAINS_MIN; that"
+         " landing is GATED-METHOD-AT-FLOOR by construction (E14), never a deficit" % nadv)
+    T(E_MAX[5] * SIGMA_P5_PRIOR / math.sqrt(3.0) < Z_BAR * se_p,
+      "worst-case selection bias per max-of-5 %.3f pp < 2 SE %.3f; S* and M* push opposite ways"
+      % (E_MAX[5] * SIGMA_P5_PRIOR / math.sqrt(3.0), Z_BAR * se_p))
+    T(abs(se_p - SIGMA_P5_PRIOR * math.sqrt(2.0 / 3.0)) < 1e-12,
+      "SE at the prior %.6f pp; every boundary 2 SE = %.6f pp" % (se_p, Z_BAR * se_p))
+
+    print("\nD. DESIGN, MANIFEST, AND THE TRAVEL ARITHMETIC")
+    T(len(ARMS) == 10 and len(arm_names()) == NJOBS == 30 and len(set(arm_names())) == 30,
+      "10 arms x 3 seeds = 30 distinct run names")
+    lrs = [float(v) for v, _ in LADDER]
+    T(lrs == sorted(lrs) and all(abs(lrs[i + 1] / lrs[i] - 2.0) < 1e-9 for i in range(4)),
+      "ladder ascending by factor 2: %s" % lrs)
+    c = META[CENTER]
+    plus = (all(META[a]["alpha0"] == c["alpha0"] for a in ("m1e4a1e3", "m1e3a1e3"))
+            and all(META[a]["ms"] == c["ms"] for a in ("m3e4a1e4", "m3e4a1e2"))
+            and float(META["m1e4a1e3"]["ms"]) < float(c["ms"]) < float(META["m1e3a1e3"]["ms"])
+            and float(META["m3e4a1e4"]["alpha0"]) < float(c["alpha0"]) < float(META["m3e4a1e2"]["alpha0"]))
+    T(plus and META[REF]["ms"] == "1e-4" and META[REF]["alpha0"] == "1e-3",
+      "the grid is a PLUS around CENTER %s and REF %s is cdn1-m's (ms 1e-4, alpha0 1e-3)" % (CENTER, REF))
+    T(all(OUT_RE.match(run_name(a, s) + "-123.out").group(1) == a for a in ARMS for s in SEEDS),
+      "every run name round-trips through the .out regex")
+    T(SEEDS == (66, 67, 68), "seeds %s are the pre-assigned block" % (SEEDS,))
+    T(len(MANIFEST) == MANIFEST_TENSORS and sum(n for _, n in MANIFEST) == MANIFEST_PARAMS
+      and sum((n + CHUNK - 1) // CHUNK for _, n in MANIFEST) == MANIFEST_CHUNKS
+      and len(set(nm for nm, _ in MANIFEST)) == MANIFEST_TENSORS,
+      "frozen manifest: %d tensors, %d parameters, %d chunk771 groups (cdn1's 14,595)"
+      % (len(MANIFEST), sum(n for _, n in MANIFEST), sum((n + CHUNK - 1) // CHUNK for _, n in MANIFEST)))
+    for a in META_ARMS:
+        ts, reach = travel(a)
+        T(ts <= TRAVEL_FRAC_MAX * TOTAL_STEPS,
+          "%-9s beta0 %.3f reaches %.1f at step %6d (%4.1f%% of training); max reachable %.2f"
+          % (a, math.log(float(META[a]["alpha0"])), BETA_EQ, ts, 100.0 * ts / TOTAL_STEPS, reach))
+    if rows is not None:
+        cells = {}
+        for r in rows:
+            if (usable(r) and batch_of(r) in ("cru1", "gm2", "gc1", "cdn1", "c100", "c100b", "c1b", "c100f")
+                    and all(r.get(k) == v for k, v in C100L.items())
+                    and r.get("granularity") in ("layerwise", "chunk771", "chunk2293", "nodewise", "nodewise1d")):
+                cells.setdefault((r["granularity"], r["meta_stepsize"], r["alpha0"]), []).append(float(r["plateau5"]))
+        reach_ok, stuck = [], []
+        for (g, ms, a0), v in sorted(cells.items()):
+            frac = max(0.0, BETA_EQ - math.log(float(a0))) / float(ms) / TOTAL_STEPS
+            (reach_ok if frac <= TRAVEL_FRAC_MAX else stuck if frac > 1.0 else []).append((mean(v), g, ms, a0, frac))
+        T(len(stuck) >= 3 and len(reach_ok) >= 8 and min(x[0] for x in reach_ok) >= 68.0
+          and max(x[0] for x in stuck) < 60.0,
+          "corpus corroboration (AUGMENT=1, SGDm+Lion, canonical box): %d cells that reach %.1f within"
+          " 60%% of training all sit >= %.2f pp; the %d that cannot reach it sit <= %.2f pp"
+          % (len(reach_ok), BETA_EQ, min(x[0] for x in reach_ok) if reach_ok else 0, len(stuck),
+             max(x[0] for x in stuck) if stuck else 0))
+    else:
+        S("D corpus corroboration of the travel premise (no corpus)")
+
+    selftest_part1(csvpath if rows is not None else None, T)
+
+    print("\n%d checks, %d failures, %d skipped" % (passes[0] + len(fails), len(fails), skips[0]))
+    if fails:
+        print("FAILED: " + " ;; ".join(fails))
+    return 0 if not fails else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cuc1 registered scorer")
+    ap.add_argument("runsdir", nargs="?", default=None,
+                    help="directory holding the cuc1-*.out files (the runner writes <WS>/runs/%%x-%%j.out)")
+    ap.add_argument("--csv", default=DEFAULT_CSV, help="read by --selftest ONLY; score() ignores it")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt", default=None,
+                    help="for --selftest: where the raw .out of the frozen pools live")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest(a.csv, a.runsdir_opt or a.runsdir)
+    if not a.runsdir:
+        ap.error("the documented invocation is: %s <runsdir>" % os.path.basename(sys.argv[0]))
+    return score(a.runsdir, a.csv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

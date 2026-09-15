@@ -8,17 +8,17 @@ async function helpers() {
   assert.ok(module, 'The general homepage needs an overview aggregation module.');
   return module;
 }
-const experiment = (id: string, area: string, outcome: Outcome) => ({ id, area, outcome }) as Experiment;
+const experiment = (id: string, area: string, outcome: Outcome | null, kind: Experiment['kind'] = 'research') => ({ id, area, outcome, kind }) as Experiment;
 const event = (id: string, date: string, kind = 'note'): ActivityEvent => ({ id, date, kind, title: id, detail: 'Recorded update', experimentIds: [] });
 
-test('area summaries count every goal by its recorded outcome, not supplied metadata counts', async () => {
+test('area summaries count research goals by outcome and list method checks separately', async () => {
   const { areaOutcomeCounts } = await helpers();
-  const experiments = [experiment('A', 'Optimization', 'success'), experiment('B', 'Optimization', 'fail'), experiment('C', 'Optimization', 'unresolved'), experiment('D', 'Audit', 'correction'), experiment('E', 'Audit', 'mixed')];
+  const experiments = [experiment('A', 'Optimization', 'success'), experiment('B', 'Optimization', 'fail'), experiment('C', 'Optimization', 'unresolved'), experiment('D', 'Audit', null, 'method-check'), experiment('E', 'Audit', 'mixed')];
   const areas = [{ id: 2, label: 'Audit', count: 500 }, { id: 1, label: 'Optimization', count: 0 }];
   const input = JSON.stringify({ experiments, areas });
   assert.deepEqual(areaOutcomeCounts(experiments, areas), [
-    { label: 'Audit', total: 2, counts: { success: 0, fail: 0, mixed: 1, unresolved: 0, correction: 1 } },
-    { label: 'Optimization', total: 3, counts: { success: 1, fail: 1, mixed: 0, unresolved: 1, correction: 0 } },
+    { label: 'Audit', total: 1, counts: { success: 0, fail: 0, mixed: 1, unresolved: 0 }, methodChecks: 1 },
+    { label: 'Optimization', total: 3, counts: { success: 1, fail: 1, mixed: 0, unresolved: 1 }, methodChecks: 0 },
   ]);
   assert.equal(JSON.stringify({ experiments, areas }), input);
 });
@@ -26,7 +26,7 @@ test('area summaries count every goal by its recorded outcome, not supplied meta
 test('empty known areas and unlisted new areas cannot hide or invent research', async () => {
   const { areaOutcomeCounts } = await helpers();
   const summaries = areaOutcomeCounts([experiment('N', 'New area', 'mixed')], [{ id: 1, label: 'Empty area', count: 99 }]);
-  assert.deepEqual(summaries.map(row => [row.label, row.total]), [['Empty area', 0], ['New area', 1]]);
+  assert.deepEqual(summaries.map(row => [row.label, row.total, row.methodChecks]), [['Empty area', 0, 0], ['New area', 1, 0]]);
   assert.equal(Object.values(summaries[0].counts).reduce((sum, n) => sum + n, 0), 0);
   assert.deepEqual(areaOutcomeCounts([], []), []);
 });
@@ -60,10 +60,13 @@ test('the published register is fully represented in the general review', async 
   const { areaOutcomeCounts } = await helpers();
   const data = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8')) as ResearchData;
   const rows = areaOutcomeCounts(data.experiments, data.areas);
-  assert.equal(rows.length, 9);
-  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 111);
+  assert.equal(rows.length, 10);
+  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 130);
+  assert.equal(rows.reduce((sum, row) => sum + row.methodChecks, 0), 18);
   for (const row of rows) {
     assert.equal(Object.values(row.counts).reduce((sum, count) => sum + count, 0), row.total);
-    assert.equal(row.total, data.experiments.filter(e => e.area === row.label).length);
+    assert.equal(row.total + row.methodChecks, data.experiments.filter(e => e.area === row.label).length);
   }
+  const audit = rows.find(row => row.label === 'Count-matched partition audit')!;
+  assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [34, { success: 12, fail: 5, mixed: 4, unresolved: 13 }, 3]);
 });

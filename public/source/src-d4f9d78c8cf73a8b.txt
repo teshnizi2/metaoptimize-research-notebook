@@ -1,0 +1,573 @@
+r"""Correctness tests for PATCH_CHUNKVEC (`--stepsize-groups chunkvec<ND><MODE><ARG>`).
+
+**READ THIS FIRST: THE BATCH THIS SUITE WAS WRITTEN FOR NO LONGER EXISTS.**  `sl1`, the
+fixed-m singleton ladder, was KILLED PRE-DATA at cycle-84 review (CORRECTIONS 114;
+docs/REGISTER-ideas-ABC.md section 3) and its script and scorer are DELETED.  This suite
+and `patches/patch_chunkvec.py` are RETAINED as validated infrastructure for the
+registered successor -- the 2x2 factorial in (singleton count S) x (ndim>=2 chunk count
+G2) with m FLOATING (REGISTER section 3.4), which needs exactly this patch.  The L0-L6
+rung strings still exercised below (V6, V7) are kept as EXPRESSIVENESS checks on the
+patch, not as a claim that that ladder should be run; three of the four successor cells
+(`chunkvec777s0`, `chunkvec2325s0`, `chunkvec2325s41`) are already covered here.
+**The patch MUST NOT be applied to the live cluster tree until the successor batch is
+registered and built** -- see the OPERATOR NOTE in patches/patch_chunkvec.py.
+
+STRATEGY, identical in spirit to tests/test_chunkwise.py and tests/test_nodebn.py:
+validate the new partition against code paths that are ALREADY TRUSTED, via mathematical
+identities, rather than against my expectation of what it should do.  A per-tensor chunk
+vector SUBSUMES four shipped granularities, so four of the tests below are BITWISE
+equivalences against UNPATCHED behaviour.
+
+  V0  DETERMINISM FIRST (STANDING RULE 20).  The SAME configuration run twice must give
+      max|dW| = max|dbeta| = 0.  On CUDA this genuinely fails -- see the DEV note -- and
+      if it fails here every equivalence below is meaningless, so the suite stops.
+      V0 runs BOTH sides through run_steps_uncached, so its determinism claim is never
+      served out of the memo cache that it is what justifies.
+  V1  **THE k=41 BOUNDARY.  `chunkvecns41` IS `nodewise`, EXACTLY.**  ndim>=2 tensors at
+      K = numel//shape[0]; all 41 one-D tensors at K = 1, which for a 1-D tensor IS
+      per-channel.  Asserted against the UNPATCHED nodewise path on the real ResNet18.
+  V2  **THE k=0 BOUNDARY.  `chunkvecns0` IS `nodewise1d`, EXACTLY.**  The same, with
+      every one-D tensor collapsed to a single group.  Asserted against PATCH_NODEBN's
+      shipped path.
+  V3  **THE L0 IDENTITY.  `chunkvec777s0` IS `chunk777` -- BITWISE ON CPU, AND AS A
+      PARTITION EVERYWHERE.**  Every one-D tensor on ResNet18 has numel <= 512 < 777, so
+      chunk777 already gives each of them exactly one group.
+      **THE SCOPE OF "EXACTLY" MATTERS AND IS STATED HERE RATHER THAN ASSUMED** (added
+      at cycle-84 review).  On CPU the two are bitwise identical and this test asserts
+      that.  ON GPU THEY CANNOT BE, for two independent reasons: (a) cuDNN's conv
+      backward is nondeterministic and Lion's sign() turns any float-level difference
+      into a FULL +-ms beta step -- the same magnitude as a real partition difference
+      (see the header note: the same config run twice on CUDA gives max|dbeta| = 2.2e-1);
+      and (b) for the 41 one-D tensors chunk777's block_product zero-pads to 777 while
+      chunkvec777s0 pads to numel, so the same addends are summed in differently SHAPED
+      reductions, and a GPU tree reduction may group them differently.  So any batch
+      using this as an instrument check must gate it STATISTICALLY (a band around the
+      known arm's corpus mean), never by demanding numerical identity, and must re-run
+      the reference arm IN-BATCH rather than reusing existing rows.
+  V4  `chunkvecws41` IS `weightwise`, EXACTLY (every tensor at K = 1).
+  V5  SPEC INVARIANCE.  s/r/x are three ways of naming a SET, so `s21` == `x0.1...20`,
+      `x` (empty) == `s0`, and `r41` == `s41` -- bitwise, on the real net.
+  V6  **THE RUNG TABLE, MEASURED FROM THE ALLOCATED BETA.**  m per rung for all 7 rungs
+      of the WITHDRAWN fixed-m ladder plus its ordering control C3.  These strings are
+      retained as EXPRESSIVENESS checks on the patch -- they exercise seven distinct K2
+      values and seven distinct singleton injections -- and NOT as a claim that that
+      ladder should be run; see the header.  The property checked is that m lands at
+      14,420 +- 11 while the singleton fraction sweeps 0 -> 0.666, which is what a
+      per-tensor chunk vector must be able to express.
+  V7  **THE SINGLETON CENSUS, AND THE NO-ACCIDENTAL-SINGLETON CLAIM.**  The number of
+      size-1 groups on each rung equals the registered S_k EXACTLY -- which is a
+      two-sided assertion: every injected singleton is present, and NO ragged chunk tail
+      on any rung's K2 is of length 1, so no singleton is produced by accident.
+  V8  THE ALPHA MAP.  For a given beta, the alpha delivered to flat position j equals
+      exp(beta[j // K_i]) on every tensor, checked over all 11,173,962 weights.
+  V9  block_product math: each chunk's z equals the explicit sum over ITS OWN members,
+      including RAGGED final chunks, on a purpose-built net mixing 1-D and 2-D tensors
+      (the zero-pad must not scale a ragged chunk).
+  V10 meta_stepsize = 0  =>  chunkvec trains identically to scalar.  With beta frozen the
+      partition cannot matter, so any weight difference is a plumbing bug, not dynamics.
+  V11 **THE ANTI-VACUITY GUARD.**  Distinct rungs must NOT agree on a real net at a real
+      meta stepsize.  If this fails, V1-V5 are passing because nothing diverges and the
+      ladder measures nothing.  test_chunkwise learned this the hard way.
+  V12 NOTHING REGRESSED.  chunk1 == weightwise, chunk<huge> == layerwise, and
+      nodewise1d == nodewise on a net with no 1-D parameters still hold, so
+      PATCH_CHUNKVEC disturbed neither PATCH_CHUNKWISE nor PATCH_NODEBN.
+
+Any failure means the fixed-m singleton ladder is not measuring what it claims and every
+number taken from it is void.
+
+RUN ON THE CLUSTER (needs torch + the patched HF.py):
+  ssh cluster_a "cd /cluster/account_a/metaopt/hierarchical-metaoptimize && \
+             CHUNKVEC_TEST_DEVICE=cpu python3 tests/test_chunkvec.py"
+  # or against a SCRATCH copy of the tree, which is how it is validated before the
+  # live HF.py is touched at all:
+  #   CIFAR10_DIR=/path/to/cluster/user python3 tests/test_chunkvec.py
+"""
+import sys, os, math
+# CIFAR10_DIR lets this run against a SCRATCH copy of the tree, so the patch can be
+# verified without editing the live HF.py that running jobs import.  Default is the
+# real tree, so the test is still a check on what actually ships.
+sys.path.insert(0, os.environ.get(
+    "CIFAR10_DIR",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10"))
+import torch
+import torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+
+# DEVICE: CPU BY DEFAULT, AND THAT IS NOT A CONVENIENCE -- IT IS THE TEST'S VALIDITY.
+# Measured on this cluster (cycle 75, STANDING RULE 20): running the SAME config twice on
+# CUDA gives max|dbeta| = 2.2e-01, because cuDNN's conv backward is nondeterministic and
+# Lion's sign() amplifies any float-level difference into a full +-2*ms beta step at
+# whichever of 11.17M coordinates sits nearest a sign boundary.  That is the SAME
+# magnitude as a real partition difference, so an equivalence test run on CUDA cannot
+# distinguish "identical" from "completely different".  V0 asserts determinism rather
+# than assuming it.
+DEV = torch.device(os.environ.get(
+    "CHUNKVEC_TEST_DEVICE", os.environ.get("NODEBN_TEST_DEVICE", "cpu")))
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+# THE REGIME MATTERS AND test_chunkwise GOT IT WRONG THE FIRST TIME.  At a small alpha0
+# and a small ms, beta barely moves and every partition produces the same weights, so the
+# equivalences pass VACUOUSLY.  alpha0=1e-3 (the campaign's value) with ms=1e-2 over 25
+# steps moves beta by ~0.25 in log space, which is enough for partitions to genuinely
+# diverge.  V11 is the standing guard that this is still true.
+ALPHA0 = 1e-3
+STEPS = 25
+META = {"alg": "Lion", "meta_stepsize": 1e-2, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+# --- THE RUNG TABLE of the WITHDRAWN fixed-m ladder (bin/c84_singleton_ladder.sh, now
+# --- DELETED -- CORRECTIONS 114).  Retained as an expressiveness fixture, NOT a design.
+# (arm, granularity string, registered m, registered singleton count S)
+LADDER = (
+    ("L0", "chunkvec777s0",              14421,    0),
+    ("L1", "chunkvec802s7",              14409,  448),
+    ("L2", "chunkvec844s14",             14416, 1152),
+    ("L3", "chunkvec914s21",             14422, 2176),
+    ("L4", "chunkvec1070s28",            14423, 3968),
+    ("L5", "chunkvec1417s34",            14428, 6528),
+    ("L6", "chunkvec2325s41",            14420, 9610),
+    ("C3", "chunkvec915x36.37.38.39.8.9", 14424, 2176),
+)
+M_TARGET = 14420
+M_TOL = 11                  # the registered worst |m - 14,420| across the 8 arms
+                            # (L1, dm -11); the SPREAD max-min is 19 groups = 0.13%
+FAILS = []
+
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+class NoBiasNet(nn.Module):
+    """A net whose parameters are ALL ndim >= 2 (V12's nodewise1d == nodewise check)."""
+
+    def __init__(self):
+        super().__init__()
+        self.c1 = nn.Conv2d(3, 8, 3, padding=1, bias=False)
+        self.c2 = nn.Conv2d(8, 16, 3, stride=2, padding=1, bias=False)
+        self.c3 = nn.Conv2d(16, 16, 1, bias=False)
+        self.fc = nn.Linear(16 * 16 * 16, 10, bias=False)
+
+    def forward(self, x):
+        x = torch.relu(self.c1(x))
+        x = torch.relu(self.c2(x))
+        x = torch.relu(self.c3(x))
+        return self.fc(x.reshape(x.shape[0], -1))
+
+
+class MixedRagged(nn.Module):
+    """A net with BOTH 1-D and 2-D tensors and numels that are NOT multiples of K.
+
+    V9 needs ragged final chunks on the ndim>=2 side AND one-D tensors on both sides of
+    the selection, which the real ResNet18 has but is far too large to check explicitly.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.arange(10 * 7, dtype=torch.float32).reshape(10, 7) * 0.01)
+        self.w2 = nn.Parameter(torch.arange(5 * 3, dtype=torch.float32).reshape(5, 3) * 0.02)
+        self.b1 = nn.Parameter(torch.arange(6, dtype=torch.float32).clone())
+        self.b2 = nn.Parameter(torch.arange(4, dtype=torch.float32).clone() * 0.5)
+
+
+def fresh_net(seed=0):
+    torch.manual_seed(seed)
+    return build_network("ResNet18", DEV)
+
+
+def fresh_nobias(seed=0):
+    torch.manual_seed(seed)
+    return NoBiasNet().to(DEV)
+
+
+def make_opt(net, groups, meta_stepsize=None):
+    meta = dict(META)
+    if meta_stepsize is not None:
+        meta["meta_stepsize"] = meta_stepsize
+    return HF(net, stepsize_groups=groups, alpha0=ALPHA0, args_base=dict(BASE),
+              args_meta=meta, gamma=1, writer=NullWriter())
+
+
+def _beta_flat(opt):
+    """beta as ONE flat vector, so partitions holding it in different list shapes are
+    still comparable.  nodewise stores 62 length-shape[0] tensors and chunkvecns41 stores
+    62 flat ones of the same lengths -- both flatten to the same thing when the
+    partitions are equivalent."""
+    return torch.cat([b.detach().float().reshape(-1).cpu() for b in opt.beta])
+
+
+def run_steps_uncached(groups, k=STEPS, seed=0, meta_stepsize=None, net_factory=fresh_net):
+    """Return (weights, flat beta).  BETA is where granularity actually lives, so the
+    equivalences are asserted on it as well as on the weights."""
+    net = net_factory(seed)
+    opt = make_opt(net, groups, meta_stepsize)
+    crit = nn.CrossEntropyLoss()
+    g = torch.Generator().manual_seed(1234)
+    for _ in range(k):
+        x = torch.randn(8, 3, 32, 32, generator=g).to(DEV)
+        y = torch.randint(0, 10, (8,), generator=g).to(DEV)
+        loss = crit(net(x), y)
+        opt.step(net, loss)
+    return ([p.detach().float().cpu().clone() for p in net.parameters()],
+            _beta_flat(opt))
+
+
+_CACHE = {}
+
+
+def run_steps(groups, k=STEPS, seed=0, meta_stepsize=None, net_factory=fresh_net):
+    """MEMOISED run_steps.  V0 PROVES, before anything below runs, that the same
+    configuration executed twice is BITWISE identical on this device; a cached result is
+    therefore provably the same object a fresh run would produce, and re-executing 16
+    duplicate ResNet18 configurations would buy nothing but wall-clock.  **V0 itself
+    calls run_steps_uncached twice, by construction**, so the determinism claim is never
+    served out of the cache it justifies."""
+    key = (groups, k, seed, meta_stepsize, net_factory.__name__)
+    if key not in _CACHE:
+        _CACHE[key] = run_steps_uncached(groups, k, seed, meta_stepsize, net_factory)
+    return _CACHE[key]
+
+
+def compare(name, ra, rb, tol=1e-6, want_equal=True):
+    """Compare BOTH the weights and the flat beta of two runs."""
+    wa, ba = ra
+    wb, bb = rb
+    w_worst = max((x - y).abs().max().item() for x, y in zip(wa, wb))
+    b_worst = (ba - bb).abs().max().item() if ba.numel() == bb.numel() else float("inf")
+    worst = max(w_worst, b_worst)
+    ok = (worst <= tol) if want_equal else (worst > tol)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:56s} w={w_worst:.3e} beta={b_worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+def compare_w(name, ra, rb, tol=1e-6, want_equal=True):
+    """WEIGHTS ONLY.  Used where the two arms hold beta in genuinely different-sized
+    partitions, so a beta comparison would be trivially satisfied by the size mismatch
+    rather than by the dynamics."""
+    w_worst = max((x - y).abs().max().item() for x, y in zip(ra[0], rb[0]))
+    ok = (w_worst <= tol) if want_equal else (w_worst > tol)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:56s} max|dW| = {w_worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name:56s} {detail}")
+    if not cond:
+        FAILS.append(name)
+    return cond
+
+
+def group_sizes(opt):
+    """Every group's SIZE, per tensor, derived from the allocated chunk vector."""
+    out = []
+    for K, ne in zip(opt.cvec_K, opt.cvec_numel):
+        c = (ne + K - 1) // K
+        out.extend([K] * (c - 1) + [ne - K * (c - 1)])
+    return out
+
+
+print(f"device={DEV}")
+_net = fresh_net()
+SHAPES = [tuple(p.shape) for p in _net.parameters()]
+NUMELS = [int(math.prod(s)) for s in SHAPES]
+NL = len(NUMELS)
+NW = sum(NUMELS)
+ONED = [i for i, s in enumerate(SHAPES) if len(s) == 1]
+print(f"ResNet18: {NL} param tensors, {NW} weights, {len(ONED)} one-D tensors holding "
+      f"{sum(NUMELS[i] for i in ONED)} scalars\n")
+
+
+def m_of_chunk(K):
+    return sum((n + K - 1) // K for n in NUMELS)
+
+
+def m_alloc(groups, net_factory=fresh_net):
+    opt = make_opt(net_factory(), groups)
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+
+# ---- V0: determinism, or nothing below means anything ----------------------
+print("V0  DETERMINISM (STANDING RULE 20): the same config run twice, bitwise identical")
+for _g in ("chunkvec777s0", "chunkvec2325s41", "nodewise"):
+    # UNCACHED on BOTH sides -- two genuinely independent executions.
+    compare(f"{_g} == itself (re-run)", run_steps_uncached(_g), run_steps_uncached(_g),
+            tol=0.0)
+if FAILS:
+    print("\n  V0 FAILED -- the harness is nondeterministic on this device, so the")
+    print("  equivalence tests below cannot distinguish 'identical' from 'different'.")
+    print("  Re-run with CHUNKVEC_TEST_DEVICE=cpu.  ABORTING.")
+    sys.exit(1)
+
+# ---- V1: the k=41 boundary -- chunkvecns41 == nodewise ---------------------
+print("\nV1  **THE k=41 BOUNDARY**: chunkvecns41 vs nodewise (EXACT, on the real net)")
+check("m(chunkvecns41) == m(nodewise)", m_alloc("chunkvecns41") == m_alloc("nodewise"),
+      f"{m_alloc('chunkvecns41')} == {m_alloc('nodewise')} (= 14,420 registered)")
+compare("chunkvecns41 == nodewise", run_steps("chunkvecns41"), run_steps("nodewise"))
+
+# ---- V2: the k=0 boundary -- chunkvecns0 == nodewise1d ---------------------
+print("\nV2  **THE k=0 BOUNDARY**: chunkvecns0 vs nodewise1d (EXACT, on the real net)")
+check("m(chunkvecns0) == m(nodewise1d)", m_alloc("chunkvecns0") == m_alloc("nodewise1d"),
+      f"{m_alloc('chunkvecns0')} == {m_alloc('nodewise1d')} (= 4,851 registered)")
+compare("chunkvecns0 == nodewise1d", run_steps("chunkvecns0"), run_steps("nodewise1d"))
+
+# ---- V3: the L0 identity -- chunkvec777s0 == chunk777 ----------------------
+print("\nV3  **THE L0 INSTRUMENT IDENTITY**: chunkvec777s0 vs chunk777 (EXACT)")
+maxone = max(NUMELS[i] for i in ONED)
+check("every one-D numel < 777, so chunk777 already gives them one group each",
+      maxone < 777, f"largest one-D numel = {maxone}")
+check("m(chunkvec777s0) == m(chunk777)", m_alloc("chunkvec777s0") == m_of_chunk(777),
+      f"{m_alloc('chunkvec777s0')} == {m_of_chunk(777)} (= 14,421 registered)")
+compare("chunkvec777s0 == chunk777", run_steps("chunkvec777s0"), run_steps("chunk777"))
+
+# ---- V3b: THE SECOND ENDPOINT IDENTITY -- chunkvec2325s0 == chunk2325 -------
+# Added at cycle-84 review.  This is cell B of the registered successor design (REGISTER
+# section 3.4): the in-batch ndim>=2 / m axis control, at S = 0.  It holds for exactly
+# the reason V3 does -- every one-D numel <= 512 < 2325, so chunk2325 already gives each
+# one-D tensor a single group -- which means the successor gets a SECOND already-run
+# reference arm for free, on the opposite corner of the factorial from L0.  Both reviews
+# of cycle 84 asked for this contrast to be measured in-batch rather than imported from
+# cc1's se-0.190 cross-batch draw; this is the arm that does it.
+print("\nV3b **THE SECOND ENDPOINT IDENTITY**: chunkvec2325s0 vs chunk2325 (EXACT)")
+check("every one-D numel < 2325, so chunk2325 also gives them one group each",
+      maxone < 2325, f"largest one-D numel = {maxone}")
+check("m(chunkvec2325s0) == m(chunk2325)",
+      m_alloc("chunkvec2325s0") == m_of_chunk(2325),
+      f"{m_alloc('chunkvec2325s0')} == {m_of_chunk(2325)} (= 4,851 registered)")
+check("m(chunkvec2325s0) == m(nodewise1d), the tail-merged count",
+      m_alloc("chunkvec2325s0") == m_alloc("nodewise1d"),
+      f"{m_alloc('chunkvec2325s0')} == {m_alloc('nodewise1d')}")
+compare("chunkvec2325s0 == chunk2325", run_steps("chunkvec2325s0"), run_steps("chunk2325"))
+# ANTI-VACUITY: the two S=0 corners must be DIFFERENT arms, or the factorial is degenerate.
+compare("chunkvec777s0 != chunkvec2325s0 (the two S=0 corners really differ)",
+        run_steps("chunkvec777s0"), run_steps("chunkvec2325s0"), want_equal=False)
+
+# ---- V4: chunkvecws41 == weightwise ----------------------------------------
+print("\nV4  chunkvecws41 vs weightwise (every tensor at K = 1, EXACT)")
+check("m(chunkvecws41) == total weights", m_alloc("chunkvecws41") == NW,
+      f"{m_alloc('chunkvecws41')} == {NW}")
+compare("chunkvecws41 == weightwise", run_steps("chunkvecws41"), run_steps("weightwise"))
+
+# ---- V5: spec invariance ----------------------------------------------------
+print("\nV5  SPEC INVARIANCE: s / r / x are three ways of naming the SAME set")
+_x21 = "chunkvec914x" + ".".join(str(i) for i in range(21))
+compare("chunkvec914s21 == chunkvec914x0...20", run_steps("chunkvec914s21"),
+        run_steps(_x21), tol=0.0)
+compare("chunkvec777x<empty> == chunkvec777s0", run_steps("chunkvec777x"),
+        run_steps("chunkvec777s0"), tol=0.0)
+compare("chunkvec2325r41 == chunkvec2325s41", run_steps("chunkvec2325r41"),
+        run_steps("chunkvec2325s41"), tol=0.0)
+compare("chunkvecnr41 == nodewise (reverse-mode k=41 is also everything)",
+        run_steps("chunkvecnr41"), run_steps("nodewise"))
+# r<k> must NOT be s<k> for an interior k, or the mode argument is inert.
+compare_w("chunkvec914r21 != chunkvec914s21 (the mode really selects)",
+          run_steps("chunkvec914r21"), run_steps("chunkvec914s21"), want_equal=False)
+
+# ---- V6: the registered ladder table, from the ALLOCATED beta --------------
+print("\nV6  **THE REGISTERED LADDER TABLE**, m MEASURED from the ALLOCATED beta")
+print("    arm  granularity                     m      registered   dm vs 14,420")
+ms_seen = []
+for arm, gran, m_reg, s_reg in LADDER:
+    m = m_alloc(gran)
+    ms_seen.append(m)
+    check(f"{arm}: m({gran}) == {m_reg}", m == m_reg,
+          f"allocated {m}, registered {m_reg}, dm {m - M_TARGET:+d}")
+check("every rung is within the registered +-%d of m=14,420" % M_TOL,
+      all(abs(m - M_TARGET) <= M_TOL for m in ms_seen),
+      f"worst |dm| = {max(abs(m - M_TARGET) for m in ms_seen)}")
+check("the ladder's m SPREAD is under 0.15% of m",
+      (max(ms_seen) - min(ms_seen)) / float(M_TARGET) < 0.0015,
+      f"spread {max(ms_seen) - min(ms_seen)} groups = "
+      f"{100.0 * (max(ms_seen) - min(ms_seen)) / M_TARGET:.3f}%")
+check("L3 and C3 sit at the SAME singleton count and (near) the same m",
+      True, "L3 m=%d, C3 m=%d, both S=2,176" % (ms_seen[3], ms_seen[7]))
+
+# ---- V7: the singleton census, in BOTH directions --------------------------
+print("\nV7  **THE SINGLETON CENSUS**: injected singletons present, and NO accidental ones")
+for arm, gran, m_reg, s_reg in LADDER:
+    opt = make_opt(fresh_net(), gran)
+    sizes = group_sizes(opt)
+    n1 = sum(1 for s in sizes if s == 1)
+    check(f"{arm}: {gran} has EXACTLY {s_reg} size-1 groups", n1 == s_reg,
+          f"counted {n1}, registered {s_reg}, f = S/m = {n1 / float(len(sizes)):.5f}")
+    check(f"{arm}: total groups == allocated beta", len(sizes) == m_reg,
+          f"{len(sizes)} == {m_reg}")
+# The two-sided statement: a size-1 group can ONLY come from a selected one-D tensor,
+# never from a ragged chunk tail on the ndim>=2 side.
+print("    minimum ragged tail on the ndim>=2 side, per registered K2:")
+ND = [i for i in range(NL) if len(SHAPES[i]) >= 2]
+for K2 in (777, 802, 844, 914, 915, 1070, 1417, 2325):
+    tails = [(NUMELS[i] % K2) or K2 for i in ND]
+    check(f"K2={K2}: no ndim>=2 tensor produces a size-1 chunk", min(tails) > 1,
+          f"minimum ragged tail {min(tails)} weights")
+
+# ---- V8: the alpha map, over every weight ----------------------------------
+print("\nV8  THE ALPHA MAP: alpha at flat position j == exp(beta[j // K_i]), all weights")
+for gran in ("chunkvec914s21", "chunkvec2325s41"):
+    net = fresh_net()
+    opt = make_opt(net, gran)
+    torch.manual_seed(7)
+    beta = [torch.randn_like(b) * 0.3 - 6.9 for b in opt.beta]
+    alphas = opt.beta_to_alpha(beta)
+    worst = 0.0
+    for i, (a, b, K, ne, sh) in enumerate(
+            zip(alphas, beta, opt.cvec_K, opt.cvec_numel, opt.cvec_shape)):
+        idx = torch.arange(ne) // K
+        want = torch.exp(b)[idx].view(sh)
+        worst = max(worst, (a - want).abs().max().item())
+    check(f"{gran}: alpha map exact over all {NW} weights", worst == 0.0,
+          f"max |alpha - exp(beta[j//K])| = {worst:.3e}")
+
+# ---- V9: block_product, explicitly, with RAGGED tails ----------------------
+print("\nV9  block_product: per-chunk sums over REAL members, with RAGGED final chunks")
+
+
+def mixed_net(seed=0):
+    torch.manual_seed(seed)
+    return MixedRagged().to(DEV)
+
+
+# w1 numel 70, w2 numel 15, b1 numel 6, b2 numel 4.  ND spec K2=4 -> counts 18 and 4,
+# both ragged.  One-D ranks are [0]=b1, [1]=b2; select rank 0 only -> b1 gets 6 size-1
+# groups and b2 gets 1 group of 4.
+GR = "chunkvec4x0"
+net = mixed_net()
+opt = make_opt(net, GR)
+u = [torch.arange(p.numel(), dtype=torch.float32, device=DEV).view_as(p) + 1.0
+     for p in net.parameters()]
+v = [torch.ones_like(p) * 2.0 for p in net.parameters()]
+got = opt.block_product(u, v)
+check("chunk vector is per-tensor", list(opt.cvec_K) == [4, 4, 1, 4],
+      f"got {list(opt.cvec_K)}, expected [4, 4, 1, 4] (w1,w2 at K2=4; b1 singletons; b2 one group)")
+check("chunk counts", [int(t.numel()) for t in got] == [18, 4, 6, 1],
+      f"got {[int(t.numel()) for t in got]}, expected [18, 4, 6, 1]")
+ok_all = True
+for li, (ui, vi) in enumerate(zip(u, v)):
+    flat = (ui * vi).reshape(-1)
+    n = flat.numel()
+    K = opt.cvec_K[li]
+    for ci in range(got[li].numel()):
+        lo, hi = ci * K, min((ci + 1) * K, n)          # REAL members only
+        want = float(flat[lo:hi].sum())
+        have = float(got[li][ci])
+        if abs(want - have) > 1e-5:
+            ok_all = False
+            print(f"      tensor {li} chunk {ci}: got {have}, explicit sum {want}")
+check("every chunk == explicit sum over its REAL members", ok_all,
+      "(a zero-pad must contribute 0, never rescale a ragged chunk)")
+
+# ---- V9b: THE SAME EXPLICIT CHECK, ON THE REAL ResNet18, ON AN INTERIOR RUNG ----
+# Added at cycle-84 review.  V1/V2/V4 use the SYMBOLIC ND specs 'n'/'w', and V3 is at
+# k=0 (an already-existing arm), so before this block the combination an interior rung
+# actually executes -- a NUMERIC K2, WITH injected one-D singletons, WITH ragged tails
+# on the ndim>=2 side -- had no explicit block_product check on the real network at all.
+# It was covered only by m-counting, the size census, the alpha map and divergence.
+# A beta_to_alpha / block_product MISMATCH would be a SILENT SCIENTIFIC CORRUPTION, not
+# a crash: beta index i would scale one set of weights while being driven by the
+# gradient product of a different set.  So both directions are now checked against each
+# other on the real net, not merely against the same cvec_K list.
+print("\nV9b block_product on the REAL ResNet18 at an interior rung (chunkvec914s21)")
+_net = fresh_net()
+_opt = make_opt(_net, "chunkvec914s21")
+_names = [n for n, _ in _net.named_parameters()]
+_ps = [p for _, p in _net.named_parameters()]
+_u = [torch.arange(p.numel(), dtype=torch.float32, device=DEV).view_as(p) * 1e-4 + 1.0
+      for p in _ps]
+_v = [torch.ones_like(p) * 0.5 for p in _ps]
+_got = _opt.block_product(_u, _v)
+# The hard cases, chosen deliberately: the smallest conv (ragged at K2=914), the
+# largest conv (many whole chunks), a SELECTED one-D tensor (K = 1), and an UNSELECTED
+# one-D tensor (K = numel, i.e. exactly one group).
+_sel = {}
+for i, (nm, p) in enumerate(zip(_names, _ps)):
+    if nm == "conv1.weight":                       _sel["smallest conv (ragged)"] = i
+    if p.numel() == max(x.numel() for x in _ps):   _sel["largest conv"] = i
+for i, nm in enumerate(_names):
+    if _ps[i].dim() == 1 and int(_opt.cvec_K[i]) == 1 and "SELECTED one-D (K=1)" not in _sel:
+        _sel["SELECTED one-D (K=1)"] = i
+    if _ps[i].dim() == 1 and int(_opt.cvec_K[i]) == _ps[i].numel() \
+            and "UNSELECTED one-D (K=numel)" not in _sel:
+        _sel["UNSELECTED one-D (K=numel)"] = i
+check("all four hard cases exist on this rung", len(_sel) == 4,
+      f"found {sorted(_sel)}")
+_bad = []
+for label, i in sorted(_sel.items()):
+    flat = (_u[i] * _v[i]).reshape(-1)
+    n = flat.numel()
+    K = int(_opt.cvec_K[i])
+    exp_chunks = (n + K - 1) // K
+    if int(_got[i].numel()) != exp_chunks:
+        _bad.append(f"{label}: {int(_got[i].numel())} chunks, expected {exp_chunks}")
+        continue
+    for ci in range(exp_chunks):
+        lo, hi = ci * K, min((ci + 1) * K, n)      # REAL members only
+        want = float(flat[lo:hi].sum())
+        have = float(_got[i][ci])
+        if abs(want - have) > max(1e-4, 1e-6 * abs(want)):
+            _bad.append(f"{label} chunk {ci}: got {have}, explicit sum {want}")
+            break
+    check(f"{label}: {_names[i]} numel {n} K {K} -> {exp_chunks} chunks, each == its "
+          f"explicit member sum", not any(label in b for b in _bad))
+# The two directions must agree WITH EACH OTHER, not merely with cvec_K: the alpha map
+# expands beta by repeat_interleave, so the number of groups it consumes per tensor
+# must equal the number of chunks block_product produces per tensor.
+_alpha_groups = [int((p.numel() + int(k) - 1) // int(k))
+                 for p, k in zip(_ps, _opt.cvec_K)]
+check("beta_to_alpha's group count == block_product's chunk count, PER TENSOR",
+      _alpha_groups == [int(t.numel()) for t in _got],
+      "a mismatch here would silently drive beta i from the wrong gradients")
+check("no explicit-sum discrepancy anywhere on the interior rung", not _bad,
+      "; ".join(_bad[:3]))
+
+# ---- V10: meta_stepsize = 0 -> chunkvec == scalar ---------------------------
+print("\nV10 meta_stepsize=0  =>  chunkvec must train identically to scalar (alpha frozen)")
+ref0 = run_steps("scalar", meta_stepsize=0.0)
+for gran in ("chunkvec777s0", "chunkvec914s21", "chunkvec2325s41"):
+    compare_w(f"{gran} == scalar @ meta_stepsize=0", ref0,
+              run_steps(gran, meta_stepsize=0.0))
+
+# ---- V11: THE ANTI-VACUITY GUARD -------------------------------------------
+print("\nV11 **ANTI-VACUITY**: distinct rungs must NOT agree on a real net")
+compare_w("L0 != L6", run_steps("chunkvec777s0"), run_steps("chunkvec2325s41"),
+          want_equal=False)
+compare_w("L3 != L0", run_steps("chunkvec914s21"), run_steps("chunkvec777s0"),
+          want_equal=False)
+compare_w("L3 != C3 (same S, same m, different placement)", run_steps("chunkvec914s21"),
+          run_steps("chunkvec915x36.37.38.39.8.9"), want_equal=False)
+compare_w("L6 != nodewise (same m, DIFFERENT size distribution on the ND side)",
+          run_steps("chunkvec2325s41"), run_steps("nodewise"), want_equal=False)
+
+# ---- V12: nothing regressed -------------------------------------------------
+print("\nV12 NOTHING REGRESSED: the three suites this patch sits beside still hold")
+compare("chunk1 == weightwise (PATCH_CHUNKWISE)", run_steps("chunk1"),
+        run_steps("weightwise"))
+# K >= the largest tensor gives ONE group per tensor, i.e. layerwise.  test_chunkwise
+# uses 1<<24; 1<<22 = 4,194,304 is used here because it is still comfortably above
+# ResNet18's largest tensor (512x512x3x3 = 2,359,296) -- asserted below rather than
+# assumed -- while keeping block_product's transient zero-pad an order of magnitude
+# smaller.  The assertion is identical; only the memory churn changes.
+HUGE = 1 << 22
+check("chunk<huge> would give one group per tensor", m_of_chunk(HUGE) == NL,
+      f"m({HUGE}) = {m_of_chunk(HUGE)}, tensors = {NL}, largest tensor = {max(NUMELS)}")
+compare(f"chunk{HUGE} == layerwise (PATCH_CHUNKWISE)", run_steps(f"chunk{HUGE}"),
+        run_steps("layerwise"))
+compare("nodewise1d == nodewise on a net with NO 1-D tensors (PATCH_NODEBN)",
+        run_steps("nodewise1d", net_factory=fresh_nobias),
+        run_steps("nodewise", net_factory=fresh_nobias))
+
+# ---- summary ---------------------------------------------------------------
+print("\n" + "=" * 72)
+if FAILS:
+    print(f"FAILED {len(FAILS)}: " + ", ".join(FAILS))
+    sys.exit(1)
+print("ALL CHUNKVEC TESTS PASS")
+print("\nthe registered fixed-m ladder, m read from the ALLOCATED beta:")
+for arm, gran, m_reg, s_reg in LADDER:
+    m = m_alloc(gran)
+    print(f"   {arm:3s} {gran:28s} m = {m:>6,}  ({m - M_TARGET:+3d})  "
+          f"singletons = {s_reg:>5,}  f = {s_reg / float(m):.5f}")
+sys.exit(0)

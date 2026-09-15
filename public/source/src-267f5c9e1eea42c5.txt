@@ -1,0 +1,347 @@
+#!/bin/bash
+# =============================================================================
+# c97_sm4_secondmoment.sh -- `sm4`, THE SECOND-MOMENT CORNER, DONE PROPERLY.
+# sm4 IS THE sm3-REDUX BATCH.  AdamW base x RMSProp meta: the one cell in the
+# design where BOTH the base and the meta carry a second-moment normaliser.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS EXISTS: sm3 IS VOID AS DESIGNED, AND THE CORNER IS UNTESTED
+# -----------------------------------------------------------------------------
+# bin/c96_secondmoment.sh composed BFLAGS with the RMSProp meta flags inside it
+# and then APPENDED a second set of meta flags after "$BFLAGS" on the sbatch
+# line.  argparse keeps the LAST occurrence, so all 12 sm3 runs ran a Lion meta.
+# Their own ARGS line, verbatim from the cluster, carries the alg-meta flag
+# TWICE (RMSProp, then Lion) and weight-decay-meta twice.  The second-moment
+# corner is therefore UNTESTED, NOT REFUTED -- and re-derived from
+# results/all_runs.csv at write time, the corpus contains ZERO rows at
+# meta=RMSProp (Lion 1676, Adam 198, '?' 161 baseline, fixed 78).  Every
+# "RMSProp meta" number ever quoted in this project came from a batch that ran
+# Lion.
+#
+# THE FIX, AND IT IS THE WHOLE POINT OF THIS SCRIPT: the payload is composed
+# ONCE, in a single bash array, with nothing appended after it.  There is no
+# BFLAGS-then-append shape anywhere below, the array is passed to sbatch without
+# eval, and guard_presubmit reads the exact string that is about to be launched.
+#
+# -----------------------------------------------------------------------------
+# WHAT SM4 RUNS.  ONE flag changes against `aw1` and `sm3`: the meta-optimiser.
+# -----------------------------------------------------------------------------
+#   base   AdamW    normalizer 0.999, momentum 0.9, weight decay 0.1
+#   meta   RMSProp  normalizer 0.999, weight decay 0, meta-stepsize 1e-4
+#   ResNet18 / CIFAR10 / 100 epochs / batch 100 / alpha0 1e-3 / gamma 1
+#   AUGMENT=1, BETA_CLIP=-15:-2.3026 (aw1's own box, colon separator)
+#   4 arms x 3 seeds = 12 jobs
+#
+# HF.py, read on the LIVE tree rather than assumed:
+#   args_meta['alg']=='RMSProp' -> required ['meta_stepsize','normalizer_param',
+#                                            'weight_decay']
+#   args_meta['alg']=='Lion'    -> required ['meta_stepsize','momentum_param',
+#                                            'Lion_beta2','weight_decay']
+# Optimizers/build_optimizer.py builds args_meta from the flags whose value is
+# not None, and train.py maps the sentinel -1 to None.  The defaults for
+# momentum-param-meta (0.99) and Lion-beta2-meta (0.9) are NOT sentinels, so
+# leaving them alone would push two Lion-only attributes into args_meta under an
+# RMSProp meta.  They are therefore passed as -1 EXPLICITLY.  That is what makes
+# args_meta reach HF as exactly {alg, meta_stepsize, normalizer_param,
+# weight_decay} with no Lion attribute leaking in, and guard 3 asserts it by
+# instantiating HF on the live tree and failing on any "missing"/"unnecessary
+# attributes" line.
+#
+# -----------------------------------------------------------------------------
+# THE CONTRASTS, both WITHIN this batch
+# -----------------------------------------------------------------------------
+#   D = chunk777  - nodewise     count-matched, m=14421 vs m=14420  (+1 group)
+#   G = chunk2325 - nodewise1d   count-matched EXACTLY, m=4851
+#   D - G is the mechanism contrast and carries no cross-batch floor.
+#
+# -----------------------------------------------------------------------------
+# PRE-REGISTERED, BEFORE ANY RUN EXISTS.  Frozen in analysis/c97_sm4_score.py.
+# -----------------------------------------------------------------------------
+# Mechanism candidate 8 says D shrinks wherever a second-moment normaliser sits.
+# Re-derived from the runs' own series at write time, D under an AdamW base with
+# a Lion meta is aw1 +0.279 +- 0.087 and sm3 +0.141 +- 0.064, against SGD +1.035
+# and SGDm +0.727.  This corner carries a second moment on BOTH sides, so the
+# pattern predicts the SMALLEST D in the corpus.
+#
+#   REFUTED if D >= +0.55.
+#
+# CONSISTENT if D <= +0.279 (aw1's own D) with a 95% interval below the bar.
+# UNDECIDED otherwise -- report the interval, add no seeds to this batch, and
+# re-register a fresh replicate instead.  All three outcomes are publishable and
+# the scorer prints the one that fires; nothing here is chosen after the fact.
+#
+# POWER, stated in advance (`python3 analysis/c97_sm4_score.py --power`):
+# within-arm sd 0.1040 (aw1+sm3, 16 df) or 0.2105 (campaign R18 cell, 18 df).
+# At n=3, se(D) is 0.085 / 0.172 and the |t|>=2 bar is 0.170 / 0.344.  THIS
+# BATCH IS POWERED TO REFUTE, not guaranteed to resolve D>0 under the
+# conservative sd.  That is disclosed, not discovered later.
+#
+# MAY NOT CLAIM: any pooling with aw1 or sm3 (different meta-optimiser); RULE 11
+# (no meta-stepsize ladder exists under an RMSProp meta -- this is at aw1's own
+# ms); anything about ResNet34, ResNet50 or CIFAR-100; anything about alignment.
+#
+# REGISTERED SCORER (STANDING RULE 21, checked below before anything is queued):
+#   analysis/c97_sm4_score.py     --selftest / --power / --runs <dir>
+#
+# USAGE   bash bin/c97_sm4_secondmoment.sh            # dry run, prints every line
+#         bash bin/c97_sm4_secondmoment.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/sm4
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+# ---- venv preamble, ONCE, at the top.  Guards that import torch fail without
+# ---- it; five consecutive submission aborts were caused by omitting this.
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# ---- STANDING RULES 20 and 21 live here ------------------------------------
+# shellcheck disable=SC1091
+if [ -f "$(dirname "$0")/_lib_guards.sh" ]; then
+  . "$(dirname "$0")/_lib_guards.sh"
+else
+  guard_fail "bin/_lib_guards.sh is missing -- STANDING RULES 20/21 cannot be enforced"
+fi
+
+TAG=sm4
+CLIP="-15:-2.3026"; MST=1e-4; ALPHA0=1e-3; EPOCHS=100; BATCH=100
+NET=ResNet18; DSET=CIFAR10; GAMMA=1; AUG=1
+SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=03:50:00
+SCORER="$REPO/analysis/c97_sm4_score.py"
+
+# The declared design, in the form guard_presubmit / guard_postlaunch consume.
+# EVERY flag that defines the science is listed, including the two sentinels.
+DESIGN=(alg-base=AdamW normalizer-param-base=0.999 momentum-param-base=0.9 \
+        weight-decay-base=0.1 alg-meta=RMSProp normalizer-param-meta=0.999 \
+        weight-decay-meta=0 momentum-param-meta=-1 Lion-beta2-meta=-1 \
+        meta-stepsize=$MST alpha0=$ALPHA0 num-epochs=$EPOCHS \
+        batch-size=$BATCH dataset=$DSET NN-name=$NET gamma=$GAMMA optimizer=HF)
+
+echo "=============================================================="
+echo " $TAG -- THE SECOND-MOMENT CORNER (sm3-redux).  AdamW base x RMSProp meta:"
+echo " the ONE cell where the base AND the meta both carry a second moment."
+echo " D is smallest wherever one sits (AdamW base +0.279/+0.141 against SGD"
+echo " +1.035, SGDm +0.727).  PREDICTED: the smallest D in the corpus."
+echo " REFUTED if D >= +0.55."
+echo " sm3 tried this and ran Lion instead -- its own ARGS line carries the"
+echo " alg-meta flag twice.  This script composes the payload ONCE, in one"
+echo " array, and guard_presubmit reads the exact string it is about to launch."
+echo " box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  4 arms x 3 seeds = 12 jobs"
+echo "=============================================================="
+
+# ---- guard 21 -- THE SCORER EXISTS FIRST -----------------------------------
+if command -v guard_scorer_registered >/dev/null 2>&1; then
+  guard_scorer_registered "$SCORER" || guard_fail "guard 21: no registered scorer"
+else
+  [ -f "$SCORER" ] || guard_fail "guard 21: no registered scorer at $SCORER"
+fi
+if [ -f "$SCORER" ]; then
+  python3 "$SCORER" --selftest >/tmp/${TAG}_selftest.$$ 2>&1 \
+    && echo "guard 21b: scorer selftest PASSES ($(grep -c PASS /tmp/${TAG}_selftest.$$) checks)" \
+    || { echo "--- scorer selftest output ---"; cat /tmp/${TAG}_selftest.$$; \
+         guard_fail "guard 21b: the registered scorer's own selftest FAILS"; }
+  rm -f /tmp/${TAG}_selftest.$$
+fi
+
+# ---- guard 0 -- the corpus is where we think it is --------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1 -- the partition patches are on THIS tree ----------------------
+grep -q PATCH_CHUNKWISE "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && grep -q PATCH_NODEBN "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && echo "guard 1: PATCH_CHUNKWISE and PATCH_NODEBN present" \
+  || guard_fail "guard 1: chunk/nodebn patches missing -- this batch cannot run here"
+
+# ---- guard 2 -- THE PREMISE.  The corner really is empty. -------------------
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2: premise"
+import csv, sys, collections
+rows = list(csv.DictReader(open(sys.argv[1])))
+metas = collections.Counter(r["meta"] for r in rows)
+print("guard 2: meta column over %d corpus rows: %s" % (len(rows), dict(metas)))
+n = metas.get("RMSProp", 0)
+assert n == 0, ("the corner is no longer empty -- %d RMSProp-meta rows already "
+                "exist; re-check whether sm4 is still needed" % n)
+cm = [r for r in rows if r["granularity"].startswith("chunk")
+      or r["granularity"] == "nodewise1d"]
+print("guard 2: %d count-matched partition rows, by (base, meta): %s"
+      % (len(cm), dict(collections.Counter((r["base"], r["meta"]) for r in cm))))
+print("guard 2: the RMSProp-meta corner is REAL and EMPTY -- 0 rows anywhere")
+PYEOF
+
+# ---- guard 3 -- beta allocation AND the meta attribute set, MEASURED on the
+# ---- LIVE tree with sm4's OWN args_meta.  This is the guard sm3 never had.
+python3 - "$CIF" "$NET" "$ALPHA0" "$MST" <<'PYEOF' || guard_fail "guard 3: allocation/attrs"
+import sys, os, io, contextlib
+cif, net, a0, mst = sys.argv[1:5]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s) -- run on the cluster "
+             "inside the venv." % ex)
+
+class NW:
+    def add_scalar(self, *a, **k): pass
+
+# EXACTLY what Optimizers/build_optimizer.py will build from sm4's flags:
+# every *_meta flag whose value is not None, plus meta_stepsize.  The two
+# Lion-only attributes are passed as -1 on the command line, train.py maps
+# -1 -> None, and build_optimizer drops them -- so they are ABSENT here.
+B = {"alg": "AdamW", "normalizer_param": 0.999, "momentum_param": 0.9,
+     "weight_decay": 0.1}
+M = {"alg": "RMSProp", "normalizer_param": 0.999, "weight_decay": 0,
+     "meta_stepsize": float(mst)}
+assert "momentum_param" not in M and "Lion_beta2" not in M, \
+    "a Lion-only attribute leaked into args_meta"
+
+want = {"nodewise": 14420, "chunk777": 14421, "nodewise1d": 4851,
+        "chunk2325": 4851}
+for g, w in sorted(want.items()):
+    torch.manual_seed(0)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        opt = HF(build_network(net, "cpu"), stepsize_groups=g, alpha0=float(a0),
+                 args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+    noise = buf.getvalue()
+    for bad in ("are missing from args_base", "are missing from args_meta",
+                "args_base includes unnecessary attributes",
+                "args_meta includes unnecessary attributes"):
+        assert bad not in noise, ("HF complained: %r\n%s" % (bad, noise.strip()))
+    m = sum(int(b.numel()) for b in opt.beta)
+    assert m == w, "m(%s) is %d, expected %d" % (g, m, w)
+    assert opt.meta_update.__name__ == "RMSProp_meta_update", \
+        "meta_update bound to %s, not RMSProp_meta_update" % opt.meta_update.__name__
+    print("guard 3: %-12s ALLOCATED beta m=%-6d (registered %d), meta_update=%s"
+          % (g, m, w, opt.meta_update.__name__))
+print("guard 3: args_meta = %s -- RMSProp's required set EXACTLY, no Lion attr"
+      % sorted(M))
+print("guard 3: D pair is 1 group apart (14421 vs 14420); G pair is EXACT (4851)")
+PYEOF
+
+# ---- guard 4 -- no name collision ------------------------------------------
+grep -q "^$TAG-" "$CSVP" && guard_fail "guard 4: $TAG-* already in the CSV" \
+  || echo "guard 4: no $TAG-* name collision in the CSV"
+ls "$WS"/runs/$TAG-*.out >/dev/null 2>&1 \
+  && guard_fail "guard 4b: $TAG-*.out already on disk in $WS/runs" \
+  || echo "guard 4b: no $TAG-*.out on disk"
+
+# ---- guard 5 -- the comparators this batch will be read against exist -------
+NAW=$(grep -c '^aw1-' "$CSVP" 2>/dev/null)
+echo "guard 5: $NAW aw1 rows on disk as the AdamW+Lion comparator (sm3's 12 .out"
+echo "         are a second comparator and are not yet in the CSV)"
+[ "${NAW:-0}" -ge 9 ] || guard_fail "guard 5: aw1 comparator missing"
+
+# ---- guard 6 -- room and queue ----------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: ${FREE:-?} GB free; pending=$PEND, adding 12"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 6: $PEND pending, over cap"
+
+# =============================================================================
+# COMPOSITION.  ONE array.  NOTHING IS APPENDED AFTER IT.
+# =============================================================================
+# The payload below is the complete set of train.py flags.  It is built once,
+# per job, and handed to sbatch as "${JOB[@]}" -- there is no eval, no BFLAGS
+# variable, and no second meta block anywhere in this file.
+# =============================================================================
+mkdir -p "$SAVE"; N=0; REJ=0; FIRSTCMD=""
+
+for S in $SEEDS; do
+  for G in nodewise chunk777 nodewise1d chunk2325; do
+    case $G in
+      nodewise)   SH=node ;;
+      chunk777)   SH=ch   ;;
+      nodewise1d) SH=n1d  ;;
+      chunk2325)  SH=c23  ;;
+    esac
+    RUN=$TAG-awrms-$SH-s$S
+    PDIR=$SAVE/probe_awrms_${SH}_${TAG}_s${S}
+
+    JOB=(sbatch
+      --job-name="$RUN"
+      --partition="$PARTS"
+      --gres=gpu:1
+      --cpus-per-task=6
+      --mem=14G
+      --time="$WALL"
+      --export="ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PDIR"
+      "$RUNNER"
+      --optimizer HF
+      --alg-base AdamW
+      --normalizer-param-base 0.999
+      --momentum-param-base 0.9
+      --weight-decay-base 0.1
+      --alg-meta RMSProp
+      --normalizer-param-meta 0.999
+      --weight-decay-meta 0
+      --momentum-param-meta -1
+      --Lion-beta2-meta -1
+      --dataset "$DSET"
+      --NN-name "$NET"
+      --batch-size "$BATCH"
+      --max-time 999:00:00
+      --gamma "$GAMMA"
+      --meta-stepsize "$MST"
+      --alpha0 "$ALPHA0"
+      --num-epochs "$EPOCHS"
+      --stepsize-groups "$G"
+      --seed "$S"
+      --save-directory "$SAVE"
+      --run-name "$RUN")
+
+    CMD="${JOB[*]}"
+    [ -z "$FIRSTCMD" ] && FIRSTCMD="$CMD"
+
+    # STANDING RULE 20, PER JOB, BEFORE sbatch sees it.
+    if command -v guard_presubmit >/dev/null 2>&1; then
+      guard_presubmit "$CMD" "${DESIGN[@]}" >/tmp/${TAG}_pre.$$ 2>&1 \
+        || { echo "--- guard_presubmit output for $RUN ---"; cat /tmp/${TAG}_pre.$$; \
+             guard_fail "guard 20: $RUN does not match the declared design"; }
+      rm -f /tmp/${TAG}_pre.$$
+    fi
+
+    if [ "$SUBMIT" = 1 ]; then
+      [ "$FAIL" = 1 ] && break 2
+      "${JOB[@]}" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"
+      N=$((N+1))
+    fi
+  done
+done
+
+if [ "$FAIL" = 1 ]; then
+  echo "!!! SUBMIT ABORTED -- nothing submitted (or the loop stopped early)."
+  exit 2
+fi
+echo "guard 20: all $N composed command lines PASS -- no repeated flag, design matched"
+
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+echo "---- ONE variable changes vs aw1/sm3: the meta-optimiser.  D and G are both WITHIN this batch. ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  echo "---- the first composed command line, verbatim ----"
+  echo "$FIRSTCMD"
+  if command -v guard_postlaunch >/dev/null 2>&1; then
+    echo "---- guard_postlaunch: reading the FIRST launched job's OWN ARGS line ----"
+    guard_postlaunch "$WS/runs" "$TAG-" "${DESIGN[@]}" \
+      || { echo "!!! THE LAUNCHED BATCH IS VOID AS DESIGNED -- cancel it now:"; \
+           echo "!!!   scancel --name=\$(squeue -h -u \$USER -o %j | grep '^$TAG-' | tr '\\n' ',' | sed 's/,\$//')"; \
+           exit 3; }
+  fi
+  echo "---- score with:  python3 analysis/c97_sm4_score.py --runs $WS/runs --probes $SAVE"
+fi

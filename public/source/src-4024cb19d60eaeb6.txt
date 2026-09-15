@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cUC1_smoke_gen.py -- SYNTHETIC run directory for the `cuc1` SCORING-PATH SMOKE
+# TEST.  NOT A SCORER.  EVERY NUMBER IT WRITES IS INVENTED and is never
+# evidence of anything about the real batch.
+#
+# Purpose: prove that the REGISTERED, UNEDITED scorer
+#     python3 analysis/cUC1_unaug_c100_score.py <runsdir>
+# reaches a FINAL: line on files in the EXACT format the harness writes, found
+# by its documented one-argument invocation (the cdn1 failure mode, 171), and
+# prints FINAL: INCOMPLETE when a run is dropped.
+#
+# Shares NO code with the scorer (imports nothing from the repo).  The file
+# structure is copied from real .out files on cluster_b: jobs/run_cifar.sh lines
+# 18-24 (NODE / ARGS / ENV echo, nvidia-smi line, train.py, RUN_DONE),
+# runs/cdn1-m-s0-4920426.out (an SGDm+Lion chunk771 PROBE=5 CIFAR-100 run: the
+# args_base line, the two torchvision lines, the CuDNN warning, `52  minutes`)
+# and runs/cdn1-lr01-s0-4920417.out (an SGD+cosine CIFAR-100 run).  The ARGS
+# and exported ENV are TRANSCRIBED from bin/cUC1_unaug_c100_denominator.sh
+# (compose_sgd / compose_meta), not from the scorer's expected_*().
+#
+# USAGE   python3 analysis/cUC1_smoke_gen.py <outdir> [--drop ARM-sSEED] [--no-shadow]
+# Writes <outdir>/cuc1-<arm>-s<seed>-<jobid>.out for all 30 (arm, seed), a
+# truncated higher-jobid resubmit shadowing cuc1-lr02-s66 (149.2), a non-cuc1
+# distractor, and <outdir>/cuc1/probe_<run>/probe.jsonl for the 15 meta runs.
+# =============================================================================
+import argparse
+import json
+import os
+import random
+
+WS_RUNS = "/cluster/account_b/metaopt/runs"          # the real layout, as a string only
+SAVE = WS_RUNS + "/cuc1"
+SEEDS = (66, 67, 68)
+LRS = [("0.05", "005"), ("0.1", "01"), ("0.2", "02"), ("0.4", "04"), ("0.8", "08")]
+GRID = [("m1e4a1e3", "1e-4", "1e-3"), ("m3e4a1e3", "3e-4", "1e-3"), ("m1e3a1e3", "1e-3", "1e-3"),
+        ("m3e4a1e4", "3e-4", "1e-4"), ("m3e4a1e2", "3e-4", "1e-2")]
+CLIP = "-15:-2.3026"
+
+# invented plateau levels (pp) -- NOT predictions, NOT evidence
+LVL_SGD = {"005": 55.0, "01": 58.0, "02": 60.0, "04": 59.0, "08": 56.0}
+LVL_META = {"m1e4a1e3": 50.0, "m3e4a1e3": 52.0, "m1e3a1e3": 51.0, "m3e4a1e4": 49.0, "m3e4a1e2": 51.5}
+
+
+def env_line(exported):
+    """the runner's echo, line 20 of jobs/run_cifar.sh, with its own defaults"""
+    g = lambda k, d: exported.get(k, d)
+    return ("ENV: AUGMENT=%s BETA_CLIP=%s HIER=%s LAM=%s ETA_RATIO=%s COS_TOTAL=%s "
+            "COS_WARMUP=%s SCHED=%s SCHED_TOTAL=%s SCHED_WARMUP=%s SCHED_MIN=%s PROBE=%s "
+            "PROBE_DIR=%s EB_RHO=%s EB_LOG=%s"
+            % (g("AUGMENT", "0"), g("BETA_CLIP", "none"), g("HIER", "none"), g("LAM", "na"),
+               g("ETA_RATIO", "na"), g("COS_TOTAL", "default"), g("COS_WARMUP", "default"),
+               g("SCHED", "none"), g("SCHED_TOTAL", "none"), g("SCHED_WARMUP", "none"),
+               g("SCHED_MIN", "none"), g("PROBE", "0"), g("PROBE_DIR", "none"),
+               g("EB_RHO", "na"), g("EB_LOG", "0")))
+
+
+def sgd_job(lr, tag, seed):
+    rn = "cuc1-lr%s-s%d" % (tag, seed)
+    args = ("--optimizer SGD --dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100 "
+            "--max-time 999:00:00 --num-epochs 100 --alpha0 %s --seed %d "
+            "--save-directory %s --run-name %s" % (lr, seed, SAVE, rn))
+    exp = {"AUGMENT": "0", "COS_TOTAL": "50000", "COS_WARMUP": "1000", "HIER": "none",
+           "SCHED": "none", "PROBE": "0"}
+    return rn, args, exp, False
+
+
+def meta_job(tag, ms, a0, seed):
+    rn = "cuc1-%s-s%d" % (tag, seed)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 "
+            "--dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100 --max-time 999:00:00 "
+            "--gamma 1 --meta-stepsize %s --alpha0 %s --num-epochs 100 --stepsize-groups chunk771 "
+            "--seed %d --save-directory %s --run-name %s" % (ms, a0, seed, SAVE, rn))
+    exp = {"AUGMENT": "0", "BETA_CLIP": CLIP, "HIER": "none", "SCHED": "none",
+           "PROBE": "5", "PROBE_DIR": SAVE + "/probe_" + rn}
+    return rn, args, exp, True
+
+
+def curve(level, meta, rng, n_ep=100):
+    te, tr = [], []
+    for e in range(n_ep):
+        if meta:
+            t = min(level, 3.0 + 5.0 * e) + rng.uniform(-0.3, 0.3)
+            r = min(100.0, 5.0 + 9.0 * e)
+        else:
+            t = level - 12.0 + 12.0 * max(0.0, (e - 70) / 29.0) ** 1.5 + rng.uniform(-0.3, 0.3)
+            r = min(100.0, 10.0 + 1.5 * e + 40.0 * max(0.0, (e - 60) / 39.0))
+        te.append(max(1.0, min(99.0, t)))
+        tr.append(max(1.0, min(100.0, r)))
+    return te, tr
+
+
+def write_out(outdir, rn, jid, args, exp, meta, te, tr, run_done=True, node="[HOST_e8d809bd94]"):
+    L = ["NODE=%s | JOB=%s %d | AUGMENT=%s" % (node, rn, jid, exp.get("AUGMENT", "0")),
+         "ARGS: " + args, env_line(exp), "NVIDIA L4, 23034 MiB"]
+    if meta:
+        L += ["", "args_base includes unnecessary attributes {'normalizer_param'} ", ""]
+    L += ["Files already downloaded and verified", "Files already downloaded and verified",
+          "/cluster/user/metaopt/envs/mo/lib/python3.10/site-packages/torch/nn/"
+          "modules/conv.py:459: UserWarning: Applied workaround for CuDNN issue, install "
+          "nvrtc.so (Triggered internally at ../aten/src/ATen/native/cudnn/Conv_v8.cpp:80.)",
+          "  return F.conv2d(input, weight, bias, self.stride,"]
+    for e in range(len(te)):
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, tr[e], te[e]))
+    if run_done:
+        L += ["52  minutes", "RUN_DONE"]
+    with open(os.path.join(outdir, "%s-%d.out" % (rn, jid)), "w") as f:
+        f.write("\n".join(L) + "\n")
+
+
+def write_probe(outdir, rn, a0, rng, n=40):
+    import math
+    d = os.path.join(outdir, "cuc1", "probe_" + rn)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "probe.jsonl"), "w") as f:
+        for i in range(n):
+            b0 = math.log(float(a0))
+            beta = [b0 + rng.uniform(-0.5, 0.5) * i / n for _ in range(8)]
+            f.write(json.dumps({"step": 1250 * i, "beta": beta, "beta_true_min": min(beta),
+                                "beta_true_max": max(beta), "n_beta": 14595,
+                                "n_at_lo": 0, "n_at_hi": 0}) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("outdir")
+    ap.add_argument("--drop", default=None, help="e.g. m3e4a1e2-s67")
+    ap.add_argument("--no-shadow", action="store_true")
+    a = ap.parse_args()
+    os.makedirs(a.outdir, exist_ok=True)
+    rng = random.Random(20260915)
+    jid, n = 8000001, 0
+    for s in SEEDS:
+        jobs = [sgd_job(lr, t, s) for lr, t in LRS] + [meta_job(t, ms, a0, s) for t, ms, a0 in GRID]
+        for rn, args, exp, meta in jobs:
+            key = rn[len("cuc1-"):]
+            arm = key.rsplit("-s", 1)[0]
+            if a.drop and key == a.drop:
+                jid += 1
+                continue
+            lvl = LVL_META[arm] if meta else LVL_SGD[arm[2:]]
+            te, tr = curve(lvl, meta, rng)
+            write_out(a.outdir, rn, jid, args, exp, meta, te, tr)
+            if meta:
+                write_probe(a.outdir, rn, dict((t, a0) for t, _, a0 in GRID)[arm], rng)
+            jid += 1
+            n += 1
+    if not a.no_shadow:
+        rn, args, exp, meta = sgd_job("0.2", "02", 66)
+        te, tr = curve(20.0, False, rng, n_ep=30)
+        write_out(a.outdir, rn, 8999999, args, exp, meta, te, tr, run_done=False)
+    write_out(a.outdir, "cgn1-x-s60", 8888888, "--optimizer HF", {"AUGMENT": "1"}, True,
+              *curve(60.0, True, rng))
+    print("wrote %d cuc1 runs (+%s shadow, +1 distractor) to %s"
+          % (n, "0" if a.no_shadow else "1", a.outdir))
+
+
+if __name__ == "__main__":
+    main()

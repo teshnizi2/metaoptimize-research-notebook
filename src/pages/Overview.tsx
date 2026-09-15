@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
-import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
+import { compactDate, correctedCount, methodCheckCount, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
 import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
 import { ArtifactDates, SnapshotDate } from '../components/ArtifactDates';
 import { SectionTitle } from '../components/common';
@@ -9,6 +9,9 @@ import { SectionTitle } from '../components/common';
 export function Overview() {
   const data = useResearch();
   const counts = outcomeCounts(data.experiments);
+  const researchTotal = outcomeOrder.reduce((sum, outcome) => sum + counts[outcome], 0);
+  const methodChecks = methodCheckCount(data.experiments);
+  const corrected = correctedCount(data.experiments);
   const areas = areaOutcomeCounts(data.experiments, data.areas);
   const updates = recentNotebookUpdates(data.activity, 2);
 
@@ -33,7 +36,7 @@ export function Overview() {
 
     <div className="snapshot-stats" aria-label="Snapshot contents">
       {[
-        {value: data.meta.stats.experiments, label: 'questions & audits', icon: FlaskConical, to: '/experiments'},
+        {value: data.meta.stats.experiments, label: 'questions & checks', icon: FlaskConical, to: '/experiments'},
         {value: data.meta.stats.runs.toLocaleString(), label: 'run logs', icon: Terminal, to: '/runs'},
         {value: data.meta.stats.figures, label: 'report pages', icon: Images, to: '/figures'},
         {value: data.sources.length, label: 'source files', icon: Braces, to: '/code'},
@@ -45,9 +48,9 @@ export function Overview() {
     <section className="home-outcomes" aria-labelledby="home-outcomes-title">
       <div className="section-title">
         <h2 id="home-outcomes-title">Research outcomes</h2>
-        <Link className="text-link" to="/experiments">All {data.experiments.length} questions & audits<ArrowUpRight size={16}/></Link>
+        <Link className="text-link" to="/experiments?kind=research">All {researchTotal} research questions<ArrowUpRight size={16}/></Link>
       </div>
-      <p className="home-section-note">Outcomes reflect each stated research goal or audit.</p>
+      <p className="home-section-note">Each research question has one of four outcomes for its stated goal. Method checks are counted separately.</p>
       <div className="home-outcome-bar" role="img" aria-label={outcomeOrder.map(outcome => `${outcomeLabels[outcome]}: ${counts[outcome]}`).join(', ')}>
         {outcomeOrder.map(outcome => <span key={outcome} className={`segment ${outcome}`} style={{flexGrow: counts[outcome]}} hidden={counts[outcome] === 0} aria-hidden="true"/>)}
       </div>
@@ -57,19 +60,30 @@ export function Overview() {
           <strong>{counts[outcome]}</strong>
         </Link>)}
       </nav>
+      <div className="home-outcome-extras">
+        <Link className="home-method-checks" to="/experiments?kind=method-check">
+          <span><i className="outcome-dot method-check" aria-hidden="true"/>Method checks</span><strong>{methodChecks}</strong>
+          <small>Errors caught in the campaign’s own methods. Not research outcomes.</small>
+        </Link>
+        <Link className="home-corrected" to="/experiments?corrected=1">
+          <span className="badge-corrected"><span className="status-dot" aria-hidden="true"/>Corrected</span><strong>{corrected}</strong>
+          <small>Records with a corrected earlier claim. The badge sits beside the outcome.</small>
+        </Link>
+      </div>
     </section>
 
     <section className="home-area-review">
       <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
-      <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all five outcomes.</p>
+      <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all four outcomes and method checks.</p>
       <div className="home-area-table-wrap" tabIndex={0} role="region" aria-label="Research area outcome counts" aria-describedby="home-area-scroll-hint">
         <table className="home-area-table">
-          <caption className="sr-only">Questions and audits by research area and outcome</caption>
-          <thead><tr><th scope="col">Research area</th><th scope="col">Total</th>{outcomeOrder.map(outcome => <th scope="col" key={outcome}><span><i className={`outcome-dot ${outcome}`} aria-hidden="true"/>{outcomeLabels[outcome]}</span></th>)}</tr></thead>
+          <caption className="sr-only">Research questions by area and outcome, with method checks listed separately</caption>
+          <thead><tr><th scope="col">Research area</th><th scope="col">Questions</th>{outcomeOrder.map(outcome => <th scope="col" key={outcome}><span><i className={`outcome-dot ${outcome}`} aria-hidden="true"/>{outcomeLabels[outcome]}</span></th>)}<th scope="col"><span><i className="outcome-dot method-check" aria-hidden="true"/>Method checks</span></th></tr></thead>
           <tbody>{areas.map(area => <tr key={area.label}>
             <th scope="row"><Link to={`/experiments?area=${encodeURIComponent(area.label)}`}>{area.label || 'Area not recorded'}</Link></th>
-            <td><Link className="home-area-total" to={`/experiments?area=${encodeURIComponent(area.label)}`} aria-label={`${area.label}: all ${area.total} questions and audits`}>{area.total}</Link></td>
+            <td><Link className="home-area-total" to={`/experiments?area=${encodeURIComponent(area.label)}&kind=research`} aria-label={`${area.label}: all ${area.total} research questions`}>{area.total}</Link></td>
             {outcomeOrder.map(outcome => <td key={outcome}><Link className={`home-area-count ${area.counts[outcome] ? `status-${outcome}` : 'is-zero'}`} to={`/experiments?area=${encodeURIComponent(area.label)}&outcome=${outcome}`} aria-label={`${area.label}: ${area.counts[outcome]} ${outcomeLabels[outcome]}`}>{area.counts[outcome]}</Link></td>)}
+            <td><Link className={`home-area-count ${area.methodChecks ? 'status-method-check' : 'is-zero'}`} to={`/experiments?area=${encodeURIComponent(area.label)}&kind=method-check`} aria-label={`${area.label}: ${area.methodChecks} method checks`}>{area.methodChecks}</Link></td>
           </tr>)}</tbody>
         </table>
       </div>

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -12,8 +13,13 @@ from pathlib import Path
 
 
 PORTAL = Path(__file__).resolve().parents[1]
-WORKSPACE = PORTAL.parents[1]
+# A verified campaign workspace and research repository are read only. Both can be
+# supplied explicitly when the portal is checked out somewhere else.
+WORKSPACE = Path(os.environ.get("NOTEBOOK_WORKSPACE", PORTAL.parents[1]))
+REPO = Path(os.environ.get("NOTEBOOK_RESEARCH_REPO", "/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize"))
+DATA_AUDIT = Path(os.environ.get("NOTEBOOK_DATA_AUDIT", WORKSPACE / "work/portal_data_audit.json"))
 PUBLIC = PORTAL / "public"
+PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -52,14 +58,19 @@ class ResearchExportTests(unittest.TestCase):
         spec.loader.exec_module(module)
         return module
 
+    def model(self):
+        self.exporter()  # puts scripts/ on sys.path
+        import register_model
+        return register_model
+
     def test_complete_register_and_area_counts(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual(len(data["experiments"]), 111)
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original})
-        self.assertEqual(len(data["areas"]), 9)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 111)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 111, "runs": 2863, "figures": 54, "areas": 9})
+        self.assertEqual(len(data["experiments"]), 148)
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS))
+        self.assertEqual(len(data["areas"]), 10)
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 148)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 148, "researchQuestions": 130, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10})
 
     def test_run_inventory_keeps_all_jobs_with_unique_identifiers(self):
         runs = self.runs()
@@ -84,7 +95,7 @@ class ResearchExportTests(unittest.TestCase):
         evidence = exporter.read_evidence(WORKSPACE)
         archived = exporter.archive_log_index(evidence)
         latest = {str(run["job_id"]): run for run in evidence["cvk2_evidence"]["runs"]}
-        audit = json.loads((WORKSPACE / "work/portal_data_audit.json").read_text())
+        audit = json.loads(DATA_AUDIT.read_text())
         receipts = {row["job_id"]: row for row in audit["raw_log_receipts"]}
         self.assertEqual(set(receipts), {run["jobId"] for run in runs})
         measurement_rows = 0
@@ -279,6 +290,70 @@ class ResearchExportTests(unittest.TestCase):
             self.assertTrue(experiment["eventIds"], experiment["id"])
             if experiment["id"] in expected:
                 self.assertIn(event["id"], experiment["eventIds"])
+
+    # ---- Four-outcome model and the count-matched partition audit ----
+    def test_approved_correction_split_is_explicit_and_complete(self):
+        model = self.model()
+        original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
+        self.assertEqual({r["id"] for r in original if r["outcome"] == "correction"}, set(model.CORRECTION_REMAP))
+        kinds = [kind for kind, _, _ in model.CORRECTION_REMAP.values()]
+        self.assertEqual((kinds.count("research"), kinds.count("method-check")), (8, 15))
+        self.assertTrue(all(reason.strip() for _, _, reason in model.CORRECTION_REMAP.values()))
+        published = {e["id"]: e for e in self.research()["experiments"]}
+        for eid, (kind, outcome, reason) in model.CORRECTION_REMAP.items():
+            row = published[eid]
+            self.assertEqual((row["kind"], row["outcome"], row["corrected"]), (kind, outcome, True), eid)
+            self.assertEqual(row["correction"]["note"], reason, eid)
+            self.assertEqual(row["correction"]["previousOutcome"], "correction", eid)
+        with self.assertRaisesRegex(ValueError, "no approved mapping"):
+            model.remap_base_row({"id": "MT999", "outcome": "correction"})
+
+    def test_published_outcome_model_has_four_outcomes_and_a_badge(self):
+        data = self.research()
+        self.assertEqual(list(data["meta"]["outcomeModel"]["outcomes"].values()), ["Goal met", "Goal missed", "Mixed", "Open"])
+        for e in data["experiments"]:
+            self.assertNotEqual(e["outcome"], "correction", e["id"])
+            if e["kind"] == "method-check":
+                self.assertIsNone(e["outcome"], e["id"])
+            else:
+                self.assertIn(e["outcome"], {"success", "fail", "mixed", "unresolved"}, e["id"])
+            self.assertEqual(e["corrected"], bool(e["correction"]), e["id"])
+        warnings = {w["id"]: w for w in data["warnings"]}
+        self.assertEqual(warnings["warning-MT014-verdict"]["severity"], "limitation")
+        self.assertEqual(warnings["warning-MT014-correction"]["severity"], "correction")
+        self.assertEqual(warnings["warning-MT113-verdict"]["severity"], "correction")
+        self.assertNotIn("warning-MT113-correction", warnings, "a method check's verdict warning is its correction record")
+
+    def test_partition_audit_rows_come_from_the_pinned_master_table(self):
+        model = self.model()
+        lines = model.master_table_at_commit(REPO)
+        rows = model.partition_rows(lines)
+        self.assertEqual([r["id"] for r in rows], PARTITION_IDS)
+        self.assertTrue(all(r["section"] == "10" and r["area"] == "Count-matched partition audit" for r in rows))
+        outcomes = [r["outcome"] or r["kind"] for r in rows]
+        self.assertEqual({o: outcomes.count(o) for o in set(outcomes)}, {"success": 12, "fail": 5, "mixed": 4, "unresolved": 13, "method-check": 3})
+        headline = rows[0]
+        self.assertEqual(headline["outcome"], "success")
+        self.assertIn("20 of 20 cells", headline["result"])
+        self.assertIn("+0.5556 ± 0.0448", headline["result"])
+        with self.assertRaisesRegex(ValueError, "heading moved"):
+            model.partition_rows(["", *lines])
+        with self.assertRaisesRegex(ValueError, "pinned section-10 bytes"):
+            model.master_table_at_commit(REPO, "627d69ffd624d768178719b4c5b52b0e3b0e9ed5")
+
+    def test_partition_audit_links_runs_phase_and_figure(self):
+        data, runs = self.research(), self.runs()
+        by_id = {e["id"]: e for e in data["experiments"]}
+        phase = next(e for e in data["activity"] if e["id"] == "phase-03")
+        self.assertIn("Partition tests", phase["title"])
+        self.assertEqual(set(phase["experimentIds"]), {"MT098", *PARTITION_IDS})
+        page8 = next(f for f in data["figures"] if f["id"] == "page-8")
+        self.assertTrue(set(PARTITION_IDS) <= set(page8["experimentIds"]))
+        expected_runs = {"MT176": 9, "MT178": 15, "MT181": 6, "MT186": 12, "MT190": 36, "MT211": 4, "MT175": 0, "MT192": 0}
+        for eid, count in expected_runs.items():
+            self.assertEqual(len(by_id[eid]["runIds"]), count, eid)
+        baseline = {r["id"]: r for r in runs}
+        self.assertTrue(all(r["batch"] == baseline[r["id"]]["batch"] for r in runs))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,395 @@
+#!/bin/bash
+# =============================================================================
+# cGN1_gn_gap.sh -- `cgn1`: IS THE SCALAR->LAYERWISE GAP A BATCHNORM PHENOMENON?
+#   ONE SUBMISSION, 6 JOBS (2 arms x 3 seeds), 100 EPOCHS, SEEDS {60,61,62},
+#   ResNet18_gn_c100 / CIFAR-100, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#   CORRECTIONS 212.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here
+# touches the other account; every guard and scancel line is filtered on the
+# `cgn1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cGN1_gn_gap_score.py, committed BEFORE this batch
+# is submitted (RULE 21).  Every bar is a frozen literal (O2); --selftest drives
+# the REAL score() on synthetic runs and proves the FINAL line invariant under
+# invented corpus rows at this batch's cells.
+#     DOCUMENTED INVOCATION:  python3 analysis/cGN1_gn_gap_score.py <runsdir>
+#
+# THE NETWORK RUNS FROM AN ISOLATED HARNESS TREE, NOT THE LIVE ONE.
+#   $WS/harness_cgn1/cifar10  -- built and verified by bin/cGN1_stage_harness.sh:
+#   every harness .py byte-identical to the live tree except build_network.py,
+#   which is the pinned pre-patch file + ONE region (patches/patch_resnet_gn_c100.py);
+#   data/ is a symlink to the live data.  The jobs run $WS/jobs/run_cifar_cgn1.sh,
+#   which differs from jobs/run_cifar.sh in EXACTLY its `cd` line.  WHY: with the
+#   region in the LIVE build_network.py, tests/test_vggbn2.py V0f FAILS (measured,
+#   CORRECTIONS 212) and that suite gates every registered VGG launcher.
+#
+# THE ARMS.  Two, deliberately: the gap's EXISTENCE on a net with no batch
+# statistics.  PROBE_TENSOR=1 rides along so the scalar arm's records can later
+# NOMINATE GroupNorm carriers without extra GPU (the ctd1->ciso1, cvg1->cvi1
+# pattern).
+#   k01  scalar      m = 1   the in-batch floor anchor
+#   kL   layerwise   m = 62  the in-batch ceiling anchor
+#
+# COST.  ResNet18_c100 at 100 epochs with PROBE_TENSOR=1: median 43-44 min
+# (cdep1 / ctd1 / ciso1), max 94.  gn1 measured GroupNorm at the same wallclock
+# as BatchNorm on ResNet18 (median 49 vs 48.5 min).  6 jobs ~= 4.5 GPU-h
+# expected; bounded by WALL x 6 = 18 GPU-h.
+#
+# RULE 20.  Every value is ONE shell token of [A-Za-z0-9_.,:/-].  BETA_CLIP and
+# PROBE ride the runner's ENV line; PROBE_TENSOR rides the patch's own line.
+#
+# PARTITIONS: composed by bin/_lib_guards.sh's slurm_parts_for_wall (178) and
+# re-checked by guard_parts_for_wall.
+#
+# USAGE   bash bin/cGN1_gn_gap.sh               # dry run: every guard, every
+#         bash bin/cGN1_gn_gap.sh --dry-run     #   composed line printed; submits nothing
+#         bash bin/cGN1_gn_gap.sh --submit      # the ONLY submitting form
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HARN=$WS/harness_cgn1/cifar10
+RUNNER=$WS/jobs/run_cifar_cgn1.sh
+SAVE=$WS/runs/cgn1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_gn_c100
+REFNET=ResNet18_c100
+SEEDS="60 61 62"
+MST=1e-3
+A0=1e-6
+NTENS=62
+TOTPAR=11220132
+G_K01='scalar'
+G_KL='layerwise'
+ARMS="k01 kL"
+WALL=03:00:00
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cGN1_gn_gap_score.py"
+PATCHF="$REPO/patches/patch_resnet_gn_c100.py"
+TESTF="$REPO/tests/test_resnet_gn_c100.py"
+STAGEF="$REPO/bin/cGN1_stage_harness.sh"
+SELF="$REPO/bin/cGN1_gn_gap.sh"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+TESTV2="$REPO/tests/test_vggbn2.py"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo " cgn1 -- is the scalar->layerwise gap a BatchNorm phenomenon?"
+echo " $DSET / $NET (GroupNorm(32,C) for every BatchNorm2d(C))"
+echo " AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C"
+echo " ms=$MST alpha0=$A0  horizon $EPOCHS epochs; seeds $SEEDS"
+echo "   k01  $G_K01      (m=1)      kL  $G_KL  (m=$NTENS)"
+echo " 2 arms x 3 seeds = 6 jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN   runner $RUNNER"
+echo " partitions $PARTS   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cGN1_gn_gap_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP" | cut -c1-12)...)" \
+               || guard_fail "guard 0: no CSV at $CSVP"
+
+# ---- guard 1a: EVERY file this launcher needs --------------------------------
+for f in "$SC" "$PATCHF" "$TESTF" "$STAGEF" "$SELF" "$LIBF" "$AGF" "$TESTV2" "$CSVP"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  ${f#$REPO/}" \
+              || guard_fail "guard 1a: missing $f"
+done
+
+# ---- guard 1b: committed (RULE 21) --------------------------------------------
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cGN1_gn_gap_score.py bin/cGN1_gn_gap.sh \
+      bin/cGN1_stage_harness.sh patches/patch_resnet_gn_c100.py tests/test_resnet_gn_c100.py \
+      bin/_lib_guards.sh analysis/argsline_guard.py tests/test_vggbn2.py 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer, launcher, stage script, patch and tests are COMMITTED (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires them committed BEFORE any run exists: $DIRTY"
+  DEL=$(git -C "$REPO" diff HEAD --numstat -- analysis/ 2>/dev/null | awk '$2+0>0{print}')
+  [ -z "$DEL" ] && echo "guard 1b2: no uncommitted deletions under analysis/ (RULE 16)" \
+               || guard_fail "guard 1b2: analysis/ has uncommitted deletions: $DEL"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 is verified on the committing"
+  echo "          host (commit time vs the earliest sacct Submit); the sha256 prefixes in guard 1a"
+  echo "          must equal the committed blobs'."
+fi
+
+# ---- guard 1c: the scorer selftest ----------------------------------------------
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >/tmp/cgn1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' /tmp/cgn1_selftest.$$) PASS, $(grep -c '^  FAIL' /tmp/cgn1_selftest.$$) FAIL)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION' /tmp/cgn1_selftest.$$ | head -20; }
+grep -q '^E. THE REAL score() ON SYNTHETIC RUNS' /tmp/cgn1_selftest.$$ \
+  && echo "guard 1c2: the synthetic-run section ran (REAL score(), O2 invariance, dropped run -> INCOMPLETE)" \
+  || guard_fail "guard 1c2: the synthetic-run section did not run"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+# ---- guard 2: RULE 21 premise -- nothing of this batch exists yet --------------
+grep -q '^cgn1-' "$CSVP" && guard_fail "guard 2: cgn1-* already in the CSV" \
+                         || echo "guard 2: no cgn1-* row in the corpus"
+grep -q ",$NET," "$CSVP" && guard_fail "guard 2a: $NET already appears in the CSV" \
+                         || echo "guard 2a: $NET appears NOWHERE in the corpus"
+python3 - "$CSVP" "$SEEDS" <<'PYEOF' || guard_fail "guard 2c: a registered seed is already used"
+import csv, sys
+seeds = set(sys.argv[2].split())
+hit = [r["run"] for r in csv.DictReader(open(sys.argv[1])) if r.get("seed") in seeds]
+print("guard 2c: rows carrying seed %s: %d" % ("/".join(sorted(seeds)), len(hit)))
+raise SystemExit(1 if hit else 0)
+PYEOF
+NOUT=$(ls "$WS/runs"/cgn1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cgn1-*.out on disk" || guard_fail "guard 2b: $NOUT cgn1-*.out already exist"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cgn1-')
+  if [ "${NS:-0}" = 0 ]; then echo "guard 2d: sacct all-time: 0 cgn1-* jobs"
+  elif [ "$SUBMIT" = 1 ]; then guard_fail "guard 2d: sacct shows $NS cgn1-* jobs already"
+  else echo "guard 2d: NOTE sacct shows $NS cgn1-* jobs"; fi
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cgn1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2e: 0 cgn1-* in squeue" || guard_fail "guard 2e: $NQ cgn1-* already queued"
+fi
+
+# ---- guard 3/4a: the isolated tree is staged, consistent, and sees CIFAR-100 ----
+bash "$STAGEF" >/tmp/cgn1_stage.$$ 2>&1 \
+  && { echo "guard 4a: bin/cGN1_stage_harness.sh VERIFIES the cgn1 tree:"; sed 's/^/          /' /tmp/cgn1_stage.$$ | grep -E 'V-|VERIFIED'; } \
+  || { guard_fail "guard 4a: the cgn1 tree is NOT consistent -- run bash bin/cGN1_stage_harness.sh --stage (operator step)"; tail -20 /tmp/cgn1_stage.$$; }
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" \
+  || guard_fail "guard 3: CIFAR-100 not visible at $HARN/data/cifar-100-python"
+
+# ---- guard 4c: the patch suite on the cgn1 tree; 4c2: the VGG suite on the LIVE tree
+if python3 "$TESTF" --pre "$HARN/build_network.py.pre_gn_c100" --post "$HARN/build_network.py" \
+     --hf "$HARN/Optimizers/HF.py" --csv "$CSVP" >/tmp/cgn1_gntest.$$ 2>&1; then
+  echo "guard 4c: tests/test_resnet_gn_c100.py PASSES on the cgn1 tree ($(grep -c '^  PASS' /tmp/cgn1_gntest.$$) PASS)"
+  grep -E '^  PASS R0f|^  PASS R0h|^  PASS R2e|^  PASS R2f|^  PASS R2g|^  PASS R2k' /tmp/cgn1_gntest.$$ | sed 's/^/          /'
+else
+  guard_fail "guard 4c: tests/test_resnet_gn_c100.py FAILED on the cgn1 tree"; grep '^  FAIL' /tmp/cgn1_gntest.$$ | head -20
+fi
+# 4c2 is a NOTE, not a guard: cgn1 never touches the live tree (the stage script's
+# V-b4 is the binding check), and another track's live patch -- e.g. cpl1's, once
+# PlainNet rows are ingested -- could fail test_vggbn2 V1 for a reason that is not
+# cgn1's.  cgn1's launch must not be blocked by that; it is reported here instead.
+if [ -f "$LIVE/build_network.py.pre_vggbn" ]; then
+  python3 "$TESTV2" --pre "$LIVE/build_network.py.pre_vggbn" --post "$LIVE/build_network.py" \
+      --hf "$LIVE/Optimizers/HF.py" --csv "$CSVP" >/tmp/cgn1_vgg2.$$ 2>&1 \
+    && echo "guard 4c2: NOTE tests/test_vggbn2.py passes on the LIVE tree ($(grep -c '^  PASS' /tmp/cgn1_vgg2.$$) PASS) -- cgn1's isolation leaves it green" \
+    || { echo "guard 4c2: NOTE tests/test_vggbn2.py FAILS on the LIVE tree -- NOT caused by cgn1 (V-b4 above); report it:"; grep '^  FAIL' /tmp/cgn1_vgg2.$$ | head | sed 's/^/          /'; }
+else
+  echo "guard 4c2: NOTE no $LIVE/build_network.py.pre_vggbn -- VGG suite not run"
+fi
+
+# ---- guard 4c': the literals here, in the scorer, and in the stage script agree
+python3 - "$SC" "$STAGEF" "$G_K01" "$G_KL" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" <<'PYEOF' \
+  || guard_fail "guard 4c': launcher / scorer / stage-script literals disagree"
+import sys, re, ast
+sc, st = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+bad = 0
+spec = ast.literal_eval(re.search(r"^SPEC = (\{.*?^\})", sc, re.S | re.M).group(1))
+for k, v in (("k01", sys.argv[3]), ("kL", sys.argv[4])):
+    if spec.get(k) != v:
+        print("!!! guard 4c': %s launcher=%r scorer=%r" % (k, v, spec.get(k))); bad += 1
+for name, val in (("NET", sys.argv[5]), ("NTENS", sys.argv[6]), ("TOTPAR", sys.argv[7])):
+    got = re.search(r"^%s = (.+)$" % name, sc, re.M).group(1).strip().strip('"')
+    if got != val:
+        print("!!! guard 4c': %s launcher=%r scorer=%r" % (name, val, got)); bad += 1
+seeds = ast.literal_eval(re.search(r"^SEEDS = (.+)$", sc, re.M).group(1))
+if tuple(int(x) for x in sys.argv[8].split()) != tuple(seeds):
+    print("!!! guard 4c': SEEDS launcher=%r scorer=%r" % (sys.argv[8], seeds)); bad += 1
+for name in ("PRE_SHA", "POST_SHA"):
+    a = re.search(r'^%s = "([0-9a-f]{64})"' % name, sc, re.M).group(1)
+    b = re.search(r"^%s=([0-9a-f]{64})$" % name, st, re.M).group(1)
+    if a != b:
+        print("!!! guard 4c': %s scorer=%s stage=%s" % (name, a[:12], b[:12])); bad += 1
+if bad:
+    raise SystemExit(1)
+print("guard 4c': SPEC, NET, NTENS, TOTPAR, SEEDS, PRE_SHA, POST_SHA identical in launcher / scorer / stage script")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, built from the cgn1 tree -----------------
+mkdir -p "$SAVE"
+MTMP=/tmp/cgn1_manifest.$$
+python3 - "$HARN" "$MTMP" "$NTENS" "$TOTPAR" "$CLIP_C" "$EPOCHS" "$BATCH" "$NET" "$REFNET" \
+         "$G_K01" "$G_KL" "$SC" <<'PYEOF' || guard_fail "guard 4: live partition / structure check FAILED"
+import sys, os, importlib.util
+harn, out, ntens, totpar = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+clip_c, epochs, bsz, net_name, ref_name = sys.argv[5], int(sys.argv[6]), int(sys.argv[7]), sys.argv[8], sys.argv[9]
+specs = {"k01": sys.argv[10], "kL": sys.argv[11]}
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu"); ref = build_network(ref_name, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+T, tot = len(nps), sum(numel); bad = 0
+print("guard 4: live %s from the cgn1 tree -- %d tensors, %d parameters" % (net_name, T, tot))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar)); raise SystemExit(1)
+if [(n, tuple(s)) for n, s in nps] != [(n, tuple(p.shape)) for n, p in ref.named_parameters()]:
+    print("!!! guard 4: (name, shape) list differs from %s's" % ref_name); bad += 1
+else:
+    print("guard 4: (name, shape) list ELEMENTWISE EQUAL to %s's (same partition object)" % ref_name)
+ngn = sum(isinstance(m, nn.GroupNorm) for m in net.modules()); nbn = sum(isinstance(m, nn.BatchNorm2d) for m in net.modules())
+print("guard 4: normalisers GroupNorm %d  BatchNorm2d %d" % (ngn, nbn))
+if (ngn, nbn) != (20, 0): bad += 1
+mod3 = [i for i in range(1, 61) if (i % 3 == 1) != (own[names[i-1]] == "Conv2d")
+        or (i % 3 != 1 and own[names[i-1]] != "GroupNorm")]
+print("guard 4: class == index mod 3 at 1..60 with every scale/shift owned by GroupNorm: %s"
+      % ("YES" if not mod3 else "NO %s" % mod3[:6]))
+if mod3: bad += 1
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "NORM GroupNorm %d BatchNorm2d %d" % (ngn, nbn),
+         "GN_GROUPS %s" % ",".join(sorted({str(m.num_groups) for m in net.modules() if isinstance(m, nn.GroupNorm)})),
+         "CLIP_C %s" % clip_c, "EPOCHS %d" % epochs, "META_STEPS %d" % (epochs * (50000 // bsz))]
+print("guard 4: THE FULL MANIFEST ON THE LIVE MODEL (1-based):")
+for i in range(T):
+    print("         %3d  %-28s %9d  %s" % (i + 1, names[i], numel[i], own[names[i]]))
+    lines.append("TENSOR %d %s %d %s" % (i + 1, names[i], numel[i], own[names[i]]))
+w512 = [(i + 1, names[i]) for i in range(T) if numel[i] == 512 and names[i].endswith(".weight") and len(nps[i][1]) == 1]
+print("guard 4: 512-wide 1-D *.weight (GN scales): %s" % w512)
+lines.append("W512 %s" % ",".join("%d:%s" % x for x in w512))
+for arm in ("k01", "kL"):
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    HF.init_meta(o, specs[arm], nps, 1e-6)
+    shp = [tuple(b.shape) for b in o.beta]
+    want = ("scalar", [()]) if arm == "k01" else ("layerwise", [(T,)])
+    ok = (o.stepsize_type, shp) == want and not getattr(o, "_rednorm", False)
+    print("guard 4: %-4s %-10s init_meta: type=%s beta shapes=%s len_beta_list=%d" % (arm, specs[arm], o.stepsize_type, shp, o.len_beta_list))
+    if not ok: bad += 1
+    lines.append("ARMSPEC %s SPEC %s TYPE %s M %d" % (arm, specs[arm], o.stepsize_type, 1 if arm == "k01" else T))
+txt = "\n".join(lines) + "\n"
+spec = importlib.util.spec_from_file_location("cgn1sc", sys.argv[12]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+if txt != m.synthetic_manifest_text():
+    print("!!! guard 4d: the live manifest differs from the scorer's synthetic_manifest_text()"); bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+if bad: raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cgn1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-12)...) at"
+    echo "          $MANIFEST"; echo "          $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+
+# ---- guard 4g: provenance (the real file ONLY on --submit) ----------------------
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "HARNESS_DIR $HARN"
+  echo "BUILD_NETWORK_SHA256 $(sha "$HARN/build_network.py")"
+  echo "BUILD_NETWORK_PRE_GN_C100_SHA256 $(sha "$HARN/build_network.py.pre_gn_c100")"
+  echo "LIVE_BUILD_NETWORK_SHA256 $(sha "$LIVE/build_network.py")"
+  echo "HF_SHA256 $(sha "$HARN/Optimizers/HF.py")"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cgn1/STAGE-MANIFEST.txt")"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "PROBE $PROBE PROBE_TENSOR $PT"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cgn1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions ----------------------------------
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 6"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  echo "guard 5b: $P timelimit $(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)   running $(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')   pending $(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')"
+done
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest -----------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cgn1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then (only with --submit) submit ----
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH \
+        gamma=$GAMMA dataset=$DSET NN-name=$NET weight-decay-meta=0 \
+        meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in k01) G=$G_K01 ;; kL) G=$G_KL ;; esac
+    RN="cgn1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = 6 ] || { echo "!!! composed $N lines, the design says 6"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cgn1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cgn1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cgn1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cgn1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cgn1 job started inside the window.  Re-check with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name cgn1- --batch-consistency --vary stepsize-groups --vary seed --vary run-name" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cgn1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "ENV AUDIT:"
+  echo "    grep -h '^ENV:' $WS/runs/cgn1-*.out | sed 's/ PROBE_DIR=[^ ]*//' | sort | uniq -c   # ONE line, x6"
+  echo "    grep -h '^PROBE_TENSOR:' $WS/runs/cgn1-*.out | sed 's/ dir=.*//' | sort | uniq -c   # scalar x3, layerwise x3, tensors=62"
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 6/6 RUN_DONE):"
+  echo "    python3 $REPO/analysis/cGN1_gn_gap_score.py $WS/runs"
+fi

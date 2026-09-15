@@ -1,0 +1,306 @@
+#!/bin/bash
+# =============================================================================
+# c97_basemod_replicate.sh -- `bm2`, THE BASE-MODERATOR REPLICATION.
+#
+# WHY.  The cycle-98 review's blocking item #2: the paper's NEW headline is that
+# the BASE OPTIMISER accounts for ~75% of the total heterogeneity (between-base
+# Q 32.1 on 3 df of a total Q 43.01 on 11 df).  Two of that moderator's four
+# levels rest on a SINGLE SUBMISSION.  `nl1` (bin/c92_norm_ladder.sh) is ONE
+# sbatch loop that produced BOTH the SGD rungs and the RMSProp rungs; `sm3`
+# replicated AdamW for free by accident; the GroupNorm cell is VOID at its own
+# registered scorer.  The project's own METHODS result -- BATCH is a large random
+# effect, F(62,85)=5.47, p 6.9e-13, while SEED is null, F 1.21, p 0.213 -- is
+# exactly why a one-submission moderator level is not yet a moderator level.
+#
+# THIS BATCH.  ONE submission, FOUR arms, THREE FRESH seeds, 12 jobs, ~10.5 GPU-h
+# (nl1's jobs ran 51-53 min each):
+#     sgd-node  SGD      nodewise  m=14,420  |  sgd-ch  SGD      chunk777 m=14,421
+#     rms-node  RMSProp  nodewise  m=14,420  |  rms-ch  RMSProp  chunk777 m=14,421
+# Every other axis is `nl1`'s cell, taken from `nl1`'s OWN ARGS LINE on the
+# cluster and never from a script header (STANDING RULE 20).
+#
+# INDEPENDENCE IS BOUGHT TWICE.  (i) a SEPARATE SUBMISSION, so the batch random
+# effect is resampled -- that is the entire point of the batch; (ii) FRESH SEEDS
+# 3,4,5 against nl1's 0,1,2.  `ml2` is the cautionary case: after argparse's
+# last-wins its two halves shared a command line AND their seeds, so two
+# "independent" 3v3 measurements were one measurement rerun.  Guard 5 asserts
+# 3/4/5 are absent at this cell before anything is submitted.
+#
+# THE CONTRASTS, both WITHIN this batch:
+#   D'_SGD = plateau5(chunk777) - plateau5(nodewise) at SGD base,     Welch 3v3
+#   D'_RMS = plateau5(chunk777) - plateau5(nodewise) at RMSProp base, Welch 3v3
+#   dD'    = D'_SGD - D'_RMS, within-batch, so it carries NO batch floor.
+# `nl1` read D_SGD +1.0353+-0.1085 (t 9.54) and D_RMS +0.9733+-0.2515 (t 3.87),
+# re-derived from results/all_runs.csv at write time and asserted by guard 3.
+#
+# THE REGISTERED SCORER IS analysis/c97_bm2_score.py.  It was written, selftested
+# and registered BEFORE this script existed and BEFORE any bm2 run existed
+# anywhere (STANDING RULE 21).  Guard 2 refuses to compose a command line without
+# it.  Run it UNEDITED and quote its verdict (STANDING RULE 16).
+#
+# PRE-REGISTERED BANDS (transcribed in the scorer, asserted by its selftest):
+#   REPLICATES         D' >= DECIDE=0.3 AND t >= 2
+#   FAILS TO REPLICATE D' <= NULL_HALF=0.15 AND se <= SE_MAX=0.15
+#   UNDECIDED          everything else
+#   R1b  |D' - D_nl1| <= OFFSET_BAR=0.5  -> agrees with nl1 within the unmodelled
+#        cross-batch offset (CORRECTIONS 106.3)
+#   R3   |dD'| <= DD_BAND=0.4 -> SGD and RMSProp agree WITHIN RESOLUTION (not an
+#        equivalence claim: the band is 1.46 planning se wide)
+#
+# POWER, REGISTERED BEFORE THE DATA.  SIGMA=0.2372 is the pooled within-arm sd of
+# plateau5 over nl1's four node/ch arms (8 df).  SE_D=0.1937 = SIGMA*sqrt(2/3);
+# SE_DD=0.2739.  Against nl1's ~1.0 pp that is t~5.3, so the batch is amply
+# powered to CONFIRM.  It is NOT powered to establish a null: SE_MAX=0.15 <
+# SE_D=0.1937, so the powered-null branch is UNREACHABLE on the planning noise
+# and a small D' reads UNDECIDED.  MDE at 80% power = 0.54 pp.  This is written
+# down HERE, before submission, because the review killed a headline for
+# reporting an underpowered null as a refutation.
+#
+# ANCHORS THIS BATCH IS SCORED AGAINST (all re-derived at write time):
+#   D_NL1_SGD=1.0353  SE_NL1_SGD=0.1085 | D_NL1_RMS=0.9733  SE_NL1_RMS=0.2515
+#   POOL=0.555  POOL_SE=0.045   (the 8-cell SGDm+BatchNorm pool, DESCRIPTIVE)
+#
+# MAY NOT CLAIM: any G / degenerate-tail statement (this batch runs NO nodewise1d
+# and NO chunk2325 arm); any pooling of SGD with RMSProp into one number; any
+# amendment of nl1's verdict; anything about AdamW, SGDm, GroupNorm, ResNet34,
+# ResNet50, CIFAR-100, or any budget but 100 epochs.
+#
+# USAGE   bash bin/c97_basemod_replicate.sh            # dry run, composes and
+#                                                      # guards, submits nothing
+#         bash bin/c97_basemod_replicate.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+OUTDIR=$WS/runs                     # run_cifar.sh writes %x-%j.out HERE
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+# ---- venv preamble, ONCE, at the top (house rule; the guards import torch) ----
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# ---- STANDING RULE 20 guard library -----------------------------------------
+LIB="$(dirname "$0")/_lib_guards.sh"
+if [ -f "$LIB" ]; then
+  # shellcheck disable=SC1090
+  . "$LIB"
+else
+  echo "!!! GUARD FAIL: bin/_lib_guards.sh is missing -- STANDING RULE 20 cannot"
+  echo "!!! be enforced mechanically.  NOTHING SUBMITTED."
+  exit 2
+fi
+
+# ---- THE REGISTRATION.  Every constant here is asserted by the scorer's -------
+# ---- selftest against THIS FILE'S OWN TEXT (STANDING RULE 19). ---------------
+TAG=bm2
+CLIP=-15:-2.3026; MST=1e-4; ALPHA0=1e-3; EPOCHS=100; BATCH=100
+NET=ResNet18; DSET=CIFAR10; GAMMA=1; AUG=1
+SEEDS="3 4 5"                       # FRESH: nl1 is 0 1 2
+BASES="SGD RMSProp"
+CHUNK_K=777
+NJOBS=12
+M_NODE=14420; M_CHUNK=14421
+SAVE=$WS/runs/$TAG
+SCORER="$REPO/analysis/c97_bm2_score.py"
+# bands
+NULL_HALF=0.15; DECIDE=0.3; SE_MAX=0.15; DD_BAND=0.4; OFFSET_BAR=0.5
+# planning noise and anchors
+SIGMA=0.2372; SE_D=0.1937; SE_DD=0.2739
+D_NL1_SGD=1.0353; SE_NL1_SGD=0.1085
+D_NL1_RMS=0.9733; SE_NL1_RMS=0.2515
+POOL=0.555; POOL_SE=0.045
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=03:50:00
+
+echo "=============================================================="
+echo " $TAG -- BASE-MODERATOR REPLICATION.  A SECOND INDEPENDENT batch at"
+echo " SGD and at RMSProp.  nodewise vs chunk$CHUNK_K, seeds $SEEDS (nl1 used 0 1 2)."
+echo " box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  4 arms x 3 seeds = $NJOBS jobs"
+echo "=============================================================="
+
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# --- guard 1 -- the partition patches are on the LIVE tree --------------------
+grep -q PATCH_CHUNKWISE "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && grep -q PATCH_NODEBN "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && echo "guard 1: PATCH_CHUNKWISE and PATCH_NODEBN present on the live tree" \
+  || guard_fail "guard 1: chunk/nodebn patches missing -- this batch cannot run here"
+
+# --- guard 2 -- STANDING RULE 21.  THE SCORER EXISTS BEFORE ANY RUN DOES ------
+guard_scorer_registered "$SCORER" || guard_fail "guard 2: no registered scorer"
+"$( command -v python3 || command -v python )" "$SCORER" --selftest \
+  && echo "guard 2: the registered scorer's selftest PASSES against this script" \
+  || guard_fail "guard 2: analysis/c97_bm2_score.py --selftest FAILED"
+
+# --- guard 3 -- THE PREMISE, re-derived from the CSV, never quoted ------------
+python3 - "$CSVP" "$D_NL1_SGD" "$SE_NL1_SGD" "$D_NL1_RMS" "$SE_NL1_RMS" "$SIGMA" \
+  <<'PYEOF' || guard_fail "guard 3: premise / anchor re-derivation"
+import csv, math, statistics as st, sys
+csvp, dsgd, sesgd, drms, serms, sigma = sys.argv[1:7]
+rows = [r for r in csv.DictReader(open(csvp)) if r["run"].startswith("nl1-")]
+def arm(a):
+    return sorted(float(r["plateau5"]) for r in rows if r["run"].startswith("nl1-%s-" % a))
+def welch(A, B):
+    d = st.mean(A) - st.mean(B)
+    se = math.sqrt(st.stdev(A)**2/len(A) + st.stdev(B)**2/len(B))
+    return d, se, d/se
+got = {}
+for base, tag in (("SGD", "sgd"), ("RMSProp", "rms")):
+    A, B = arm(tag + "-ch"), arm(tag + "-node")
+    assert len(A) == 3 and len(B) == 3, "nl1 %s is not 3v3 (%d v %d)" % (base, len(A), len(B))
+    d, se, t = welch(A, B)
+    got[base] = (d, se)
+    print("guard 3: nl1 D_%-8s %+.4f +- %.4f  t %.2f  (3v3, plateau5, WITHIN batch)"
+          % (base, d, se, t))
+for base, wd, wse in (("SGD", float(dsgd), float(sesgd)), ("RMSProp", float(drms), float(serms))):
+    d, se = got[base]
+    assert abs(d - wd) < 5e-4, "D_%s re-derives to %.4f, registered %.4f" % (base, d, wd)
+    assert abs(se - wse) < 5e-4, "se(D_%s) re-derives to %.4f, registered %.4f" % (base, se, wse)
+print("guard 3: both registered anchors re-derive EXACTLY from the CSV")
+# the pooled within-arm sd the power statement is built on
+sds, dof = [], 0
+for a in ("sgd-node", "sgd-ch", "rms-node", "rms-ch"):
+    v = arm(a); sds.append(st.stdev(v)); dof += len(v) - 1
+pooled = math.sqrt(sum((len(arm(a))-1) * s * s for a, s in
+                       zip(("sgd-node","sgd-ch","rms-node","rms-ch"), sds)) / dof)
+assert abs(pooled - float(sigma)) < 5e-4, "SIGMA re-derives to %.4f, registered %s" % (pooled, sigma)
+print("guard 3: SIGMA %.4f re-derives on %d df; planning se(D') %.4f at n=3"
+      % (pooled, dof, pooled * math.sqrt(2/3)))
+# and the hole this batch fills: how many SUBMISSIONS stand behind each base?
+subs = {}
+for r in csv.DictReader(open(csvp)):
+    if r["granularity"] not in ("nodewise", "chunk777"):
+        continue
+    if r["base"] not in ("SGD", "RMSProp") or r["meta"] != "Lion":
+        continue
+    subs.setdefault(r["base"], set()).add(r["run"].split("-")[0])
+for b in ("SGD", "RMSProp"):
+    print("guard 3: base %-8s node/chunk777 rows come from batches: %s"
+          % (b, sorted(subs.get(b, []))))
+    assert subs.get(b) == {"nl1"}, "the hole is already filled for %s (%s)" % (b, subs.get(b))
+print("guard 3: THE HOLE IS REAL -- both levels rest on nl1 ALONE")
+PYEOF
+
+# --- guard 4 -- m MEASURED on the LIVE tree, not asserted from a header -------
+python3 - "$CIF" "$NET" "$ALPHA0" "$MST" "$M_NODE" "$M_CHUNK" "$CHUNK_K" <<'PYEOF' \
+  || guard_fail "guard 4: beta allocation"
+import sys, os
+cif, net, a0, mst, mnode, mchunk, k = sys.argv[1:8]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s) -- run on the cluster "
+             "inside the venv." % ex)
+class NW:
+    def add_scalar(self, *a, **k): pass
+# m does not depend on the base optimiser; SGD has the fewest required attributes.
+B = {"alg": "SGD", "weight_decay": 0.1}
+M = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+     "Lion_beta2": 0.9, "weight_decay": 0}
+want = {"nodewise": int(mnode), "chunk%s" % k: int(mchunk)}
+for g, w in sorted(want.items()):
+    torch.manual_seed(0)
+    opt = HF(build_network(net, "cpu"), stepsize_groups=g, alpha0=float(a0),
+             args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+    m = sum(int(b.numel()) for b in opt.beta)
+    assert m == w, "m(%s) is %d, expected %d" % (g, m, w)
+    print("guard 4: %-12s ALLOCATED beta m=%-6d (registered %d)" % (g, m, w))
+print("guard 4: the pair is count-matched to 1 group in %s (0.007%%)" % mnode)
+PYEOF
+
+# --- guard 5 -- NAME COLLISION AND SEED FRESHNESS -----------------------------
+grep -q "^$TAG-" "$CSVP" && guard_fail "guard 5: $TAG-* already in the CSV" \
+  || echo "guard 5: no $TAG-* name collision in the CSV"
+python3 - "$CSVP" "$SEEDS" <<'PYEOF' || guard_fail "guard 5: seed freshness"
+import csv, sys
+csvp, seeds = sys.argv[1], set(sys.argv[2].split())
+clash = []
+for r in csv.DictReader(open(csvp)):
+    if r["granularity"] not in ("nodewise", "chunk777"): continue
+    if r["base"] not in ("SGD", "RMSProp") or r["meta"] != "Lion": continue
+    if r["seed"] in seeds:
+        clash.append(r["run"])
+assert not clash, "seeds %s already exist at this cell: %s" % (sorted(seeds), clash)
+print("guard 5: seeds %s are FRESH at this cell -- bm2 is an independent batch, "
+      "not a rerun of nl1" % sorted(seeds))
+PYEOF
+
+# --- guard 6 -- capacity -------------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: ${FREE:-?} GB free; pending=$PEND, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 6: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# =============================================================================
+# COMPOSE.  The meta flags are composed ONCE, in the emitter, and are NEVER put
+# inside $BFLAGS -- that $BFLAGS-then-append shape is exactly what voided `ml2`
+# and `sm3`, and argparse keeps the LAST occurrence.  guard_presubmit reads the
+# EXACT string this script is about to eval and rejects any repeated flag.
+# =============================================================================
+mkdir -p "$SAVE"; N=0; REJ=0; GBAD=0
+for S in $SEEDS; do
+ for BA in $BASES; do
+  case $BA in
+    SGD)     BT=sgd; BFLAGS="--alg-base SGD --weight-decay-base 0.1" ;;
+    RMSProp) BT=rms; BFLAGS="--alg-base RMSProp --normalizer-param-base 0.999 --weight-decay-base 0.1" ;;
+  esac
+  for G in nodewise chunk$CHUNK_K; do
+    case $G in nodewise) SH=node ;; *) SH=ch ;; esac
+    RN="${TAG}-${BT}-${SH}-s${S}"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$SAVE/probe_${BT}_${SH}_${TAG}_s${S} \
+$RUNNER --optimizer HF $BFLAGS --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+
+    DESIGN=(optimizer=HF alg-base=$BA alg-meta=Lion momentum-param-meta=0.99 \
+            Lion-beta2-meta=0.9 weight-decay-meta=0 weight-decay-base=0.1 \
+            dataset=$DSET NN-name=$NET batch-size=$BATCH gamma=$GAMMA \
+            meta-stepsize=$MST alpha0=$ALPHA0 num-epochs=$EPOCHS \
+            stepsize-groups=$G seed=$S run-name=$RN)
+
+    echo "--- $RN ---"
+    [ "$SUBMIT" = 1 ] || echo "$CMD"
+    if guard_presubmit "$CMD" "${DESIGN[@]}"; then
+      if [ "$SUBMIT" = 1 ]; then
+        eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+      else
+        N=$((N+1))
+      fi
+    else
+      GBAD=$((GBAD+1))
+    fi
+  done
+ done
+done
+
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected by slurm; $GBAD rejected by guard_presubmit ----"
+[ "$GBAD" = 0 ] || { echo "!!! guard_presubmit rejected $GBAD command lines -- fix the composition."; exit 2; }
+
+# --- POST-LAUNCH.  Read the FIRST run's OWN ARGS line off the cluster ---------
+if [ "$SUBMIT" = 1 ]; then
+  guard_postlaunch "$OUTDIR" "${TAG}-" \
+      optimizer=HF alg-meta=Lion momentum-param-meta=0.99 Lion-beta2-meta=0.9 \
+      weight-decay-meta=0 dataset=$DSET NN-name=$NET batch-size=$BATCH \
+      gamma=$GAMMA meta-stepsize=$MST alpha0=$ALPHA0 num-epochs=$EPOCHS \
+    || { echo "!!! THE LAUNCHED BATCH DOES NOT MATCH THE DESIGN.  Cancel it NOW:"
+         echo "!!!   scancel --name=\$(squeue -h -u \$USER -o %j | grep '^${TAG}-' | tr '\\n' ',' | sed 's/,\$//')"
+         exit 2; }
+  echo "---- $TAG launched and VERIFIED against the run's own ARGS line. ----"
+  echo "---- score with:  python3 analysis/c97_bm2_score.py --root $SAVE \\"
+  echo "----                     --outs $OUTDIR --csv results/all_runs.csv"
+fi

@@ -1,0 +1,136 @@
+"""RULE 13 -- every guard added or changed at cycle-84 review, tested in BOTH
+directions.  The real configuration must PASS and an injected violation must FAIL.
+NOTHING here invokes --submit or sbatch: the guard bodies are extracted from the
+script and driven directly as pure python, and the shell path is exercised only in
+dry-run mode with an EDITED COPY of the script."""
+import os, re, subprocess, sys, tempfile, shutil
+
+REPO = "/workspace/hierarchical-metaoptimize"
+SCRIPT = os.path.join(REPO, "bin", "c84_normaliser_transfer.sh")
+src = open(SCRIPT).read()
+PASS = FAIL = 0
+
+def report(name, ok):
+    global PASS, FAIL
+    if ok: PASS += 1; print("  PASS  %s" % name)
+    else:  FAIL += 1; print("  FAIL  %s" % name)
+
+def block(marker, delim):
+    """Extract the heredoc body that follows `marker`."""
+    i = src.index(marker)
+    j = src.index("<<'%s'" % delim, i)
+    k = src.index("\n", j) + 1
+    e = src.index("\n%s\n" % delim, k)
+    return src[k:e]
+
+def run_py(body, args, expect_fail):
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(body); path = fh.name
+    try:
+        r = subprocess.run([sys.executable, path] + args, capture_output=True, text=True)
+        ok = (r.returncode != 0) if expect_fail else (r.returncode == 0)
+        return ok, (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout or r.stderr) else ""
+    finally:
+        os.unlink(path)
+
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+print("=" * 76)
+print("RULE 13 -- gn1's cycle-84 guards, BOTH DIRECTIONS")
+print("=" * 76)
+
+# ---------------- GUARD 9: the sequencing interlock ----------------------
+print("\n-- GUARD 9  the sequencing interlock")
+g9 = block("--- GUARD 9", "PY9EOF")
+ok, msg = run_py(g9, [REPO, CSV, "", "0"], expect_fail=False)
+report("real config, DRY RUN, no token -> PASSES (the emitter can be validated)", ok)
+ok, msg = run_py(g9, [REPO, CSV, "", "1"], expect_fail=True)
+report("INJECTED: --submit with NO generalisation result -> REFUSES", ok and "GUARD FAIL" in msg)
+ok, msg = run_py(g9, [REPO, CSV, "g3d: D=+0.51 (t=4.1) on ResNet34", "1"], expect_fail=False)
+report("real config, --submit WITH a recorded result -> PASSES", ok)
+
+# ---------------- GUARD 2: seeds, sigma, anchor, box --------------------
+print("\n-- GUARD 2  the CSV preconditions (seed split, sigma, anchor)")
+g2 = block("--- GUARD 2 --", "PYEOF")
+def g2args(seeds_bn="0 1 2 3", seeds_gn="0 1 2 3 4 5 6 7", njobs="24",
+           clip="-15:-2.3026", anchor="0.5805", sigma="0.174"):
+    return [CSV, clip, "100", "1e-4", "1e-3", "100", "CIFAR10", "ResNet18",
+            "ResNet18_gn", "gn1", anchor, "0.0939", sigma, "0.30",
+            seeds_bn, seeds_gn, njobs]
+ok, msg = run_py(g2, g2args(), expect_fail=False)
+report("real config -> PASSES 2a-2f", ok)
+ok, msg = run_py(g2, g2args(seeds_bn="0 1 2 3 4 5"), expect_fail=True)
+report("INJECTED: control silently back to n=6 -> FAILS", ok and "SEEDS_BN" in msg)
+ok, msg = run_py(g2, g2args(seeds_gn="0 1 2 3 4 5"), expect_fail=True)
+report("INJECTED: primary dropped to n=6 (se 0.100 > 0.09) -> FAILS", ok)
+ok, msg = run_py(g2, g2args(seeds_bn="0 1 2 3", seeds_gn="0 1 2 3 4 5 6 7", njobs="28"),
+                 expect_fail=True)
+report("INJECTED: NJOBS inconsistent with the two seed lists -> FAILS", ok)
+ok, msg = run_py(g2, g2args(seeds_bn="0 1 2 2"), expect_fail=True)
+report("INJECTED: a repeated control seed -> FAILS", ok)
+ok, msg = run_py(g2, g2args(sigma="0.240"), expect_fail=True)
+report("INJECTED: sigma re-based to 0.240 (would move the frozen SE_MAX) -> FAILS",
+       ok and "0.113" in msg)
+ok, msg = run_py(g2, g2args(anchor="0.8805"), expect_fail=True)
+report("INJECTED: anchor mis-registered -> FAILS", ok)
+
+# ---------------- GUARD 3: the box ---------------------------------------
+print("\n-- GUARD 3  the box registration")
+g3 = block("--- GUARD 3", "PYEOF")
+ok, msg = run_py(g3, [REPO, "-15:-2.3026", "gn1"], expect_fail=False)
+report("real config -> PASSES, and reports the ANCHOR box", ok)
+ok, msg = run_py(g3, [REPO, "-25:-2.3026", "gn1"], expect_fail=True)
+report("INJECTED: CLIP moved to -25 while c55 still says -15 -> FAILS (drift check)",
+       ok and "GUARD FAIL" in msg)
+# The check that actually matters: BOTH moved to -25 together, so the drift check is
+# silent and only the ANCHOR_BOX condition can catch it.  `fa1` is registered at -25,
+# so passing it here is exactly that scenario.
+ok, msg = run_py(g3, [REPO, "-25:-2.3026", "fa1"], expect_fail=True)
+report("INJECTED: script AND registry both at -25 -> the ANCHOR_BOX check FAILS it",
+       ok and "cross-box import" in msg)
+ok, msg = run_py(g3, [REPO, "-15:-2.3026", "sl1"], expect_fail=True)
+report("INJECTED: the DELETED sl1 tag -> FAILS (it is unregistered by design)", ok)
+
+# ---------------- GUARD 1b-4: the per-arm seed selection ------------------
+print("\n-- GUARD 1b  the ENV/ARGS pin, incl. the 4/4/8/8 rebalance")
+def dry(edit=None, label=""):
+    tmp = tempfile.mkdtemp()
+    dst = os.path.join(tmp, "s.sh")
+    body = src if edit is None else edit(src)
+    open(dst, "w").write(body)
+    r = subprocess.run(["bash", dst], capture_output=True, text=True,
+                       cwd=REPO, env={**os.environ})
+    shutil.rmtree(tmp)
+    return r.stdout + r.stderr
+
+out = dry()
+report("real config -> guard 1b-4 passes and the split is asserted from the emitter",
+       "guard 1b-4:" in out and "each selecting its own seed list" in out)
+out = dry(lambda t: t.replace('if [ "$WHICH" = "BN" ]; then ARM_SEEDS="$SEEDS_BN"; '
+                              'else ARM_SEEDS="$SEEDS_GN"; fi',
+                              'ARM_SEEDS="$SEEDS"'))
+report("INJECTED: emitter collapsed to ONE shared seed list -> guard 1b-4 FAILS",
+       "the registered 4/4/8/8 rebalance is not in force" in out)
+out = dry(lambda t: t.replace('BETA_CLIP=${CLIP},', 'BETA_CLIP=${CLIP}'))
+report("INJECTED: the BETA_CLIP comma removed from --export -> FAILS",
+       "GUARD FAIL" in out and "guard 1b" in out)
+
+# ---------------- the emitter's job table --------------------------------
+print("\n-- THE EMITTER  what it actually builds")
+out = dry()
+jobs = re.findall(r"--job-name=(\S+)", out)
+counts = {}
+for j in jobs:
+    counts[j.rsplit("-s", 1)[0]] = counts.get(j.rsplit("-s", 1)[0], 0) + 1
+report("24 jobs, 4 arms, split 4/4/8/8 exactly as registered",
+       len(jobs) == 24 and counts == {"gn1-bn-node": 4, "gn1-bn-ch": 4,
+                                      "gn1-gn-node": 8, "gn1-gn-ch": 8})
+report("every emitted job carries BETA_CLIP=-15:-2.3026 WITH its colon",
+       out.count("BETA_CLIP=-15:-2.3026") >= 24)
+report("no job was submitted (dry run is the default and says so)",
+       "dry run, nothing submitted" in out)
+
+print("\n" + "=" * 76)
+print("RULE 13 SUMMARY: %d PASS, %d FAIL" % (PASS, FAIL))
+print("=" * 76)
+sys.exit(1 if FAIL else 0)

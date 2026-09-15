@@ -60,7 +60,7 @@ export function ResearchPhaseDetail({ phase }: { phase: ResearchPhase }) {
         <h2 id="phase-detail-questions-title">Current linked question verdicts</h2>
         <Link className="text-link" to={recordsHref}>{phase.experiments.length} linked {phase.experiments.length === 1 ? 'record' : 'records'}<ArrowUpRight size={17} aria-hidden="true"/></Link>
       </div>
-      <p className="phase-detail-context">Verdicts apply to each question’s goal. There is no single verdict for the whole phase.</p>
+      <p className="phase-detail-context">Verdicts apply to each question’s goal. There is no single verdict for the whole phase. Method checks are listed but not counted as outcomes.</p>
       {phase.experiments.length > 0 ? <>
         <nav className="phase-detail-outcomes" aria-label="Filter linked questions by current verdict">
           {outcomeOrder.filter(outcome => phase.counts[outcome] > 0).map(outcome => <Link key={outcome}
@@ -68,6 +68,10 @@ export function ResearchPhaseDetail({ phase }: { phase: ResearchPhase }) {
             aria-label={`${phase.counts[outcome]} linked questions: ${outcomeLabels[outcome]}`}>
             <span className="status-dot" aria-hidden="true"/>{phase.counts[outcome]} {outcomeLabels[outcome]}
           </Link>)}
+          {phase.methodChecks > 0 && <Link className="status status-method-check" to={`${recordsHref}&kind=method-check`}
+            aria-label={`${phase.methodChecks} linked method ${phase.methodChecks === 1 ? 'check' : 'checks'}`}>
+            <span className="status-dot" aria-hidden="true"/>{phase.methodChecks} method {phase.methodChecks === 1 ? 'check' : 'checks'}
+          </Link>}
         </nav>
         <p className="phase-detail-scroll-hint" id="phase-detail-scroll-hint">Scroll sideways to see outcomes and evidence links.</p>
         <div className="phase-detail-table-region" role="region" tabIndex={0} aria-label="Linked questions, results and evidence" aria-describedby="phase-detail-scroll-hint">

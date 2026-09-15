@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Export a deterministic, redacted research-source catalog without executing code.
 
-The 111-row experiment register is the mapping authority. References resolve to
+The experiment register (scripts/register_model.load_register: the exported
+register plus the pinned MASTER-TABLE section-10 rows) is the mapping authority. References resolve to
 real files/line anchors; additional links explicitly disclose exact batch-name
 mentions. Filename similarity never establishes an experiment association.
 Shared implementation snapshots do not establish historical per-run provenance.
@@ -14,8 +15,12 @@ import csv
 import hashlib
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import register_model  # noqa: E402  (shared outcome model and partition-audit import)
 
 PORTAL = Path(__file__).resolve().parents[1]
 WORKSPACE = PORTAL.parents[1]
@@ -54,7 +59,7 @@ HEADING_RE = re.compile(r'^(#{1,6})\s+(?:(?:CORRECTIONS|FINDINGS)\s+)?'
 HOST_RE = re.compile(r'\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|'
                      r'login\.[A-Za-z0-9_.…-]+)\b', re.I)
 PRIVATE_PATTERNS = [
-    r'(?i)teshnizi|salehkaleybars|s5014158|hmkhd2', r'/(?:Users|home|data1)/',
+    r'(?i)teshnizi|salehkaleybars|s5014158|hmkhd2', r'/(?:Users|home|data1|scratch)/',
     r'/zfsstore/user/',
     r'[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}',
     r'\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{16,}',
@@ -90,7 +95,9 @@ def redact(text: str) -> str:
                            ('/data1/salehkaleybars', '/cluster/account_a')]:
         text = text.replace(prefix, public)
     text = re.sub(r'/Users/[^/\s]+(?:/Saber Optimization/alice-backup)?', '/workspace', text)
-    text = re.sub(r'/(?:home|data1|zfsstore/user)/[^/\s\'\"`<>]+', '/cluster/user', text)
+    # /scratch/ is a private cluster root too; the research exporter rejects it, so
+    # rewrite it here in place (one line in, one line out) rather than weaken that check.
+    text = re.sub(r'/(?:home|data1|scratch|zfsstore/user)/[^/\s\'\"`<>]+', '/cluster/user', text)
     for private, public in [('s5014158', 'account_b'), ('salehkaleybars', 'account_a'),
                             ('teshnizi', 'researcher'), ('hmkhd2', 'legacy_reviewer'),
                             ('alice2', 'cluster_b'), ('alice', 'cluster_a')]:
@@ -122,9 +129,17 @@ def role(path: str) -> str:
     return 'Research scorer or analysis snapshot'
 
 
-def build_catalog(repo: Path, workspace: Path):
+def register_rows(repo: Path, workspace: Path):
+    """The published register, with MASTER-TABLE anchors resolved by row content."""
+    repo = Path(repo).resolve()
+    lines = (repo / register_model.MASTER_TABLE).read_text().splitlines()
+    return register_model.anchor_master_table(register_model.load_register(Path(workspace).resolve(), repo), lines)
+
+
+def build_catalog(repo: Path, workspace: Path, rows=None):
     repo, workspace = Path(repo).resolve(), Path(workspace).resolve()
-    rows = list(csv.DictReader((workspace / 'outputs/tables/complete_experiment_register.csv').read_text().splitlines()))
+    if rows is None:
+        rows = list(csv.DictReader((workspace / 'outputs/tables/complete_experiment_register.csv').read_text().splitlines()))
     ids = [r['id'] for r in rows]
     if len(ids) != len(set(ids)):
         raise ValueError('Duplicate experiment IDs in the authoritative register')
@@ -455,8 +470,8 @@ def build_catalog(repo: Path, workspace: Path):
     return index, links, audit, assets
 
 
-def export_catalog(repo: Path, workspace: Path, public_root: Path):
-    index, links, audit, assets = build_catalog(repo, workspace)
+def export_catalog(repo: Path, workspace: Path, public_root: Path, rows=None):
+    index, links, audit, assets = build_catalog(repo, workspace, rows)
     public_root = Path(public_root)
     source_dir, data_dir = public_root / 'source', public_root / 'data'
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -482,7 +497,11 @@ def main():
     parser.add_argument('--public', type=Path, default=PORTAL / 'public')
     parser.add_argument('--audit', type=Path, default=WORKSPACE / 'work/portal_source_audit.json')
     args = parser.parse_args()
-    audit = export_catalog(args.repo, args.workspace, args.public)
+    rows = register_rows(args.repo, args.workspace)
+    audit = export_catalog(args.repo, args.workspace, args.public, rows)
+    audit['partitionAuditCommit'] = register_model.PARTITION_AUDIT_COMMIT
+    audit['registerModel'] = {'researchQuestions': sum(r['kind'] == 'research' for r in rows),
+                              'methodChecks': sum(r['kind'] == 'method-check' for r in rows)}
     args.audit.write_text(json.dumps(audit, indent=2, ensure_ascii=False, allow_nan=False) + '\n')
     print(json.dumps({k: audit[k] for k in ['experiments', 'sources', 'redactedSources',
         'experimentsWithDocuments', 'experimentsWithCode', 'cvk2Registration']}, indent=2))
