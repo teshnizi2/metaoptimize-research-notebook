@@ -17,19 +17,21 @@ const phase = (id: string, date: string, experimentIds: string[] = []): Activity
 const experiment = (id: string, outcome: Experiment['outcome'] = 'success') => ({ id, outcome }) as Experiment;
 const normalize = (text: string) => text.replace(/\s+/g, ' ').replace(/[.\s]+$/, '').trim();
 
-test('timeline retains documented windows and matches every original CSV observation', async () => {
+test('newest-first timeline retains documented windows and every original CSV observation', async () => {
   const { researchTimeline } = await helpers();
   const rows = researchTimeline(data.activity, data.experiments);
   const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;
   assert.equal(rows.length, 8);
-  assert.deepEqual(rows.map(row => row.id), Array.from({ length: 8 }, (_, i) => `phase-0${i + 1}`));
-  rows.forEach((row, index) => {
-    const [period, title] = csv[index].phase.split('\n');
+  assert.deepEqual(rows.map(row => row.id), Array.from({ length: 8 }, (_, i) => `phase-0${8 - i}`));
+  rows.forEach(row => {
+    const original = csv.find(entry => entry.phase.split('\n')[1] === row.title)!;
+    assert.ok(original, `${row.title} must preserve a recorded CSV phase`);
+    const [period, title] = original.phase.split('\n');
     assert.equal(row.period, `${period} 2026`);
     assert.equal(row.title, title);
-    assert.equal(normalize(row.test!), normalize(csv[index].test));
-    assert.equal(normalize(row.observation!), normalize(csv[index].observed_result));
-    assert.equal(normalize(row.nextQuestion!), normalize(csv[index].next_question));
+    assert.equal(normalize(row.test!), normalize(original.test));
+    assert.equal(normalize(row.observation!), normalize(original.observed_result));
+    assert.equal(normalize(row.nextQuestion!), normalize(original.next_question));
   });
 });
 
@@ -66,7 +68,7 @@ test('phase filters use exact explicit links, deduplicate links and reject unkno
   assert.deepEqual(filterByResearchPhase(entries, events, 'unlinked').map(entry => entry.id), ['Other']);
   assert.deepEqual(filterByResearchPhase(entries, events, 'missing'), []);
   assert.deepEqual(filterByResearchPhase(entries, events), entries);
-  assert.equal(researchTimeline(events, entries)[0].experiments.length, 1);
+  assert.equal(researchTimeline(events, entries).find(row => row.id === 'first')!.experiments.length, 1);
   assert.equal(JSON.stringify({ entries, events }), before);
 });
 
@@ -80,7 +82,7 @@ test('non-phase events never create test periods, and incomplete phases stay vis
     phase('invalid-date', '2026-02-30'),
   ];
   const rows = researchTimeline(events, []);
-  assert.deepEqual(rows.map(row => row.id), ['earlier', 'unknown-window', 'later', 'invalid-date']);
+  assert.deepEqual(rows.map(row => row.id), ['later', 'unknown-window', 'earlier', 'invalid-date']);
   assert.equal(rows.find(row => row.id === 'unknown-window')!.period, null);
   assert.equal(rows.find(row => row.id === 'unknown-window')!.test, null);
   assert.equal(rows.find(row => row.id === 'invalid-date')!.startDate, null);
@@ -101,4 +103,21 @@ test('malformed phase detail and ID lists cannot crash pages or disagree with ph
       assert.equal(filterByResearchPhase(entries, events, 'unlinked').length, 1 - expected.length);
     }
   }
+});
+
+test('explicit phase links remain stable as the log grows and honor excluding filters', async () => {
+  const { researchTimeline, resolvePhaseDetail } = await helpers();
+  assert.equal(typeof resolvePhaseDetail, 'function');
+  const phases = researchTimeline(data.activity, data.experiments);
+  const event = data.activity.find(entry => entry.id === 'phase-08')!;
+  const note = { ...event, id: 'review-note', kind: 'note', detail: 'Reviewed phase-08 scope' };
+  assert.equal(resolvePhaseDetail(phases, [event, note], 'phase-08', 'phase')?.id, 'phase-08', 'Later notes must not break an existing detail link');
+  assert.equal(resolvePhaseDetail(phases, [event], 'phase-08', 'phase')?.id, 'phase-08');
+  assert.equal(resolvePhaseDetail(phases, [event], 'phase-08'), undefined, 'An ordinary search remains a log search');
+  assert.equal(resolvePhaseDetail(phases, [], 'phase-08', 'phase'), undefined, 'Excluding type or experiment filters must not expose a detail');
+  assert.equal(resolvePhaseDetail(phases, [event], 'VGG', 'phase'), undefined);
+  assert.equal(resolvePhaseDetail(phases, [event], 'phase-0', 'phase'), undefined);
+  assert.equal(resolvePhaseDetail(phases, [note], 'phase-08', 'phase'), undefined);
+  assert.equal(resolvePhaseDetail(phases, [{ ...event, kind: 'note' }], 'phase-08', 'phase'), undefined);
+  assert.equal(resolvePhaseDetail([], [event], 'phase-08', 'phase'), undefined);
 });

@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
+import { ArrowUpRight, BookOpen, Braces, ChevronDown, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
 import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
 import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
@@ -11,7 +11,7 @@ export function Overview() {
   const data = useResearch();
   const counts = outcomeCounts(data.experiments);
   const areas = areaOutcomeCounts(data.experiments, data.areas);
-  const updates = recentNotebookUpdates(data.activity);
+  const updates = recentNotebookUpdates(data.activity, 2);
 
   return <div className="overview-notebook">
     <header className="notebook-header">
@@ -20,12 +20,15 @@ export function Overview() {
         <SnapshotDate/>
       </div>
       <div className="notebook-actions">
-        <div className="notebook-download"><a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
+        <div className="notebook-download-buttons"><a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
           <BookOpen size={17}/>Report PDF<ArrowUpRight size={16}/>
-        </a><ArtifactDates kind="download" id="pdf"/><details className="download-date-details"><summary>Report dates</summary><ArtifactDates kind="download" id="pdf" variant="detail"/></details></div>
-        <div className="notebook-download"><a className="button" href={data.meta.downloads.bundle} download>
+        </a><a className="button" href={data.meta.downloads.bundle} download>
           <Download size={16}/>Download evidence
-        </a><ArtifactDates kind="download" id="bundle"/><details className="download-date-details"><summary>Evidence bundle dates</summary><ArtifactDates kind="download" id="bundle" variant="detail"/></details></div>
+        </a></div>
+        <details className="home-download-dates"><summary>Download dates</summary>
+          <strong>Report PDF</strong><ArtifactDates kind="download" id="pdf" variant="detail"/>
+          <strong>Evidence bundle</strong><ArtifactDates kind="download" id="bundle" variant="detail"/>
+        </details>
       </div>
     </header>
 
@@ -59,8 +62,8 @@ export function Overview() {
 
     <ResearchTimeline/>
 
-    <section className="home-area-review">
-      <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
+    <details className="home-area-review home-area-disclosure">
+      <summary><span className="home-area-label">Research areas</span><span className="home-section-meta">{areas.length} areas</span><ChevronDown size={18}/></summary>
       <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all five outcomes.</p>
       <div className="home-area-table-wrap" tabIndex={0} role="region" aria-label="Research area outcome counts" aria-describedby="home-area-scroll-hint">
         <table className="home-area-table">
@@ -73,10 +76,10 @@ export function Overview() {
           </tr>)}</tbody>
         </table>
       </div>
-    </section>
+    </details>
 
     <section className="home-updates">
-      <SectionTitle title="Notebook updates" to="/activity" label="Research log"/>
+      <SectionTitle title="Notebook updates" to="/activity" label="All updates"/>
       {updates.length ? <ul className="home-update-list">{updates.map(event => <li key={event.id}>
         <Link to={`/activity?q=${encodeURIComponent(event.id)}`}>
           <div className="home-update-meta"><time dateTime={event.date}>{compactDate(event.date)}</time><span>{event.kind}</span></div>
@@ -84,6 +87,5 @@ export function Overview() {
         </Link>
       </li>)}</ul> : <p className="home-section-note">No dated notebook updates are recorded.</p>}
     </section>
-    <p className="notebook-scope">Read each result with its scope and corrections. The run ledger also retains reruns and superseded history.</p>
   </div>;
 }

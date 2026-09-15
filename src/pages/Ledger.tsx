@@ -5,6 +5,8 @@ import { useResearch, useRuns } from '../data';
 import { CopyLink, Empty, ExperimentChips, PageHeading, Status } from '../components/common';
 import { compactDate, safeHref } from '../lib/research';
 import { ArtifactDates } from '../components/ArtifactDates';
+import { ResearchPhaseDetail } from '../components/ResearchPhaseDetail';
+import { researchTimeline, resolvePhaseDetail } from '../lib/timeline';
 import type { Run } from '../types';
 
 type Filters = Record<string, string | undefined>;
@@ -148,6 +150,8 @@ export function ActivityPage() {
   const filtered = entries.filter(e => (!kind || e.kind === kind) && (!experiment || e.experimentIds.includes(experiment))
     && matches(q, [e.id, e.date, compactDate(e.date), e.kind, e.title, e.detail, ...e.experimentIds]));
   const page = ledgerPage(filtered, f.get('page') || 1);
+  const phase = resolvePhaseDetail(researchTimeline(data.activity, data.experiments), filtered, q, f.get('view'));
+  if (phase) return <ResearchPhaseDetail phase={phase}/>;
   return <><PageHeading eyebrow="The research record" title="Research log" description="Dated findings, corrections, and maintainer notes connected to their experiments." actions={<CopyLink/>}/>
     <p className="notice"><History size={18}/>Versioned research log · Updates published by the maintainer.</p>
     <div className="filter-bar"><Query value={q} onChange={v => f.set('q', v)} placeholder="Search entries, dates or experiment IDs…"/>
@@ -157,6 +161,6 @@ export function ActivityPage() {
     <div className="results-summary"><span>{filtered.length.toLocaleString()} matching entries</span><span>Newest recorded dates first</span></div>
     {filtered.length ? <><div className="activity-list">{page.items.map(e => <article className="activity-item" key={e.id} id={`event-${e.id}`}>
       <div className="activity-date">{dateValue(e.date) !== -Infinity ? <time dateTime={e.date}>{compactDate(e.date)}</time> : <span>Date not recorded</span>}<span className="mono small">{pretty(e.kind)}</span></div>
-      <div><span className="record-id">{e.id}</span><h3>{e.title}</h3><p>{e.detail}</p><ExperimentChips ids={e.experimentIds} limit={e.experimentIds.length}/></div>
+      <div><span className="record-id">{e.id}</span><h3>{e.kind === 'research-phase' ? <Link to={`/activity?q=${encodeURIComponent(e.id)}&view=phase`}>{e.title}</Link> : e.title}</h3><p>{e.detail}</p><ExperimentChips ids={e.experimentIds} limit={e.experimentIds.length}/></div>
     </article>)}</div><Pagination {...page} total={filtered.length} set={p => f.set('page', p)}/></> : <Empty title="No matching history" detail="Try another search, or remove a filter to see the published log." action={<Reset onClick={f.reset}/>}/>}</>;
 }

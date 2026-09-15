@@ -9,6 +9,7 @@ import '@fontsource/manrope/800.css';
 import '@fontsource/ibm-plex-mono/400.css';
 import '@fontsource/ibm-plex-mono/500.css';
 import './styles.css';
+import './components/ResearchPhaseDetail.css';
 import { ResearchProvider } from './data';
 import { ArtifactDatesProvider } from './artifact-dates';
 import { Layout } from './components/Layout';

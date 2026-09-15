@@ -34,7 +34,12 @@ export function researchTimeline(activity: ActivityEvent[], experiments: Experim
       nextQuestion: fields ? clean(fields[4]) : null,
       experiments: linked, counts: outcomeCounts(linked),
     };
-  }).sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999') || a.id.localeCompare(b.id));
+  }).sort((a, b) => (b.startDate || '').localeCompare(a.startDate || '') || a.id.localeCompare(b.id));
+}
+
+export function resolvePhaseDetail(phases: ResearchPhase[], filteredEntries: ActivityEvent[], query: string, view = ''): ResearchPhase | undefined {
+  if (view !== 'phase' || !filteredEntries.some(entry => entry.kind === 'research-phase' && entry.id === query)) return undefined;
+  return phases.find(phase => phase.id === query);
 }
 
 export function filterByResearchPhase(experiments: Experiment[], activity: ActivityEvent[], phaseId = ''): Experiment[] {
