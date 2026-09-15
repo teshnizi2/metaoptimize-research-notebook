@@ -17,6 +17,17 @@ PUBLIC = PORTAL / "public"
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
+PUBLIC_REPOSITORY_PREFIX = re.compile(
+    r'https://github\.com/teshnizi2/(?:hierarchical-metaoptimize|metaoptimize-research-notebook)(?=$|[/#?\s"\'])'
+)
+
+
+def public_metadata_private_match(text):
+    # Exempt only the explicitly public repository prefix, never the remaining
+    # path, query, or surrounding content that could still contain private data.
+    return PRIVATE.search(PUBLIC_REPOSITORY_PREFIX.sub('PUBLIC_REPOSITORY', text))
+
+
 def csv_rows(path):
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
@@ -167,10 +178,24 @@ class ResearchExportTests(unittest.TestCase):
         with hdis.open() as handle:
             self.assertEqual(sum(1 for _ in csv.DictReader(handle)), 122)
 
+    def test_privacy_scan_allows_only_the_two_public_repository_prefixes(self):
+        for repository in ["hierarchical-metaoptimize", "metaoptimize-research-notebook"]:
+            url = "https://github.com/teshnizi2/" + repository
+            self.assertIsNone(public_metadata_private_match(url))
+            self.assertIsNone(public_metadata_private_match(url + "/commit/" + "a" * 40))
+        for text in [
+            "teshnizi", "account=teshnizi2",
+            "https://github.com/teshnizi2/unrelated",
+            "https://github.com/teshnizi2/hierarchical-metaoptimize-copy",
+            "https://github.com/teshnizi2/hierarchical-metaoptimize/blob/main/home/teshnizi/key",
+            "https://github.com/teshnizi2/hierarchical-metaoptimize?account=s5014158",
+        ]:
+            self.assertIsNotNone(public_metadata_private_match(text))
+
     def test_public_text_has_no_private_paths_or_accounts(self):
         self.research()
         for path in list((PUBLIC / "data").glob("*.json")) + list((PUBLIC / "assets").rglob("*.csv")) + list((PUBLIC / "assets").rglob("*.txt")):
-            self.assertIsNone(PRIVATE.search(path.read_text()), str(path.relative_to(PUBLIC)))
+            self.assertIsNone(public_metadata_private_match(path.read_text()), str(path.relative_to(PUBLIC)))
 
     def test_zip_contains_all_charts_and_tables_and_sanitized_text(self):
         data = self.research()

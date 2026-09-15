@@ -18,7 +18,7 @@ These are syntax examples; replace the example content with a real update before
 
 Entries require a nonempty title, nonempty text, and at least one existing experiment ID. Only `note`, `correction`, and `warning` are accepted. Unknown IDs, duplicate entry IDs, duplicate linked experiment IDs, invalid dates, unsupported options, and corrupt stored JSON cause a nonzero exit without modifying the journal. Obvious private paths, credentials, contact addresses, IP addresses, and infrastructure account assignments are also rejected before append or publication; entries are never silently rewritten. These patterns support maintainer review and do not establish that arbitrary prose is safe to publish. An ID must begin with a letter and contain only letters, numbers, underscores, or hyphens, with at most 80 characters. Titles allow 160 characters and text allows 20,000.
 
-`npm run log` saves immediately to the local file, independently of the browser. Each write preserves previous entries, uses an exclusive writer lock, and atomically replaces the complete JSON file. `npm run build` validates the journal, requires already published entries to remain an unchanged prefix, and copies it to `public/data/journal.json` before compiling the website. An initial `[]` journal is valid. Commit both journal files to retain the durable research history in version control.
+`npm run log` saves immediately to the local file, independently of the browser. Each write preserves previous entries, uses an exclusive writer lock, and atomically replaces the complete JSON file. `npm run build` validates the journal, requires already published entries to remain an unchanged prefix, and copies it to `public/data/journal.json`. It also validates and synchronizes the artifact date catalog before compiling the website. An initial `[]` journal is valid. Commit both journal files to retain the durable research history in version control.
 
 Append a new correction instead of editing or deleting an earlier entry. A journal note does not revise an imported experiment outcome, registered score, or numerical table. Those changes require verified evidence and a new import. Journal warnings appear in both **Warnings & limits** and **Research log**, linked to their experiments. They carry a journal label, with no invented resolution state.
 
@@ -48,6 +48,8 @@ python3 scripts/export_sources.py --repo "$RESEARCH_REPO" --workspace "$RESEARCH
 python3 scripts/export_research.py --workspace "$RESEARCH_WORKSPACE" --public-dir ./public --as-of "$PUBLICATION_DATE"
 python3 scripts/export_research.py --public-dir ./public --check
 npx tsx scripts/export_github_links.ts --research-repo "$RESEARCH_REPO" --research-revision "$RESEARCH_REVISION" --archive-revision "$ARCHIVE_REVISION"
+npm run dates:refresh -- --evidence "$RESEARCH_WORKSPACE/work/artifact-date-evidence.json"
+npm run dates:check
 npm run test:data
 node scripts/sync-journal.mjs
 python3 scripts/package_notebook.py --verify
@@ -75,7 +77,7 @@ Deployment is a maintainer action after review. Use the existing Vercel project 
 npm run deploy
 ```
 
-The local `npm run deploy` command runs the JavaScript tests, synchronizes the journal, regenerates and verifies the source ZIP, builds production assets, then calls `vercel --prod --archive=tgz`. This order keeps the downloadable source aligned with the publication and uploads the thousands of assets as an archive. The packaging command writes `public/assets/notebook-source.zip` plus the source deliverable in the campaign outputs and records hashes, privacy coverage, and portability checks in `work/notebook_source_package_report.json`. Vercel's remote build runs `npm test` followed by `npm run build`; the Python packager is local tooling and is excluded from the hosted deployment. Run the Python data checks above first whenever imported evidence changes. Commit the reviewed source and generated data using the project's normal version-control workflow. Once Vercel reports a successful deployment, open its reported production URL and verify the snapshot ID, a new journal entry, direct route reloads, and downloads. Build success alone does not verify a deployment.
+The local `npm run deploy` command runs the JavaScript tests, validates and synchronizes the journal and date catalog, regenerates and verifies the source ZIP, builds production assets, then calls `vercel --prod --archive=tgz`. This order keeps the downloadable source aligned with the publication and uploads the thousands of assets as an archive. The packaging command writes `public/assets/notebook-source.zip` plus the source deliverable in the campaign outputs and records hashes, privacy coverage, and portability checks in `work/notebook_source_package_report.json`. Vercel's remote build runs `npm test` followed by `npm run build`; the Python packager is local tooling and is excluded from the hosted deployment. Run the Python data checks above first whenever imported evidence changes. Commit the reviewed source and generated data using the project's normal version-control workflow. Once Vercel reports a successful deployment, open its reported production URL and verify the snapshot ID, a new journal entry, direct route reloads, and downloads. Build success alone does not verify a deployment.
 
 ## Metric and provenance boundaries
 
@@ -102,3 +104,25 @@ Both GitHub repositories are public and readable without invitations. The notebo
 The existing Vercel project is connected to the notebook GitHub repository with `main` as its production branch. After a verified update, synchronize the journal, regenerate the source ZIP, test, build, commit the reviewed changes and push `main`; Vercel starts the build automatically. Confirm the new deployment is ready and still denies anonymous HTML, data, source, log and download requests before sharing it. The CLI deployment command remains available for an authorized manual release. Do not disable protection to make a browser check or automated verification pass.
 
 The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.
+
+## Artifact dates
+
+The UI reads `public/data/artifact-dates.json`; its maintained source is `content/artifact-dates.json`. The build validates complete artifact coverage, date precision, links, snapshot hashes and current evidence bytes before synchronizing the reader copy. `npm run dates:check` verifies both copies without changing them.
+
+- **Created** requires a dated producer record for the exact original artifact. Unknown creation remains explicitly unrecorded.
+- **First recorded** and **Updated** identify the documented file or notebook-record scope. Git dates do not prove original creation. Copied protocols use their own path history.
+- **Exported** dates the public export of the bytes; it does not date model training.
+- **Submitted**, **Started** and **Finished** come from retained scheduler accounting. Offset-qualified timestamps display in UTC.
+- **Linked run window** gives the start/finish range and dated coverage for runs linked through the experiment register. It is not an asserted timestamp for every figure measurement.
+- Relative age uses the reader's current clock. Age alone does not mark a scientific result failed or automatically obsolete. ZIP member dates are fixed packaging metadata, not research dates.
+
+A website rebuild or journal note does not refresh unchanged artifact dates. Keep both date-catalog files together with their evidence. If validation detects stale hashes or missing records, supply a verified metadata update; never silence the error by changing dates to today's date.
+
+For the maintained repository, after updating the scientific export and verifying new date evidence, refresh the catalog from the local evidence fixture:
+
+```sh
+npm run dates:refresh
+npm run dates:check
+```
+
+The default fixture is `../artifact-date-evidence.json` relative to the portal. Supply `npm run dates:refresh -- --evidence /path/to/verified-artifact-date-evidence.json` on another machine. The importer records the time a changed notebook record was saved; it preserves unchanged dates and only retains historical facts when their source evidence matches. Review the catalog diff, then synchronize the journal, package, test, build and publish. Keep the raw evidence fixture outside public assets and version control.

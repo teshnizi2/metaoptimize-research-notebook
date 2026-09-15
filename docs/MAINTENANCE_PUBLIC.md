@@ -81,3 +81,18 @@ Both GitHub repositories are public and readable without invitations. The notebo
 The existing Vercel project is connected to the notebook GitHub repository with `main` as its production branch. After a verified update, synchronize the journal, regenerate the source ZIP, test, build, commit the reviewed changes and push `main`; Vercel starts the build automatically. Confirm the new deployment is ready and still denies anonymous HTML, data, source, log and download requests before sharing it. The CLI deployment command remains available for an authorized manual release. Do not disable protection to make a browser check or automated verification pass.
 
 The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.
+
+## Artifact dates
+
+The UI reads `public/data/artifact-dates.json`; its maintained source is `content/artifact-dates.json`. The build validates complete artifact coverage, date precision, links, snapshot hashes and current evidence bytes before synchronizing the reader copy. `npm run dates:check` verifies both copies without changing them.
+
+- **Created** requires a dated producer record for the exact original artifact. Unknown creation remains explicitly unrecorded.
+- **First recorded** and **Updated** identify the documented file or notebook-record scope. Git dates do not prove original creation. Copied protocols use their own path history.
+- **Exported** dates the public export of the bytes; it does not date model training.
+- **Submitted**, **Started** and **Finished** come from retained scheduler accounting. Offset-qualified timestamps display in UTC.
+- **Linked run window** gives the start/finish range and dated coverage for runs linked through the experiment register. It is not an asserted timestamp for every figure measurement.
+- Relative age uses the reader's current clock. Age alone does not mark a scientific result failed or automatically obsolete. ZIP member dates are fixed packaging metadata, not research dates.
+
+A website rebuild or journal note does not refresh unchanged artifact dates. Keep both date-catalog files together with their evidence. If validation detects stale hashes or missing records, supply a verified metadata update; never silence the error by changing dates to today's date.
+
+The portable package includes the catalog and Node validator. Its private-evidence importer is deliberately omitted. For a new scientific snapshot, obtain the matching verified date catalog from the maintainer together with the replacement evidence. You can edit the interface or append journal notes without changing historical artifact dates.

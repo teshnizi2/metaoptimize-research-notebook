@@ -4,6 +4,7 @@ import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Download, History, 
 import { useResearch, useRuns } from '../data';
 import { CopyLink, Empty, ExperimentChips, PageHeading, Status } from '../components/common';
 import { compactDate, safeHref } from '../lib/research';
+import { ArtifactDates } from '../components/ArtifactDates';
 import type { Run } from '../types';
 
 type Filters = Record<string, string | undefined>;
@@ -76,7 +77,7 @@ export function RunsPage() {
       {Object.values(filters).some(Boolean) && <Reset onClick={f.reset}/>}</div>
       <div className="results-summary"><span>{filtered.length.toLocaleString()} matching runs</span><span>Test accuracy: last five epoch records</span></div>
       {filtered.length ? <><div className="table-wrap"><table className="ledger-table"><thead><tr><th>Run / batch</th><th>Model / dataset</th><th>Completed epochs</th><th>Test accuracy</th><th>Execution state</th><th>Evidence</th></tr></thead>
-        <tbody>{page.items.map(r => <tr key={r.id}><td><Link className="experiment-title mono" to={`/runs/${encodeURIComponent(r.id)}`}>{r.id}</Link><div className="small muted">{r.batch || 'Batch not recorded'} · Seed {r.seed || '—'}</div></td>
+        <tbody>{page.items.map(r => <tr key={r.id}><td><Link className="experiment-title mono" to={`/runs/${encodeURIComponent(r.id)}`}>{r.id}</Link><div className="small muted">{r.batch || 'Batch not recorded'} · Seed {r.seed || '—'}</div><ArtifactDates kind="run" id={r.id}/></td>
           <td><strong>{r.architecture || 'Not recorded'}</strong><div className="small muted">{r.dataset || 'Not recorded'}</div></td><td className="mono">{r.epochs ?? '—'}</td><td className="mono">{accuracy(r.testAccuracy)}</td>
           <td><ExecutionState value={r.status}/></td><td><Link className="text-link" to={`/runs/${encodeURIComponent(r.id)}`}>{r.logHref ? 'Log + details' : 'Parameters'}<ArrowUpRight size={16}/></Link><div className="small muted">{r.experimentIds.length} linked questions</div></td></tr>)}</tbody></table></div>
         <Pagination {...page} total={filtered.length} set={p => f.set('page', p)}/></> : <Empty action={<Reset onClick={f.reset}/>}/>}</>}
@@ -101,6 +102,7 @@ export function RunDetailPage() {
   const connected = data.experiments.filter(e => run.experimentIds.includes(e.id));
   return <><Link className="text-link" to="/runs"><ArrowLeft size={16}/>Run ledger</Link>
     <PageHeading eyebrow={`${run.batch || 'Recorded run'} · Job ${run.jobId || 'ID unavailable'}`} title={run.id} description={`${run.architecture} · ${run.dataset} · Seed ${run.seed}`} actions={<CopyLink/>}/>
+    <ArtifactDates kind="run" id={run.id} variant="detail"/>
     <div className="run-metrics"><div className="metric-card"><span className="eyebrow">Execution state</span><ExecutionState value={run.status}/></div>
       <div className="metric-card"><span className="eyebrow">Test accuracy</span><strong>{accuracy(run.testAccuracy)}</strong><span className="small muted">Mean of the last five completed epochs; valid windows only</span></div>
       <div className="metric-card"><span className="eyebrow">Completed epochs</span><strong>{run.epochs ?? '—'}</strong><span className="small muted">Requested budget is recorded below</span></div></div>
@@ -135,7 +137,7 @@ export function WarningsPage() {
       {(q || severity || state || experiment) && <Reset onClick={f.reset}/>}</div>
     <div className="results-summary"><span>{filtered.length.toLocaleString()} matching warnings and limits</span><span>These qualify conclusions; they are not job failures.</span></div>
     {filtered.length ? <><div className="warning-list">{page.items.map(w => <article className="warning-card" key={w.id} id={w.id}><TriangleAlert size={20} aria-hidden="true"/>
-      <div><div className="record-id">{w.id}<span>{w.journal ? `Journal · ${compactDate(w.date)}` : pretty(w.status)}</span></div><h3>{w.title}</h3><p>{w.detail}</p><ExperimentChips ids={w.experimentIds} limit={w.experimentIds.length}/></div>
+      <div><div className="record-id">{w.id}<span>{w.journal ? `Journal · ${compactDate(w.date)}` : pretty(w.status)}</span></div><h3>{w.title}</h3>{!w.journal && <ArtifactDates kind="warning" id={w.id}/>}<p>{w.detail}</p><ExperimentChips ids={w.experimentIds} limit={w.experimentIds.length}/></div>
       <Status outcome={w.severity === 'correction' ? 'correction' : w.severity === 'open' ? 'unresolved' : 'mixed'} label={w.journal ? 'Journal warning' : pretty(w.severity)}/></article>)}</div>
       <Pagination {...page} total={filtered.length} set={p => f.set('page', p)}/></> : <Empty title="No matching warnings" action={<Reset onClick={f.reset}/>}/>}</>;
 }

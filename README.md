@@ -14,6 +14,12 @@ Both GitHub repositories are public and readable without invitations. The notebo
 
 Vercel is connected to the notebook repository, with production built from `main`. Native Vercel Authentication protects every deployment and its downloads. This project setting protects the hosted routes, not copies published on GitHub. Keep it enabled when publishing updates.
 
+## Dates and age
+
+Figures, tables, code, experiments, runs and downloads show their recorded dates. **Created** is used only when a producer record establishes creation; otherwise the notebook labels **First recorded** or **Exported** explicitly. Code dates come from the pinned file history, and run dates come from recorded scheduler accounting. Open **Date provenance** for the basis of a date. Timestamp displays use UTC.
+
+Age describes the labeled artifact or record; it does not change a scientific verdict. Unchanged records keep their dates across website rebuilds. The versioned catalog is in `content/artifact-dates.json`, with a validated reader copy in `public/data/artifact-dates.json`. ZIP entry timestamps are fixed for reproducibility; use the catalog for research dates.
+
 ## Run the portable website
 
 Extract the source ZIP into a new folder and open a terminal in that folder. Install Node.js 22.12 or later, then run:

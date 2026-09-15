@@ -1,7 +1,8 @@
 import { Link } from 'react-router-dom';
 import { ArrowRight, ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
-import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
+import { outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
+import { ArtifactDates, SnapshotDate } from '../components/ArtifactDates';
 import { ExperimentTable, SectionTitle, Status } from '../components/common';
 import { CutChart } from '../components/CutChart';
 
@@ -16,15 +17,15 @@ export function Overview() {
     <header className="notebook-header">
       <div>
         <h1>Research notebook</h1>
-        <p>MetaOptimize · Snapshot {compactDate(data.meta.asOf)}</p>
+        <SnapshotDate/>
       </div>
       <div className="notebook-actions">
-        <a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
+        <div className="notebook-download"><a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
           <BookOpen size={17}/>Report PDF<ArrowUpRight size={16}/>
-        </a>
-        <a className="button" href={data.meta.downloads.bundle} download>
+        </a><ArtifactDates kind="download" id="pdf"/><details className="download-date-details"><summary>Report dates</summary><ArtifactDates kind="download" id="pdf" variant="detail"/></details></div>
+        <div className="notebook-download"><a className="button" href={data.meta.downloads.bundle} download>
           <Download size={16}/>Download evidence
-        </a>
+        </a><ArtifactDates kind="download" id="bundle"/><details className="download-date-details"><summary>Evidence bundle dates</summary><ArtifactDates kind="download" id="bundle" variant="detail"/></details></div>
       </div>
     </header>
 

@@ -15,8 +15,8 @@ from pathlib import Path, PurePosixPath
 PORTAL = Path(__file__).resolve().parents[1]
 WORKSPACE = PORTAL.parents[1]
 ROOT_FILES = ["README.md", "index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts", "vercel.json", ".gitignore"]
-SCRIPTS = ["journal.mjs", "sync-journal.mjs"]
-PORTABLE_COMMANDS = {"dev", "build", "preview", "test", "log"}
+SCRIPTS = ["journal.mjs", "sync-journal.mjs", "sync-artifact-dates.mjs"]
+PORTABLE_COMMANDS = {"dev", "build", "preview", "test", "log", "dates:check"}
 EXCLUDED_NAMES = {".DS_Store", "notebook-source.zip", "MetaOptimize_Research_Notebook_Source.zip"}
 PRIVATE_PATTERNS = [
     ("private filesystem root", re.compile(r"/(?:Users|home|data1|scratch)/|/zfsstore/user/|/private/var/|[A-Za-z]:[\\/]+Users[\\/]+", re.I)),
@@ -114,6 +114,7 @@ def collect_payloads(root=PORTAL):
         add(".vercelignore")
     add("docs/MAINTENANCE_PUBLIC.md", "docs/MAINTENANCE.md")
     add("content/journal.json")
+    add("content/artifact-dates.json")
     for name in SCRIPTS:
         add("scripts/" + name)
     for folder in ["src", "public"]:
@@ -129,11 +130,13 @@ def collect_payloads(root=PORTAL):
                 add(path.relative_to(root).as_posix())
     for path in sorted((root / "tests").glob("*.test.ts")):
         add(path.relative_to(root).as_posix())
-    for required in ["public/data/research.json", "public/data/runs.json", "public/data/journal.json"]:
+    for required in ["public/data/research.json", "public/data/runs.json", "public/data/journal.json", "public/data/artifact-dates.json"]:
         if required not in payloads:
             raise ValueError(f"Required evidence snapshot file is missing: {required}")
     if json.loads(payloads["content/journal.json"]) != json.loads(payloads["public/data/journal.json"]):
         raise ValueError("The journal is not synchronized. Run npm run build before packaging.")
+    if json.loads(payloads["content/artifact-dates.json"]) != json.loads(payloads["public/data/artifact-dates.json"]):
+        raise ValueError("Artifact dates are not synchronized. Run npm run build before packaging.")
     package = json.loads(payloads["package.json"])
     removed = sorted(set(package.get("scripts", {})) - PORTABLE_COMMANDS)
     package["scripts"] = {key: value for key, value in package.get("scripts", {}).items() if key in PORTABLE_COMMANDS}
@@ -208,7 +211,7 @@ def verify_portability(archive_path, log_path):
                     raise RuntimeError(f"Portable verification failed: {label}. See the local portability log.")
         if not (root / "dist/index.html").is_file():
             raise RuntimeError("Portable build did not produce dist/index.html")
-        for name in ["data/research.json", "data/runs.json", "data/journal.json"]:
+        for name in ["data/research.json", "data/runs.json", "data/journal.json", "data/artifact-dates.json"]:
             if (root / "dist" / name).read_bytes() != (root / "public" / name).read_bytes():
                 raise RuntimeError(f"Portable build changed evidence: {name}")
     return {"status": "PASS", "commands": results, "isolatedExtraction": True, "privateImportToolingRequired": False, "sourceDownloadRestoredFromOuterZip": True}

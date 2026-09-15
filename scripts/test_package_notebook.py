@@ -26,7 +26,9 @@ class NotebookPackageTests(unittest.TestCase):
             "vercel.json": "{}", ".gitignore": "node_modules/\n",
             "src/main.tsx": "export {};", "tests/research.test.ts": "export {};",
             "scripts/journal.mjs": "export {};", "scripts/sync-journal.mjs": "export {};",
+            "scripts/sync-artifact-dates.mjs": "export {};",
             "content/journal.json": "[]\n", "public/data/journal.json": "[]\n",
+            "content/artifact-dates.json": "{}\n", "public/data/artifact-dates.json": "{}\n",
             "public/data/research.json": json.dumps({"meta": {"snapshotId": "test-snapshot"}, "experiments": [{"id": "CVK2"}]}),
             "public/data/runs.json": "[]", "public/source/example.txt": "Scientific evidence\n",
             "public/assets/notebook-source.zip": "old recursive archive",
@@ -103,6 +105,17 @@ class NotebookPackageTests(unittest.TestCase):
     def test_unsynchronized_journal_is_rejected(self):
         (self.root / "content/journal.json").write_text('[{"id":"J-NEW"}]')
         with self.assertRaisesRegex(ValueError, "journal.*synchron|synchron.*journal"):
+            pack.collect_payloads(self.root)
+
+    def test_artifact_dates_and_validator_travel_with_the_portable_evidence(self):
+        payloads, _ = pack.collect_payloads(self.root)
+        self.assertIn("scripts/sync-artifact-dates.mjs", payloads)
+        self.assertIn("content/artifact-dates.json", payloads)
+        self.assertEqual(payloads["content/artifact-dates.json"], payloads["public/data/artifact-dates.json"])
+
+    def test_unsynchronized_artifact_dates_are_rejected(self):
+        (self.root / "content/artifact-dates.json").write_text('{"changed": true}')
+        with self.assertRaisesRegex(ValueError, "[Dd]ate.*synchron|synchron.*date"):
             pack.collect_payloads(self.root)
 
     def test_manifest_tampering_is_detected(self):
