@@ -25,3 +25,5 @@ Deployment: `dpl_DBBDdy6YDZcha6aKL73XPVgKJzNa`; deployed application commit: `e5
 ## Private research group update
 
 The initial public release has been superseded by native access protection for every deployment and downloadable evidence file. The same website address is now for the researcher and professors using a revocable group link stored outside this repository. GitHub is connected to Vercel production on `main`; deployment runs the application tests before building. The compact interface links all 291 source snapshots to GitHub: 284 verified original revisions and seven exact archived copies. Scientific evidence and registered outcomes are unchanged.
+
+Private release verification passed on15September2026:33 authorized content checks and50 negative access checks. The alias-scoped group link survived the automatic GitHub deployment and cannot authorize other deployment hostnames. Detailed deployment/asset receipts are retained outside the repository; access credentials are never stored here.
