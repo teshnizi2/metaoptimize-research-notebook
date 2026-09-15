@@ -41,9 +41,9 @@ If a write was interrupted, inspect the recorded process ID in `content/.journal
 
 ## Preserve or replace the evidence snapshot
 
-Interface changes can use the included verified JSON, figures, tables, source text, and logs directly. Keep their content and hashes intact. The local ingestion/export scripts are excluded because they rely on a separate verified research workspace.
+Interface changes can use the included verified JSON, figures, tables, source text, and logs directly. Keep their content and hashes intact. The local ingestion/export scripts, including the GitHub mapping generator, are excluded because they rely on a separate verified research workspace. Obtain a complete verified export from the maintainer rather than guessing GitHub revisions.
 
-For a later research update, obtain a complete, verified public export from the research maintainer. Preserve stable historical experiment IDs, replace the corresponding public data/assets/source set together, retain journal history, and record the update in a new journal entry. Review the supplied provenance and validation receipts before building. Removing an experiment referenced by an existing journal entry blocks synchronization until the historical reference is restored.
+For a later research update, obtain a complete, verified public export from the research maintainer. Preserve stable historical experiment IDs, replace the corresponding public data/assets/source set together, including a matching verified `data/github-links.json`, retain journal history, and record the update in a new journal entry. Review the supplied provenance and validation receipts before building. Removing an experiment referenced by an existing journal entry blocks synchronization until the historical reference is restored.
 
 `npm test` checks application behavior and the journal workflow. It does not reproduce model training or replace scientific validation of a new export. `npm run build` validates journal links and compiles the website; it does not rederive registered scores.
 
@@ -71,3 +71,11 @@ After the host reports success, verify the reported production URL: check the sn
 - All 2,863 runs in this snapshot have sanitized raw logs linked by `logHref`, with original/public SHA-256 pairs. If a future snapshot omits an archived log, preserve its explicit archived-but-unpublished availability distinction.
 - Research code records contain both original and public hashes. Redactions can change bytes while retaining scientific content and line references. Related current code is not automatically exact historical runtime provenance.
 - History records documented phases, completions, imports, or maintainer recording times. It does not infer per-run launch times or show live cluster status.
+
+## Research group access and GitHub
+
+The hosted notebook and all its downloadable evidence require access through Vercel. Keep **Vercel Authentication → All Deployments** enabled in the project settings, including after redeployment. Both the notebook repository and original research repository are private; their collaborator permissions are managed separately. A site-access link does not grant GitHub access. Never place access links, passwords, tokens or professor contact details in the journal, code archive or repository.
+
+The existing Vercel project is connected to the notebook GitHub repository with `main` as its production branch. After a verified update, synchronize the journal, regenerate the source ZIP, test, build, commit the reviewed changes and push `main`; Vercel starts the build automatically. Confirm the new deployment is ready and still denies anonymous HTML, data, source, log and download requests before sharing it. The CLI deployment command remains available for an authorized manual release. Do not disable protection to make a browser check or automated verification pass.
+
+The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.

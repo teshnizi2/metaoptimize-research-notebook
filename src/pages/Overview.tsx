@@ -1,7 +1,96 @@
 import { Link } from 'react-router-dom';
-import { ArrowRight, ArrowUpRight, BookOpen, Braces, CheckCheck, FlaskConical, Images, Terminal, TriangleAlert, Download, GitBranch } from 'lucide-react';
+import { ArrowRight, ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
-import { compactDate,outcomeCounts,outcomeLabels,outcomeOrder } from '../lib/research';
+import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
 import { ExperimentTable, SectionTitle, Status } from '../components/common';
 import { CutChart } from '../components/CutChart';
-export function Overview(){const data=useResearch(),counts=outcomeCounts(data.experiments);const latest=data.experiments.find(e=>e.id===data.latest.experimentId)!;const recent=['CVK2','MT166','MT165','MT163','MT155'].map(id=>data.experiments.find(e=>e.id===id)).filter(e=>!!e);return <div className="page-enter"><div className="overview-intro"><div><div className="eyebrow"><span className="tiny-line"/>A living record of the research</div><h1>Every result.<br/><em>Connected to its evidence.</em></h1><p>Explore the full MetaOptimize investigation.<br className="desktop-break"/> Follow a question from experiment to code.</p></div><div className="intro-actions"><a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer"><BookOpen size={17}/>Read the visual report<ArrowUpRight size={17}/></a><a className="text-link" href={data.meta.downloads.bundle} download><Download size={16}/>Download charts & tables</a><span className="muted small">Evidence verified {compactDate(data.meta.asOf)}</span></div></div><div className="stats-strip">{[{value:data.meta.stats.experiments,label:'Questions & audits',icon:FlaskConical,to:'/experiments'},{value:data.meta.stats.runs.toLocaleString(),label:'Recorded runs',icon:Terminal,to:'/runs'},{value:data.meta.stats.figures,label:'Visual report pages',icon:Images,to:'/figures'},{value:data.sources.length,label:'Source files',icon:Braces,to:'/code'}].map(m=><Link to={m.to} className="stat" key={m.label}><div className="stat-label"><m.icon size={16}/>{m.label}<ArrowUpRight size={14}/></div><strong>{m.value}</strong></Link>)}</div><div className="overview-grid"><section className="panel latest-panel"><div className="panel-topline"><span className="eyebrow">Latest completed experiment</span><Link className="mono id-link" to="/experiments/CVK2">CVK2 <ArrowUpRight size={14}/></Link></div><div className="latest-heading"><h2>Where is the best VGG cut?</h2><Status outcome="unresolved" label="Prediction unresolved"/></div><p className="chart-subtitle">Seven cuts. Two anchors. One registered prediction.</p><CutChart/><div className="latest-conclusion"><div><span className="eyebrow">What we learned</span><strong>Cuts 16, 19 and 22 share the peak set.</strong><span>Best observed mean: cut 19. Prediction: cut 22.</span></div><Link className="round-arrow" to="/experiments/CVK2" aria-label="Open the CVK2 experiment"><ArrowUpRight size={21}/></Link></div></section><aside className="overview-side"><section className="execution-card"><div className="eyebrow"><CheckCheck size={16}/>Execution verified</div><div className="big-fraction">27<span>/ 27</span></div><h3>All 27 CVK2 runs completed.</h3><p>Clean execution. Scientific conclusion still open.</p><Link to="/experiments/CVK2?tab=runs">Inspect the run records<ArrowRight size={16}/></Link></section><section className="panel outcome-panel"><div className="panel-topline"><h3>The full picture</h3><span className="muted small">{data.experiments.length} records</span></div><div className="outcome-bar" aria-label="Outcome distribution">{outcomeOrder.map(s=><div key={s} className={`segment ${s}`} style={{flex:counts[s]}} title={`${outcomeLabels[s]}: ${counts[s]}`}/>)}</div><div className="outcome-counts">{outcomeOrder.map(s=><Link to={`/experiments?outcome=${s}`} key={s}><span><i className={`outcome-dot ${s}`}/>{outcomeLabels[s]}</span><strong>{counts[s]}</strong></Link>)}</div><p className="small muted">Each color judges its stated research goal.</p></section></aside></div><section className="research-path"><div><GitBranch size={24}/><strong>Nothing stands alone.</strong><span>Follow the links behind every claim.</span></div><nav aria-label="CVK2 evidence trail">{[{label:'Question',tab:'overview'},{label:'Results',tab:'figures'},{label:'Code',tab:'code'},{label:'Runs & logs',tab:'runs'}].map((x,i)=><span key={x.tab}>{i>0&&<ArrowRight size={14}/>}<Link to={`/experiments/${latest.id}?tab=${x.tab}`}>{x.label}</Link></span>)}</nav></section><section><SectionTitle title="Recent research, at a glance" to="/experiments" label="All experiments"/><div className="panel"><ExperimentTable experiments={recent}/></div></section><section className="areas-section"><SectionTitle title="Explore the investigation" aside={<span className="small muted">9 connected research areas</span>}/><div className="area-grid">{data.areas.map((area,i)=>{const local=outcomeCounts(data.experiments.filter(e=>e.section===area.id));return <Link className="area-card" key={area.id} to={`/experiments?area=${encodeURIComponent(area.label)}`}><span className="area-number">{String(i+1).padStart(2,'0')}</span><h3>{area.label}</h3><div className="area-card-bottom"><span>{area.count} questions & audits</span><div className="area-dots">{outcomeOrder.filter(s=>local[s]>0).map(s=><i key={s} className={`outcome-dot ${s}`} title={`${outcomeLabels[s]}: ${local[s]}`}/>)}</div><ArrowUpRight size={17}/></div></Link>})}</div></section><div className="scope-note"><TriangleAlert size={19}/><p><strong>Read the scope with the result.</strong> Runs include reruns and cancelled history. Shared seeds, tuning limits, corrected claims and unresolved mechanisms stay linked to the evidence.</p><Link to="/warnings">Review limitations<ArrowRight size={16}/></Link></div></div>}
+
+export function Overview() {
+  const data = useResearch();
+  const counts = outcomeCounts(data.experiments);
+  const latest = data.experiments.find(e => e.id === data.latest.experimentId)!;
+  const recent = ['CVK2', 'MT166', 'MT165', 'MT163', 'MT155']
+    .map(id => data.experiments.find(e => e.id === id)).filter(e => !!e);
+
+  return <div className="overview-notebook">
+    <header className="notebook-header">
+      <div>
+        <h1>Research notebook</h1>
+        <p>MetaOptimize · Snapshot {compactDate(data.meta.asOf)}</p>
+      </div>
+      <div className="notebook-actions">
+        <a className="button primary" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
+          <BookOpen size={17}/>Report PDF<ArrowUpRight size={16}/>
+        </a>
+        <a className="button" href={data.meta.downloads.bundle} download>
+          <Download size={16}/>Download evidence
+        </a>
+      </div>
+    </header>
+
+    <div className="snapshot-stats" aria-label="Snapshot contents">
+      {[
+        {value: data.meta.stats.experiments, label: 'questions & audits', icon: FlaskConical, to: '/experiments'},
+        {value: data.meta.stats.runs.toLocaleString(), label: 'run logs', icon: Terminal, to: '/runs'},
+        {value: data.meta.stats.figures, label: 'report pages', icon: Images, to: '/figures'},
+        {value: data.sources.length, label: 'source files', icon: Braces, to: '/code'},
+      ].map(item => <Link to={item.to} key={item.label}>
+        <item.icon size={17}/><strong>{item.value}</strong><span>{item.label}</span>
+      </Link>)}
+    </div>
+
+    <section className="notebook-results">
+      <SectionTitle title="Recent results" to="/experiments" label={`All ${data.meta.stats.experiments} questions & audits`}/>
+      <p className="table-scroll-hint">Scroll the table sideways for outcomes and evidence.</p>
+      <div className="panel"><ExperimentTable experiments={recent}/></div>
+    </section>
+
+    <div className="overview-grid notebook-latest">
+      <section className="panel latest-panel">
+        <div className="panel-topline">
+          <h2>CVK2 · VGG cut comparison</h2>
+          <Status outcome={latest.outcome} label="Prediction open"/>
+        </div>
+        <p className="chart-subtitle">Seven cuts and two anchors · 27 of 27 runs completed</p>
+        <CutChart/>
+        <div className="notebook-chart-result">
+          <p><strong>Cuts 16, 19 and 22 share the registered peak set.</strong> Best observed mean: cut 19. Predicted cut: 22.</p>
+          <nav className="notebook-evidence-links" aria-label="CVK2 evidence">
+            {[
+              {label: 'Result & scope', tab: 'overview'},
+              {label: 'Figures', tab: 'figures'},
+              {label: 'Code', tab: 'code'},
+              {label: 'Runs & logs', tab: 'runs'},
+            ].map(item => <Link className="text-link" key={item.tab} to={`/experiments/${latest.id}?tab=${item.tab}`}>
+              {item.label}<ArrowUpRight size={14}/>
+            </Link>)}
+          </nav>
+        </div>
+      </section>
+
+      <aside className="panel outcome-panel">
+        <div className="panel-topline"><h2>Research outcomes</h2></div>
+        <div className="outcome-bar" aria-label="Outcome distribution">
+          {outcomeOrder.map(outcome => <div key={outcome} className={`segment ${outcome}`} style={{flex: counts[outcome]}} title={`${outcomeLabels[outcome]}: ${counts[outcome]}`}/>)}
+        </div>
+        <div className="outcome-counts">
+          {outcomeOrder.map(outcome => <Link to={`/experiments?outcome=${outcome}`} key={outcome}>
+            <span><i className={`outcome-dot ${outcome}`}/>{outcomeLabels[outcome]}</span><strong>{counts[outcome]}</strong>
+          </Link>)}
+        </div>
+        <p>Outcomes refer to each stated research goal. Completed runs can still leave a prediction open.</p>
+        <Link className="text-link" to="/warnings">Warnings & limits<ArrowRight size={16}/></Link>
+      </aside>
+    </div>
+
+    <section className="notebook-areas">
+      <SectionTitle title="Research areas" aside={<span className="small muted">{data.areas.length} areas</span>}/>
+      <nav className="area-links" aria-label="Research areas">
+        {data.areas.map(area => <Link key={area.id} to={`/experiments?area=${encodeURIComponent(area.label)}`}>
+          <strong>{area.label}</strong><span>{area.count}</span><ArrowUpRight size={16}/>
+        </Link>)}
+      </nav>
+    </section>
+    <p className="notebook-scope">The run ledger retains reruns, incomplete runs and superseded history. Read each result with its linked scope and corrections.</p>
+  </div>;
+}

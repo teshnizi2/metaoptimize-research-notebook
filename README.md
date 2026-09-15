@@ -1,8 +1,18 @@
 # MetaOptimize Research Notebook
 
-A searchable, read-only website for the published MetaOptimize research record: experiment questions, visual findings, numerical tables, related research code, execution parameters, warnings, and dated history.
+A private working notebook for the researcher and two professors: experiment questions, visual findings, numerical tables, related research code, execution parameters, warnings, and dated history.
 
 The snapshot currently covers 111 experiment questions, 2,863 recorded runs, 54 report figures, and the completed CVK2 cut-location test. Coverage and publication metadata come from `public/data/research.json`. Job completion is separate from scientific success, and each conclusion retains its comparison and scope.
+
+## Repositories and access
+
+- [Notebook website and versioned log](https://github.com/teshnizi2/metaoptimize-research-notebook)
+- [Original research code](https://github.com/teshnizi2/hierarchical-metaoptimize)
+- [Hosted notebook](https://metaoptimize-research-notebook.vercel.app)
+
+Both GitHub repositories are private. Website access and GitHub repository access are separate: a notebook access link does not grant repository membership. The code viewer provides verified original-revision links where available, with an explicitly labeled archived-copy fallback. Research snapshots remain viewable inside the notebook.
+
+Vercel is connected to the notebook repository, with production built from `main`. Native Vercel Authentication protects every deployment and its downloads. This protection is a project setting, not something enforced by a private repository or by the exported static files alone. Keep it enabled when publishing updates.
 
 ## Run the portable website
 
@@ -37,3 +47,5 @@ Preserve the verified evidence files when changing presentation. Adding new rese
 - The website records a publication snapshot. It does not report live cluster state or infer launch dates from publication dates.
 
 Research evidence remains subject to its recorded caveats and original attribution. Included source associations and hashes should accompany any reuse or scientific claim.
+
+The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.

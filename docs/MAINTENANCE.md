@@ -37,7 +37,7 @@ Review `/activity` and any linked experiment pages, then follow the deployment s
 
 Prepare the verified campaign workspace first. The import expects its `outputs/tables/complete_experiment_register.csv`, `complete_run_inventory.csv`, `complete_figure_index.csv`, `research_timeline.csv`, supporting evidence JSON files under `work/`, the completed PDF, and supporting tables/assets. It imports the established evidence schema; it does not infer new scientific verdicts from raw jobs.
 
-Set the two paths for the machine performing the import. `PUBLICATION_DATE` is the date of this publication snapshot; measurement windows and historical phase dates remain in the source evidence.
+Set the two paths for the machine performing the import. Also set `RESEARCH_REVISION` and `ARCHIVE_REVISION` to verified full 40-character commit SHAs available on GitHub. The research revision identifies the original code tree; the archive revision must already contain the exact exported `public/source` bytes. For new evidence, first commit and push those sanitized source snapshots on a protected nonproduction branch. Then generate the mappings, package and test the complete update before publishing `main`. Never claim that a changed local file is identical to the pinned original. `PUBLICATION_DATE` is the date of this publication snapshot; measurement windows and historical phase dates remain in the source evidence.
 
 ```sh
 RESEARCH_WORKSPACE="/path/to/verified-campaign-workspace"
@@ -47,6 +47,7 @@ PUBLICATION_DATE="$(date -u +%F)"
 python3 scripts/export_sources.py --repo "$RESEARCH_REPO" --workspace "$RESEARCH_WORKSPACE" --public ./public --audit "$RESEARCH_WORKSPACE/work/portal_source_audit.json"
 python3 scripts/export_research.py --workspace "$RESEARCH_WORKSPACE" --public-dir ./public --as-of "$PUBLICATION_DATE"
 python3 scripts/export_research.py --public-dir ./public --check
+npx tsx scripts/export_github_links.ts --research-repo "$RESEARCH_REPO" --research-revision "$RESEARCH_REVISION" --archive-revision "$ARCHIVE_REVISION"
 npm run test:data
 node scripts/sync-journal.mjs
 python3 scripts/package_notebook.py --verify
@@ -74,7 +75,7 @@ Deployment is a maintainer action after review. Use the existing Vercel project 
 npm run deploy
 ```
 
-The local `npm run deploy` command runs the JavaScript tests, synchronizes the journal, regenerates and verifies the source ZIP, builds production assets, then calls `vercel --prod --archive=tgz`. This order keeps the downloadable source aligned with the publication and uploads the thousands of assets as an archive. The packaging command writes `public/assets/notebook-source.zip` plus the source deliverable in the campaign outputs and records hashes, privacy coverage, and portability checks in `work/notebook_source_package_report.json`. Vercel's remote build uses `npm run build`; the Python packager is local tooling and is excluded from the hosted deployment. Run the Python data checks above first whenever imported evidence changes. Commit the reviewed source and generated data using the project's normal version-control workflow. Once Vercel reports a successful deployment, open its reported production URL and verify the snapshot ID, a new journal entry, direct route reloads, and downloads. Build success alone does not verify a deployment.
+The local `npm run deploy` command runs the JavaScript tests, synchronizes the journal, regenerates and verifies the source ZIP, builds production assets, then calls `vercel --prod --archive=tgz`. This order keeps the downloadable source aligned with the publication and uploads the thousands of assets as an archive. The packaging command writes `public/assets/notebook-source.zip` plus the source deliverable in the campaign outputs and records hashes, privacy coverage, and portability checks in `work/notebook_source_package_report.json`. Vercel's remote build runs `npm test` followed by `npm run build`; the Python packager is local tooling and is excluded from the hosted deployment. Run the Python data checks above first whenever imported evidence changes. Commit the reviewed source and generated data using the project's normal version-control workflow. Once Vercel reports a successful deployment, open its reported production URL and verify the snapshot ID, a new journal entry, direct route reloads, and downloads. Build success alone does not verify a deployment.
 
 ## Metric and provenance boundaries
 
@@ -90,4 +91,12 @@ The local `npm run deploy` command runs the JavaScript tests, synchronizes the j
 
 Read the command's error before retrying. Validation failures leave the previous journal intact. Restore malformed JSON or a changed published prefix from version control, then append a correction. If `.journal.lock` remains after an interrupted process, inspect its recorded PID and verify that no journal or build-time sync writer is running before removing that specific stale lock. Never clear another active writer's lock.
 
-The two JSON files and version control provide the persistence boundary. There is no browser-local storage, collaborative editor, authentication service, or backend database. A saved local entry becomes visible to readers only after a successful build and publication.
+The two JSON files and version control provide the persistence boundary. There is no browser-local storage, collaborative editor, or backend database. The hosted notebook uses native Vercel access protection. A saved local entry becomes visible to readers only after a successful build and publication.
+
+## Research group access and GitHub
+
+The hosted notebook and all its downloadable evidence require access through Vercel. Keep **Vercel Authentication → All Deployments** enabled in the project settings, including after redeployment. Both the notebook repository and original research repository are private; their collaborator permissions are managed separately. A site-access link does not grant GitHub access. Never place access links, passwords, tokens or professor contact details in the journal, code archive or repository.
+
+The existing Vercel project is connected to the notebook GitHub repository with `main` as its production branch. After a verified update, synchronize the journal, regenerate the source ZIP, test, build, commit the reviewed changes and push `main`; Vercel starts the build automatically. Confirm the new deployment is ready and still denies anonymous HTML, data, source, log and download requests before sharing it. The CLI deployment command remains available for an authorized manual release. Do not disable protection to make a browser check or automated verification pass.
+
+The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.

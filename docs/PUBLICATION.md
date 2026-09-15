@@ -21,3 +21,7 @@ Public website source: https://metaoptimize-research-notebook.vercel.app/assets/
 Source archive SHA-256: `3fd74d052a61b5d7d6b302192904702af0aaf0bfb3d500ec2f06115166bd9851`. The final archive differs from the independently clean-installed/tested/built package only in `.vercelignore`; every application and evidence payload hash is identical. The successful Vercel build also compiled the final submitted source.
 
 Deployment: `dpl_DBBDdy6YDZcha6aKL73XPVgKJzNa`; deployed application commit: `e58287a`. The repository is private because it includes maintainer import tooling; public code and the portable source download are sanitized and available without login.
+
+## Private research group update
+
+The initial public release has been superseded by native access protection for every deployment and downloadable evidence file. The same website address is now for the researcher and professors using a revocable group link stored outside this repository. GitHub is connected to Vercel production on `main`; deployment runs the application tests before building. The compact interface links all 291 source snapshots to GitHub: 284 verified original revisions and seven exact archived copies. Scientific evidence and registered outcomes are unchanged.
