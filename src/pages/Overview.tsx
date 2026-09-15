@@ -5,6 +5,7 @@ import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/
 import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
 import { ArtifactDates, SnapshotDate } from '../components/ArtifactDates';
 import { SectionTitle } from '../components/common';
+import { ResearchTimeline } from '../components/ResearchTimeline';
 
 export function Overview() {
   const data = useResearch();
@@ -55,6 +56,8 @@ export function Overview() {
         </Link>)}
       </nav>
     </section>
+
+    <ResearchTimeline/>
 
     <section className="home-area-review">
       <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
