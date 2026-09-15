@@ -1,4 +1,3 @@
-import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ChevronRight } from 'lucide-react';
 import { useResearch } from '../data';
@@ -9,23 +8,13 @@ export function ResearchTimeline() {
   const data = useResearch();
   const phases = researchTimeline(data.activity, data.experiments);
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  const [expanded, setExpanded] = useState(false);
-  const feed = useRef<HTMLDivElement>(null);
-  const hasHistory = phases.length > 4;
-
-  function toggleHistory() {
-    setExpanded(value => !value);
-    // Show less returns the scrolling list to the newest work.
-    if (expanded && feed.current) feed.current.scrollTop = 0;
-  }
 
   return <section className="home-research-timeline" aria-labelledby="home-timeline-title" id="research-timeline">
     <div className="section-title">
       <h2 id="home-timeline-title">Research timeline</h2>
       <span className="home-section-meta">Newest first</span>
     </div>
-    <div className={`home-review-feed${expanded ? ' is-expanded' : ''}`} id="research-history" ref={feed}
-      tabIndex={hasHistory && !expanded ? 0 : undefined} role="region" aria-label="Research phases, newest first"
+    <div className="home-review-feed" id="research-history" role="region" aria-label="Research phases, newest first"
       aria-describedby="research-history-hint">
       <ul className="home-review-list">{phases.map(phase => <li key={phase.id}>
         <Link className="home-review-row" to={`/activity?q=${encodeURIComponent(phase.id)}&view=phase`}>
@@ -41,8 +30,7 @@ export function ResearchTimeline() {
       </li>)}</ul>
     </div>
     <div className="home-review-footer">
-      <span id="research-history-hint">{hasHistory && !expanded ? 'Scroll for older work' : `${phases.length} documented research periods`}</span>
-      {hasHistory && <button className="button" onClick={toggleHistory} aria-expanded={expanded} aria-controls="research-history">{expanded ? 'Show less' : `Show all ${phases.length}`}</button>}
+      <span id="research-history-hint">{phases.length} documented research periods</span>
       {unlinked.length > 0 && <Link className="text-link" to="/experiments?phase=unlinked">{unlinked.length} records without a phase link</Link>}
     </div>
   </section>;
