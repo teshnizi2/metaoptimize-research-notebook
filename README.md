@@ -1,6 +1,6 @@
 # MetaOptimize Research Notebook
 
-A private working notebook for the researcher and two professors: experiment questions, visual findings, numerical tables, related research code, execution parameters, warnings, and dated history.
+A working notebook for the researcher and two professors: experiment questions, visual findings, numerical tables, related research code, execution parameters, warnings, and dated history.
 
 The snapshot currently covers 111 experiment questions, 2,863 recorded runs, 54 report figures, and the completed CVK2 cut-location test. Coverage and publication metadata come from `public/data/research.json`. Job completion is separate from scientific success, and each conclusion retains its comparison and scope.
 
@@ -10,9 +10,9 @@ The snapshot currently covers 111 experiment questions, 2,863 recorded runs, 54 
 - [Original research code](https://github.com/teshnizi2/hierarchical-metaoptimize)
 - [Hosted notebook](https://metaoptimize-research-notebook.vercel.app)
 
-Both GitHub repositories are private. Website access and GitHub repository access are separate: a notebook access link does not grant repository membership. The code viewer provides verified original-revision links where available, with an explicitly labeled archived-copy fallback. Research snapshots remain viewable inside the notebook.
+Both GitHub repositories are public and readable without invitations. The notebook repository includes published source and evidence, so site login does not make those files private. The code viewer retains verified original-revision links and explicitly labeled archived copies.
 
-Vercel is connected to the notebook repository, with production built from `main`. Native Vercel Authentication protects every deployment and its downloads. This protection is a project setting, not something enforced by a private repository or by the exported static files alone. Keep it enabled when publishing updates.
+Vercel is connected to the notebook repository, with production built from `main`. Native Vercel Authentication protects every deployment and its downloads. This project setting protects the hosted routes, not copies published on GitHub. Keep it enabled when publishing updates.
 
 ## Run the portable website
 
@@ -33,7 +33,7 @@ The archive cannot contain itself. To retain the website's source-download link 
 
 ## Maintain the research record
 
-See [the maintenance guide](docs/MAINTENANCE.md) for journal updates, validation, preview checks, and publishing the static `dist` folder. In the portable bundle this guide describes the portable workflow. A maintainer can append a note, correction, or warning with `npm run log`; the public website itself stays read only. Saved entries become visible after a build and publication.
+See [the maintenance guide](docs/MAINTENANCE.md) for journal updates, validation, preview checks, and publishing the static `dist` folder. In the portable bundle this guide describes the portable workflow. A maintainer can append a note, correction, or warning with `npm run log`; the website itself stays read only. Saved entries become visible after a build and publication.
 
 Preserve the verified evidence files when changing presentation. Adding new research results requires a separately verified evidence export; browser edits and journal notes do not change registered scientific outcomes.
 

@@ -95,7 +95,9 @@ The two JSON files and version control provide the persistence boundary. There i
 
 ## Research group access and GitHub
 
-The hosted notebook and all its downloadable evidence require access through Vercel. Keep **Vercel Authentication → All Deployments** enabled in the project settings, including after redeployment. Both the notebook repository and original research repository are private; their collaborator permissions are managed separately. A site-access link does not grant GitHub access. Never place access links, passwords, tokens or professor contact details in the journal, code archive or repository.
+The hosted notebook and downloads served by Vercel require site access. Keep **Vercel Authentication → All Deployments** enabled in the project settings, including after redeployment.
+
+Both GitHub repositories are public and readable without invitations. The notebook repository includes published source and evidence; site login does not make those files private. Never place access links, passwords, tokens or professor contact details in the journal, code archive or repository.
 
 The existing Vercel project is connected to the notebook GitHub repository with `main` as its production branch. After a verified update, synchronize the journal, regenerate the source ZIP, test, build, commit the reviewed changes and push `main`; Vercel starts the build automatically. Confirm the new deployment is ready and still denies anonymous HTML, data, source, log and download requests before sharing it. The CLI deployment command remains available for an authorized manual release. Do not disable protection to make a browser check or automated verification pass.
 

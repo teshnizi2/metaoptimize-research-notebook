@@ -45,13 +45,13 @@ export function Layout() {
         <a className="sidebar-report" href={data.meta.downloads.pdf} target="_blank" rel="noreferrer">
           <FileDown size={18}/><span>Report PDF</span><ArrowUpRight size={15}/>
         </a>
-        <div className="sidebar-repositories" aria-label="Private GitHub repositories">
+        <div className="sidebar-repositories" aria-label="Public GitHub repositories">
           <div className="nav-label">GitHub repositories</div>
           <a href="https://github.com/teshnizi2/metaoptimize-research-notebook" target="_blank" rel="noopener noreferrer">
-            <GitBranch size={17}/><span><strong>Notebook repository</strong><small>Private · site & evidence</small></span><ArrowUpRight size={14}/>
+            <GitBranch size={17}/><span><strong>Notebook repository</strong><small>Public · site & evidence</small></span><ArrowUpRight size={14}/>
           </a>
           <a href="https://github.com/teshnizi2/hierarchical-metaoptimize" target="_blank" rel="noopener noreferrer">
-            <GitBranch size={17}/><span><strong>Research repository</strong><small>Private · experiments & code</small></span><ArrowUpRight size={14}/>
+            <GitBranch size={17}/><span><strong>Research repository</strong><small>Public · experiments & code</small></span><ArrowUpRight size={14}/>
           </a>
         </div>
       </div>
