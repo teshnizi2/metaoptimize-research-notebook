@@ -4,6 +4,8 @@ A working notebook for the researcher and two professors: experiment questions, 
 
 The snapshot currently covers 111 experiment questions, 2,863 recorded runs, 54 report figures, and the completed CVK2 cut-location test. Coverage and publication metadata come from `public/data/research.json`. Job completion is separate from scientific success, and each conclusion retains its comparison and scope.
 
+The homepage summarizes the whole register through overall outcomes, an area-by-area table and dated notebook updates. Outcome counts link to the matching experiments; detailed plots belong to each experiment page. These counts cover different research goals and audits and are not a method win rate or a record of professor reviews.
+
 ## Repositories and access
 
 - [Notebook website and versioned log](https://github.com/teshnizi2/metaoptimize-research-notebook)

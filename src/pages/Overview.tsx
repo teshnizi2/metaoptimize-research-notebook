@@ -1,17 +1,16 @@
 import { Link } from 'react-router-dom';
-import { ArrowRight, ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
+import { ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
-import { outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
+import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
+import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
 import { ArtifactDates, SnapshotDate } from '../components/ArtifactDates';
-import { ExperimentTable, SectionTitle, Status } from '../components/common';
-import { CutChart } from '../components/CutChart';
+import { SectionTitle } from '../components/common';
 
 export function Overview() {
   const data = useResearch();
   const counts = outcomeCounts(data.experiments);
-  const latest = data.experiments.find(e => e.id === data.latest.experimentId)!;
-  const recent = ['CVK2', 'MT166', 'MT165', 'MT163', 'MT155']
-    .map(id => data.experiments.find(e => e.id === id)).filter(e => !!e);
+  const areas = areaOutcomeCounts(data.experiments, data.areas);
+  const updates = recentNotebookUpdates(data.activity);
 
   return <div className="overview-notebook">
     <header className="notebook-header">
@@ -40,58 +39,48 @@ export function Overview() {
       </Link>)}
     </div>
 
-    <section className="notebook-results">
-      <SectionTitle title="Recent results" to="/experiments" label={`All ${data.meta.stats.experiments} questions & audits`}/>
-      <p className="table-scroll-hint">Scroll the table sideways for outcomes and evidence.</p>
-      <div className="panel"><ExperimentTable experiments={recent}/></div>
-    </section>
-
-    <div className="overview-grid notebook-latest">
-      <section className="panel latest-panel">
-        <div className="panel-topline">
-          <h2>CVK2 · VGG cut comparison</h2>
-          <Status outcome={latest.outcome} label="Prediction open"/>
-        </div>
-        <p className="chart-subtitle">Seven cuts and two anchors · 27 of 27 runs completed</p>
-        <CutChart/>
-        <div className="notebook-chart-result">
-          <p><strong>Cuts 16, 19 and 22 share the registered peak set.</strong> Best observed mean: cut 19. Predicted cut: 22.</p>
-          <nav className="notebook-evidence-links" aria-label="CVK2 evidence">
-            {[
-              {label: 'Result & scope', tab: 'overview'},
-              {label: 'Figures', tab: 'figures'},
-              {label: 'Code', tab: 'code'},
-              {label: 'Runs & logs', tab: 'runs'},
-            ].map(item => <Link className="text-link" key={item.tab} to={`/experiments/${latest.id}?tab=${item.tab}`}>
-              {item.label}<ArrowUpRight size={14}/>
-            </Link>)}
-          </nav>
-        </div>
-      </section>
-
-      <aside className="panel outcome-panel">
-        <div className="panel-topline"><h2>Research outcomes</h2></div>
-        <div className="outcome-bar" aria-label="Outcome distribution">
-          {outcomeOrder.map(outcome => <div key={outcome} className={`segment ${outcome}`} style={{flex: counts[outcome]}} title={`${outcomeLabels[outcome]}: ${counts[outcome]}`}/>)}
-        </div>
-        <div className="outcome-counts">
-          {outcomeOrder.map(outcome => <Link to={`/experiments?outcome=${outcome}`} key={outcome}>
-            <span><i className={`outcome-dot ${outcome}`}/>{outcomeLabels[outcome]}</span><strong>{counts[outcome]}</strong>
-          </Link>)}
-        </div>
-        <p>Outcomes refer to each stated research goal. Completed runs can still leave a prediction open.</p>
-        <Link className="text-link" to="/warnings">Warnings & limits<ArrowRight size={16}/></Link>
-      </aside>
-    </div>
-
-    <section className="notebook-areas">
-      <SectionTitle title="Research areas" aside={<span className="small muted">{data.areas.length} areas</span>}/>
-      <nav className="area-links" aria-label="Research areas">
-        {data.areas.map(area => <Link key={area.id} to={`/experiments?area=${encodeURIComponent(area.label)}`}>
-          <strong>{area.label}</strong><span>{area.count}</span><ArrowUpRight size={16}/>
+    <section className="home-outcomes" aria-labelledby="home-outcomes-title">
+      <div className="section-title">
+        <h2 id="home-outcomes-title">Research outcomes</h2>
+        <Link className="text-link" to="/experiments">All {data.experiments.length} questions & audits<ArrowUpRight size={16}/></Link>
+      </div>
+      <p className="home-section-note">Outcomes reflect each stated research goal or audit.</p>
+      <div className="home-outcome-bar" role="img" aria-label={outcomeOrder.map(outcome => `${outcomeLabels[outcome]}: ${counts[outcome]}`).join(', ')}>
+        {outcomeOrder.map(outcome => <span key={outcome} className={`segment ${outcome}`} style={{flexGrow: counts[outcome]}} hidden={counts[outcome] === 0} aria-hidden="true"/>)}
+      </div>
+      <nav className="home-outcome-counts" aria-label="Research outcome filters">
+        {outcomeOrder.map(outcome => <Link to={`/experiments?outcome=${outcome}`} key={outcome}>
+          <span><i className={`outcome-dot ${outcome}`} aria-hidden="true"/>{outcomeLabels[outcome]}</span>
+          <strong>{counts[outcome]}</strong>
         </Link>)}
       </nav>
     </section>
-    <p className="notebook-scope">The run ledger retains reruns, incomplete runs and superseded history. Read each result with its linked scope and corrections.</p>
+
+    <section className="home-area-review">
+      <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
+      <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all five outcomes.</p>
+      <div className="home-area-table-wrap" tabIndex={0} role="region" aria-label="Research area outcome counts" aria-describedby="home-area-scroll-hint">
+        <table className="home-area-table">
+          <caption className="sr-only">Questions and audits by research area and outcome</caption>
+          <thead><tr><th scope="col">Research area</th><th scope="col">Total</th>{outcomeOrder.map(outcome => <th scope="col" key={outcome}><span><i className={`outcome-dot ${outcome}`} aria-hidden="true"/>{outcomeLabels[outcome]}</span></th>)}</tr></thead>
+          <tbody>{areas.map(area => <tr key={area.label}>
+            <th scope="row"><Link to={`/experiments?area=${encodeURIComponent(area.label)}`}>{area.label || 'Area not recorded'}</Link></th>
+            <td><Link className="home-area-total" to={`/experiments?area=${encodeURIComponent(area.label)}`} aria-label={`${area.label}: all ${area.total} questions and audits`}>{area.total}</Link></td>
+            {outcomeOrder.map(outcome => <td key={outcome}><Link className={`home-area-count ${area.counts[outcome] ? `status-${outcome}` : 'is-zero'}`} to={`/experiments?area=${encodeURIComponent(area.label)}&outcome=${outcome}`} aria-label={`${area.label}: ${area.counts[outcome]} ${outcomeLabels[outcome]}`}>{area.counts[outcome]}</Link></td>)}
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </section>
+
+    <section className="home-updates">
+      <SectionTitle title="Notebook updates" to="/activity" label="Research log"/>
+      {updates.length ? <ul className="home-update-list">{updates.map(event => <li key={event.id}>
+        <Link to={`/activity?q=${encodeURIComponent(event.id)}`}>
+          <div className="home-update-meta"><time dateTime={event.date}>{compactDate(event.date)}</time><span>{event.kind}</span></div>
+          <strong>{event.title}</strong><ArrowUpRight size={17}/>
+        </Link>
+      </li>)}</ul> : <p className="home-section-note">No dated notebook updates are recorded.</p>}
+    </section>
+    <p className="notebook-scope">Read each result with its scope and corrections. The run ledger also retains reruns and superseded history.</p>
   </div>;
 }
