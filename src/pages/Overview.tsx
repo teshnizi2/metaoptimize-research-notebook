@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import { ArrowUpRight, BookOpen, Braces, ChevronDown, FlaskConical, Images, Terminal, Download } from 'lucide-react';
+import { ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
 import { compactDate, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
 import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
@@ -62,8 +62,8 @@ export function Overview() {
 
     <ResearchTimeline/>
 
-    <details className="home-area-review home-area-disclosure">
-      <summary><span className="home-area-label">Research areas</span><span className="home-section-meta">{areas.length} areas</span><ChevronDown size={18}/></summary>
+    <section className="home-area-review">
+      <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
       <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all five outcomes.</p>
       <div className="home-area-table-wrap" tabIndex={0} role="region" aria-label="Research area outcome counts" aria-describedby="home-area-scroll-hint">
         <table className="home-area-table">
@@ -76,7 +76,7 @@ export function Overview() {
           </tr>)}</tbody>
         </table>
       </div>
-    </details>
+    </section>
 
     <section className="home-updates">
       <SectionTitle title="Notebook updates" to="/activity" label="All updates"/>
