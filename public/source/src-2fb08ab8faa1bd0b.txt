@@ -1,0 +1,37 @@
+set -e
+cd /cluster/account_a/metaopt
+R=/cluster/account_a/metaopt/runs
+CLIP="BETA_CLIP=-15:-2.3026"
+BL="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --meta-stepsize 1e-3 --alpha0 1e-6 --gamma 1 --NN-name ResNet18 --dataset CIFAR10 --num-epochs 100 --batch-size 100 --max-time 999:00:00"
+BA="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Adam --normalizer-param-meta 0.999 --momentum-param-meta 0.9 --weight-decay-meta 0 --meta-stepsize 1e-3 --alpha0 1e-6 --gamma 1 --NN-name ResNet18 --dataset CIFAR10 --num-epochs 100 --batch-size 100 --max-time 999:00:00"
+
+sub () { # 1=name 2=granularity 3=seed 4=extra_env(may be empty) 5=basecfg
+  local EXP="ALL,AUGMENT=1,$CLIP"
+  [ -n "$4" ] && EXP="$EXP,$4"
+  sbatch --parsable --job-name=$1-s$3 --partition=gpu-l4-24g --gres=gpu:l4:1 --time=03:00:00 \
+    --export="$EXP" \
+    jobs/run_cifar.sh $5 --stepsize-groups $2 --seed $3 --save-directory $R/hier2 --run-name $1_s$3 >/dev/null
+}
+
+for s in 0 1 2; do
+  # --- A. LAM sweep on layerwise (LAM is a PER-STEP shrink rate; resolve the range)
+  sub h2-l-L0p001 layerwise $s "HIER=shrink,LAM=0.001" "$BL"
+  sub h2-l-L0p01  layerwise $s "HIER=shrink,LAM=0.01"  "$BL"
+  sub h2-l-L0p5   layerwise $s "HIER=shrink,LAM=0.5"   "$BL"
+  sub h2-l-L1p0   layerwise $s "HIER=shrink,LAM=1.0"   "$BL"
+  # --- B. does the win transfer to the 6-block arm?
+  sub h2-b-L0p1   resnet18_blocks $s "HIER=shrink,LAM=0.1" "$BL"
+  # --- C. MECHANISM: does the shrink win survive a NON-SIGN meta-optimizer?
+  sub h2A-l-L0p1  layerwise $s "HIER=shrink,LAM=0.1" "$BA"
+  sub h2A-l-plain layerwise $s ""                    "$BA"
+done
+# --- D. complete LAM=0.1 layerwise to 3 seeds (s0,s1 exist as hs-l-lam01)
+sub h2-l-L0p1 layerwise 2 "HIER=shrink,LAM=0.1" "$BL"
+# --- E. weightwise at MUCH smaller LAM -- the 0.01/0.1/0.5 cells were saturated
+for s in 0 1; do
+  sub h2-w-L1e4 weightwise $s "HIER=shrink,LAM=0.0001"  "$BL"
+  sub h2-w-L1e5 weightwise $s "HIER=shrink,LAM=0.00001" "$BL"
+done
+sleep 3
+echo "H2_SUBMITTED=$(squeue -h -u account_a -o '%j' | grep -c '^h2')"
+echo "TOTAL_QUEUED=$(squeue -h -u account_a | wc -l)"

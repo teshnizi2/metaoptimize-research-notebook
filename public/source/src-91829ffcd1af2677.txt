@@ -1,0 +1,855 @@
+# REGISTRATION — ideas A, B, C: **`gn1` (normaliser transfer)** — the one surviving batch
+
+**STATUS: FINAL, post-review. Registered before any `gn1` run exists** (STANDING RULE 19),
+before the required cluster patch has been applied to the live tree, and before any job has
+been submitted. Repo state at first registration: commit `93d7870`, `results/all_runs.csv` =
+1,891 runs, **zero rows whose `run` begins `sl1` or `gn1`**, zero rows on any non-BatchNorm
+network. Everything numeric was **re-derived at write time** from `results/all_runs.csv`,
+from `probes_*/probe.jsonl`, and from an independent re-run of the shape enumerator. No
+number is quoted from prose in `FINDINGS.md`, `CORRECTIONS.md`, or the feasibility pass.
+
+**THIS REVISION (cycle-84 review) KILLED ONE OF THE TWO REGISTERED BATCHES AND CHANGED SIX
+THINGS IN THE OTHER.** Every change is recorded in §3 and §4.8 and in CORRECTIONS 114. The
+headline: **`sl1`, the fixed-m singleton ladder, is WITHDRAWN pre-data and its script and
+scorer are DELETED.** It was fully built and fully validated — 68/0 equivalence suite,
+105/105 scorer selftest, guards firing in both directions — and none of that saved it,
+because two arithmetic defects meant it could not answer the question it was built to ask.
+That is the sixth pre-data kill of this campaign and the first of a batch that was already
+finished.
+
+Nothing was submitted. **No cluster file was modified** (verified after the fact: the live
+`HF.py` contains 0 occurrences of `PATCH_CHUNKVEC`, the live `build_network.py` 0 of
+`ResNet18_gn`, and `squeue -u account_a` reads 0). `gn1` remains **NOT SUBMITTABLE**
+until §6 is done.
+
+---
+
+## 0. WHAT SURVIVED, IN ONE LINE EACH
+
+| idea | as sketched | verdict | what is registered here |
+|---|---|---|---|
+| **A** singleton-count ladder | naive ladder, k of 41 one-D tensors per-channel, ND side left at nodewise | **KILLED** (§5.1) — perfectly collinear with m | **nothing.** The fixed-m replacement `sl1` was built and then **also killed** (§3) |
+| **B** no-BatchNorm falsification | BN-free ResNet18, gap should vanish | **KILLED** (§5.2) — re-measures `G`, and its only informative outcome is un-attributable | **`gn1`**, the *GroupNorm* normaliser-transfer test (§4) |
+| **C** count-matched prescription test | `nodewise1d` + finer ND chunking to reach m ≈ 14,420 | **KILLED** (§5.3) — that arm **is** `chunk777`, already run 18 times | nothing |
+
+**ONE batch survives: `gn1`, 24 jobs, 4 arms, n = 4 on the BatchNorm control and n = 8 on the
+GroupNorm arms, one cell.** ≈ 24–36 GPU-hours. It is **not first in the queue** (§6.0).
+
+---
+
+
+## 1. THE FROZEN CENSUS — ResNet18 / CIFAR-10, re-derived at write time
+
+Enumerated from the `named_parameters()` shape list exactly as `HF.py:72` builds it. The
+instrument self-validates 7/7 against the frozen record (params · nodewise m · singletons ·
+f · weight coverage · nodewise1d m · number of one-D tensors).
+
+```
+62 tensors            11,173,962 params
+41 tensors ndim==1    lengths {64×10, 128×10, 256×10, 512×10, 10}   Σ = 9,610 params
+21 tensors ndim>=2    11,164,352 params   Σ shape[0] = 4,810 nodewise groups
+                      min ndim>=2 nodewise group size = 27  (conv1, 64×3×3×3)
+```
+
+| quantity | value |
+|---|---|
+| `m(nodewise)` = Σ shape[0] | **14,420** |
+| size-1 groups under `nodewise` | **9,610** = **66.6436 %** of m, covering **0.086004 %** of the weights |
+| `m(nodewise1d)` = 4,810 + 41 | **4,851** (= 14,420 − 9,610 + 41 ✓) |
+| size-1 groups under `nodewise1d` | **0** — verified, not assumed (min ND group size 27 > 1) |
+| `m(chunk777)` = Σ⌈numel/777⌉ | **14,421** (+1); **no K gives 14,420 exactly** — searched K ∈ [2, 200000] |
+| `m(chunk2325)` = `m(chunk2326)` | **4,851 EXACT** |
+
+**Identity used throughout, verified per-tensor:** max one-D numel = 512 < 777 ≤ K, so for
+every K ≥ 512 each one-D tensor is **one chunk**. `chunk<K≥512>`'s one-D groups are
+identical, 41/41, to `nodewise1d`'s.
+
+---
+
+## 2. THE CELL — `gn1`'s cell, and the two box corrections
+
+### 2.1 The configuration, held byte-identical across every arm (RULE 10)
+
+```
+--optimizer HF  --alg-base SGDm  --momentum-param-base 0.99  --weight-decay-base 0.1
+--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+--dataset CIFAR10  --batch-size 100  --gamma 1  --alpha0 1e-3
+--meta-stepsize 1e-4        <-- see 2.2/2.3
+--num-epochs 100            <-- see 2.4
+AUGMENT=1   BETA_CLIP=-15:-2.3026   HIER unset   PROBE=5  PROBE5=1   <-- see 2.2/2.6
+```
+
+Only two fields vary: `--NN-name` and `--stepsize-groups`.
+
+### 2.2 Why `ms = 1e-4`, and why the floor choice is free
+
+`HF.py:676` `Lion_meta_update` with `weight_decay_meta = 0` gives |Δβ| = `ms` **exactly**,
+per coordinate, per step. CIFAR-10 at batch 100 is 500 steps/epoch, so over 100 epochs the
+total reachable excursion from β₀ = log(1e-3) = −6.907755 is `500 × 100 × ms`:
+
+| ms | max ‖Δβ‖ | reachable β interval | floor −15 | floor −25 | ceiling −2.3026 |
+|---|---|---|---|---|---|
+| 1e-4 | 5.0 | [−11.9078, −1.9078] | needs 80,922 of 50,000 steps → **unreachable** | unreachable | reachable |
+| 3e-4 | 15.0 | [−21.9078, +8.0922] | reached at step 26,974 of 50,000 | unreachable | reachable |
+
+So **at ms = 1e-4 the floor is provably dead and `-25` and `-15` are identical in effect**,
+and the box question reduces entirely to the ceiling, which is reachable (from epoch 92.1) and
+is **not** released: the corpus's only released-ceiling runs (`bd7-w-c6-s0/s1`, box `-30:6.0`)
+are 2/2 `collapsed=1`. **Which of the two identical floors to write down is settled in §2.6.**
+
+### 2.3 THE CORRECTION — `ms = 3e-4` HAS NO CLEAN BOX, AND THE FEASIBILITY PASS HAD THIS WRONG
+
+The feasibility pass recommended running the ladder at `ms = 3e-4`, `BETA_CLIP -25:-2.3026`,
+on the stated ground that box occupancy there reads `rec_lo = rec_hi = 0.0000 on 12/12`.
+**I re-measured every relevant `probe.jsonl` (10,000 records each) and that is false.** What
+is actually on disk (`rec` = fraction of probe records with ≥1 β at the guard):
+
+| batch | ms | box | arm | `rec_lo` | `rec_hi` | worst coord count |
+|---|---|---|---|---|---|---|
+| `ar1` | 3e-4 | −15:−2.3026 | chunk777 / chunk2325 / nodewise1d | **0.4560–0.4582** | 0.0000 | 19–27 of 14,4xx |
+| `ar1` | 3e-4 | −15:−2.3026 | **nodewise** | **0.4521–0.4596** | 0.0000–0.1195 | **1,699–1,748** of 14,420 |
+| `fa1` | 3e-4 | −25:−2.3026 | chunk777 / chunk2325 / nodewise1d | 0.0000 (18/18) | 0.0000 (18/18) | 0 |
+| `fa1` | 3e-4 | −25:−2.3026 | **nodewise** | 0.0000 | **0.0000 / 0.1672 / 0.0023 / 0.0137 / 0.2192 / 0.0600** (s0…s5) | 1–4 of 14,420 |
+| `mm1`,`pp1`,`bn1`,`cc1` | **1e-4** | −15:−2.3026 | **all four granularities, 33 probe arms** | **0.0000 (33/33)** | **0.0000 (33/33)** | 0; max β reached = **−3.32**, a full 1.0 nat below the ceiling |
+
+Reading, stated plainly: at `ms = 3e-4` **there is no box that is free for the singleton
+arm.** Closing the floor at −15 pins ~12 % of `nodewise`'s coordinates there; releasing it to
+−25 frees the floor but the meta-learner then runs the other way and `nodewise` — and *only*
+`nodewise*, the arm that loses the contrast — touches the **ceiling** on 3 of 6 seeds above
+R4's 5 %-of-records threshold. The bind is small in coordinates (1–4 β of 14,420, i.e.
+0.007–0.028 %, versus `ar1`'s 1,700), so `fa1`'s D is not thereby void; but it is nonzero,
+it is **arm-asymmetric in the same direction as the effect**, and under RULE 5 that makes it
+a caveat that must travel with `fa1`'s +0.629 wherever it is quoted.
+
+**Consequence, registered:** both batches run at **`ms = 1e-4`**, the only cell where both
+guards read exactly zero on every arm and every seed of every batch that owns probes, with a
+measured 1.0-nat margin to the reachable ceiling. This overrides the feasibility pass's cell
+for the ladder. The price is paid in §4.6: the anchor is the ms=1e-4 pooled D, not `fa1`'s.
+
+### 2.4 Why 100 epochs
+
+Fixed, not chosen per arm. (a) Every anchor this registration predicts against — `mm1`,
+`pp1`, `bn1`, `cc1`, `fa1` — is a 100-epoch batch, and `plateau5` is the mean of the last 5
+test epochs, so it is a **budget-relative** statistic and is not comparable across budgets
+(this is also why the CSV's `plateau` column, mean-of-last-20, is never used here). (b) The
+reachability arithmetic in 2.2 is a function of `500 × epochs × ms`; changing the budget
+changes the box occupancy and would void the clean cell established in 2.3. (c) 100 epochs
+is the corpus's modal budget for ResNet18 (median wall-clock **42 min**, n = 1,068, range
+28–115), so cost is known rather than estimated.
+
+### 2.5 The primary metric
+
+**`plateau5`** — mean of the last 5 test epochs read from the `.out` series. Contrasts are
+**Welch, unpaired**. Seeds do **not** pair across batches on this cluster, so every registered
+contrast below is formed **within one batch**; no contrast in this document crosses a batch
+boundary except where explicitly labelled as an anchor comparison, and those carry their own
+inflated uncertainty.
+
+---
+
+### 2.6 THE SECOND BOX CORRECTION — **−25 → −15**, made at cycle-84 review
+
+§2.2 proves the two floors are identical *in effect*. It does not follow that the choice is
+free of consequence for the **thresholds**, and that is what the first draft missed.
+
+**`(ms = 1e-4, −25:-2.3026)` exists in ZERO of the 1,891 corpus rows.** Re-derived at write
+time: every ms = 1e-4 run sits at `-15:-2.3026` (`nodewise` 16, `chunk777` 9, `nodewise1d` 6,
+`chunk2325` 6), and the only `-25` rows in the corpus are `fa1`'s, at ms = 3e-4. Meanwhile
+**every frozen number in `gn1`** — the +0.30 T1 gate, the +0.5805 anchor, σ = 0.1740, and
+therefore the powered-null threshold — is computed from −15 data. Running the batch at −25
+would have made each one a **cross-box import**, which is exactly the move CORRECTIONS 113
+forbids after `fa1` showed the box changes the *optimiser* and not merely the instrument
+(`nodewise1d` moved −0.177, t −2.22, RESOLVED).
+
+Moving to −15 costs nothing by §2.2's proof and buys a cell that is **byte-identical to the
+anchors**. It also gains direct empirical support on the arm that matters most: at this exact
+cell the `nodewise` (singleton) arm — the one that binds hardest everywhere else — reads
+`rec_lo = rec_hi = 0.0000` on **12/12** probe arms (mm1 s0–2, pp1 s0–2, cc1 s3–5, tw0 s0–2),
+re-measured from `probes_*/probe.jsonl` at write time. Guard 3 now asserts the box against the
+**anchor** box rather than against `fa1`'s, and it was tested in both directions, including the
+case where the script *and* the registry are both moved to −25 together (§4.9).
+
+---
+
+## 3. IDEA A → **`sl1` IS WITHDRAWN.** The fixed-m ladder was built, validated, and killed
+
+`bin/c84_singleton_ladder.sh` and `analysis/c84_sl1_score.py` are **DELETED**. `sl1` is
+**deliberately left unregistered** in `analysis/c55_neff_noise.BOXES`, with the reason
+recorded there. `patches/patch_chunkvec.py` and `tests/test_chunkvec.py` are **RETAINED** —
+see §3.4.
+
+This is not a retreat from a hard result. The batch was finished: a per-tensor chunk-vector
+patch that subsumed four existing code paths and reproduced each of them **bitwise** (68
+checks, 0 failures, on the real ResNet18), a 105/105 scorer selftest, a beta-allocation guard
+that measured `m` on every rung from the *allocated* β, and RULE-13 both-directions evidence
+on 16 guard checks. It was killed anyway, on arithmetic that was re-derived rather than
+argued.
+
+### 3.1 DEFECT 1 — holding *m* fixed does not remove the collinearity, it **relocates** it
+
+The ladder's own identity is `m = G2(K2) + S_k + (41 − k)`, where `G2` is the number of chunk
+groups on the 21 tensors with ndim ≥ 2 and `S_k` the number of injected size-1 groups. Fixing
+`m` therefore **forces** `dG2 = −dS + dk`, and `|dk| ≤ 41` against `dS` spanning **9,610**.
+Recomputed over the seven registered rungs:
+
+| rung | k | K2 | **G2** | **S** | m | f |
+|---|---|---|---|---|---|---|
+| L0 | 0 | 777 | 14,380 | 0 | 14,421 | 0.00000 |
+| L1 | 7 | 802 | 13,927 | 448 | 14,409 | 0.03109 |
+| L2 | 14 | 844 | 13,237 | 1,152 | 14,416 | 0.07991 |
+| L3 | 21 | 914 | 12,226 | 2,176 | 14,422 | 0.15088 |
+| L4 | 28 | 1070 | 10,442 | 3,968 | 14,423 | 0.27512 |
+| L5 | 34 | 1417 | 7,893 | 6,528 | 14,428 | 0.45245 |
+| L6 | 41 | 2325 | 4,810 | 9,610 | 14,420 | 0.66644 |
+
+**corr(S, G2) = −0.9999975.** That is the *same order* as the `corr(S, m) = 0.9999991` that
+this document already used (§5.1) to kill the naive ladder as dead on arrival. The ladder has
+**one** degree of freedom, and "singletons hurt" and "coarse ndim ≥ 2 chunks hurt" are two
+names for it. **No rung in the design distinguishes them, and none could:** it is a theorem
+about any fixed-*m* ladder, not an artefact of the chosen K2 values. The header's claim that
+"there is no comparator here to move" was wrong in a specific way — the comparator did not
+disappear, it was **absorbed into the treatment arm**.
+
+The defence §3.4 offered was that the ndim ≥ 2 axis is independently pinned at ~0. That
+defence is legitimate in *kind* but not in *strength*. At the registered cell the only reading
+is `cc1`'s `chunk777 − chunk2325` = **−0.101, se 0.190, t −0.53** (n = 3v3) — **unresolved**,
+with a ~95 % envelope of roughly [−0.71, +0.50]. The other two draws (+0.031 `ar1`, −0.019
+`fa1`) are both at ms = 3e-4, the cell this very document forbids pooling with. Quoting the
+point estimate of an unresolved statistic as a bound, and then hard-coding "it cannot
+MANUFACTURE one" into the scorer's selftest, is having it both ways.
+
+**Consequence for the verdict, and this is the part that matters:** the collinearity does not
+break the CONFIRMED branch (the nuisance is signed *against* the prediction at `cc1`, so a
+resolved negative slope stays conservative). It breaks the **REFUTED** branch, which the
+registration left uncovered. A true singleton slope of −0.3 pp per unit f cancelled by an
+ndim ≥ 2 slope of +0.3 would produce `b̂ ≈ 0` with se ≤ 0.16, and the scorer would print
+**REFUTED — "the tail mechanism is wrong at fixed m"** for a cancellation it cannot see.
+
+### 3.2 DEFECT 2 — the registered primary could not fail on the question it was built to ask
+
+The primary was `b̂`, the OLS slope of plateau5 on f across the seven rungs, registered
+negative. On the registered f grid (f̄ = 0.23656, Sxx = 0.36295, se(b̂) = 0.1179 at n = 6),
+with the two endpoints pinned at their predicted values (L0 = 0, L6 = −0.581), the CONFIRMED
+gate (`b̂ ≤ −0.45`, `t ≤ −2`, span in [+0.30, +0.90]) was driven directly and returns:
+
+| interior shape | b̂ | t | CONFIRMED? |
+|---|---|---|---|
+| true linear dose-response | −0.872 | −7.4 | **yes** |
+| **pure STEP at L6** (no dose-response at all) | −0.688 | −5.8 | **yes** |
+| **NON-MONOTONE zigzag** | −0.565 | −4.8 | **yes** |
+| threshold at L4 | −1.095 | −9.3 | yes |
+| **saturating** — a *genuine* dose-response, all of it by L1 | −0.379 | −3.2 | **no** |
+
+**The gate is miscalibrated in both directions.** It fires for two shapes that are not
+dose-responses and fails the one shape that is most mechanistically interesting. The reason is
+structural: OLS leverage on this grid is `|w|` = 17.3 / 15.0 / 11.4 / 6.3 / 2.8 / 15.8 /
+31.4 %, so **L0 and L6 together carry 48.7 %** — and *both endpoints are already in the CSV*.
+L0 **is** `chunk777` by exact identity (largest one-D numel 512 < 777); L6 is `nodewise` up to
+the ndim ≥ 2 alignment term, which is what `G` measures. The span the ladder was registered to
+reproduce is `D − G`, both of which the campaign already owns. Meanwhile T4.2 and T4.3
+**forbade** reporting rung ordering, monotonicity, adjacent pairs, or any functional form —
+because at n = 6 none of them is resolvable. **Thirty of the forty-eight jobs bought a
+quantity the batch had pre-committed to never state, and the remaining eighteen re-measured
+`D`.**
+
+### 3.3 A third reason, sufficient on its own: the refutation was worth little
+
+A flat ladder would have removed a *mechanistic gloss*, not a claim. The paper's contribution
+is the **endpoint prescription** — "do not give BatchNorm scalars their own step sizes" —
+which is established at matched count five times over (`D` IV-pooled **+0.627, se 0.063**, 18
+within-batch seed pairs, five batches, two meta-stepsizes, two boxes) and is untouched by a
+flat interior. No reviewer asks whether the penalty is linear in the number of singletons.
+
+### 3.4 THE REGISTERED SUCCESSOR — a 2×2 factorial with *m* floating, **not built, not costed**
+
+Recorded so the kill does not have to be re-derived, and so the retained patch has a stated
+purpose. **`m` cannot be held fixed AND the collinearity broken — that is the identity.** So
+let `m` float and run a factorial in (S, G2) instead of a 1-D diagonal:
+
+| cell | granularity | S | G2 | m |
+|---|---|---|---|---|
+| A | `chunkvec777s0` (= `chunk777`) | 0 | 14,380 | 14,421 |
+| B | `chunkvec2325s0` (= `chunk2325`) | 0 | 4,810 | 4,851 |
+| C | `chunkvec777s41` | 9,610 | 14,380 | 23,990 |
+| D | `chunkvec2325s41` (= ladder rung L6) | 9,610 | 4,810 | 14,420 |
+
+The **S main effect at fixed G2** is `½[(C−A) + (D−B)]` — a real contrast that can genuinely
+return null, unlike a diagonal slope. `A − B` measures the ndim ≥ 2 / *m* axis **in-batch, at
+the registered cell, at the batch's own n**, instead of importing `cc1`'s se-0.190 draw; that
+single arm is what converts the design from re-confounded to de-confounded. `m` becomes a
+measured covariate rather than a constraint. **This is a sketch, not a registration.** Before
+it may be built it needs its own power computation, its own frozen bands, its own treatment of
+the *m* nuisance (ck1 measures −0.407 pp per decade of m, and `C − A` spans 0.221 decades
+while `D − B` spans 0.473 — those are **not** equal, so the two half-contrasts carry different
+nuisances and the design must say how it handles that), and its own registration document.
+It needs `PATCH_CHUNKVEC`, which is why that patch and its suite are retained — but the patch
+**must not be applied to the live tree until the successor exists**, and its operator note now
+says so.
+
+---
+
+
+## 4. IDEA B → BATCH **`gn1`** — NORMALISER TRANSFER AT FIXED SINGLETON STRUCTURE
+
+### 4.1 The question, and what it is *not*
+
+*Is the partition gap carried by the degenerate size-1 tail **per se**, or by **BatchNorm**
+specifically?*
+
+It is **not** a test of "does a network without normalisation show a partition gap". It
+removes **zero** singletons. §4.7 T3.2 forbids writing it up as one.
+
+### 4.2 Why the test is unusually tight — verified, not assumed
+
+`nn.GroupNorm(G, C)` has `weight` and `bias` of shape `(C,)`, exactly as `nn.BatchNorm2d(C)`.
+BN's `running_mean`/`running_var` are **buffers**: they never appear in `named_parameters()`,
+so they never received a step size under any granularity and their absence changes nothing.
+I re-derived the census for a GroupNorm ResNet18 and it is **identical to the BN row in every
+column**: 11,173,962 params · nodewise m 14,420 · 9,610 singletons · f 66.6436 % · 0.086004 %
+weight coverage · nodewise1d m 4,851 · 41 one-D tensors · same count-matched K = 777 → 14,421.
+
+`grep` over `train.py` and `Optimizers/HF.py` returns **no module-type logic whatsoever** — no
+`BatchNorm`, no `named_modules`, no `isinstance`-on-modules. `HF.init_meta` is driven entirely
+by `[(name, p.data.size()) for name,p in net.named_parameters()]`. The partition is therefore
+not merely similar across the two nets; it is **provably the same object**, and **no optimiser
+patch is required**. Exactly one thing in the experiment changes.
+
+`G = 32` is buildable everywhere: all ResNet18 channel counts are 64/128/256/512, each
+divisible by 32, including the three downsample shortcuts. **LayerNorm is rejected** — on conv
+activations it is `GroupNorm(1, C)`, the same caveat below in its most extreme form with no
+compensating advantage.
+
+### 4.3 The arms and their computed group counts
+
+All four **in one batch**, so `D_BN` and `D_GN` are within-batch and the cross-batch offset
+(three draws, no stable sign) cancels.
+
+| arm | `--NN-name` | `--stepsize-groups` | **m** |
+|---|---|---|---|
+| `bn-node` | `ResNet18` | `nodewise` | **14,420** |
+| `bn-ch` | `ResNet18` | `chunk777` | **14,421** |
+| `gn-node` | `ResNet18_gn` | `nodewise` | **14,420** |
+| `gn-ch` | `ResNet18_gn` | `chunk777` | **14,421** |
+
+Count mismatch **+1 group in 14,420 = 0.007 %**, identical to every previous reading of `D`.
+
+### 4.4 The comparator
+
+`bn-ch` − `bn-node` is the comparator for `gn-ch` − `gn-node`, in the same batch. It is a
+**gate**, not a result (§4.7 T1): a batch whose own BatchNorm control fails to show the effect
+cannot be asked whether the effect transfers.
+
+### 4.5 The registered statistics
+
+* **PRIMARY** `D_GN = plateau5(gn-ch) − plateau5(gn-node)`, within-batch, Welch, **8v8**.
+* **CO-PRIMARY / GATE** `D_BN = plateau5(bn-ch) − plateau5(bn-node)`, same batch, **4v4**.
+  It is a *gate*, so it carries the smaller n (§4.6).
+* **SECONDARY** `ΔD = D_GN − D_BN`.
+* **T0.6 COMMENSURABILITY GATE — ADDED AT CYCLE-84 REVIEW, evaluated after T0.1–T0.5 and
+  BEFORE T2.** `|mean plateau5 over the GN arms − mean over the BN arms| ≤ 2.0 pp`. The
+  T0.3 floor of 85 does **not** protect this batch's arithmetic on its own: the whole test
+  compares two differences **in percentage points** on two networks that need not sit at
+  the same accuracy. BN plateaus near 92.2 (error budget 7.8 pp); a GN arm at 88.0 would
+  pass T0.1–T0.5 cleanly while sitting on a **12.0 pp** budget — a 1.6× change in the scale
+  the effect lives on. If the gap is even partly *multiplicative* in the budget, `D_GN` is
+  distorted by ~60 %, about **7× se(`D_GN`)**, straddling **both** the +0.30 TRANSFERS line
+  and the [−0.15, +0.15] null band, so a T2 firing could be a pure accuracy-regime artefact.
+  **If it fires, the batch reports "GroupNorm sits in a different accuracy regime; `D_GN`
+  and `D_BN` are not commensurable in pp" and issues NO transfer verdict. That is not a
+  null.**
+* **T2c ERROR-BUDGET-NORMALISED, DESCRIPTIVE ONLY, REPORTED ALWAYS.** `D / (100 − level)`
+  per net, printed beside the pp numbers so a reader can see for themselves whether a
+  verdict is a scale artefact. It **gates nothing**: registering two primaries would move
+  the argmax problem up a level rather than solve it.
+* **MANDATORY** all four arm means reported separately with sd, n and both occupancy channels.
+  The absolute GN level is itself the headroom check.
+* **NOT AVAILABLE AT THIS CELL — recorded so it is not reached for later.** The clip-severity
+  corroboration (`coord_lo`, the time-averaged fraction of β at the floor) discriminates
+  sharply on BN: re-derived from `probes_ar1`, `coord_lo(nodewise)` = **0.03430 / 0.03425 /
+  0.03406** against **0.00039–0.00040** (chunk777), **0.00092–0.00093** (chunk2325) and
+  **0.00138–0.00141** (nodewise1d) — a **24–88×** separation. But that is `ar1`'s cell
+  (ms = 3e-4, floor −15). **At the registered cell no coordinate reaches either guard on any
+  arm** (§2.3), so `coord_lo` is identically 0 and this channel yields nothing here. It may
+  **not** be recovered by moving the batch to a binding box: that would trade an
+  interpretable accuracy contrast for an uninterpretable one. Report `rec_lo`/`rec_hi` as the
+  T0.5 gate only.
+
+### 4.6 Seeds, power, epochs — **REBALANCED 6/6/6/6 → 4/4/8/8 AT CYCLE-84 REVIEW**
+
+σ = **0.1740**, re-derived at write time as the pooled within-cell sd of plateau5 over 22 dof
+and 11 arm-cells at this cell (guard 2d recomputes it at submit time and refuses to run if it
+has moved by more than 0.03).
+
+Half the original batch was a **sixth reading of `D`**. The BN control only has to **clear a
+gate** (`t ≥ 2` against +0.5805); the GN arms carry the **primary**. So:
+
+| arm pair | n | se | note |
+|---|---|---|---|
+| `bn-node`, `bn-ch` | **4** | se(`D_BN`) = 0.174·√(2/4) = **0.1230** | T1 clears at **t = 4.72**, 2.7 se of margin |
+| `gn-node`, `gn-ch` | **8** | se(`D_GN`) = 0.174·√(2/8) = **0.0870** | the PRIMARY |
+| — | — | se(`ΔD`) = **0.1507** | the secondary; slightly worse than the old 0.142, accepted |
+
+**The job count is unchanged at 24** and the primary's se improves from 0.100 to **0.0870**.
+Consequently the frozen powered-null threshold tightens from 0.13 to **`se(D_GN) ≤ 0.113`**
+(1.3 × the new planning se), fixed here in advance and **not** to be recomputed post hoc; at
+p90 corpus noise (sd 0.24) the realised se would be 0.120 > 0.113 and the verdict would be
+UNDECIDED, which is the intended conservatism. Against the pooled anchor `D` = +0.5805 (se
+0.0939), a **full collapse** of `D_GN` is a **6.7-σ** effect on `D_GN` and 3.9-σ on `ΔD`.
+n = 3 resolves only 0.27 pp and this test must distinguish **collapsed** from **attenuated**;
+n = 8 resolves 0.17 pp. Epochs: 100, per §2.4. **24 jobs**; GroupNorm has no cuDNN-fused
+kernel, so budget 60–90 min/job ⇒ ≈ 24–36 GPU-hours, cluster_a only.
+
+The split is **asserted from the emitter** by guard 1b-4 (`ARM_SEEDS` per arm) and by guard
+2f (both seed lists, both standard errors, and `2·n_BN + 2·n_GN == NJOBS`), so a silent
+collapse back to one shared seed list — which would change the primary's se without changing
+the job count — fails a guard rather than passing unnoticed. Both were tested in **both
+directions** (§4.8).
+
+### 4.7 THE PREDICTED NUMBERS AND THE REFUTATION CONDITION
+
+Three bright lines with no reinterpretable middle. The failure this avoids is `bn1`'s, which
+landed at +0.295 — **0.005 pp** under its own threshold — and had to be closed UNDECIDED.
+
+> **TRANSFERS** (tail mechanism is normaliser-agnostic): `D_GN ≥ +0.30` **and** `t(D_GN) ≥ 2`.
+> The line is ≈ half the pooled anchor of +0.581; attenuation is expected and is not failure,
+> because GroupNorm is a different network at a slightly different accuracy level.
+>
+> **DOES NOT TRANSFER AT THIS CELL** (see the three readings below — this is **not**, on its
+> own, "the carrier is BatchNorm-specific"): `D_GN ∈ [−0.15, +0.15]` **and** the equivalence
+> is **powered**, `se(D_GN) ≤ 0.113` (fixed here in advance at 1.3 × the planning se of
+> 0.0870 at n = 8; not to be recomputed post hoc).
+>
+> **UNDECIDED:** anything else — including `D_GN ∈ (0.15, 0.30)`, and **including any null
+> whose se exceeds 0.113**. An underpowered null is UNDECIDED and **may not be reported as
+> "no gap"**.
+>
+> **SECONDARY on `ΔD`** (se 0.151): `|ΔD| ≤ 0.30` ⇒ the two normalisers agree within
+> resolution. `ΔD ≤ −0.30` with `t ≤ −2` ⇒ resolved **attenuation** under GroupNorm — report
+> as attenuation, **not** collapse, unless `D_GN` independently lands in the null band.
+
+**WHAT I EXPECT, STATED SO IT CAN BE WRONG:** `D_GN` lands in **[+0.35, +0.70]** and
+TRANSFERS. The gap has been a partition/estimator effect in every reading the campaign owns —
+alignment was REFUTED as the carrier at fixed count *and* fixed size-multiset (−0.009,
+t −0.06) while the size distribution carried it (+0.590, t 5.53) — and nothing in that chain
+mentions what the parameters *do*. The honest reason for doubt comes from the clip-severity
+channel measured at `ar1`'s binding cell: `coord_lo` = **0.0343** for `nodewise` against
+**0.00039–0.00141** for the other three arms, i.e. **the degenerate tail is what seeks the α
+floor**, 24–88× harder than any other partition. If that floor-seeking is driven by
+BatchNorm's specific scale-invariance geometry rather than by group size, GroupNorm could
+genuinely break it — and the accuracy gap would go with it. That is the live way this
+prediction fails, and it is why the batch is worth running. (The evidence is from a *binding*
+cell and is therefore itself a caveated statistic; it motivates the doubt, it does not
+license a prediction.)
+
+**T0 — TRAINS-AT-ALL AND BOX GATE:** T0.1–T0.5 exactly as §3.8, applied per arm. In
+particular **T0.5 is measured on the `gn` arms and never inherited from the `bn` anchor** —
+the GN net's β trajectory is not the BN net's. ≥ 2 of the 4 arms void or drop ⇒ **whole batch
+VOID**. Expected GN cost is 0.5–1.5 pp of absolute accuracy versus BN, leaving the plateau
+near 91–92 against the T0.3 floor of 85, i.e. ample margin — but that is an expectation, and
+T0 is what decides.
+
+**T1 — POSITIVE-CONTROL GATE:** if `D_BN < +0.30` **or** `t(D_BN) < 2`, **the batch is VOID
+as a test of GroupNorm.** `D_BN` is then recorded as a failed sixth replication of `D` — a
+serious finding in its own right — but **nothing about GroupNorm may be concluded**.
+
+**T2 — THE MECHANISM REFUTATION.** With T0 and T1 passed:
+
+> The tail mechanism **as currently written** is REFUTED if, in the same batch,
+> `D_GN ∈ [−0.15, +0.15]` with `se(D_GN) ≤ 0.113`, **while** `D_BN ≥ +0.30` with `t ≥ 2`,
+> **and T0.6 passed** — a null in an incommensurate batch is not a refutation, it is a
+> scale artefact (§4.5).
+
+That is a within-batch dissociation at byte-identical partition structure — same 9,610 size-1
+groups, same 41 one-D tensors, same `chunk777` count-match — so the carrier would not be the
+degenerate size-1 tail per se. **Consequences, written now so they cannot be softened later:**
+the paper's prescriptive sentence narrows from *"do not give normalisation scalars their own
+step sizes"* to *"do not give **BatchNorm** scalars their own step sizes"*, with **no licence
+to generalise** to normalisation layers at large.
+
+**T2's AMBIGUITY, REGISTERED IN ADVANCE — REWRITTEN AT CYCLE-84 REVIEW, AND THE OLD VERSION
+WAS FACTUALLY WRONG ABOUT THE ARCHITECTURE.** A T2 firing **does not identify the replacement
+carrier.**
+
+`nn.GroupNorm(32, C)` takes `num_groups = 32`, so it forms **32 groups of C/32 channels** —
+**2, 4, 8 and 16** channels per group at ResNet18's widths 64/128/256/512. The earlier draft
+of this paragraph, of `bin/c84_normaliser_transfer.sh`, of `analysis/c84_gn1_score.py` and of
+`patches/patch_resnet_gn.py` all said "blocks of 32 channels". **That was backwards**, and it
+was the *sole basis* of this entire paragraph — which is what stops a T2 firing being
+over-read — so it is corrected in all four files **before any run**, and each file carries the
+correction visibly rather than silently. The qualitative claim survives (any group size > 1
+breaks per-channel scale invariance) but the magnitude is inverted, and a structure the old
+wording hid now appears: **the departure is GRADED BY DEPTH.** At layer1 (C = 64) GN(32,64)
+puts **two** channels per group and is very nearly per-channel; at layer4 (C = 512) it puts
+**sixteen**. So a null cannot be attributed *uniformly* to "loss of per-channel scale
+invariance", and the registered disambiguator `GroupNorm(num_groups = C)` is a **smaller**
+perturbation from GN(32,C) than the old text implied — which makes it a cheaper follow-up
+than registered, not a more expensive one.
+
+The test is **asymmetric**: a **positive is clean** — the gap survives a normaliser change at
+byte-identical singleton structure, and all three readings below can only *suppress* a gap,
+never manufacture one. A **null is ambiguous between THREE readings, and this batch separates
+none of them:**
+
+1. the carrier is **batch statistics**;
+2. the carrier is **per-channel scale invariance** — depth-graded as above, so not even
+   uniform across the net;
+3. **MISTUNING (RULE 11).** This batch runs a **different network** at a cell — α₀ = 1e-3,
+   ms = 1e-4 — inherited wholesale from BatchNorm, and **no arm's argmax is located on either
+   net** (CORRECTIONS 111.7 item 5 is still open: "two stepsizes are two points"). A null at a
+   mistuned cell is observationally identical to "the carrier is BatchNorm-specific". This is
+   the same structural defect that correctly killed the BN-free arm (§5.2), one level up, and
+   RULE 11 was named nowhere in the batch before this review.
+
+**BINDING CONSEQUENCE: a null from `gn1` alone MAY NOT be written as a mechanism narrowing.**
+What may be reported is *"DOES NOT TRANSFER AT THIS CELL, three unseparated readings"*. The
+prescriptive sentence stays as written until `gn2` has run. **`gn2` is specified now so it
+cannot be designed after seeing the answer, and it runs ONLY if T2 fires:**
+
+* **`gn2a` — THE TUNING BRACKET**, which discharges reading 3: all four arms re-run at
+  **α₀ = 3e-4** (β₀ = ln 3e-4 = −8.1117), n = 4, **16 jobs**. **That cell is PROVABLY FREE IN
+  BOTH DIRECTIONS** by the same Lion identity guard 8 applies here: reach = ms·T = 5.0 nats
+  gives β ∈ [−13.112, −3.112], so **neither** the −15 floor **nor** the −2.3026 ceiling is
+  reachable. **α₀, not ms, is the bracket axis, and that is forced by data rather than
+  chosen:** at ms = 3e-4 there is **no free box for the singleton arm** — re-measured from
+  `probes_fa1`, the `nodewise` arm reads `rec_hi` = 0.0000 / 0.1672 / 0.0023 / 0.0137 /
+  0.2192 / 0.0600, i.e. **3 of 6 seeds over the 5 % T0.5 threshold**, so an ms-bracket arm
+  would be dropped as uninterpretable before it could be read. Both nets are re-run so that a
+  null at `gn2a` cannot be confused with "the α₀ = 3e-4 cell kills the gap for everyone".
+* **`gn2b` — THE CARRIER DISAMBIGUATOR**, separating reading 1 from reading 2:
+  `GroupNorm(num_groups = C)`, which restores per-channel scale invariance exactly and leaves
+  batch-vs-sample statistics as the sole difference. It is a weaker network, so it is not the
+  primary; running it first would trade a clean test for a poor one.
+
+**T3 — ANTI-NARRATION.**
+* T3.1 A **VOID GN cell is not evidence of anything.** If T0 voids the GN arms, the batch
+  reports "GroupNorm did not train to a usable plateau at this cell" and stops. It may not be
+  reported as an absent gap, and it may not be salvaged by adding seeds after seeing which
+  side it fell on.
+* T3.2 **NO REBRANDING.** This batch may not be written up as a no-BatchNorm test, a norm-free
+  test, or a falsification of the singleton mechanism by removal. Its headline is: *does the
+  gap survive a change of normaliser at fixed singleton structure?*
+* T3.3 **NO CROSS-BOX POOLING.** `D_GN` and `D_BN` come from this batch at `ms = 1e-4`,
+  **`-15:-2.3026`** (moved from −25 at cycle-84 review, §4.8). The box changed the optimiser,
+  not merely the instrument. Every prose sentence about a `D` carries its cell.
+* T3.4 No argmax harvesting; the four-arm table is reported whole.
+
+### 4.8 WHAT CYCLE-84 REVIEW CHANGED IN `gn1`, AND WHY — six items
+
+1. **THE BOX MOVED −25 → −15.** `(ms = 1e-4, −25:-2.3026)` exists in **zero** of the 1,891
+   corpus rows: every ms = 1e-4 run (nodewise 16, chunk777 9, nodewise1d 6, chunk2325 6) sits
+   at −15, and the only −25 rows are `fa1`'s at ms = 3e-4. Yet **every** frozen threshold in
+   this batch — the +0.30 T1 gate, the +0.5805 anchor, σ = 0.1740 — is computed from −15 data.
+   Running at −25 would have made each one a **cross-box import**, exactly what CORRECTIONS
+   113 forbids after the box was shown to change the *optimiser* and not merely the
+   instrument. The move costs nothing and that is a **proof**, not a hope: at ms = 1e-4 the
+   Lion identity with `--weight-decay-meta 0` gives `|Δβ| = ms` exactly per step, so over
+   T = 50,000 steps β is confined to [−11.9078, −1.9078] for **any** velocity profile and both
+   floors lie strictly below it. **And it is now also empirical on the arm that matters:** at
+   this exact cell the `nodewise` (singleton) arm reads `rec_lo = rec_hi = 0.0000` on all of
+   mm1 s0–2, pp1 s0–2, cc1 s3–5 and tw0 s0–2 — **12/12**. Guard 3 now asserts the box against
+   the *anchor* box rather than against `fa1`'s, and both directions were tested (§4.9).
+2. **SEEDS REBALANCED 6/6/6/6 → 4/4/8/8** (§4.6). Same 24 jobs; se(`D_GN`) 0.100 → **0.0870**;
+   the frozen powered-null threshold tightens 0.13 → **0.113**.
+3. **T0.6, THE COMMENSURABILITY GATE, ADDED** (§4.5), plus the descriptive T2c
+   error-budget-normalised row.
+4. **THE GROUPNORM ARITHMETIC CORRECTED** in all four files, and T2's ambiguity rewritten
+   from two readings to **three**, with the depth-grading made explicit (§4.7).
+5. **RULE 11 NAMED, AND `gn2` REGISTERED IN ADVANCE** as the conditional follow-up, with the
+   bracket axis moved from ms to α₀ because ms = 3e-4 has no free box for the singleton arm
+   (§4.7).
+6. **GUARD 9, THE SEQUENCING INTERLOCK, ADDED** (§6.0).
+
+### 4.9 RULE 13 — every guard added or changed at review, tested in BOTH directions
+
+`tests/test_gn1_guards_rule13.py`, **20 PASS / 0 FAIL**. It never invokes `--submit`: the
+guard bodies are extracted from the script and driven as pure Python, and the shell path is
+exercised only in dry-run mode against an **edited copy** of the script.
+
+| guard | real config | injected violation |
+|---|---|---|
+| 9 sequencing | dry run, no token → **passes** | `--submit` with no generalisation result → **refuses**; with a recorded result → passes |
+| 2f seeds | passes, reports both se's | control back to n = 6 → fails; primary down to n = 6 → fails; NJOBS inconsistent → fails; repeated seed → fails |
+| 2c/2d anchor & σ | re-derive to +0.5805 / 0.1740 | anchor mis-set → fails; σ re-based to 0.240 → fails, naming the frozen 0.113 |
+| 3 box | passes, reports the ANCHOR box | script at −25 with registry at −15 → fails (drift); **both** moved to −25 → fails on the ANCHOR_BOX condition; the deleted `sl1` tag → fails |
+| 1b-4 arm table | passes, split asserted from the emitter | emitter collapsed to one shared seed list → fails; BETA_CLIP comma removed → fails |
+| emitter | 24 jobs, exactly 4/4/8/8, every job carrying `BETA_CLIP=-15:-2.3026` **with its colon**, "dry run, nothing submitted" | — |
+
+The scorer was additionally driven end-to-end on six synthetic batches (deleted afterwards):
+TRANSFERS, T2-fires, **T0.6-fires**, T1-fails, T0.5-binds-→-VOID, and underpowered-null-→-
+UNDECIDED. All six behaved exactly as registered; in particular the T0.6 case (GN 3.5 pp low)
+suppressed the transfer verdict rather than reporting a null.
+
+---
+
+## 5. THE KILLED IDEAS — reasons on the record, so they are not re-proposed
+
+### 5.1 KILLED: Idea A as sketched — the naive within-architecture singleton-count ladder
+
+*Design:* k of the 41 one-D tensors keep per-channel treatment, 41−k collapse to one group
+each, **ndim≥2 side left at nodewise**, each rung against a count-matched chunk comparator.
+
+**REASON — perfect collinearity with m, arithmetically, not merely empirically.**
+`m(k) = 4,810 + (41 − k) + S_k`, so `m − S_k = 4,851 − k`, confined to **[4,810, 4,851]**
+across the entire ladder — 0.28 % of m at the top rung, 0.85 % at the bottom.
+**`corr(S, m) = 0.9999991`** over all 42 rungs (re-derived). m runs 4,851 → 14,420, a factor
+of **2.973**, and each step is exactly the un-collapsed tensor's channel count (+63 through the
+ten width-64 tensors, +127, +255, +511, then +9 for `linear.bias`). The ladder's m-motion is
+**100 % determined by its singleton-motion**; it measures count, not singletons.
+
+No choice of *which* one-D tensors breaks it: the 41 tensors carry 9,610 scalars while k
+contributes at most 41, so even the most extreme re-selection (ten width-512 tensors, S = 5,120
+at k = 10, versus thirty-one small ones, S = 4,490 at k = 31) moves S and m apart by < 0.5 %.
+
+The count-matched-comparator patch does **not** rescue it: the comparator's own ndim≥2 group
+count must then sweep **4,810 → 14,380** as K goes 2325 → 777, so the measured gap mixes
+singleton injection with a 3× change in the comparator's partition of **99.91 %** of the
+weights, perfectly anti-correlated with the treatment. This is precisely defect 3 that
+withdrew `sf1`. And the two endpoints of this ladder are the two contrasts already in hand
+(`D` at k = 41, `G` at k = 0), so a naive interior ladder would add cost without adding one
+de-confounded degree of freedom. **Its fixed-m replacement `sl1` was built and then KILLED TOO (§3): holding m fixed does not remove this collinearity, it relocates it to `G2` (corr(S, G2) = −0.9999975). Nothing on this axis is buildable without the §3.4 factorial.**
+
+### 5.2 KILLED: Idea B as sketched — the BN-free ResNet falsification
+
+*Design:* a ResNet18 with `nn.Identity()` in place of every `BatchNorm2d`; if the gap is
+carried by singletons on normalisation parameters, it should vanish.
+
+Technically cheap — ~12 additive lines threading a `norm` kwarg through `BasicBlock` and
+`ResNet`, plus a `'ResNet18_nn'` dispatch key, and **zero** optimiser change (§4.2). Killed
+anyway, for three reasons in order of force.
+
+1. **IT RE-MEASURES A CONTRAST THE CAMPAIGN ALREADY OWNS.** A BN-free ResNet18 with
+   `conv bias=False` has **11,164,362 params, nodewise m = 4,820, and TEN singletons**
+   (`linear.bias` only), f = 0.208 %. That is not "a network with the tail removed by a
+   partition choice" — it is a network whose nodewise partition **is already structurally
+   tail-free** at m ≈ 4,820. The contrast it would measure (nodewise vs count-matched
+   `chunk2320` at m ≈ 4,820) is, to within 31 groups of 4,850, **the same contrast `G`
+   already measures at m = 4,851 EXACT**. `G` re-derived at write time: `bn1` **+0.295**
+   (t 6.15) / `ar1` **−0.139** (t −1.94) / `fa1` **−0.001** (t −0.01) / `cc1` **+0.011**
+   (t 0.08). It collapses. The BN-free arm's predicted answer is already in the CSV, obtained
+   without an architecture change.
+2. **THE ONLY INFORMATIVE OUTCOME IS UNINTERPRETABLE.** If the gap *persisted* at m ≈ 4,820
+   you could not attribute it: you removed the singletons, the normalisation, the batch
+   statistics, the scale invariance, ~9,600 parameters and the accuracy regime, all at once.
+   No arm in the design separates them.
+3. **THE TRAINING RISK IS REAL, UNMEASURED, AND ASYMMETRIC — stated, not papered over.**
+   The corpus has **zero** evidence in either direction: all 1,891 runs are BatchNorm nets
+   (ResNet18 1,470 · ResNet18_c100 168 · ResNet10 110 · ResNet34 105 · ResNet50 19 ·
+   ResNet10_c100 9 · ResNet34_c100 9 · ResNet101 1); zero `M1`/`M2` runs; zero norm-free runs.
+   What *is* decisive is arithmetic: |Δβ| = ms exactly per step, so α can move by at most
+   1.051× per epoch at ms = 1e-4 and cutting α by 10× takes **46 epochs**. **There is no fast
+   brake.** The meta-learner follows `sign(HᵀT ∇f)` — a greedy loss-descent signal with no
+   stability term — toward a ceiling (α ≤ 0.1, two decades above α₀, reachable in ~46 epochs)
+   that was calibrated on BN nets. A BN-free post-activation ResNet18 has residual-branch
+   variance compounding across 8 blocks with no renormalisation and a far lower stable-LR
+   ceiling. If it goes, it **cannot recover inside the budget**. The phenotype is already in
+   the corpus: 14 of 1,891 runs are `collapsed=1`, and the released-ceiling pair
+   `bd7-w-c6-s0/s1` trained to best_test 88.82/88.94 and ended at **final_test 10.0**.
+   **Honest bottom line: I cannot say whether a BN-free ResNet18 reaches a usable plateau at
+   this cell, and nobody can from this corpus.** RULE 11 would then require its own α₀/ms
+   sweep, turning a 12-job test into a multi-batch programme. *"Cannot be tested without a
+   training-stability confound, and the confound costs more to remove than the test is
+   worth"* is the verdict.
+
+**Two nearby variants, also considered, also not run.**
+* **BN with `affine=False`** — trains fine, but gives the *identical* shape list to the
+  BN-free net (11,164,362 params, m 4,820, 10 singletons), so it inherits defect 1 exactly:
+  it re-measures `G` by deleting the tail parameters instead of merging them.
+* **Norm-free with `conv bias=True`** — genuinely new: m **9,620**, **4,810 singletons**,
+  f exactly **50.000 %**, count-matched K = 1164 → 9,621. The only design that separates
+  "singletons" from "normalisation exists at all". But it carries the full training risk;
+  there is **no anchor `D` at m = 9,620** (every owned `D` is at m ≈ 14,420 and every `G` at
+  m ≈ 4,851, and the uniform-chunk ladder `ck1` measures **−0.407 pp per decade of m**
+  (chunk128 m = 87,303 → 92.159; chunk1024 m = 10,944 → 92.526; re-derived), so accuracy at
+  m ≈ 9,620 is not the same baseline and the magnitude is not transportable); and the cross-family f extrapolations that would supply a
+  prediction are withdrawn. Sign prediction only, at high void risk. **Hold as the follow-up
+  if and only if `gn1` returns the BN-specific null.**
+* **`M1`/`M2`** (MNIST MLPs) are already buildable, already norm-free, f = 50.000 %, and need
+  no patch — rejected on **dynamic range**: an MNIST MLP plateaus near 98 %, so the whole
+  error budget is ~1.7 pp against a 0.12 pp seed floor, compressing a ~0.6 pp target effect
+  ~5× into the noise, on a task whose pp gaps are not commensurable with the ResNet ones.
+  Underpowered, not merely dirty.
+
+**Superseded by `gn1` (§4)**, which is not a consolation prize: it is the tighter test, and
+it is the one `PLAN-appendix-paper.md` already registered as required ("ResNet-18 (BN) + a
+GroupNorm or ViT variant").
+
+### 5.3 KILLED: Idea C entirely — the count-matched prescription test
+
+*Design:* `nodewise1d` with groups added back by finer chunking of the ndim≥2 tensors to reach
+m ≈ 14,420, compared against plain `nodewise`.
+
+**REASON — THE PROPOSED ARM ALREADY EXISTS AND HAS BEEN RUN 18 TIMES UNDER THE NAME
+`chunk777`.** Max one-D numel is **512 < 777**, so `⌈numel/777⌉ = 1` for **all 41** one-D
+tensors: `chunk777`'s one-D groups are identical to `nodewise1d`'s, **41/41, zero mismatches**.
+`chunk777` **is** "nodewise1d with the ndim≥2 tensors re-chunked to restore m to ≈14,420",
+group for group. Not similar to it — **it is it**.
+
+So Idea C's contrast is `D`, re-derived within-batch at write time: `mm1` **+0.485** (t 3.01)
+/ `pp1` **+0.581** (t 4.11) / `ar1` **+0.697** (t 5.90) / `fa1` **+0.629** (t 5.11) / `cc1`
+**+0.727** (t 3.63); **inverse-variance pooled +0.627, se 0.063** across five batches, two
+meta-stepsizes, two clip boxes, Δm = 1 group. **The count-matched prescription test has already
+returned CONFIRMED, five times.**
+
+**And the count confound it was invented to remove is separately measured and null.** With the
+prescription applied on both sides, `chunk777 − nodewise1d` spans exactly the 0.4731 decades of
+m at issue (14,421 → 4,851) and reads **−0.109** (`ar1`) / **−0.019** (`fa1`) / **−0.089**
+(`cc1`) — about **−0.06 pp**, not the +0.19 pp the uniform-chunk ladder's −0.407 pp/decade
+would predict. Consequently the count-**un**matched `H = nodewise1d − nodewise` (+0.427 `bn1`
+/ +0.806 `ar1` / +0.649 `fa1` / **+0.816** `cc1`) and the count-**matched** `D` (+0.627) agree
+to **0.044 pp — about a third of the 0.12 pp seed-noise median.** The confound is empirically
+negligible. (Separately: **+0.816 is the max cell of `H`, not the effect**; the campaign's own
+rule forbids quoting it. `H` pooled ≈ +0.67.)
+
+**The "purer" node-aligned fixed-m variant is blocked by a hard identity**, not an engineering
+shortfall: nodewise = 4,810 ND + 9,610 one-D groups, so deleting 9,569 tail groups at fixed
+m = 14,420 **forces** the ND side to 14,379 groups, ~3× finer. You can never hold both the tail
+and the ND partition fixed at fixed m. Nor can it hit 14,420 with any uniform K — the ND
+node-slice sizes are {27, 64, 128, 256, 512, 576, 1152, 2304, 4608}, so `⌈gsize/K⌉` jumps
+14,195 (K = 922) → 15,731 (K = 768) with nothing between. It would need a new patch and a new
+batch to answer a question `G` has already returned null on.
+
+**Cost of the kill: 0 jobs. Saved: ~9–12 jobs on a single-account queue.**
+
+**ONE THING IDEA C DID EXPOSE, AND IT BELONGS IN THE PAPER.** Every chunk arm at K ≥ 512
+silently implements the prescription. So the campaign's "uniform beats architecture-aligned"
+partition story is, mechanically, "arms that merge the normalisation scalars beat arms that do
+not". **The uniform-vs-aligned framing and the tail framing are the same finding read two
+ways**, and the paper must say so explicitly rather than presenting `D` and the tail census as
+independent evidence.
+
+---
+
+## 6. ORDER OF WORK — NOTHING MAY BE SUBMITTED UNTIL 6.0–6.5 ARE DONE
+
+Steps 6.1–6.2 modify cluster code and are outside the read-only remit under which this
+document was written. **`PATCH_CHUNKVEC` is deliberately absent from this list**: `sl1` is
+withdrawn (§3), so that patch has no consumer and **must not be applied to the live tree**
+until the successor of §3.4 is registered and built. Its operator note says so.
+
+### 6.0 **`gn1` IS NOT FIRST IN THE QUEUE.** Run the generalisation batches before it.
+
+`gn1` **refines** a mechanism on ResNet18/CIFAR-10. The campaign's own rank-1 question — does
+the tail prescription **generalise at all** — has been rank 1 for four consecutive cycles
+(CORRECTIONS 110.7 item 1, 111.7 item 1) and has **fully built, guard-complete,
+pre-registered batches sitting on disk with zero rows** — as this cycle closed,
+`bin/c83_gen_r34_merged.sh` (`g3m`, 36 jobs, D and G in **one** batch at **one** ms, itself the
+product of a concurrent adversarial review that merged and deleted the two earlier ResNet34
+scripts) and `bin/c83_gen_c100_screen.sh` (8 jobs). **Neither needs a patch.** **Guard 9
+discovers them by glob (`bin/c83_gen_*.sh`), never by filename** — precisely because they were
+restructured mid-cycle, and a guard that hard-codes names goes quietly green the moment one is
+renamed. And the hole is not arguable: re-derived at write time and re-derived again by guard
+9 at run time, over all 1,891 rows the granularities `nodewise1d`, `chunk777` and `chunk2325`
+appear on **ResNet18/CIFAR-10 and nowhere else** (48 runs); ResNet34, ResNet10 and
+ResNet18_c100 carry `nodewise` **only**.
+
+**If `D` does not survive on a second architecture, `gn1` is a refinement of something that
+does not exist** — a normaliser-transfer result would be retrospectively worthless, and it
+costs more than either generalisation batch. **GUARD 9 enforces the ordering**: it refuses
+`--submit` until the operator exports `GN1_GEN_OK` naming the generalisation batch that has
+been **scored** and the `D` leg that survived. It fails **closed** on an empty glob. It is an interlock of the same kind as
+`GN1_MIN_PER_EPOCH` — it cannot check the science, it can only stop the batch jumping the
+queue silently.
+
+### 6.1 The one patch `gn1` needs — `build_network.py`, additive, no optimiser change
+
+Thread a `norm='bn'` kwarg through `BasicBlock`, `Bottleneck` and `ResNet`; `nn.GroupNorm(32,
+c)` when `norm=='gn'`, else `nn.BatchNorm2d(c)`; anything else raises via the file's own `0/0`
+idiom, so a typo'd norm cannot silently rebuild the control arm. **Keep the attribute names
+`bn1`/`bn2`/`bn3`/shortcut index UNCHANGED** so `named_parameters()` ordering is preserved
+exactly — `HF.init_meta` consumes that list positionally. Register `'ResNet18_gn'`. Every
+existing name takes the default path. **No `HF.py` change is required or written**, because
+the partition is driven entirely by `[(name, p.data.size())]` and `HF.py` contains no
+module-type logic at all — guard 1c asserts that on the *live* file, checking executable lines
+only (its first version grepped raw text and would have red-failed on the string "BatchNorm"
+inside `PATCH_NODEBN`'s comment).
+
+### 6.2 Tests — first assertion is that a configuration equals ITSELF (STANDING RULE 20)
+
+`tests/test_resnet18_gn.py`, **79 PASS / 0 FAIL / 0 SKIPPED on CPU on the cluster**, against a
+scratch copy of the tree. Since the patch adds no *granularity*, the boundary equivalences
+that matter are stronger than "k = 41 reduces to nodewise":
+
+* **G1 INERTNESS, BITWISE AGAINST THE UNPATCHED TREE** — identical `(name, shape)` list,
+  bitwise identical initial weights at seed 0, and bitwise identical weights **and β** after
+  25 real HF steps (both `0.000e+00`); ResNet34/50/`ResNet18_soft`/ResNet10/M1 shape lists
+  unchanged; and the reference tree is asserted to *really be unpatched*, so G1 cannot be
+  vacuous.
+* **G4 THE PARTITION IS THE SAME OBJECT** — `m` and the **per-tensor** β-length lists are
+  elementwise equal for `ResNet18` and `ResNet18_gn` under `nodewise` (14,420), `chunk777`
+  (14,421), `nodewise1d` (4,851), `weightwise` (11,173,962) and `layerwise` (62), **all
+  measured from the allocated β**.
+* Plus G0 determinism first, G2 the frozen census, G3 the elementwise identity, G5
+  anti-vacuity (20 `GroupNorm(32,C)` and 0 `BatchNorm2d` versus the exact reverse; the two
+  nets are different functions, max|Δy| = 0.929), G6–G10.
+
+### 6.3 The scorer, committed with its selftest while no `gn1` row exists
+
+`analysis/c84_gn1_score.py`, **112/112 selftest PASS** (was 88/88 before review). It asserts every constant against
+`bin/c84_normaliser_transfer.sh`'s own text, the `c55` box entry, the arithmetic of the frozen
+thresholds, the band boundaries exhaustively (including "+0.295 → UNDECIDED", `bn1`'s exact
+number), the T0 rows in both directions, and — added at review — the fourteen cycle-84
+registered interpretations: the corrected GroupNorm arithmetic, the depth-grading, the three
+readings, `gn2a`/`gn2b`, T0.6 and its 2.0 pp bar, "that is not a null", the descriptive
+normalised row, and guard 9's existence. **One of those checks had to be built out to avoid
+matching its own source text** — the CORRECTIONS 112 self-referential-guard failure — so the
+literal is split at construction and the file says why.
+
+### 6.4 The smoke run — still owed, and guard 7 refuses `--submit` without it
+
+One job, `gn-node`, **3 epochs**, seed 0 (~5 min). **The corpus contains 1,891 runs and not one
+is a GroupNorm net**, so the `--time=03:50:00` wall currently rests on a *declared* 1.60×
+slowdown (projected worst 181 min against a 230 min wall, 1.27× headroom) rather than on a
+measurement. Export the observed minutes/epoch as `GN1_MIN_PER_EPOCH`.
+
+### 6.5 Pre-submit assertions, then submit
+
+Carried verbatim from `fa1`/`cc1` and checked by guards 1b and 8: `wd_meta == 0`, `ms == 1e-4`,
+`alpha0 == 1e-3`, `epochs == 100`, `len(trainloader) == 500`, `HIER` unset, **`BETA_CLIP ==
+-15:-2.3026`** — plus **guard 4, which MEASURES `m` per arm from the ALLOCATED β on both
+really-built networks** (never from the census script) and compares it to §4.3. A mismatch
+aborts the batch. Then: **`gn1`, 24 jobs, cluster_a only** (cluster_b lacks `PATCH_CHUNKWISE` and
+`PATCH_NODEBN` — unchanged for six cycles and still the campaign's most expensive unaddressed
+infrastructure item).
+
+---
+
+## 7. WHAT MAY AND MAY NOT BE CLAIMED, TODAY
+
+**MAY**, today, before `gn1` runs — this sentence is **already earned** at fixed count by five
+independent batches across two meta-stepsizes and two clip boxes:
+
+> At matched group count (14,421 vs 14,420), merging each BatchNorm scale and shift into a
+> single step-size group instead of giving every channel its own is worth **+0.63 pp**
+> (IV-pooled +0.627, se 0.063, 18 within-batch seed pairs) of final test accuracy on
+> ResNet18/CIFAR-10.
+
+**MAY ALSO**: the census; the structural identity `f = b/(1+b) → 2/3`; the DO-NOT-RUN verdict
+on the cross-architecture singleton-fraction test; the observation that every `chunk<K≥512>`
+arm silently implements the prescription (§5.3) — which means the campaign's "uniform beats
+architecture-aligned" story and its tail story are **the same finding read two ways**, and the
+paper must say so rather than presenting them as independent evidence.
+
+**MAY NOT**:
+
+* that the gap **scales with** singleton count, or any dose-response language at all. **This
+  is now a permanent prohibition, not a pending one:** `sl1` was the batch that would have
+  earned it, and §3 shows the design could not — a fixed-*m* ladder cannot separate singleton
+  injection from ndim ≥ 2 coarsening at any n, and its slope scored CONFIRMED for a pure step
+  and a non-monotone zigzag. No dose-response claim may be made until the §3.4 successor is
+  registered, built and run.
+* that the prescription generalises to **normalisation layers** rather than to **BatchNorm** —
+  that is exactly what `gn1` is for, and **a null from `gn1` alone does not license the
+  converse narrowing either** (§4.7, three readings).
+* `gap(f)` in any functional form, any predicted rung value, or any extrapolation.
+* **+0.816** as "the effect" of the prescription (it is the max cell of `H`; pooled ≈ +0.67,
+  and the count-matched form is +0.627).
+* `fa1`'s +0.629 without §2.3's ceiling caveat attached.
+* any `D` sentence that does not carry its box, and no pooling of `gn1`'s numbers with
+  `mm1`/`pp1`/`cc1`/`ar1`/`fa1`.
+
+**AND THE STANDING GENERALISATION DEBT, WHICH THIS CYCLE MADE MORE URGENT, NOT LESS:** the
+tail is still **one architecture and one dataset** — 48 runs, all ResNet18/CIFAR-10, and zero
+elsewhere. `gn1` discharges the *normalisation* axis only. The three built generalisation
+batches outrank it (§6.0) and now have a new number to carry on every branch: the count
+confound at this *m* range is measured at **≈ −0.06 pp** (`chunk777 − nodewise1d` = −0.109 /
+−0.019 / −0.089), not the +0.19 pp the uniform ladder extrapolation predicts.

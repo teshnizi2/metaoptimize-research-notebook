@@ -1,0 +1,240 @@
+#!/bin/bash
+# =============================================================================
+# cH1_head_backbone.sh -- `hb1`, THE CIFAR-100 HEAD/BACKBONE PARTITION TEST.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches /cluster/account_a and nothing is submitted to cluster_a.
+# cluster_a is holding 12 in489g1 jobs that this script must not go near.
+#
+# REGISTERED SCORER: analysis/cH1_hb1_score.py, git-committed BEFORE this batch
+# is submitted (STANDING RULE 21).  Every bar quoted here is frozen there, and
+# that file's --selftest re-derives every archived number from
+# results/all_runs.csv and asserts each constant against THIS FILE'S own text.
+#
+# NO CODE PATCH.  Optimizers/HF.py::polish_the_stepsize_groups already parses an
+# explicit int list given as the STRING "[a,b,...]" and init_meta routes any
+# unrecognised string to `blockwise`.  GUARD 4 below re-proves that on the LIVE
+# model at submission time and writes PARTITION-MANIFEST.txt, which the scorer
+# REQUIRES.  The shared tree is not modified by this batch in any way.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# Granularity buys +46.5 pp at CIFAR-100 and only +3.0 pp at CIFAR-10, and the
+# CIFAR-100 scalar arm fails on TRAIN as badly as on test (archived final_train
+# 22.97 against layerwise's 98.96) -- it cannot fit, it does not merely fail to
+# generalise.  The head/backbone hypothesis: a single step size cannot serve
+# both a backbone and a classifier head whose share of the model grows with the
+# class count.  If so, ONE binary cut {backbone, head} should capture most of
+# the 46.5 pp, and an arbitrary binary cut should not.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  18 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85)=5.47, p 6.9e-13; SEED is null, F 1.21, p 0.213) -- is held constant
+# and every contrast is WITHIN this batch.
+#
+#   scal   scalar            m=1    baseline
+#   head   [60,2]            m=2    THE HYPOTHESIS: {backbone, head}
+#   stem   [2,60]            m=2    CONTROL: size-matched, wrong END
+#   mid    [31,31]           m=2    CONTROL: balanced, wrong PLACE
+#   blk    resnet18_blocks   m=6    in-batch bridge to the archived 0.650
+#   lay    layerwise         m=62   ceiling
+#   x seed in {0,1,2}
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / ms 1e-3 / alpha0 1e-6 /
+#   100 ep / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 / AUGMENT=1 / HIER
+#   unset / PROBE=0.  Matched cell-for-cell to the archived CIFAR-100 rows.
+#
+#   CAPTURE(arm) = (M(arm) - M(scal)) / (M(lay) - M(scal))   on plateau5
+#   CAP_HEAD  primary;  SPEC = CAP_HEAD - max(CAPTURE(mid), CAPTURE(stem))
+#
+# PRE-REGISTERED BARS, frozen in the scorer and re-derived there from the CSV
+# (archived: scalar 22.776 n=5, blockwise 53.020 n=5, layerwise 69.302 n=8; gap
+# 46.526 pp; blockwise already captures 0.650 with m=6):
+#
+#   HEAD_MECHANISM        CAP_HEAD >= 0.50 and SPEC >= 0.25 and t >= 2
+#   HEAD_PARTIAL          0.25 <= CAP_HEAD < 0.50 with SPEC >= 0.25
+#   REFUTED-SMALL         CAP_HEAD < 0.25
+#   REFUTED-NOTSPECIFIC   SPEC <= 0.10   -- an arbitrary m=2 cut does as well;
+#                         the head account dies and a NEW claim about partition
+#                         COUNT is recorded as a positive finding
+#   REFUTED-HURTS         M(head) < M(scal) - 0.50 pp
+#   otherwise             UNRESOLVED
+#
+# MAY NOT CLAIM: anything about CIFAR-10, Tiny-ImageNet, ImageNet-489, ResNet-50,
+# alpha0 1e-3, any meta-stepsize but 1e-3, any optimiser pair but SGDm+Lion, any
+# hierarchical or shrinkage operator (HIER is unset in every arm), or which
+# partition is optimal at any other class count.  Three m values cannot locate
+# an optimum.
+#
+# WALLTIME, MEASURED not guessed.  The archived 100-epoch CIFAR-100 runs at this
+# cell have a maximum wallclock of 93 min (results/all_runs.csv, wallclock_min).
+# 02:30:00 is +61% on the worst observed, and stays inside gpu-short's 4 h
+# ceiling so no partition in the list is excluded.
+#
+# USAGE   bash bin/cH1_head_backbone.sh            # dry run, submits nothing
+#         bash bin/cH1_head_backbone.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/hb1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP="-15:-2.3026"; MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=02:30:00
+
+echo "=============================================================="
+echo " hb1 -- CIFAR-100 head/backbone partition test"
+echo " $DSET / $NET  box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG"
+echo " 6 arms x 3 seeds = 18 jobs, one submission"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ------
+SC="$REPO/analysis/cH1_hb1_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: scorer missing"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cH1_hb1_score.py bin/cH1_head_backbone.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires the scorer committed BEFORE any run exists: $DIRTY"
+else
+  guard_fail "guard 1b: no git repo here; cannot verify RULE 21"
+fi
+python3 "$SC" --selftest >/tmp/hb1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -25 /tmp/hb1_selftest.$$; }
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^hb1-' "$CSVP" && guard_fail "guard 2: hb1-* already in the CSV" \
+                        || echo "guard 2: no hb1-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/hb1-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no hb1-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT hb1-*.out files already exist"
+fi
+
+# ---- guard 3: the CIFAR-100 data is actually staged on THIS account ---------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4: THE PARTITION IS PROVEN ON THE LIVE MODEL, AND WRITTEN DOWN ---
+# No assumption about tensor ordering: named_parameters() is read from the model
+# this batch will actually train, and polish_the_stepsize_groups is called on it.
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+python3 - "$CIF" "$MANIFEST" <<'PYEOF' || guard_fail "guard 4: live partition check FAILED"
+import sys, os
+cif, out = sys.argv[1], sys.argv[2]
+sys.path.insert(0, cif)
+os.chdir(cif)
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network("ResNet18_c100", "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+tot = sum(int(p.numel()) for _, p in net.named_parameters())
+lines = ["NUM_PARAM_TENSORS %d" % len(nps), "TOTAL_PARAMS %d" % tot]
+print("guard 4: live ResNet18_c100 has %d parameter tensors, %d parameters"
+      % (len(nps), tot))
+head_n = sum(int(p.numel()) for n, p in net.named_parameters()
+             if n in ("linear.weight", "linear.bias"))
+lines.append("HEAD_PARAMS %d" % head_n)
+print("guard 4: head = linear.weight + linear.bias = %d params (%.4f%% of the model)"
+      % (head_n, 100.0 * head_n / tot))
+for spec in ["scalar", "[60,2]", "[2,60]", "[31,31]", "resnet18_blocks", "layerwise"]:
+    if spec in ("scalar", "layerwise"):
+        continue
+    g = HF.polish_the_stepsize_groups(None, spec, nps)
+    sizes = [len(x) for x in g]
+    lines.append("SPEC %s M %d SIZES %s FIRSTGROUP %s LASTGROUP %s"
+                 % (spec, len(g), ",".join(str(s) for s in sizes),
+                    " ".join(g[0]), " ".join(g[-1])))
+    print("guard 4: %-16s m=%d sizes=%s  last group = %s"
+          % (spec, len(g), sizes, g[-1]))
+assert HF.polish_the_stepsize_groups(None, "[60,2]", nps)[-1] == \
+       ["linear.weight", "linear.bias"], "the [60,2] tail is NOT the head"
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: PARTITION-MANIFEST.txt written to %s" % out)
+PYEOF
+[ -s "$MANIFEST" ] && echo "guard 4b: manifest is non-empty" || guard_fail "guard 4b: no manifest"
+
+# ---- guard 5: capacity ------------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 18"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in scal head stem mid blk lay; do
+    case $ARM in
+      scal) G=scalar ;;
+      head) G='[60,2]' ;;
+      stem) G='[2,60]' ;;
+      mid)  G='[31,31]' ;;
+      blk)  G=resnet18_blocks ;;
+      lay)  G=layerwise ;;
+    esac
+    # NOTE the single quotes around $G below: "[60,2]" is a bash bracket GLOB.
+    # Unquoted, inside the eval, it would expand against the CWD if a file named
+    # 6, 0, 2 or , ever existed there.  Quoted, argv reaches train.py literally
+    # and the runner's `echo "ARGS: $@"` prints it unchanged for RULE 20.
+    CMD="sbatch --job-name=hb1-$ARM-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups '$G' --seed $S --save-directory $SAVE --run-name hb1-$ARM-s$S"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for hb1-$ARM-s$S"
+      guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; echo; N=$((N+1)); fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'hb1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "hb1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- hb1- added to bin/PROTECTED.txt ----"
+  # jobs/run_cifar.sh hard-codes #SBATCH --output=$WS/runs/%x-%j.out, so the .out
+  # files land in $WS/runs, NOT in --save-directory.
+  guard_postlaunch "$WS/runs" "hb1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no hb1 job started inside the window.  This is NOT"
+       echo "         a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name hb1-" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^hb1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+fi

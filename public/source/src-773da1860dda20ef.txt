@@ -1,0 +1,471 @@
+#!/bin/bash
+# =============================================================================
+# c77_permuted_partition.sh -- `pp1`, THE THREE-WAY DECOMPOSITION OF mm1's +0.485.
+# Runs on cluster_a ONLY (needs PATCH_CHUNKWISE and PATCH_PERMNODE).
+# 9 jobs: {nodewise, permnode<seed>, chunk777} x seeds 0-2, ms=1e-4, 100 ep, probe ON.
+#
+# WHY THIS BATCH EXISTS
+#   `mm1`'s M1 CONFIRMED: at m matched to ONE group in 14,420, within one batch,
+#   chunk777 beat nodewise by +0.485 pp (t=3.01).  So the partition matters at fixed
+#   count.  CORRECTIONS 105.3 then forbade the sentence that would actually be worth
+#   having -- "architecture ALIGNMENT matters" -- because mm1's two arms differ in
+#   TWO ways at once:
+#
+#       nodewise  groups = output channels;  sizes HETEROGENEOUS across tensors
+#                 (measured: 14,420 groups, 10 distinct sizes, min 1, max 4,608)
+#       chunk777  groups = flat chunks;      sizes UNIFORM at 777 everywhere
+#
+#   Matched m fixes the MEAN group size by construction and says NOTHING about the
+#   distribution.  `permnode<S>` (PATCH_PERMNODE, cycle 77) is the arm that separates
+#   them: it keeps nodewise's group count AND nodewise's per-tensor group-size
+#   multiset EXACTLY, and randomises only WHICH weights land in which group, within
+#   each tensor.  tests/test_permnode.py P3 asserts the multiset identity on the real
+#   network; P1 asserts that permnode at the IDENTITY permutation is nodewise BITWISE.
+#
+#   THE DECOMPOSITION, all three arms in ONE batch at m ~ 14,420:
+#       nodewise -> permnode  =  A  = the ALIGNMENT leg       (sizes IDENTICAL)
+#       permnode -> chunk777  =  B  = the SIZE-DISTRIBUTION leg (both arbitrary)
+#       nodewise -> chunk777  =  D  = both at once = mm1's +0.485, re-measured here
+#   A + B == D holds ALGEBRAICALLY, so it is a receipt and not a result.
+#
+# WHAT permnode DOES NOT TEST, STATED BEFORE THE DATA EXISTS
+#   The permutation is WITHIN each tensor.  So `pp1` asks whether an output channel
+#   is special AMONG THE SAME-SIZED SUBSETS OF ITS OWN LAYER -- which is the question
+#   the Adam-mini / Adalayer / SGG line asks -- and it does NOT test whether LAYER
+#   boundaries matter.  A confirmed A is a within-layer statement.  Do not write it
+#   as "architecture is irrelevant".
+#
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+#
+#   P0    VALIDITY.  n_records == 10000; beta moved; epochs_done == requested == 100.
+#   P0.2  n_beta EXACT on EVERY record: nodewise 14420, permnode 14420, chunk777
+#         14421.  Guard 4 MEASURES all three from the ALLOCATED beta on the real
+#         built network before anything is submitted, and ALSO asserts that
+#         permnode's per-tensor size multiset equals nodewise's.
+#   P0.3  THE INSTRUMENT FIRED.  neg_counts.json, n_tot == n_beta, npy shape from its
+#         HEADER == (n_tot,).
+#   P0.4  BOX-FREE at BOTH guards, rec_-based 5% gate, PRIMARY and UNCHANGED.  All 6
+#         mm1 arms read 0.0000 on all four columns in this same box, so a bind on the
+#         permnode arm would be NEW and would be reported as such.
+#
+#   P1    **THE REPLICATION.  REGISTERED.**  D = plateau5(chunk777) - plateau5(nodewise),
+#         measured HERE.  mm1 measured +0.485.  PREDICTS |D - 0.485| <= 0.50.
+#         This is the FIRST out-of-batch replication of M1 and it is worth having on
+#         its own.  **P1 DOES NOT GATE P2.**  P2 is a within-batch contrast between
+#         two arms that both run here, so it stands whatever P1 does -- and saying so
+#         in advance stops a failed replication being used to discard an inconvenient
+#         P2.  **BUT:** if D is not resolvably positive in THIS batch, the quantity
+#         being decomposed does not exist here, and P3/P4 must NOT be reported as a
+#         decomposition of anything.  That condition is separate and is registered too.
+#
+#   P2    **THE ALIGNMENT LEG.  THE PRIMARY.  FIVE-WAY, SYMMETRIC, REGISTERED.**
+#         A = plateau5(permnode) - plateau5(nodewise).  Same m, same per-tensor size
+#         multiset, ONLY membership randomised.  The bands are mm1's M1 bands,
+#         deliberately, so the two legs are read on one scale.
+#           A >  +0.30      -> **ALIGNMENT HURTS.**  Grouping by output channel is
+#                WORSE than grouping the same number of same-sized arbitrary subsets
+#                of the same layer.  This is the sentence that bears on the
+#                Adam-mini / Adalayer / SGG line, and it would be the campaign's
+#                first claim about that line rather than about MetaOptimize.
+#           (+0.15, +0.30] -> **UNDECIDED**, registered in advance.
+#           [-0.15, +0.15] -> **NULL.**  Alignment is not the carrier; nodewise's
+#                deficit against chunk777 is about the SIZE DISTRIBUTION.  This is a
+#                clean negative and is worth as much as the positive.
+#           [-0.30, -0.15) -> **UNDECIDED**, registered in advance.
+#           A <= -0.30      -> **ALIGNMENT HELPS.**  Channel structure is a genuine
+#                benefit, and B must then exceed D for the arithmetic to close.
+#         The band is SYMMETRIC because there is no prior favouring either sign, and
+#         it is written down before the data exists so neither sign can be promoted
+#         after the fact.
+#
+#   P3    THE SIZE-DISTRIBUTION LEG.  B = plateau5(chunk777) - plateau5(permnode).
+#         **NO INDEPENDENT VERDICT, AND THAT IS DELIBERATE:** B = D - A algebraically,
+#         so registering a direction for B as well as for P1 and P2 would be scoring
+#         one degree of freedom twice.  B is REPORTED with its sem and read as the
+#         remainder.
+#   P4    THE ADDITIVITY RECEIPT.  A + B == D to floating point.  An arithmetic check
+#         on the reduction, NOT a finding.
+#
+#   P5    THE FIELD, THREE WAYS AT MATCHED m.  **DESCRIPTIVE, NO DIRECTION.**
+#         a_raw, a_deb, pbar, bias_share, N_eff/m for all three arms.
+#         **The "53.1%" sentence is NOT reproduced and must NOT be written.**
+#
+#   P5b   **THE CHANNEL DISCRIMINANT.  REGISTERED, AND ITS ORIGIN IS DECLARED.**
+#         c77's F2 was POST-HOC: it found that at matched m the chunk777-vs-nodewise
+#         RAW agreement gap is +113% bias channel and -13% debiased channel, i.e. the
+#         two partitions differ almost entirely through a PERSISTENT TILT.  Measured
+#         there: dev_bias(chunk777) = 0.00370, dev_bias(nodewise) = 0.02346.
+#         A prediction DERIVED from a post-hoc finding and tested on NEW data is a
+#         legitimate registration, which is why it is written here rather than scored
+#         off the old data.  Let x = dev_bias(permnode) and let the midpoint be
+#         M = (0.00370 + 0.02346)/2 = 0.01358.
+#           x < M - 0.25*(0.02346-0.00370)  -> the bias channel is an ALIGNMENT effect
+#           x > M + 0.25*(0.02346-0.00370)  -> it is a SIZE-DISTRIBUTION effect
+#           within +-25% of the midpoint     -> **UNDECIDED**, registered in advance
+#         P5b and P2 are LOGICALLY INDEPENDENT -- the field could track alignment
+#         while accuracy tracks size.  **If they agree, that is a mechanism; if they
+#         disagree, that is the more interesting result and it must not be buried.**
+#
+# WHAT THIS BATCH DELIBERATELY DOES NOT DO
+#   * It does NOT sweep ms.  ms=1e-4 is held because that is the ms mm1's M1 and
+#     ck1's K2 were measured at, and P1 must be the SAME contrast re-measured rather
+#     than a different one.  **THE RISK IS STATED, AND IT IS mm1's RISK INHERITED:
+#     nodewise is read at 1e-4, not at its own argmax of 3e-4, so every verdict here
+#     is a statement at ms=1e-4 and not at each partition's own optimum.**
+#   * It does NOT vary the permutation independently of the run seed.  permnode<S>
+#     uses S = the run seed, so seeds 0-2 are three DIFFERENT permutations as well as
+#     three different inits.  That folds permutation variance into seed variance,
+#     which is the conservative direction (it can only widen the sem, never narrow
+#     it), but it means the batch CANNOT separate the two.  Stated, not hidden.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 tests/test_permnode.py         (27/27, CPU, P0 asserts determinism)
+#   2. python3 tests/test_chunkwise.py        (CPU, unchanged by PATCH_PERMNODE)
+#   3. python3 analysis/c76_mm1_score.py --selftest    (80/80)
+#   4. python3 analysis/c55_neff_noise.py --selftest   (51/51 -- the selftest does not
+#      enumerate BOXES, so this count does NOT move when a family is registered)
+#   5. `pp1` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   6. plateau5 is PRIMARY.  best_test inflates ~0.37 pp.
+#
+# USAGE
+#   bash c77_permuted_partition.sh            # dry run
+#   bash c77_permuted_partition.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+USER_NAME="${USER:-$(whoami)}"
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/pp1
+WALL=04:00:00
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+NJOBS=9
+CLIP=-15:-2.3026               # ck1's/mm1's box EXACTLY -- not a new box
+MST=1e-4                       # the ms M1 and K2 were both measured at
+EPOCHS=100
+WRITE_EVERY=500
+CHUNK_K=777                    # m(777) = 14,421, ONE group from nodewise's 14,420
+M_CHUNK=14421
+M_NODE=14420
+M_PERM=14420                   # permnode carries nodewise's count EXACTLY, every S
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  pp1 -- THE THREE-WAY DECOMPOSITION OF mm1's +0.485 pp"
+echo "    nodewise (m=$M_NODE) / permnode<seed> (m=$M_PERM) / chunk${CHUNK_K} (m=$M_CHUNK)"
+echo "    seeds 0,1,2 = $NJOBS jobs;  ms=$MST, BETA_CLIP=$CLIP, ${EPOCHS}ep"
+echo "    P2 (PRIMARY): A = permnode - nodewise, SAME m, SAME size multiset"
+echo "       A > +0.30 ALIGNMENT HURTS | [-0.15,+0.15] NULL | A <= -0.30 HELPS"
+echo "       (+-0.15,+-0.30] UNDECIDED, registered in advance"
+echo "=============================================================="
+
+# --- GUARD 0 ---------------------------------------------------------------
+[ -f "$CSVP" ] || { echo "GUARD FAIL: no CSV at $CSVP"; exit 1; }
+[ -f "$RUNNER" ] || { echo "GUARD FAIL: no runner at $RUNNER"; exit 1; }
+echo "guard 0: runner and CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || exit 1
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script exports for")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in mine[0]:
+        sys.exit("GUARD FAIL: export line missing %r -- that is bf8's bug" % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+if keys(mine[0]) != keys(ref[0]):
+    sys.exit("GUARD FAIL: export KEYS differ from tw0's CONFIRMED-FIRING line")
+print("guard 1c: export keys identical to tw0's CONFIRMED-FIRING line")
+PYEOF
+
+# --- GUARD 1d -- BOTH PARTITION PATCHES ARE PRESENT ON THIS ACCOUNT --------
+python3 - "$WS" <<'PYEOF' || exit 1
+import os, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks",
+                  "MetaOptimize", "cifar10", "Optimizers", "HF.py")
+src = open(hf).read()
+for marker, needs in (("PATCH_CHUNKWISE", ("chunkwise", "chunk_size")),
+                      ("PATCH_PERMNODE", ("permnode", "perm_idx", "perm_inv",
+                                          "perm_gsize", "perm_groups"))):
+    if marker not in src:
+        sys.exit("GUARD FAIL: %s is NOT applied to %s" % (marker, hf))
+    for need in needs:
+        if need not in src:
+            sys.exit("GUARD FAIL: %s present but %r missing -- partial patch"
+                     % (marker, need))
+# The three permnode branches must all exist: dispatch, beta init, alpha, product.
+if src.count("self.stepsize_type == 'permnode'") != 3:
+    sys.exit("GUARD FAIL: expected 3 permnode branches, found %d"
+             % src.count("self.stepsize_type == 'permnode'"))
+if src.count("self.stepsize_type = 'permnode'") != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 permnode type assignment")
+print("guard 1d: PATCH_CHUNKWISE and PATCH_PERMNODE both present and complete")
+PYEOF
+
+# --- GUARD 1e -- THE PERMNODE SUITE PASSES ON THIS TREE, ON CPU ------------
+# STANDING RULE 20: an equivalence suite must run on a deterministic device, and its
+# FIRST assertion must be that a configuration equals ITSELF.  This does not trust
+# the earlier scratch run -- it re-runs against the tree the jobs will import.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$REPO" || exit 1
+  PERM_TEST_DEVICE=cpu python3 tests/test_permnode.py > /tmp/pp1_permtest.$$ 2>&1
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    echo "GUARD FAIL: tests/test_permnode.py did NOT pass on this tree:"
+    tail -20 /tmp/pp1_permtest.$$
+    rm -f /tmp/pp1_permtest.$$
+    exit 1
+  fi
+  grep -c PASS /tmp/pp1_permtest.$$ | xargs -I{} echo "guard 1e: test_permnode.py {} PASS, 0 FAIL, on CPU, against the LIVE tree"
+  rm -f /tmp/pp1_permtest.$$
+) || exit 1
+
+# --- GUARD 2 -- the 13-axis signature, re-derived FROM THE CSV --------------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$MST" <<'PYEOF' || exit 1
+import csv, sys, statistics, math
+csvp, clip, epochs, mst = sys.argv[1:5]
+rd = list(csv.DictReader(open(csvp)))
+AX = ['network','dataset','batch_size','base','meta','alpha0','gamma',
+      'augment','beta_clip','hier','lam','eta_ratio','epochs_done']
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row")
+sig = {a: ref[0][a] for a in AX}
+mine = {'network':'ResNet18','dataset':'CIFAR10','batch_size':'100','base':'SGDm',
+        'meta':'Lion','alpha0':'1e-3','gamma':'1','augment':'1',
+        'beta_clip':clip,'epochs_done':epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a,m,s in bad: print("  axis %s: this batch %r vs reference %r" % (a,m,s))
+    sys.exit("GUARD FAIL: pp1 does not match the ladder's axis signature")
+print("guard 2: all 13 axes match the rs-lay-1e4 signature read FROM THE CSV")
+
+def pl(prefix):
+    return [float(r['plateau5']) for r in rd
+            if r['run'].startswith(prefix) and r.get('plateau5','').strip()]
+
+# guard 2b: P1's reference is mm1's MEASURED D, re-derived from the CSV right now.
+# If the CSV has moved since c77 read it, this batch's registration is stale.
+ch = pl('mm1-ch-s'); nd = pl('mm1-node-s')
+if len(ch) != 3 or len(nd) != 3:
+    sys.exit("GUARD FAIL: expected mm1's 3+3 rows, found %d+%d" % (len(ch), len(nd)))
+D = statistics.mean(ch) - statistics.mean(nd)
+if abs(D - 0.485) > 0.002:
+    sys.exit("GUARD FAIL: mm1's D reads %+.3f now, not the +0.485 P1 registers "
+             "against.  The CSV moved; re-reduce before submitting." % D)
+print("guard 2b: P1 reference = mm1's D = %+.3f pp (n=3 per arm) as registered" % D)
+
+# guard 2c: mm1's nodewise arm is the SAME configuration this batch's node arm runs,
+# so its level is the one P0.4 and P1 inherit.  Assert it still reads as reduced.
+if abs(statistics.mean(nd) - 92.044) > 0.002:
+    sys.exit("GUARD FAIL: mm1 nodewise reads %.3f, not the 92.044 registered"
+             % statistics.mean(nd))
+print("guard 2c: mm1 nodewise = %.3f, chunk777 = %.3f, both as reduced"
+      % (statistics.mean(nd), statistics.mean(ch)))
+
+# guard 2d: pp1 must not collide with an existing run name.
+clash = [r['run'] for r in rd if r['run'].startswith('pp1-')]
+if clash:
+    sys.exit("GUARD FAIL: %d pp1-* runs already in the CSV: %s"
+             % (len(clash), clash[:5]))
+print("guard 2d: no pp1-* run name already exists in the CSV")
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs -------------------
+python3 - "$REPO" "$CLIP" <<'PYEOF' || exit 1
+import sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if "pp1" not in c55.BOXES:
+    sys.exit("GUARD FAIL: `pp1` is not registered in c55_neff_noise.BOXES.  Register "
+             "it from THIS script's CLIP= line BEFORE submitting or the root is skipped.")
+lo, hi, prov = c55.BOXES["pp1"]
+want = tuple(float(x) for x in clip.split(":"))
+if (lo, hi) != want:
+    sys.exit("GUARD FAIL: c55 registers pp1 as %s but CLIP= is %s" % ((lo,hi), want))
+if (lo, hi) != c55.BOXES.get("mm1", (None, None, None))[:2]:
+    sys.exit("GUARD FAIL: pp1's box is not mm1's box -- P1 would not be comparable")
+print("guard 3: pp1 registered as (%.1f, %.4f) from %s, identical to mm1's"
+      % (lo, hi, prov))
+PYEOF
+
+# --- GUARD 4 -- ALL THREE m MEASURED FROM THE ALLOCATED BETA, AND THE -------
+# --- PERMNODE SIZE MULTISET ASSERTED EQUAL TO NODEWISE'S --------------------
+# The batch's entire claim is that `perm` and `node` differ ONLY in membership.
+# That is therefore MEASURED here, on the real built network, from the beta the
+# optimizer actually allocates and from the permutation it actually builds --
+# not from a formula and not from a comment in the patch.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10" || exit 1
+  python - "$CHUNK_K" "$M_CHUNK" "$M_NODE" "$M_PERM" <<'PYEOF' || exit 1
+import sys, math, torch
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+K, want_chunk, want_node, want_perm = (int(x) for x in sys.argv[1:5])
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": 1e-4, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def build(gran):
+    torch.manual_seed(0)
+    net = build_network("ResNet18", "cpu")
+    return HF(net, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+net = build_network("ResNet18", "cpu")
+shapes = [tuple(p.shape) for p in net.parameters()]
+numels = [int(p.numel()) for p in net.parameters()]
+
+o_ch = build("chunk%d" % K)
+o_nd = build("nodewise")
+m_chunk, m_node = m_of(o_ch), m_of(o_nd)
+print("guard 4: chunk%-6d ALLOCATED beta m=%-8d (registered %d)" % (K, m_chunk, want_chunk))
+print("guard 4: nodewise      ALLOCATED beta m=%-8d (registered %d)" % (m_node, want_node))
+if m_chunk != want_chunk:
+    sys.exit("GUARD FAIL: m(chunk%d) is %d, not the %d registered" % (K, m_chunk, want_chunk))
+if m_node != want_node:
+    sys.exit("GUARD FAIL: m(nodewise) is %d, not the %d registered" % (m_node, want_node))
+
+# nodewise's per-tensor size multiset, from the SHAPES the network actually has.
+node_groups = [s[0] for s in shapes]
+node_gsize = [n // g for n, g in zip(numels, node_groups)]
+node_multiset = sorted(gs for g, gs in zip(node_groups, node_gsize) for _ in range(g))
+
+# EVERY seed's permutation is checked, because every seed is a submitted job.
+for S in (0, 1, 2):
+    o_pm = build("permnode%d" % S)
+    m_perm = m_of(o_pm)
+    if m_perm != want_perm:
+        sys.exit("GUARD FAIL: m(permnode%d) is %d, not the %d registered"
+                 % (S, m_perm, want_perm))
+    if list(o_pm.perm_groups) != node_groups:
+        sys.exit("GUARD FAIL: permnode%d group COUNTS differ from nodewise's" % S)
+    if list(o_pm.perm_gsize) != node_gsize:
+        sys.exit("GUARD FAIL: permnode%d group SIZES differ from nodewise's" % S)
+    pm_multiset = sorted(gs for g, gs in zip(o_pm.perm_groups, o_pm.perm_gsize)
+                         for _ in range(g))
+    if pm_multiset != node_multiset:
+        sys.exit("GUARD FAIL: permnode%d size MULTISET differs from nodewise's" % S)
+    # a permutation that repeated an index would silently drop weights from groups
+    bad = [i for i, n in enumerate(o_pm.perm_numel)
+           if not torch.equal(torch.sort(o_pm.perm_idx[i].cpu()).values,
+                              torch.arange(n))]
+    if bad:
+        sys.exit("GUARD FAIL: permnode%d perm is not a permutation on tensors %s"
+                 % (S, bad[:5]))
+    # and it must actually DIFFER from the identity, or the arm is nodewise
+    ident = sum(1 for i, n in enumerate(o_pm.perm_numel)
+                if torch.equal(o_pm.perm_idx[i].cpu(), torch.arange(n)))
+    if ident > 2:
+        sys.exit("GUARD FAIL: permnode%d is the identity on %d tensors" % (S, ident))
+    print("guard 4: permnode%d  ALLOCATED beta m=%-8d  size multiset IDENTICAL to "
+          "nodewise's (%d groups, %d distinct sizes, min %d max %d), perm verified"
+          % (S, m_perm, len(pm_multiset), len(set(pm_multiset)),
+             min(pm_multiset), max(pm_multiset)))
+
+# The three seeds must be three DIFFERENT permutations, or they are not three draws.
+p0, p1 = build("permnode0"), build("permnode1")
+big = [i for i, n in enumerate(p0.perm_numel) if n > 64]
+same = sum(1 for i in big
+           if torch.equal(p0.perm_idx[i].cpu(), p1.perm_idx[i].cpu()))
+if same:
+    sys.exit("GUARD FAIL: permnode0 and permnode1 share %d permutations" % same)
+print("guard 4b: seeds 0 and 1 give different permutations on all %d sizeable tensors"
+      % len(big))
+if abs(m_chunk - m_node) > 1:
+    sys.exit("GUARD FAIL: chunk and node counts differ by %d groups" % abs(m_chunk - m_node))
+print("guard 4c: node and perm counts are EQUAL; chunk is %d group away.  All three "
+      "measured from the ALLOCATED beta, none inherited from a comment."
+      % abs(m_chunk - m_node))
+PYEOF
+) || { echo "GUARD 4 FAILED -- nothing submitted"; exit 1; }
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" <<'PYEOF' || exit 1
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+need_gb = 9 * 0.060
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)" % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# --- GUARD 6 -- queue depth ------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS"
+if [ "$PEND" -gt 40 ]; then
+  echo "GUARD FAIL: $PEND already pending, over the 40 cap"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for S in 0 1 2; do
+  # permnode<S> uses the RUN SEED as its permutation seed, so seeds 0-2 are three
+  # different permutations as well as three different inits (stated in the header).
+  for ARM in "nodewise:node" "permnode${S}:perm" "chunk${CHUNK_K}:ch"; do
+    GRAN="${ARM%%:*}"; SHORT="${ARM##*:}"
+    RN="pp1-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_pp1_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+exit 0

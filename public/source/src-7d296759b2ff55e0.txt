@@ -1,0 +1,199 @@
+"""cX1_reduction_noop_proof.py -- IS "NORMALISE THE GROUP REDUCTION" A NO-OP?
+
+THE CLAIM UNDER TEST.  `HF.block_product` returns one scalar per group, the
+UNNORMALISED sum z_G = sum_{i in G} <h_i, g_i>, and `HF.Lion_meta_update` applies
+`torch.sign()` to a linear function of the z-history.  If that is so, then
+dividing EACH GROUP's reduction by ANY POSITIVE PER-GROUP CONSTANT c_G -- the
+group's tensor count, or its parameter count, or anything else fixed in time --
+leaves the beta trajectory UNCHANGED, because
+
+    momentum_meta is a zero-initialised LINEAR recursion in z, so scaling z_G by
+    1/c_G scales momentum_meta_G by 1/c_G, so the sign() argument is scaled by
+    the POSITIVE constant 1/c_G, so its sign -- and therefore the entire update
+    beta <- (1 - ms*wd)*beta - ms*sign(...) -- is IDENTICAL.
+
+If the claim holds, an experiment that "normalises the group reduction" is a
+NULL BY CONSTRUCTION and must not be run.
+
+This file does not argue it.  It drives the LIVE `HF` object's own bound
+meta_update methods with a synthetic z-history and its per-group-rescaled twin
+and compares beta bit for bit, for all three meta-optimisers HF supports.
+
+RUN:  python3 analysis/cX1_reduction_noop_proof.py [--cifar-dir DIR]
+      (--cifar-dir defaults to the cluster_b workspace path; any tree whose
+       Optimizers/HF.py is the live file will do.)
+Exit 0 iff every registered check passes.
+"""
+import argparse, importlib.util, os, sys
+
+DEFAULT_CIF = ("/cluster/account_b/metaopt/MetaOptimize/codes/Supervised_tasks/"
+               "MetaOptimize/cifar10")
+
+NPASS = [0]
+NFAIL = [0]
+
+
+def chk(cond, msg, extra=""):
+    if cond:
+        NPASS[0] += 1
+        print("  PASS %s %s" % (msg, extra))
+    else:
+        NFAIL[0] += 1
+        print("  FAIL %s %s" % (msg, extra))
+
+
+def load_hf(cifar_dir):
+    p = os.path.join(cifar_dir, "Optimizers", "HF.py")
+    spec = importlib.util.spec_from_file_location("HF_live", p)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["HF_live"] = m
+    spec.loader.exec_module(m)
+    return m, p
+
+
+class Shell:
+    """A minimal object carrying exactly the attributes the meta_update methods
+    touch, so the LIVE unbound functions can be driven without a network."""
+
+    pass
+
+
+def run_meta(fn, m, nz, T, z, wd=0.0, ms=1e-3, mom=0.99, lb2=0.9, norm=0.999):
+    import torch
+    s = Shell()
+    s.args_meta = {"meta_stepsize": ms, "weight_decay": wd,
+                   "momentum_param": mom, "Lion_beta2": lb2,
+                   "normalizer_param": norm}
+    s.len_beta_list = 1
+    s.beta = [torch.full((m,), float(nz), dtype=torch.float32)]
+    s.momentum_meta = [0.0]
+    s.trace_meta = [0.0]
+    s.lambda_meta_t = 1.0
+    s.epsilon = 1e-10
+    out = []
+    for t in range(T):
+        fn(s, [z[t]])
+        out.append(s.beta[0].clone())
+    return torch.stack(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cifar-dir", default=DEFAULT_CIF)
+    ap.add_argument("--steps", type=int, default=4000)
+    ap.add_argument("--groups", type=int, default=2)
+    a = ap.parse_args()
+
+    import torch
+    HF, path = load_hf(a.cifar_dir)
+    src = open(path).read()
+    print("LIVE HF.py: %s" % path)
+    import hashlib
+    print("sha256    : %s" % hashlib.sha256(src.encode()).hexdigest())
+
+    print("\nA. THE TWO LOAD-BEARING LINES, QUOTED FROM THE LIVE FILE")
+    lines = src.split("\n")
+    bp = [i for i, l in enumerate(lines) if "def block_product" in l]
+    lm = [i for i, l in enumerate(lines) if "def Lion_meta_update" in l]
+    chk(len(bp) == 1, "block_product is defined exactly once", "line %s" % [i + 1 for i in bp])
+    chk(len(lm) == 1, "Lion_meta_update is defined exactly once", "line %s" % [i + 1 for i in lm])
+    if bp:
+        i = bp[0]
+        print("    %d: %s" % (i + 1, lines[i].strip()))
+        for k in range(1, 8):
+            print("    %d: %s" % (i + 1 + k, lines[i + k].strip()))
+        blk = "\n".join(lines[i:i + 8])
+        chk("return [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]" in blk,
+            "scalar branch is an UNNORMALISED sum over every tensor")
+        chk("for group_indices in self.param_groups_indices" in blk
+            and "sum([(u[i]*v[i]).sum() for i in group_indices])" in blk,
+            "blockwise branch is an UNNORMALISED sum over the group's tensors")
+        chk("/" not in blk.split("blockwise")[-1].split("\n")[1]
+            if "blockwise" in blk else False,
+            "no division appears in the blockwise reduction line")
+    if lm:
+        i = lm[0]
+        for k in range(0, 4):
+            print("    %d: %s" % (i + 1 + k, lines[i + k].strip()))
+        blk = "\n".join(lines[i:i + 4])
+        chk("torch.sign(" in blk, "the meta-update applies torch.sign() to the reduction")
+        chk("self.args_meta['meta_stepsize'] * torch.sign(" in blk,
+            "|dbeta| is EXACTLY meta_stepsize (times sign), magnitude discarded")
+        chk("self.momentum_meta[i] = self.args_meta['momentum_param'] * self.momentum_meta[i]"
+            " + (1-self.args_meta['momentum_param'])*HtT_gradft[i]" in blk,
+            "momentum_meta is a ZERO-INITIALISED LINEAR recursion in the reduction")
+
+    print("\nB. WHO CONSUMES THE REDUCTION (nothing may rescale it downstream)")
+    st = src.split("def step(self, net, loss):")[1].split("def beta_to_alpha")[0]
+    chk("HtT_gradft = self.block_product(self.h_condenced, g)" in st,
+        "step() calls block_product(h_condenced, g) exactly as assumed")
+    cons = [l.strip() for l in st.split("\n") if "HtT_gradft" in l]
+    print("    consumers of HtT_gradft inside step():")
+    for l in cons:
+        print("      %s" % l)
+    chk(all(("_zpool" in l or "_zmpool" in l or "_ebjs_pool_z" in l
+             or "_tl_update" in l or "meta_update" in l or "_probe" in l
+             or "block_product" in l) for l in cons),
+        "every consumer is a hierarchical pool (HIER), the meta-update, or the probe")
+    chk("HIER" in src and "_os.environ.get('HIER','')" in src,
+        "the pools are opt-in via the HIER env var; the standard cell sets HIER=none")
+
+    print("\nC. THE NO-OP THEOREM, DRIVEN THROUGH THE LIVE meta_update METHODS")
+    torch.manual_seed(0)
+    m, T = a.groups, a.steps
+    # A z-history whose per-group scales differ by four orders of magnitude, the
+    # regime the real reduction is in (group parameter counts 6.3e6 vs 4.9e6, and
+    # per-tensor terms spanning >4 decades).
+    base = torch.randn(T, m, dtype=torch.float32)
+    trend = torch.linspace(-1.0, 1.0, T).unsqueeze(1)
+    z = [(base[t] * torch.tensor([1.0, 1e-4]) + 0.3 * trend[t]).clone() for t in range(T)]
+    # THE CLAIM IS ASSERTED SEPARATELY FOR THE THREE META-OPTIMISERS, because
+    # they are NOT the same claim.  Lion is EXACTLY sign-based, so per-group
+    # rescaling is BITWISE inert at every scale -- that is the campaign's cell
+    # (`--alg-meta Lion`, read off every ARGS line) and the only load-bearing
+    # case.  RMSProp and Adam divide by sqrt(trace) + epsilon with epsilon =
+    # 1e-10 HARD-CODED, so they are scale-invariant only while z stays large
+    # against that floor; rescaling by ~1e6 pushes z under it and the trajectory
+    # moves.  That is recorded as a MEASURED PROPERTY, not scored as a failure,
+    # and it is a further reason not to build an experiment on rescaling.
+    for cvec in ([1.0, 1.0], [62.0, 1.0], [49.0, 13.0], [6315072.0, 4905060.0],
+                 [1e-3, 7.0]):
+        c = torch.tensor(cvec[:m], dtype=torch.float32)
+        zc = [zt / c for zt in z]
+        for nm, fn in (("Lion", HF.HF.Lion_meta_update),
+                       ("RMSProp", HF.HF.RMSProp_meta_update),
+                       ("Adam", HF.HF.Adam_meta_update)):
+            b0 = run_meta(fn, m, -13.8155, T, z)
+            b1 = run_meta(fn, m, -13.8155, T, zc)
+            same = bool(torch.equal(b0, b1))
+            mx = float((b0 - b1).abs().max())
+            if nm == "Lion":
+                chk(same, "LION (the campaign cell) is BITWISE inert under "
+                          "per-group scaling c=%s" % (cvec[:m],),
+                    "max|dbeta| %.3e" % mx)
+            else:
+                print("  NOTE %-7s c=%-24s %s  max|dbeta| %.3e"
+                      % (nm, str(cvec[:m]),
+                         "bitwise identical" if same else "differs (epsilon floor)", mx))
+
+    print("\nD. THE CONSEQUENCE")
+    print("    Dividing a GROUP's reduction by a positive per-group constant --")
+    print("    its tensor count, its parameter count, anything fixed in time --")
+    print("    cannot change the beta trajectory this optimizer produces.")
+    print("    'Normalise the group reduction' is therefore a NULL BY")
+    print("    CONSTRUCTION at every granularity, and any batch built on it")
+    print("    has ZERO POWER.  The only reduction intervention with power is")
+    print("    one that changes the RELATIVE WEIGHT OF TENSORS WITHIN a group,")
+    print("    i.e. normalisation applied PER TENSOR BEFORE the group sum --")
+    print("    which is itself a no-op for every granularity whose groups hold")
+    print("    exactly one tensor (layerwise, nodewise, weightwise, chunk*,")
+    print("    permnode*, nodewise1d).  It bites ONLY where a group holds two")
+    print("    or more tensors: `scalar` (m=1, 62 tensors) and `blockwise`/")
+    print("    `sets:` partitions.")
+
+    print("\n%d PASS, %d FAIL" % (NPASS[0], NFAIL[0]))
+    raise SystemExit(1 if NFAIL[0] else 0)
+
+
+if __name__ == "__main__":
+    main()

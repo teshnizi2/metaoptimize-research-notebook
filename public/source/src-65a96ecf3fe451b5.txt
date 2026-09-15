@@ -1,0 +1,1296 @@
+#!/usr/bin/env python3
+# =============================================================================
+# c87_an0_score.py -- THE REGISTERED SCORER FOR `an0`, THE THREE ANALYSIS-ONLY
+# FIXES THAT MUST LAND BEFORE ANY FURTHER SUBMISSION.
+#
+# an0 BUYS NO GPU-HOURS.  It emits ZERO Slurm jobs.  Its whole product is three
+# corrections computed from runs that are ALREADY ON DISK, two of which CHANGE
+# PUBLISHED NUMBERS.
+#
+# -----------------------------------------------------------------------------
+# **THE RULE-19 DISCLOSURE.  READ THIS BEFORE READING ANY VERDICT.**
+# -----------------------------------------------------------------------------
+# STANDING RULE 19 requires the scorer to be committed BEFORE the runs exist.
+# **an0 CANNOT SATISFY RULE 19 AND DOES NOT CLAIM TO.**  Every run it reads --
+# mm1, pp1, cc1, bn1, ar1, fa1 (ResNet18/CIFAR-10), g3m (ResNet34/CIFAR-10),
+# gc1 (ResNet18/CIFAR-100), ck1 and cx2 (the chunk ladder) -- was submitted,
+# completed and scored months before this file was written.  Pretending otherwise
+# would be exactly the record-hygiene failure the batch exists to fix.
+#
+# What CAN be honestly frozen, and IS frozen here before the scorer's first run:
+#   (i)   THE METRICS.  Relative error reduction is the commensurable scale, and
+#         it is applied to EVERY cell including the paper's own headline -- not
+#         only to gn1, which is where the campaign registered it (CORRECTIONS
+#         114.2e) and then did not apply it to itself.
+#   (ii)  THE DECISION RULES.  F1/F2/F3 each carry a rule, below, whose inputs
+#         are ORDERINGS, SPANS and SIGNS -- structural facts of the output, not
+#         thresholds tuned to a number somebody already knows.
+#   (iii) THE IDENTITY.  T = (D - G) + U is ALGEBRA, not a fit.  It closes to
+#         zero or the scorer is broken; F2 asserts closure to 1e-9 and refuses.
+#   (iv)  THE GRID.  F3's trajectory grid is fixed as FRACTIONS OF BUDGET, so it
+#         is defined identically for a 100-epoch cell and for a 300-epoch one,
+#         and its endpoint is plateau5 BY CONSTRUCTION (asserted in the selftest).
+# Every verdict below is therefore labelled POST-HOC (existing data) and NONE of
+# them may be written up as a pre-registered test.  They are CORRECTIONS.
+#
+# -----------------------------------------------------------------------------
+# WHAT IS SCORED
+# -----------------------------------------------------------------------------
+#   H0  THE BOX GATE, FIRST AND BEFORE EVERY OTHER NUMBER.  rec_lo/rec_hi at BOTH
+#       denominators (coordinate AND record), per seed per arm, for every cell.
+#       A statistic from a run at a guard is UNINTERPRETABLE; occupancy is printed
+#       beside every number and an ARM-ASYMMETRIC guard marks a contrast
+#       GUARD-CONFOUNDED and removes it from the PRIMARY.
+#
+#   F1  PRIMARY -- COMMENSURABILITY.  D on BOTH scales (raw pp AND relative error
+#       reduction) for every cell, plus the gn1 T0.6 admissibility gate applied to
+#       the paper's OWN cross-dataset headline.  RULE: if the argmax cell differs
+#       between the two scales, the paper MAY NOT name a largest D without naming
+#       the scale, and the sentence "CIFAR-100 gives the largest D in the corpus,
+#       2.5x the R18/C10 value" must be DELETED.
+#
+#   F2  PRIMARY -- THE PRACTITIONER'S NUMBER, DECOMPOSED IN-BATCH.
+#           T = nodewise1d - nodewise          (what a reader would actually do)
+#           D = chunk_fine   - nodewise        (the count-matched gap)
+#           G = chunk_coarse - nodewise1d      (the same gap, tail removed)
+#           U = chunk_coarse - chunk_fine      (the PURE COUNT axis, IN-BATCH)
+#           T = (D - G) + U                    EXACTLY, by construction.
+#       Every term is measured inside ONE batch, so STANDING RULE 14's cross-batch
+#       floor enters none of them and NO IMPORTED SLOPE IS NEEDED.  RULE: if the
+#       count share U/T spans more than SHARE_SPAN_BAR across the cells, the
+#       imported ck1 slope is NOT TRANSPORTABLE to this count range and must be
+#       deleted rather than quoted.  The four values the record carries for that
+#       one slope are reconciled or all four are withdrawn.
+#
+#   F3  SECONDARY -- THE HORIZON TRAJECTORY.  D(t) and (D-G)(t) on a fixed grid of
+#       budget fractions, per seed, from the .out series.  This is on disk today
+#       and a referee holding the artefact computes it in an afternoon; the paper
+#       publishes it or gets it published for it.  RULE: a cell shows REVERSAL
+#       PRESENT if D is negative at |t| >= 2 at any grid point at or below
+#       REVERSAL_FRAC of the budget; NO REVERSAL if D >= 0 at every grid point;
+#       UNRESOLVED otherwise.
+#
+#   DESCRIPTIVE -- T itself, the per-arm means, and the ck1/cx2 chunk ladder
+#       re-fitted every way the record fits it.  Descriptive means DESCRIPTIVE:
+#       no verdict is issued from any of it.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS SCORER MAY NOT DO
+# -----------------------------------------------------------------------------
+#   * NO FIELD STATISTIC.  Direction C was dropped on its own pre-registered
+#     adoption gate (C2 anti-concordant t -11.14; C3 dissociation t -23.26).  The
+#     selftest asserts the absence over this file's OWN identifiers.
+#   * NO NEW CLAIM.  an0 corrects the presentation of numbers the corpus already
+#     owns.  It may not promote a descriptive quantity to a result.
+#   * NO POOLING ACROSS ARCHITECTURES OR DATASETS.  F1 puts cells on a common
+#     scale so they can be COMPARED; it does not licence pooling them.
+#   * NO RULE-11 CLAIM.  ms is untuned on R34 and on CIFAR-100 and every verdict
+#     line says so.
+#   * NO CROSS-BATCH CONTRAST IN A PRIMARY.  D, G, U and T are within-batch in
+#     every cell that carries them; ck1's slope is cross-batch and is DESCRIPTIVE.
+# =============================================================================
+"""Registered scorer for an0 -- the three analysis-only fixes (F1, F2, F3)."""
+
+import argparse
+import csv
+import json
+import math
+import os
+import re
+import statistics as st
+import sys
+
+# ---------------------------------------------------------------------------
+# FROZEN REGISTRATION
+# ---------------------------------------------------------------------------
+TAG = "an0"
+BATCH_SCRIPT = "bin/c87_an0_analysis.sh"
+
+# ---- the arms, and the m each one ALLOCATES.  Every entry below was MEASURED
+# ---- off the allocated beta on the LIVE built network on cluster_a (guard 4 of the
+# ---- batch script re-measures it at run time and refuses on any mismatch).
+# ---- (net, granularity) -> m
+REG_M = {
+    ("ResNet18", "nodewise"): 14420,
+    ("ResNet18", "chunk777"): 14421,
+    ("ResNet18", "nodewise1d"): 4851,
+    ("ResNet18", "chunk2325"): 4851,
+    ("ResNet34", "nodewise"): 25556,
+    ("ResNet34", "chunk835"): 25562,
+    ("ResNet34", "nodewise1d"): 8595,
+    ("ResNet34", "chunk2500"): 8587,
+    ("ResNet18_c100", "nodewise"): 14600,
+    ("ResNet18_c100", "chunk771"): 14595,
+    # the ladder rungs.  THESE SPLIT 1-D TENSORS (K < 512) and are DESCRIPTIVE.
+    ("ResNet18", "chunk1"): 11173962,
+    ("ResNet18", "chunk2"): 5586981,
+    ("ResNet18", "chunk16"): 698373,
+    ("ResNet18", "chunk128"): 87303,
+    ("ResNet18", "chunk1024"): 10944,
+    ("ResNet18", "chunk8192"): 1407,
+    ("ResNet18", "chunk65536"): 220,
+}
+
+# The largest 1-D tensor on each net.  A count-matched comparator must use
+# K > this, or it splits the very tensors whose merging is the prescription.
+MAX_1D = {"ResNet18": 512, "ResNet34": 512, "ResNet18_c100": 512}
+
+# ---- the cells.  arms: short tag -> granularity.  legs: which contrasts exist.
+# ---- `fine` is the count-match to nodewise; `coarse` the count-match to n1d.
+CELLS = {
+    "mm1": dict(net="ResNet18", dset="CIFAR10", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2],
+                arms={"node": "nodewise", "ch": "chunk777"},
+                fine="ch", coarse=None, node="node", n1d=None),
+    "pp1": dict(net="ResNet18", dset="CIFAR10", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2],
+                arms={"node": "nodewise", "ch": "chunk777"},
+                fine="ch", coarse=None, node="node", n1d=None),
+    "cc1": dict(net="ResNet18", dset="CIFAR10", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[3, 4, 5],
+                arms={"node": "nodewise", "ch": "chunk777",
+                      "n1d": "nodewise1d", "c23": "chunk2325"},
+                fine="ch", coarse="c23", node="node", n1d="n1d"),
+    "bn1": dict(net="ResNet18", dset="CIFAR10", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2],
+                arms={"node": "nodewise", "n1d": "nodewise1d", "c23": "chunk2325"},
+                fine=None, coarse="c23", node="node", n1d="n1d"),
+    "ar1": dict(net="ResNet18", dset="CIFAR10", ms="3e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2],
+                arms={"node": "nodewise", "ch": "chunk777",
+                      "n1d": "nodewise1d", "c23": "chunk2325"},
+                fine="ch", coarse="c23", node="node", n1d="n1d"),
+    "fa1": dict(net="ResNet18", dset="CIFAR10", ms="3e-4", alpha0="1e-3",
+                box="-25:-2.3026", epochs=100, seeds=[0, 1, 2, 3, 4, 5],
+                arms={"node": "nodewise", "ch": "chunk777",
+                      "n1d": "nodewise1d", "c23": "chunk2325"},
+                fine="ch", coarse="c23", node="node", n1d="n1d"),
+    "g3m": dict(net="ResNet34", dset="CIFAR10", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                arms={"node": "nodewise", "chd": "chunk835",
+                      "n1d": "nodewise1d", "chg": "chunk2500"},
+                fine="chd", coarse="chg", node="node", n1d="n1d"),
+    "gc1": dict(net="ResNet18_c100", dset="CIFAR100", ms="1e-4", alpha0="1e-3",
+                box="-15:-2.3026", epochs=100, seeds=[0, 1, 2, 3],
+                arms={"node": "nodewise", "ch": "chunk771"},
+                fine="ch", coarse=None, node="node", n1d=None),
+}
+
+# the chunk ladder, DESCRIPTIVE ONLY.  ck1 and cx2 are TWO batches.
+LADDER = {
+    "ck1": {"k1": "chunk1", "k2": "chunk2", "k16": "chunk16",
+            "k128": "chunk128", "k1024": "chunk1024"},
+    "cx2": {"k8192": "chunk8192", "k65536": "chunk65536"},
+}
+LADDER_SEEDS = [0, 1, 2]
+
+# ---- the four values the record carries for ONE slope.  F2 reconciles or
+# ---- withdraws all four.  (source label -> pp per decade of m)
+SLOPE_RECORD = {
+    "CORRECTIONS 114.1/114.5": -0.407,
+    "CORRECTIONS 116 / c83_gen_score.py": -0.4906,
+    "FINDINGS 14561/14975": -0.51,
+    "cycle-87 audit OLS re-fit of ck1": -0.5361,
+}
+
+# ---- BANDS AND DECISION RULES, FIXED BEFORE THE SCORER'S FIRST RUN ----------
+BOX_GATE = 0.05       # coordinate-denominator occupancy at which a seed is BOUND
+BOX_ASYM = 0.10       # arm-to-arm occupancy asymmetry that CONFOUNDS a contrast
+MIN_SEEDS = 3         # below this a cell contributes nothing to a PRIMARY
+T06_RATIO = 1.6       # gn1's T0.6 commensurability gate (CORRECTIONS 114.2e):
+                      # a raw-pp comparison across a >1.6x change in the error
+                      # budget the effect lives on is INADMISSIBLE
+IDENT_TOL = 1e-9      # T = (D-G) + U is ALGEBRA and must close to this
+SHARE_SPAN_BAR = 20.0 # pp of span in the count share U/T across cells above
+                      # which an imported slope is NOT TRANSPORTABLE
+SLOPE_SPREAD_BAR = 0.10   # pp/decade spread across the record's own values
+                          # above which all of them must be withdrawn
+FRACS = (0.10, 0.25, 0.40, 0.55, 0.70, 0.85, 1.00)   # F3's grid, budget fractions
+WINDOW = 5            # epochs per trajectory point -- plateau5's own window
+REVERSAL_FRAC = 0.60  # a negative D at or below this fraction of budget is a
+                      # MID-TRAINING REVERSAL, not a start-up transient
+SIG_T = 2.0           # |t| required to call a sign, anywhere
+
+
+# ---------------------------------------------------------------------------
+# Distribution tails.  The cluster env has no scipy; validated in the selftest
+# against published critical values.
+# ---------------------------------------------------------------------------
+def _betacf(a, b, x):
+    MAXIT, EPS, FPMIN = 300, 3e-16, 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, MAXIT + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        de = d * c
+        h *= de
+        if abs(de - 1.0) < EPS:
+            break
+    return h
+
+
+def betainc(a, b, x):
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+             + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return math.exp(lbeta) * _betacf(a, b, x) / a
+    return 1.0 - math.exp(lbeta) * _betacf(b, a, 1.0 - x) / b
+
+
+def t_sf(t, df):
+    """P(T > t) for Student-t on df degrees of freedom."""
+    if df <= 0:
+        return float("nan")
+    x = df / (df + t * t)
+    p = 0.5 * betainc(0.5 * df, 0.5, x)
+    return p if t > 0 else 1.0 - p
+
+
+def t_two(t, df):
+    return 2.0 * t_sf(abs(t), df)
+
+
+def binom_sf(k, n, p=0.5):
+    """P(X >= k) for Binomial(n, p) -- the SIGN TEST, exact."""
+    tot = 0.0
+    for i in range(k, n + 1):
+        tot += math.comb(n, i) * (p ** i) * ((1 - p) ** (n - i))
+    return tot
+
+
+def welch(a, b):
+    """(diff, se, df) for mean(a) - mean(b), Welch-UNPAIRED.
+
+    Unpaired on purpose: the campaign's two-way ANOVA finds SEED statistically
+    NULL (F(60,85)=1.21, p=0.213) while BATCH is overwhelming (F(62,85)=5.47,
+    p=6.9e-13).  Per-seed agreement is reported as a SIGN TEST, never as a
+    pairing argument."""
+    if len(a) < 2 or len(b) < 2:
+        return (st.mean(a) - st.mean(b) if a and b else float("nan"),
+                float("nan"), float("nan"))
+    va, vb = st.variance(a), st.variance(b)
+    na, nb = len(a), len(b)
+    se = math.sqrt(va / na + vb / nb)
+    if se == 0:
+        return st.mean(a) - st.mean(b), 0.0, float("nan")
+    df = (va / na + vb / nb) ** 2 / ((va / na) ** 2 / (na - 1) + (vb / nb) ** 2 / (nb - 1))
+    return st.mean(a) - st.mean(b), se, df
+
+
+def ols(xs, ys):
+    """(slope, intercept, se_slope, r2) -- plain least squares."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    a = my - b * mx
+    resid = [y - (a + b * x) for x, y in zip(xs, ys)]
+    if n > 2:
+        s2 = sum(r * r for r in resid) / (n - 2)
+        seb = math.sqrt(s2 / sxx)
+    else:
+        seb = float("nan")
+    syy = sum((y - my) ** 2 for y in ys)
+    r2 = 1.0 - sum(r * r for r in resid) / syy if syy > 0 else float("nan")
+    return b, a, seb, r2
+
+
+# ---------------------------------------------------------------------------
+# plateau5 and the epoch series, re-derived from the .out.  NEVER read from the
+# CSV `plateau` column, which is mean-of-last-20 and is NOT comparable across
+# budgets -- that confusion has already produced one 22.8 pp error in this
+# project (CLOSEOUT item 3a).
+# ---------------------------------------------------------------------------
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^ENV:\s*(.*)$")
+
+
+def series_from_out(path):
+    """[(epoch, test_acc)] sorted by epoch, deduplicated on the LAST occurrence."""
+    seen = {}
+    with open(path, "r", errors="replace") as fh:
+        for line in fh:
+            m = EP_RE.search(line)
+            if m:
+                seen[int(m.group(1))] = float(m.group(2))
+    return sorted(seen.items())
+
+
+def window_mean(series, upto_n, w=WINDOW):
+    """Mean test accuracy over the last `w` recorded epochs among the first
+    `upto_n`.  At upto_n == len(series) and w == 5 this IS plateau5, exactly --
+    the selftest asserts that identity."""
+    if upto_n < w or upto_n > len(series):
+        return None
+    seg = series[:upto_n][-w:]
+    return sum(v for _, v in seg) / float(w)
+
+
+def header_pins(path):
+    """The ARGS: and ENV: header lines of a run, as dicts.  This is the ONLY
+    instrument that can prove what a completed run actually ran -- the CSV is a
+    derived artefact and an unidentified schedule has already made one batch of
+    this corpus unreadable (CLOSEOUT 5.1)."""
+    args, env = {}, {}
+    with open(path, "r", errors="replace") as fh:
+        for _ in range(12):
+            line = fh.readline()
+            if not line:
+                break
+            m = ARGS_RE.match(line.strip())
+            if m:
+                toks = m.group(1).split()
+                i = 0
+                while i < len(toks):
+                    if toks[i].startswith("--"):
+                        k = toks[i][2:]
+                        v = toks[i + 1] if i + 1 < len(toks) and not toks[i + 1].startswith("--") else ""
+                        args[k] = v
+                        i += 2 if v else 1
+                    else:
+                        i += 1
+            m = ENV_RE.match(line.strip())
+            if m:
+                for tok in m.group(1).split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        env[k] = v
+    return args, env
+
+
+# ---------------------------------------------------------------------------
+# THE RAIL READER.  CORRECTED 2026-08-30, CORRECTIONS 117.1.
+#
+# The per-coordinate rail counts live in  n_at_lo / n_at_hi  over  n_beta.
+# r["beta"] is a PER-TENSOR summary -- 62 entries on ResNet18 against
+# n_beta = 14,420 -- and reading rails off it is BLIND to real clipping and,
+# where it does fire, gets the arm ranking BACKWARDS.  Both failures were
+# measured on data already on disk, in the plateau5 window:
+#
+#   fa1 (ms=3e-4, 100 ep, box -25:-2.3026).  The 62-list reads 0.000000 on
+#   ALL 24 runs.  The coordinate counts read nodewise s1/s4/s5 rec_hi = 1.0000
+#   -- a clipped coordinate in EVERY record -- while all 18 merged-tail runs
+#   are exactly 0.  The ceiling binds, and it binds only on the arm the paper
+#   is about.
+#
+#   ar1 (ms=3e-4, 100 ep, box -15:-2.3026).  The 62-list says chunk777 is
+#   7x MORE floor-bound than nodewise (0.2305 vs 0.0325).  The coordinate
+#   counts say nodewise is 75x more bound than chunk777 (0.1103 vs 0.00145).
+#   The instrument inverted the sign of the arm asymmetry.
+#
+# The 62-list is retained as a THIRD, LABELLED column so the historical
+# statistic stays visible, and is never used for a gate.
+# ---------------------------------------------------------------------------
+def rail_fracs(rec, lo, hi):
+    """(coord_lo, coord_hi, rec_lo, rec_hi, tensor_lo, tensor_hi) or None.
+
+    coord_*  : fraction of the run's beta COORDINATES at a rail (n_at_*/n_beta)
+    rec_*    : 1 if ANY coordinate is at that rail in this record, else 0
+    tensor_* : the historical 62-entry per-tensor statistic; DIAGNOSTIC ONLY
+    """
+    nb = rec.get("n_beta")
+    nlo = rec.get("n_at_lo")
+    nhi = rec.get("n_at_hi")
+    if not isinstance(nb, (int, float)) or not nb or nlo is None or nhi is None:
+        return None
+    nb = float(nb)
+    clo, chi = float(nlo) / nb, float(nhi) / nb
+    rlo = 1.0 if float(nlo) > 0 else 0.0
+    rhi = 1.0 if float(nhi) > 0 else 0.0
+    b = rec.get("beta")
+    if isinstance(b, list) and b:
+        n = float(len(b))
+        tlo = sum(1 for x in b if x <= lo + 1e-9) / n
+        thi = sum(1 for x in b if x >= hi - 1e-9) / n
+    else:
+        tlo = thi = float("nan")
+    return clo, chi, rlo, rhi, tlo, thi
+
+
+def read_occupancy(probe_dir, lo, hi):
+    """Occupancy at BOTH denominators, over the last quarter of the run.
+
+    coord_lo/coord_hi -- the MEAN FRACTION OF beta COORDINATES at a rail.
+                         THIS IS THE GATE.  Read from n_at_lo / n_at_hi over
+                         n_beta (CORRECTIONS 117.1); the 62-entry per-tensor
+                         summary that this scorer previously used is blind to
+                         real clipping and inverts the arm ranking on ar1.
+    rec_lo/rec_hi     -- the FRACTION OF RECORDS in which AT LEAST ONE
+                         coordinate sits at a rail.  Printed beside the first,
+                         never instead of it: the two disagree by up to three
+                         orders of magnitude on the same run.
+    Returns (coord_lo, coord_hi, rec_lo, rec_hi, n_records)."""
+    p = os.path.join(probe_dir, "probe.jsonl")
+    if not os.path.exists(p):
+        return (None,) * 4 + (0,)
+    recs = []
+    with open(p, "r", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                recs.append(json.loads(line))
+            except Exception:
+                continue
+    if not recs:
+        return (None,) * 4 + (0,)
+    tail = recs[int(len(recs) * 0.75):]
+    c_lo, c_hi, r_lo, r_hi = [], [], [], []
+    for r in tail:
+        f = rail_fracs(r, lo, hi)
+        if f is None:
+            continue
+        c_lo.append(f[0]); c_hi.append(f[1]); r_lo.append(f[2]); r_hi.append(f[3])
+    if not c_lo:
+        return (None,) * 4 + (len(recs),)
+    n = float(len(c_lo))
+    return (sum(c_lo) / n, sum(c_hi) / n, sum(r_lo) / n, sum(r_hi) / n, len(recs))
+
+
+# ---------------------------------------------------------------------------
+def find_out(runs_dirs, fam, short, seed):
+    """The .out for one run.  .out files live in the ROOT of runs/, NOT in
+    runs/<family>/ -- a layout that has already once turned a real result into a
+    would-be VOID (CORRECTIONS 116, 'A PROCESS NOTE')."""
+    stem = "%s-%s-s%d" % (fam, short, seed)
+    hits = []
+    for d in runs_dirs:
+        if not os.path.isdir(d):
+            continue
+        for fn in os.listdir(d):
+            if fn.startswith(stem + "-") and fn.endswith(".out"):
+                hits.append(os.path.join(d, fn))
+            elif fn == stem + ".out":
+                hits.append(os.path.join(d, fn))
+    return sorted(hits)[-1] if hits else None
+
+
+def find_probe(probe_dirs, fam, short, seed):
+    """probe dirs live in <root>/<family>/probe_<short>_<family>_s<seed>."""
+    name = "probe_%s_%s_s%d" % (short, fam, seed)
+    for d in probe_dirs:
+        p = os.path.join(d, fam, name)
+        if os.path.isdir(p):
+            return p
+        p = os.path.join(d, name)
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def load_cell(fam, spec, runs_dirs, probe_dirs):
+    """{short: {seed: rec}} with plateau5, the full series, and occupancy."""
+    lo, hi = (float(x) for x in spec["box"].split(":"))
+    out = {}
+    for short in spec["arms"]:
+        out[short] = {}
+        for s in spec["seeds"]:
+            f = find_out(runs_dirs, fam, short, s)
+            if f is None:
+                continue
+            ser = series_from_out(f)
+            pd = find_probe(probe_dirs, fam, short, s)
+            clo, chi, rlo, rhi, nrec = read_occupancy(pd, lo, hi) if pd else ((None,) * 4 + (0,))
+            boxfree = (clo is not None and clo < BOX_GATE and chi < BOX_GATE)
+            out[short][s] = dict(
+                path=f, series=ser, n_ep=len(ser),
+                plateau5=window_mean(ser, len(ser)) if len(ser) >= WINDOW else None,
+                coord_lo=clo, coord_hi=chi, rec_lo=rlo, rec_hi=rhi,
+                n_records=nrec, probe=pd, boxfree=boxfree,
+                complete=(len(ser) >= spec["epochs"]))
+    return out
+
+
+def arm_values(cell, short, boxfree_only=True):
+    d = cell.get(short, {})
+    return {s: r["plateau5"] for s, r in d.items()
+            if r["plateau5"] is not None and r["complete"]
+            and (r["boxfree"] or not boxfree_only)}
+
+
+def contrast(cell, a, b, boxfree_only=True):
+    """(diff, se, df, n_a, n_b, k, n_pairs) for arm a minus arm b."""
+    A, B = arm_values(cell, a, boxfree_only), arm_values(cell, b, boxfree_only)
+    if len(A) < 2 or len(B) < 2:
+        return (float("nan"),) * 3 + (len(A), len(B), 0, 0)
+    d, se, df = welch(list(A.values()), list(B.values()))
+    pair = [s for s in A if s in B]
+    k = sum(1 for s in pair if A[s] > B[s])
+    return d, se, df, len(A), len(B), k, len(pair)
+
+
+def traj_contrast(cell, a, b, frac, budget, boxfree_only=True):
+    """(diff, se, df, n) for arm a minus arm b at a budget FRACTION."""
+    n_ep = max(WINDOW, int(round(frac * budget)))
+    A, B = {}, {}
+    for short, dst in ((a, A), (b, B)):
+        for s, r in cell.get(short, {}).items():
+            if boxfree_only and not r["boxfree"]:
+                continue
+            v = window_mean(r["series"], min(n_ep, r["n_ep"]))
+            if v is not None and r["n_ep"] >= n_ep:
+                dst[s] = v
+    if len(A) < 2 or len(B) < 2:
+        return float("nan"), float("nan"), float("nan"), 0, n_ep
+    d, se, df = welch(list(A.values()), list(B.values()))
+    return d, se, df, min(len(A), len(B)), n_ep
+
+
+# ---------------------------------------------------------------------------
+def score(runs_dirs, probe_dirs, csvp, out=sys.stdout):
+    P = lambda *a: print(*a, file=out)
+    P("=" * 78)
+    P("  an0 -- THE THREE ANALYSIS-ONLY FIXES.  ZERO GPU-HOURS, ZERO SLURM JOBS.")
+    P("  F1 COMMENSURABILITY (primary) | F2 THE PRACTITIONER'S NUMBER (primary)")
+    P("  F3 THE HORIZON TRAJECTORY (secondary) | ladder + arm means (descriptive)")
+    P("")
+    P("  **RULE 19 IS NOT SATISFIED AND IS NOT CLAIMED.**  Every run read below")
+    P("  existed before this scorer was written.  The metrics, the decision rules,")
+    P("  the identity and the grid were frozen before its first run; the DATA was")
+    P("  not.  Every verdict here is POST-HOC (existing data) and is a CORRECTION,")
+    P("  never a test.  RULE 11 is open on ResNet34 and on CIFAR-100.")
+    P("=" * 78)
+
+    data = {fam: load_cell(fam, spec, runs_dirs, probe_dirs)
+            for fam, spec in CELLS.items()}
+
+    # =====================================================================
+    # H0 -- THE BOX GATE.  FIRST, BEFORE EVERY OTHER NUMBER.
+    # =====================================================================
+    P("")
+    P("H0  BOX OCCUPANCY GATE -- FIRST, AND BEFORE EVERY OTHER NUMBER.")
+    P("    A statistic from a run at a guard is UNINTERPRETABLE.  Occupancy is")
+    P("    printed at BOTH denominators because they disagree by up to three")
+    P("    orders of magnitude on the same run and quoting one of them is how a")
+    P("    guard-bound cell gets published as clean.")
+    P("    %-5s %-5s %-4s %8s %9s %9s %9s %9s  %s"
+      % ("cell", "arm", "seed", "plat5", "coordLO", "coordHI", "recLO", "recHI", "status"))
+    occ = {}
+    recocc = {}
+    for fam, spec in CELLS.items():
+        for short in spec["arms"]:
+            los, his = [], []
+            rlos, rhis = [], []
+            for s in spec["seeds"]:
+                r = data[fam].get(short, {}).get(s)
+                if r is None:
+                    P("    %-5s %-5s %-4d %8s %9s %9s %9s %9s  MISSING"
+                      % (fam, short, s, "-", "-", "-", "-", "-"))
+                    continue
+                if not r["complete"] or r["plateau5"] is None:
+                    P("    %-5s %-5s %-4d %8s %9s %9s %9s %9s  TRUNCATED (%d ep) -- DROPPED"
+                      % (fam, short, s, "-", "-", "-", "-", "-", r["n_ep"]))
+                    continue
+                if r["coord_lo"] is None:
+                    stat = "NO PROBE -- occupancy UNMEASURED, seed UNINTERPRETABLE"
+                elif r["boxfree"]:
+                    stat = "box-free"
+                    los.append(r["coord_lo"])
+                    his.append(r["coord_hi"])
+                    rlos.append(r["rec_lo"]); rhis.append(r["rec_hi"])
+                else:
+                    stat = "BOX-BOUND -- DROPPED FROM PRIMARIES"
+                    los.append(r["coord_lo"])
+                    his.append(r["coord_hi"])
+                    rlos.append(r["rec_lo"]); rhis.append(r["rec_hi"])
+                fm = lambda v: ("%.4f" % v) if v is not None else "-"
+                P("    %-5s %-5s %-4d %8.3f %9s %9s %9s %9s  %s"
+                  % (fam, short, s, r["plateau5"], fm(r["coord_lo"]), fm(r["coord_hi"]),
+                     fm(r["rec_lo"]), fm(r["rec_hi"]), stat))
+            occ[(fam, short)] = (st.mean(los) if los else None,
+                                 st.mean(his) if his else None)
+            recocc[(fam, short)] = (st.mean(rlos) if rlos else None,
+                                    st.mean(rhis) if rhis else None)
+
+    P("")
+    P("    ARM-ASYMMETRY, per contrast.  A contrast whose two arms press a guard")
+    P("    UNEQUALLY is confounded WITH the guard and leaves the PRIMARY.")
+    P("    The GATE is the COORDINATE fraction.  Where the RECORD fraction is")
+    P("    also asymmetric the line says so: a single pinned coordinate out of")
+    P("    14,420 sets rec to 1.0 while coord reads 7e-5, so the record figure")
+    P("    over-reads by three orders of magnitude -- but it is the figure that")
+    P("    caught fa1's nodewise ceiling contact, and it is never suppressed.")
+    confounded = set()
+    for fam, spec in CELLS.items():
+        for label, a, b in (("D", spec["fine"], spec["node"]),
+                            ("G", spec["coarse"], spec["n1d"]),
+                            ("U", spec["coarse"], spec["fine"])):
+            if not a or not b:
+                continue
+            (la, ha), (lb, hb) = occ.get((fam, a), (None, None)), occ.get((fam, b), (None, None))
+            if None in (la, ha, lb, hb):
+                P("    %-5s %s leg: occupancy UNMEASURED on an arm -- UNINTERPRETABLE"
+                  % (fam, label))
+                confounded.add((fam, label))
+                continue
+            dlo, dhi = abs(la - lb), abs(ha - hb)
+            flag = ""
+            if dlo > BOX_ASYM or dhi > BOX_ASYM:
+                confounded.add((fam, label))
+                flag = "  !!! GUARD-CONFOUNDED -- EXCLUDED FROM THE PRIMARY"
+            (rla, rha), (rlb, rhb) = (recocc.get((fam, a), (None, None)),
+                                      recocc.get((fam, b), (None, None)))
+            rec_note = ""
+            if None not in (rla, rha, rlb, rhb):
+                rdlo, rdhi = abs(rla - rlb), abs(rha - rhb)
+                if max(rdlo, rdhi) > BOX_ASYM:
+                    rec_note = ("   [RECORD-DENOMINATOR ASYMMETRY |d recLO| %.3f "
+                                "|d recHI| %.3f -- DISCLOSED, NOT A GATE]"
+                                % (rdlo, rdhi))
+            P("    %-5s %s leg asymmetry: |d coordLO| %.5f  |d coordHI| %.5f (bar %.2f)%s%s"
+              % (fam, label, dlo, dhi, BOX_ASYM, flag, rec_note))
+    nfree = {fam: {sh: sum(1 for s in CELLS[fam]["seeds"]
+                           if data[fam].get(sh, {}).get(s, {}).get("boxfree"))
+                   for sh in CELLS[fam]["arms"]} for fam in CELLS}
+    P("    box-free seeds per arm: %s"
+      % "; ".join("%s %s" % (f, nfree[f]) for f in CELLS))
+
+    # =====================================================================
+    # F1 -- COMMENSURABILITY.  PRIMARY.
+    # =====================================================================
+    P("")
+    P("=" * 78)
+    P("F1  PRIMARY -- COMMENSURABILITY.  D ON BOTH SCALES, EVERY CELL.")
+    P("    A percentage POINT is not a comparable unit across a 3.7x change in")
+    P("    the error budget the effect lives on.  The campaign registered exactly")
+    P("    this gate for gn1 (CORRECTIONS 114.2e, the T0.6 gate plus the")
+    P("    D/(100-level) print) and then did not apply it to its own cross-dataset")
+    P("    headline.  It is applied here, to the headline.")
+    P("=" * 78)
+    P("    %-5s %-14s %6s %8s %8s %7s %9s %9s %5s"
+      % ("cell", "net/dset", "ms", "err_base", "D_pp", "t", "relERR%", "level", "n"))
+    f1 = {}
+    for fam, spec in CELLS.items():
+        if not spec["fine"]:
+            continue
+        d, se, df, na, nb, k, npair = contrast(data[fam], spec["fine"], spec["node"])
+        base = arm_values(data[fam], spec["node"])
+        if not base or na < MIN_SEEDS or nb < MIN_SEEDS or math.isnan(d):
+            P("    %-5s %-14s %6s   INSUFFICIENT box-free seeds (%d v %d) -- no D"
+              % (fam, spec["net"][:8] + "/" + spec["dset"][-3:], spec["ms"], na, nb))
+            continue
+        level = st.mean(base.values()) if hasattr(st, "mean") else sum(base.values()) / len(base)
+        err = 100.0 - level
+        rel = 100.0 * d / err
+        conf = (fam, "D") in confounded
+        f1[fam] = dict(d=d, se=se, t=d / se, rel=rel, err=err, level=level,
+                       n=min(na, nb), confounded=conf)
+        P("    %-5s %-14s %6s %8.3f %+8.3f %7.2f %+9.3f %9.3f %5d%s"
+          % (fam, spec["net"][:8] + "/" + spec["dset"][-3:], spec["ms"], err, d,
+             d / se, rel, level, min(na, nb), "  [GUARD-CONFOUNDED]" if conf else ""))
+
+    clean = {f: v for f, v in f1.items() if not v["confounded"]}
+    if len(clean) < 2:
+        P("    VERDICT: F1 UNDECIDED -- fewer than two guard-clean cells.")
+    else:
+        top_pp = max(clean, key=lambda f: clean[f]["d"])
+        top_rel = max(clean, key=lambda f: clean[f]["rel"])
+        P("")
+        P("    argmax on RAW pp                 : %s (%+0.3f pp)" % (top_pp, clean[top_pp]["d"]))
+        P("    argmax on RELATIVE ERROR REDUCTION: %s (%+0.3f%%)" % (top_rel, clean[top_rel]["rel"]))
+        # the T0.6 admissibility gate, applied pairwise against the CIFAR-100 cell
+        P("")
+        P("    T0.6 ADMISSIBILITY (CORRECTIONS 114.2e): a raw-pp comparison across a")
+        P("    >%.1fx change in the base error budget is INADMISSIBLE." % T06_RATIO)
+        inadmissible = []
+        fams = sorted(clean)
+        for i in range(len(fams)):
+            for j in range(i + 1, len(fams)):
+                a, b = fams[i], fams[j]
+                ratio = max(clean[a]["err"], clean[b]["err"]) / min(clean[a]["err"], clean[b]["err"])
+                if ratio > T06_RATIO:
+                    inadmissible.append((a, b, ratio))
+        if inadmissible:
+            for a, b, ratio in inadmissible:
+                P("      %s vs %s: error budgets %.3f vs %.3f = %.2fx -> RAW-pp COMPARISON"
+                  " INADMISSIBLE" % (a, b, clean[a]["err"], clean[b]["err"], ratio))
+        else:
+            P("      every pair sits inside %.1fx -- raw pp is admissible across them"
+              % T06_RATIO)
+        if top_pp != top_rel:
+            P("")
+            P("    VERDICT: **SCALE-DEPENDENT.**  The cell with the largest D changes")
+            P("    when the scale changes (%s on pp, %s on relative error)." % (top_pp, top_rel))
+            P("    THE PAPER MAY NOT NAME A LARGEST D WITHOUT NAMING THE SCALE, and the")
+            P("    sentence asserting CIFAR-100 as the largest effect in the corpus must")
+            P("    be DELETED.  Print D on BOTH scales everywhere, or pick one and use")
+            P("    it consistently -- including in the abstract.")
+        else:
+            P("")
+            P("    VERDICT: SCALE-ROBUST.  The same cell is the argmax on both scales.")
+            P("    The both-scales table is still printed, because the T0.6 gate above")
+            P("    governs which cross-cell comparisons are admissible at all.")
+
+    # =====================================================================
+    # F2 -- THE PRACTITIONER'S NUMBER, DECOMPOSED IN-BATCH.  PRIMARY.
+    # =====================================================================
+    P("")
+    P("=" * 78)
+    P("F2  PRIMARY -- THE PRACTITIONER'S NUMBER.  **TWO EXACT DECOMPOSITIONS,")
+    P("    BOTH REPORTED.**  CORRECTIONS 117.10.  T = nodewise1d - nodewise splits")
+    P("    algebraically in TWO ways, and they are both identities, so 'the count")
+    P("    component' is a DEFINITIONAL CHOICE and not a measurement:")
+    P("        T = (D - G) + U      count charged AFTER the ND-partition term")
+    P("        T =  D      + C      count charged BEFORE it,  C = U - G")
+    P("    They differ by exactly G, which is +0.171 on R34 = 23% of T there, so")
+    P("    on that cell the count share reads 34.7% one way and 12.1% the other.")
+    P("    The build registered only the first and printed a single share.  Both")
+    P("    are printed now, and the paper must quote the RANGE, never one alone.")
+    P("    T = nodewise1d - nodewise is what a reader would actually DO, and it is")
+    P("    count-confounded by construction.  The decomposition is an EXACT")
+    P("    algebraic identity, not a fit, and U -- the pure count axis -- is")
+    P("    measured INSIDE THE SAME BATCH.  No imported slope is needed and none")
+    P("    is used: STANDING RULE 14's cross-batch floor enters no term below.")
+    P("=" * 78)
+    P("    %-5s %9s %9s %9s %9s %9s %8s %5s"
+      % ("cell", "T", "D", "G", "D-G(tail)", "U(count)", "count%", "n"))
+    shares = {}
+    shares2 = {}
+    for fam, spec in CELLS.items():
+        if not (spec["fine"] and spec["coarse"] and spec["n1d"]):
+            continue
+        T, seT, _, nTa, nTb, _, _ = contrast(data[fam], spec["n1d"], spec["node"])
+        D, seD, _, _, _, _, _ = contrast(data[fam], spec["fine"], spec["node"])
+        G, seG, _, _, _, _, _ = contrast(data[fam], spec["coarse"], spec["n1d"])
+        U, seU, _, _, _, _, _ = contrast(data[fam], spec["coarse"], spec["fine"])
+        if any(math.isnan(v) for v in (T, D, G, U)):
+            P("    %-5s   INSUFFICIENT box-free seeds -- no decomposition" % fam)
+            continue
+        C = U - G
+        resid2 = T - (D + C)
+        resid = T - ((D - G) + U)
+        if abs(resid2) > IDENT_TOL:
+            P("    !!! %s: THE SECOND IDENTITY T = D + C DOES NOT CLOSE (residual "
+              "%.3e).  REFUSING this cell." % (fam, resid2))
+            continue
+        if abs(resid) > IDENT_TOL:
+            P("    !!! %s: THE IDENTITY DOES NOT CLOSE (residual %.3e).  The scorer is"
+              " broken or the arms are mismatched.  REFUSING this cell." % (fam, resid))
+            continue
+        conf = any((fam, lbl) in confounded for lbl in ("D", "G", "U"))
+        share = 100.0 * U / T if T != 0 else float("nan")
+        share2 = 100.0 * C / T if T != 0 else float("nan")
+        shares[fam] = share
+        shares2[fam] = share2
+        nmin = min(nTa, nTb)
+        P("    %-5s %+9.3f %+9.3f %+9.3f %+9.3f %+9.3f %7.1f%% %5d%s"
+          % (fam, T, D, G, D - G, U, share, nmin,
+             "  [GUARD-CONFOUNDED]" if conf else ""))
+        P("          se: T %.3f  D %.3f  G %.3f  D-G %.3f  U %.3f    identity closes"
+          " to %.1e" % (seT, seD, seG, math.sqrt(seD ** 2 + seG ** 2), seU, abs(resid)))
+        P("          SECOND DECOMPOSITION T = D + C with C = U - G = %+0.3f: tail "
+          "%+0.3f (%.1f%%), count %+0.3f (%.1f%%); closes to %.1e"
+          % (C, D, 100.0 - share2, C, share2, abs(resid2)))
+    if shares:
+        span = max(shares.values()) - min(shares.values())
+        P("")
+        P("    THE TWO DECOMPOSITIONS SIDE BY SIDE (count share of T):")
+        for f in sorted(shares):
+            P("      %-5s  U/T = %6.1f%%   C/T = %6.1f%%   (they differ by G/T = "
+              "%6.1f%%)" % (f, shares[f], shares2[f], shares[f] - shares2[f]))
+        both = list(shares.values()) + list(shares2.values())
+        P("    ACROSS BOTH DEFINITIONS AND ALL CELLS the count share of the")
+        P("    practitioner's number runs %.1f%% to %.1f%%.  **THAT RANGE, NOT A"
+          % (min(both), max(both)))
+        P("    SINGLE NUMBER, IS WHAT THE PAPER MAY QUOTE.**  Neither decomposition")
+        P("    is more correct than the other; they charge the count to different")
+        P("    sides of an identity, and the choice is not settled by any datum.")
+        P("")
+        P("    count share of the practitioner's number, per cell (U/T form): %s"
+          % ", ".join("%s %.1f%%" % (f, v) for f, v in sorted(shares.items())))
+        P("    SPAN = %.1f pp of share across %d cells (bar %.1f)"
+          % (span, len(shares), SHARE_SPAN_BAR))
+        if span > SHARE_SPAN_BAR:
+            P("    VERDICT: **THE COUNT SHARE IS NOT A CONSTANT.**  An imported slope")
+            P("    cannot stand in for U at this count range -- the same 0.4732-decade")
+            P("    count move buys a different share in every batch.  DELETE the")
+            P("    imported ck1 slope from every count-correction in the paper and")
+            P("    report U in-batch, which is the estimate of exactly the quantity the")
+            P("    slope was being imported for, measured on the right architecture at")
+            P("    the right count range with no cross-batch offset.")
+        else:
+            P("    VERDICT: the count share is stable across cells; an imported slope")
+            P("    would have been defensible.  U is still preferred -- it is measured")
+            P("    in-batch and costs nothing.")
+
+    # --- the slope the record cannot agree with itself about ----------------
+    P("")
+    P("    SLOPE RECONCILIATION.  The record carries FOUR values for ONE quantity:")
+    for src, v in sorted(SLOPE_RECORD.items(), key=lambda kv: kv[1]):
+        P("      %-42s %+0.4f pp/decade" % (src, v))
+    spread = max(SLOPE_RECORD.values()) - min(SLOPE_RECORD.values())
+    P("      SPREAD = %.4f pp/decade (bar %.2f)" % (spread, SLOPE_SPREAD_BAR))
+    lad = ladder_fits(runs_dirs, probe_dirs, P)
+    if spread > SLOPE_SPREAD_BAR:
+        P("      VERDICT: **IRRECONCILABLE.**  Four values for one number, spread")
+        P("      %.4f pp/decade, is a record-hygiene defect a referee finds in an" % spread)
+        P("      afternoon.  All four must be WITHDRAWN in favour of the in-batch U")
+        P("      above, or reconciled to a single value with its derivation stated.")
+    else:
+        P("      VERDICT: the four values agree inside the bar; state one and cite it.")
+
+    # =====================================================================
+    # F3 -- THE HORIZON TRAJECTORY.  SECONDARY.
+    # =====================================================================
+    P("")
+    P("=" * 78)
+    P("F3  SECONDARY -- THE HORIZON TRAJECTORY.  D(t) AND (D-G)(t).")
+    P("    Computed from the .out epoch series that is ALREADY ON DISK, on a grid")
+    P("    of BUDGET FRACTIONS so the same grid is defined at any horizon.  Each")
+    P("    point is a %d-epoch window, so the last point IS plateau5 exactly." % WINDOW)
+    P("    THIS IS PUBLISHED WHATEVER A LONGER-HORIZON BATCH LATER SAYS: a referee")
+    P("    holding the artefact computes it in an afternoon, and a headline that is")
+    P("    a property of the last fifth of a fixed budget must say so itself.")
+    P("=" * 78)
+    P("    grid (fraction of budget): %s" % ", ".join("%.2f" % f for f in FRACS))
+    verdicts = {}
+    for fam, spec in CELLS.items():
+        if not spec["fine"]:
+            continue
+        P("")
+        P("    %s (%s/%s, ms=%s, box %s, %d ep)"
+          % (fam, spec["net"], spec["dset"], spec["ms"], spec["box"], spec["epochs"]))
+        rows = []
+        for fr in FRACS:
+            d, se, df, n, nep = traj_contrast(data[fam], spec["fine"], spec["node"],
+                                              fr, spec["epochs"])
+            rows.append((fr, nep, d, se, n))
+        P("      D(t):     " + "  ".join("ep%-3d %+0.3f" % (nep, d) if not math.isnan(d)
+                                         else "ep%-3d   n/a" % nep
+                                         for _, nep, d, _, _ in rows))
+        P("      t:        " + "  ".join("ep%-3d %+0.2f" % (nep, d / se)
+                                         if se and not math.isnan(se) and se > 0
+                                         else "ep%-3d   n/a" % nep
+                                         for _, nep, d, se, _ in rows))
+        if spec["coarse"] and spec["n1d"]:
+            dg_rows = []
+            for fr in FRACS:
+                d, sed, _, _, nep = traj_contrast(data[fam], spec["fine"], spec["node"],
+                                                  fr, spec["epochs"])
+                g, seg, _, _, _ = traj_contrast(data[fam], spec["coarse"], spec["n1d"],
+                                                fr, spec["epochs"])
+                dg_rows.append((nep, d - g, math.sqrt(sed ** 2 + seg ** 2)
+                                if not (math.isnan(sed) or math.isnan(seg)) else float("nan")))
+            P("      (D-G)(t): " + "  ".join("ep%-3d %+0.3f" % (nep, v) if not math.isnan(v)
+                                             else "ep%-3d   n/a" % nep
+                                             for nep, v, _ in dg_rows))
+        # the registered rule
+        neg = [(nep, d, d / se) for fr, nep, d, se, n in rows
+               if not math.isnan(d) and se and se > 0
+               and d < 0 and abs(d / se) >= SIG_T and fr <= REVERSAL_FRAC]
+        finite = [d for _, _, d, _, _ in rows if not math.isnan(d)]
+        allpos = bool(finite) and len(finite) == len(rows) and all(d >= 0 for d in finite)
+        dips = any(d < 0 for d in finite)
+        if not finite:
+            v = "VOID"
+            P("      VERDICT: VOID -- no grid point has enough box-free seeds on both")
+            P("      arms.  NO TRAJECTORY CLAIM MAY BE MADE ABOUT THIS CELL, in either")
+            P("      direction; the box gate removed it before F3 ever ran.")
+            verdicts[fam] = v
+            continue
+        if len(finite) < len(rows):
+            P("      NOTE: %d of %d grid points are unreadable; the verdict below is"
+              " read off the %d that are." % (len(rows) - len(finite), len(rows), len(finite)))
+        if neg:
+            v = "REVERSAL PRESENT"
+            P("      VERDICT: **REVERSAL PRESENT** -- D is negative at |t| >= %.1f at"
+              " epoch(s) %s" % (SIG_T, ", ".join(str(n) for n, _, _ in neg)))
+            xs = [(nep, d) for _, nep, d, _, _ in rows if not math.isnan(d)]
+            cross = None
+            for i in range(1, len(xs)):
+                if xs[i - 1][1] < 0 <= xs[i][1]:
+                    e0, d0 = xs[i - 1]
+                    e1, d1 = xs[i]
+                    cross = e0 + (e1 - e0) * (0 - d0) / (d1 - d0)
+            if cross is not None:
+                P("      crossing epoch (linear interpolation on the grid): ~%.0f of %d"
+                  " = %.0f%% of budget" % (cross, spec["epochs"],
+                                           100.0 * cross / spec["epochs"]))
+        elif allpos:
+            v = "NO REVERSAL"
+            P("      VERDICT: NO REVERSAL -- D >= 0 at every grid point.")
+        else:
+            v = "UNRESOLVED"
+            P("      VERDICT: UNRESOLVED -- %s, so neither branch of the registered"
+              % ("D dips below zero but never at |t| >= %.1f at or below %.2f of budget"
+                 % (SIG_T, REVERSAL_FRAC) if dips
+                 else "D never resolvably dips, but a grid point is unreadable"))
+            P("      rule fires.  This cell supports NEITHER a reversal claim NOR a")
+            P("      no-reversal claim.")
+        verdicts[fam] = v
+    P("")
+    P("    TRAJECTORY VERDICTS: %s" % ", ".join("%s %s" % (f, v) for f, v in verdicts.items()))
+    verdicts = {f: v for f, v in verdicts.items() if v != "VOID"}
+    if verdicts and len(set(verdicts.values())) > 1:
+        P("    **THE REVERSAL IS NOT UNIVERSAL.**  It is present in some cells and")
+        P("    absent in others, so it is a property OF A CELL, not of the effect.")
+        P("    A horizon caveat must be written per cell, with this table beside it.")
+    elif verdicts and set(verdicts.values()) == {"REVERSAL PRESENT"}:
+        P("    THE REVERSAL IS PRESENT IN EVERY CELL SCORED.  Every headline in the")
+        P("    paper must be written 'at a 100-epoch budget' until a longer horizon")
+        P("    is measured.")
+
+    # =====================================================================
+    # DESCRIPTIVE
+    # =====================================================================
+    P("")
+    P("=" * 78)
+    P("DESCRIPTIVE ONLY -- NO VERDICT IS ISSUED FROM ANY OF THIS.")
+    P("=" * 78)
+    P("    per-arm plateau5 means (box-free seeds only), and the m each arm allocates:")
+    for fam, spec in CELLS.items():
+        parts = []
+        for short, gran in spec["arms"].items():
+            v = arm_values(data[fam], short)
+            m = REG_M.get((spec["net"], gran), "?")
+            parts.append("%s(%s, m=%s) %s" % (short, gran, m,
+                                              "%.3f" % st.mean(v.values()) if v else "n/a"))
+        P("      %-5s %s" % (fam, "; ".join(parts)))
+    if csvp and os.path.exists(csvp):
+        P("")
+        P("    CSV CROSS-CHECK (second instrument; plateau5 from the .out is PRIMARY):")
+        rows = list(csv.DictReader(open(csvp)))
+        for fam in CELLS:
+            n = sum(1 for r in rows if r["run"].startswith(fam + "-"))
+            P("      %-5s %d rows in results/all_runs.csv" % (fam, n))
+    P("")
+    P("NOT COMPUTED, BY REGISTRATION: any field statistic.  Direction C was dropped")
+    P("on its own pre-registered adoption gate (C2 t -11.14, C3 t -23.26).")
+    P("NOT CLAIMED: a RULE-11 tuned result on any cell; any pooling across")
+    P("architectures or datasets; any new effect.  an0 CORRECTS PUBLISHED NUMBERS.")
+    return dict(f1=f1, shares=shares, traj=verdicts, ladder=lad)
+
+
+def ladder_fits(runs_dirs, probe_dirs, P):
+    """The ck1/cx2 chunk ladder, fitted every way the record fits it.
+    DESCRIPTIVE: ck1 and cx2 are TWO batches, so any slope spanning them carries
+    the 0.20-0.29 pp cross-batch floor that neither pairing nor Welch removes."""
+    pts = []
+    for fam, arms in LADDER.items():
+        for short, gran in arms.items():
+            vals = []
+            for s in LADDER_SEEDS:
+                f = find_out(runs_dirs, fam, short, s)
+                if not f:
+                    continue
+                ser = series_from_out(f)
+                v = window_mean(ser, len(ser))
+                if v is not None and len(ser) >= 100:
+                    vals.append(v)
+            if vals:
+                pts.append((fam, gran, REG_M[("ResNet18", gran)],
+                            sum(vals) / len(vals), len(vals)))
+    if len(pts) < 3:
+        P("      (ladder unavailable at these paths -- slope not re-fitted)")
+        return {}
+    pts.sort(key=lambda p: p[2])
+    P("")
+    P("      the ck1/cx2 chunk ladder, re-derived from the .out (plateau5):")
+    for fam, gran, m, v, n in pts:
+        P("        %-5s %-11s m=%9d  plateau5 %.3f (n=%d)" % (fam, gran, m, v, n))
+    ck = [p for p in pts if p[0] == "ck1"]
+    fits = {}
+    if len(ck) >= 3:
+        b, a, seb, r2 = ols([math.log10(p[2]) for p in ck], [p[3] for p in ck])
+        fits["ck1 5-rung OLS"] = (b, seb, r2)
+        P("        ck1-only OLS (%d rungs, ONE batch): %+0.4f +- %.4f pp/decade, R2 %.3f"
+          % (len(ck), b, seb, r2))
+    if len(pts) >= 4:
+        b, a, seb, r2 = ols([math.log10(p[2]) for p in pts], [p[3] for p in pts])
+        fits["ck1+cx2 pooled OLS"] = (b, seb, r2)
+        P("        ck1+cx2 pooled OLS (%d rungs, TWO batches): %+0.4f +- %.4f pp/decade,"
+          " R2 %.3f" % (len(pts), b, seb, r2))
+        P("        ^ CROSS-BATCH.  sd_batch ~ 0.21 pp is inside this fit and neither")
+        P("          pairing nor Welch removes it.  DESCRIPTIVE.")
+    # the local secant the record's -0.407 comes from
+    by_m = {p[1]: p for p in pts}
+    if "chunk1024" in by_m and "chunk128" in by_m:
+        p1, p2 = by_m["chunk1024"], by_m["chunk128"]
+        sec = (p1[3] - p2[3]) / (math.log10(p1[2]) - math.log10(p2[2]))
+        fits["local secant chunk1024<->chunk128"] = (sec, float("nan"), float("nan"))
+        P("        local secant bracketing m=14,420 (chunk1024 <-> chunk128): %+0.4f"
+          " pp/decade" % sec)
+    P("        THE LADDER RUNGS SPLIT 1-D TENSORS.  Every K here is below the")
+    P("        largest 1-D tensor (%d), so these rungs do NOT hold the tail intact"
+      % MAX_1D["ResNet18"])
+    P("        the way chunk777/chunk2325/chunk835/chunk2500 do.  That is a second,")
+    P("        structural reason the ladder slope is the wrong instrument for a")
+    P("        count correction between two TAIL-PRESERVING partitions.")
+    return fits
+
+
+# ---------------------------------------------------------------------------
+def selftest():
+    ok = fail = 0
+
+    def chk(cond, msg):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print("FAIL: %s" % msg)
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    bs_path = os.path.join(repo, BATCH_SCRIPT)
+    chk(os.path.exists(bs_path), "batch script %s must exist" % BATCH_SCRIPT)
+    bs = open(bs_path).read() if os.path.exists(bs_path) else ""
+
+    # --- the registration cannot drift from the batch script -----------------
+    chk("TAG=an0" in bs, "batch script must pin TAG=an0")
+    chk("NJOBS=0" in bs, "an0 must emit ZERO Slurm jobs")
+    chk("GPU_HOURS=0" in bs, "an0 must cost ZERO GPU-hours")
+    chk("BOX_GATE=%s" % BOX_GATE in bs, "the box gate must match the batch script")
+    chk("BOX_ASYM=%s" % BOX_ASYM in bs, "the asymmetry bar must match")
+    chk("T06_RATIO=%s" % T06_RATIO in bs, "the T0.6 gate must match")
+    chk("SHARE_SPAN_BAR=%s" % SHARE_SPAN_BAR in bs, "the share-span bar must match")
+    chk("SLOPE_SPREAD_BAR=%s" % SLOPE_SPREAD_BAR in bs, "the slope-spread bar must match")
+    chk("REVERSAL_FRAC=%s" % REVERSAL_FRAC in bs, "the reversal fraction must match")
+    chk("IDENT_TOL=%s" % IDENT_TOL in bs, "the identity tolerance must match")
+    for fam in CELLS:
+        chk(fam in bs, "batch script must name cell %s" % fam)
+    for fam in LADDER:
+        chk(fam in bs, "batch script must name ladder family %s" % fam)
+
+    # --- the batch script must carry every guard the build requires ----------
+    for needle, why in (
+            ("guard 1b", "the ENV/ARGS pin, read off the .out headers on disk"),
+            ("guard 2g", "the CSV name-collision guard"),
+            ("guard 4", "THE BETA-ALLOCATION GUARD -- m MEASURED, never asserted"),
+            ("guard 4e", "the torch-free second instrument"),
+            ("guard 5", "the disk guard"),
+            ("guard 6", "the queue-depth guard"),
+            ("guard 7", "the throughput-headroom guard"),
+            ("guard 8", "the box-reachability guard"),
+            ("guard 9", "the ZERO-GPU guard"),
+            ("--rule13", "RULE 13: guards tested in BOTH directions"),
+            ("RULE 19 IS NOT SATISFIED", "the RULE-19 disclosure must be explicit"),
+            ("BINDING", "guard 7 must name its binding quantity")):
+        chk(needle in bs, "batch script must contain %r (%s)" % (needle, why))
+
+    # --- registered m: internal consistency ----------------------------------
+    # every COUNT-MATCHED comparator must use K strictly greater than the largest
+    # 1-D tensor, or it splits the tensors whose merging is the prescription.
+    for fam, spec in CELLS.items():
+        for role in ("fine", "coarse"):
+            sh = spec[role]
+            if not sh:
+                continue
+            gran = spec["arms"][sh]
+            chk((spec["net"], gran) in REG_M, "m must be registered for %s/%s"
+                % (spec["net"], gran))
+            k = int(gran.replace("chunk", ""))
+            chk(k > MAX_1D[spec["net"]],
+                "%s's %s comparator K=%d must exceed the largest 1-D tensor (%d) or "
+                "it SPLITS the tail" % (fam, role, k, MAX_1D[spec["net"]]))
+    # and the ladder rungs must NOT -- they are descriptive precisely because
+    # they split it.  Both directions of the same structural fact.
+    for gran in LADDER["ck1"].values():
+        k = int(gran.replace("chunk", ""))
+        chk(k <= MAX_1D["ResNet18"] or k == 1024,
+            "ck1 rung %s is expected to split the tail" % gran)
+    chk(int("1024") > MAX_1D["ResNet18"], "chunk1024 does NOT split the tail -- the "
+        "ladder is mixed, which is itself the disclosure")
+
+    # --- count matching, from the registered m -------------------------------
+    for fam, spec in CELLS.items():
+        if spec["fine"]:
+            mf = REG_M[(spec["net"], spec["arms"][spec["fine"]])]
+            mn = REG_M[(spec["net"], spec["arms"][spec["node"]])]
+            dec = abs(math.log10(mf / float(mn)))
+            chk(dec < 1e-3, "%s's D leg must be count-matched to <1e-3 decades "
+                            "(got %.2e)" % (fam, dec))
+        if spec["coarse"]:
+            mc = REG_M[(spec["net"], spec["arms"][spec["coarse"]])]
+            m1 = REG_M[(spec["net"], spec["arms"][spec["n1d"]])]
+            dec = abs(math.log10(mc / float(m1)))
+            chk(dec < 1e-3, "%s's G leg must be count-matched to <1e-3 decades "
+                            "(got %.2e)" % (fam, dec))
+
+    # --- THE IDENTITY.  Algebra, not a fit.  Exact on synthetic arms. --------
+    node, fine, coarse, n1d = 91.0, 91.7, 92.9, 92.8
+    D, G, U, T = fine - node, coarse - n1d, coarse - fine, n1d - node
+    chk(abs(T - (D + (U - G))) < IDENT_TOL,
+        "the SECOND decomposition T = D + C with C = U - G must close identically "
+        "-- it is the same algebra with the count charged on the other side")
+    chk(abs(((D - G) + U) - (D + (U - G))) < IDENT_TOL,
+        "and the two decompositions must agree on T while disagreeing on which "
+        "term the count sits in -- that disagreement is the whole point")
+    chk(abs(T - ((D - G) + U)) < IDENT_TOL,
+        "T = (D-G) + U must close EXACTLY (residual %.3e)" % abs(T - ((D - G) + U)))
+    # and it must close for ANY four numbers -- the identity has no content about
+    # the data, which is exactly why F2 is safe to run post-hoc.
+    for quad in ((0, 0, 0, 0), (1, -2, 3.5, -4.25), (-10, 10, -10, 10)):
+        n_, f_, c_, o_ = quad
+        chk(abs((o_ - n_) - (((f_ - n_) - (c_ - o_)) + (c_ - f_))) < IDENT_TOL,
+            "the identity must close for %s" % (quad,))
+
+    # --- THE F3 GRID.  Its endpoint must be plateau5 BY CONSTRUCTION. --------
+    ser = [(i, 80.0 + 0.1 * i) for i in range(100)]
+    chk(abs(window_mean(ser, len(ser)) - sum(v for _, v in ser[-5:]) / 5.0) < 1e-12,
+        "the last grid point must be plateau5 exactly")
+    chk(window_mean(ser, 40) == sum(v for _, v in ser[35:40]) / 5.0,
+        "a grid point must be the 5-epoch window ENDING at that epoch")
+    chk(window_mean(ser, 3) is None, "a window shorter than 5 epochs must return None")
+    chk(window_mean(ser, 200) is None, "a window past the end must return None")
+    chk(FRACS[-1] == 1.0, "the grid must end at the full budget")
+    chk(all(FRACS[i] < FRACS[i + 1] for i in range(len(FRACS) - 1)),
+        "the grid must be strictly increasing")
+
+    # --- distribution tails, against published critical values ---------------
+    chk(abs(t_sf(6.3138, 1) - 0.05) < 1e-4, "t_{.95,1} = 6.3138")
+    chk(abs(t_sf(1.7459, 16) - 0.05) < 1e-4, "t_{.95,16} = 1.7459")
+    chk(abs(t_sf(2.2281, 10) - 0.025) < 1e-4, "t_{.975,10} = 2.2281")
+    chk(abs(t_two(0.0, 9) - 1.0) < 1e-9, "two-sided t at 0 is 1")
+    chk(abs(binom_sf(9, 9) - 1.0 / 512) < 1e-12, "sign test 9/9 -> 1/512")
+    chk(abs(binom_sf(5, 9) - 0.5) < 1e-12, "sign test 5/9 -> 0.5")
+
+    # --- welch and ols -------------------------------------------------------
+    d, se, df = welch([1.0, 2.0, 3.0], [0.0, 1.0, 2.0])
+    chk(abs(d - 1.0) < 1e-12, "welch mean difference")
+    chk(abs(se - math.sqrt(2.0 / 3)) < 1e-12, "welch se")
+    b, a, seb, r2 = ols([0.0, 1.0, 2.0, 3.0], [1.0, 3.0, 5.0, 7.0])
+    chk(abs(b - 2.0) < 1e-12 and abs(a - 1.0) < 1e-12, "ols on an exact line")
+    chk(abs(r2 - 1.0) < 1e-12, "ols R2 on an exact line is 1")
+
+    # --- THE DECISION RULES, TESTED IN BOTH DIRECTIONS (RULE 13) -------------
+    # F1's rule fires when the argmax MOVES between scales, and must NOT fire
+    # when it does not.  Both constructed here from arithmetic alone.
+    cellsA = {"a": dict(d=1.640, err=29.689), "b": dict(d=0.727, err=8.110)}
+    relA = {k: 100 * v["d"] / v["err"] for k, v in cellsA.items()}
+    chk(max(cellsA, key=lambda k: cellsA[k]["d"]) != max(relA, key=lambda k: relA[k]),
+        "F1 must FIRE when a big-pp/big-error cell loses on the relative scale")
+    cellsB = {"a": dict(d=1.640, err=8.200), "b": dict(d=0.727, err=8.110)}
+    relB = {k: 100 * v["d"] / v["err"] for k, v in cellsB.items()}
+    chk(max(cellsB, key=lambda k: cellsB[k]["d"]) == max(relB, key=lambda k: relB[k]),
+        "F1 must NOT fire when the argmax is the same on both scales")
+    chk(29.689 / 8.110 > T06_RATIO,
+        "the CIFAR-100 vs CIFAR-10 error budgets must TRIP the T0.6 gate")
+    chk(8.664 / 8.110 < T06_RATIO,
+        "two CIFAR-10 cells must NOT trip it -- the gate must be a real cut")
+    # F2's rule
+    chk(max([12.0, 3.0, -4.0, 35.0]) - min([12.0, 3.0, -4.0, 35.0]) > SHARE_SPAN_BAR,
+        "F2 must FIRE on a 39-pp span of count share")
+    chk(max([12.0, 10.0, 14.0]) - min([12.0, 10.0, 14.0]) < SHARE_SPAN_BAR,
+        "F2 must NOT fire on a 4-pp span")
+    chk(max(SLOPE_RECORD.values()) - min(SLOPE_RECORD.values()) > SLOPE_SPREAD_BAR,
+        "the record's four slope values must TRIP the spread bar")
+    chk(0.51 - 0.49 < SLOPE_SPREAD_BAR,
+        "two nearly equal values must NOT trip it")
+    # F3's rule
+    chk(0.40 <= REVERSAL_FRAC and 1.00 > REVERSAL_FRAC,
+        "the reversal window must sit inside the budget, below the endpoint")
+    chk(SIG_T == 2.0, "a sign is called at |t| >= 2, everywhere")
+
+    # --- NO FIELD STATISTIC, over this file's OWN identifiers ---------------
+    me = open(os.path.abspath(__file__)).read()
+    import ast as _ast
+    idents = set()
+    for node_ in _ast.walk(_ast.parse(me)):
+        if isinstance(node_, _ast.Name):
+            idents.add(node_.id)
+        elif isinstance(node_, _ast.Attribute):
+            idents.add(node_.attr)
+        elif isinstance(node_, (_ast.FunctionDef, _ast.ClassDef)):
+            idents.add(node_.name)
+        elif isinstance(node_, _ast.arg):
+            idents.add(node_.arg)
+    low = {i.lower() for i in idents}
+    for banned in ("rho", "neff", "n_eff", "negcount", "neg_count"):
+        chk(not any(banned in i for i in low),
+            "this scorer must compute no field statistic (identifier %r)" % banned)
+    reads = [m for m in _ast.walk(_ast.parse(me))
+             if isinstance(m, _ast.Constant) and isinstance(m.value, str)
+             and "neg_" + "counts" in m.value]
+    chk(not reads, "this scorer must not name a neg_" + "counts artefact in any path")
+
+    # --- HONESTY CLAUSES, asserted against this file's own text -------------
+    for phrase, why in (
+            ("RULE 19 IS NOT SATISFIED", "the RULE-19 disclosure must be in the file"),
+            ("POST-HOC", "every verdict must be labelled post-hoc"),
+            ("CORRECTION", "an0 produces corrections, not tests"),
+            ("SIGN TEST", "per-seed agreement is a sign test"),
+            ("RULE 11 is open", "the RULE-11 gap must be printed"),
+            ("DESCRIPTIVE ONLY", "the descriptive section must be labelled"),
+            ("BOTH denominators", "occupancy must be printed at both denominators"),
+            ("GUARD-CONFOUNDED", "an asymmetric guard must remove a contrast"),
+            ("cross-batch", "the cross-batch floor must be named where it applies"),
+            ("mean-of-last-20", "the CSV plateau column must be disowned"),
+            ("NEITHER a reversal claim NOR a no-reversal claim",
+             "an unresolved cell must be refused in BOTH directions"),
+            ("VERDICT: VOID", "a cell the box gate emptied must get NO trajectory "
+                              "verdict, not a substantive one")):
+        chk(phrase in me, "%s (%r)" % (why, phrase))
+
+    # --- structural constants ------------------------------------------------
+    chk(len(CELLS) == 8, "an0 reads 8 accuracy cells")
+    chk(sum(len(c["seeds"]) * len(c["arms"]) for c in CELLS.values()) == 113,
+        "an0 reads 113 accuracy runs (got %d)"
+        % sum(len(c["seeds"]) * len(c["arms"]) for c in CELLS.values()))
+    chk(MIN_SEEDS == 3, "a cell needs at least 3 box-free seeds per arm")
+    chk(WINDOW == 5, "plateau5's window is 5 epochs")
+
+    print("selftest: %d/%d PASS" % (ok, ok + fail) if fail == 0
+          else "selftest: %d PASS, %d FAIL" % (ok, fail))
+    return 0 if fail == 0 else 1
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runs", action="append", default=None,
+                    help="directory holding <fam>-<arm>-s<seed>-<jobid>.out "
+                         "(repeatable; .out live in the ROOT of runs/)")
+    ap.add_argument("--probes", action="append", default=None,
+                    help="directory holding <fam>/probe_<arm>_<fam>_s<seed> "
+                         "(repeatable)")
+    ap.add_argument("--csv", default=os.path.join(repo, "results", "all_runs.csv"))
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    runs = a.runs or [os.path.join(repo, "..", "runs"),
+                      os.path.join(repo, "..", "runs_cluster_b")]
+    probes = a.probes or list(runs)
+    present = [d for d in runs if os.path.isdir(d)]
+    if not present:
+        print("no run directory found at %s -- point --runs at the raw .out root."
+              % ", ".join(runs))
+        return 0
+    score(runs, probes, a.csv)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

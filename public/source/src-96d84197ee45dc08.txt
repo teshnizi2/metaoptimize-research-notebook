@@ -1,0 +1,178 @@
+#!/bin/bash
+# =============================================================================
+# c88_ub9_widebox.sh -- `ub9`, IS THE CORPUS'S ONLY REPRODUCTION OF THE PARENT'S
+# CIFAR-10 CLAIM REAL, OR A CLIPPING ARTEFACT?
+#
+# THE PROBLEM.  The 18 AUGMENT=0 runs (AdamW+Adam, ms=1e-3, alpha0=1e-6, 100 ep)
+# are the ONLY cell in 1,984 runs that touches the parent paper's actual
+# experiment.  They read scalar 73.830 / blk6 74.352 / layerwise 73.449 -- the
+# parent's blockwise>scalar claim reproducing at +0.522, and the NEXT rung
+# reversing it.  But beta0 = ln(1e-6) = -13.8155 sits 1.1845 nats above a -15
+# floor and 11.5129 nats below a -2.3026 ceiling, and under Lion |dbeta| = ms
+# per step with 500 steps/epoch x 100 epochs = 50 nats of travel:
+#     the FLOOR is reachable at epoch 2.4 and the CEILING at epoch 23.0.
+# runs/PP holds only Tensorboard_outputs -- NO probe.jsonl exists, so occupancy
+# is UNMEASURED IN BOTH DIRECTIONS.  A floor bind on the single-group scalar arm
+# while the 6-group arm is free to differentiate away from it is PRECISELY the
+# mechanism that manufactures a +0.522.
+#
+# THE PURCHASE.  The SAME cell, 3 arms x 3 seeds, in a WIDE box (-60:6.0) with
+# PATCH_CLIPCOUNT on so the per-coordinate rails n_at_lo / n_at_hi exist.
+#
+# HONEST SCOPE, REGISTERED: at ms=1e-3 over 100 epochs NO box with a sane ceiling
+# is PROVABLY free -- it would need hi >= beta0 + 50 = +36.2, a step size of
+# ~5e15.  **ub9 buys MEASURED freedom, not provable freedom**, and the scorer
+# reports occupancy PER SEED rather than asserting the box was inert.
+#
+# PRE-REGISTERED RULE (analysis/c88_scorers.py, committed BEFORE this batch):
+#   step1 = blk6 - scalar   (the parent's own claim)
+#   step2 = layerwise - blk6 (the rung that reverses it)
+#   |step1| <= 0.30 in the wide box  ->  the +0.522 was a CLIPPING ARTEFACT.
+#        That is a POSITIVE result: it identifies guard occupancy as a mechanism
+#        for the parent's OWN reported inconsistency.  It may not be buried.
+#   step1 > +0.30 AND step2 < 0       ->  the parent's claim AND its reversal are
+#        both real in a measured-free box.
+#
+# THIS BATCH MAY NOT CLAIM: anything about AUGMENT=1 cells; any pooling with the
+# -15:-2.3026 runs (different box); any RULE-11 result (no ladder here).
+#
+# USAGE
+#   bash bin/c88_ub9_widebox.sh            # dry run
+#   bash bin/c88_ub9_widebox.sh --submit   # submits ONLY if every guard passes
+# =============================================================================
+set -u
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+FAIL=0
+guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/ub9
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+# --- PROJECT ENVIRONMENT, ONCE (cycle 85 lesson: 14 python sites, 1 activation)
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP="-60:6.0"; MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+NET=ResNet18; DSET=CIFAR10; GAMMA=1; AUG=0
+ARMS="scalar resnet18_blocks layerwise"; SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=03:50:00
+
+echo "=============================================================="
+echo " ub9 -- the parent's unaugmented cell, re-run in a WIDE box"
+echo " box $CLIP (orig -15:-2.3026)  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG"
+echo " 3 arms x 3 seeds = 9 jobs.  MEASURED freedom, not provable."
+echo "=============================================================="
+
+# --- GUARD 0: CSV -----------------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# --- GUARD 1: PATCH_CLIPCOUNT is present, else the rails do not exist -------
+if grep -q PATCH_CLIPCOUNT "$CIF/Optimizers/HF.py" 2>/dev/null; then
+  echo "guard 1: PATCH_CLIPCOUNT present -- per-coordinate rails n_at_lo/n_at_hi will be written"
+else
+  guard_fail "guard 1: PATCH_CLIPCOUNT ABSENT from $CIF/Optimizers/HF.py -- occupancy would be UNMEASURABLE, which is the exact defect ub9 exists to fix"
+fi
+
+# --- GUARD 2: BETA_CLIP parses, ordered, and is NOT the original box ---------
+python3 - "$CLIP" <<'PYEOF' || guard_fail "guard 2: BETA_CLIP"
+import sys
+lo, hi = sys.argv[1].split(":")
+lo, hi = float(lo), float(hi)
+assert lo < hi, "unordered"
+assert (lo, hi) != (-15.0, -2.3026), "this is the ORIGINAL box; ub9 must widen it"
+b0 = -13.815510557964274
+print("guard 2: box (%.1f, %.1f); beta0 = %.6f is %.4f nats above the floor and %.4f below the ceiling"
+      % (lo, hi, b0, b0 - lo, hi - b0))
+print("guard 2: travel budget ms*T = %.1f nats, so NEITHER rail is provably unreachable -- "
+      "ub9 buys MEASURED freedom and the scorer reports occupancy per seed" % (1e-3 * 500 * 100))
+PYEOF
+
+# --- GUARD 3: the three granularities allocate the m they should ------------
+python3 - "$CIF" "$NET" "$ALPHA0" "$MST" <<'PYEOF' || guard_fail "guard 3: beta allocation"
+import sys, os
+cif, net, a0, mst = sys.argv[1:5]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s). Run this on the cluster inside the venv." % ex)
+class NW:
+    def add_scalar(self, *a, **k): pass
+# EXACT match to the PP reference cell (PP-blk6-s0-4700551.out ARGS line):
+# AdamW base needs normalizer_param, momentum_param, weight_decay;
+# Adam meta needs meta_stepsize, normalizer_param, momentum_param, weight_decay.
+B = {"alg": "AdamW", "normalizer_param": 0.999, "momentum_param": 0.9, "weight_decay": 0.1}
+M = {"alg": "Adam", "meta_stepsize": float(mst), "normalizer_param": 0.999,
+     "momentum_param": 0.9, "weight_decay": 0}
+want = {"scalar": 1, "resnet18_blocks": 6, "layerwise": 62}
+for g, w in want.items():
+    torch.manual_seed(0)
+    opt = HF(build_network(net, "cpu"), stepsize_groups=g, alpha0=float(a0),
+             args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+    m = sum(int(b.numel()) for b in opt.beta)
+    assert m == w, "m(%s) is %d, expected %d" % (g, m, w)
+    print("guard 3: %-18s ALLOCATED beta m=%-6d (registered %d)" % (g, m, w))
+PYEOF
+
+# --- GUARD 4: no name collision --------------------------------------------
+if [ -f "$CSVP" ] && grep -q '^ub9-' "$CSVP"; then
+  guard_fail "guard 4: ub9-* run names already exist in the CSV"
+else
+  echo "guard 4: no ub9-* run name exists in the CSV"
+fi
+
+# --- GUARD 5: the comparison cell is actually on disk -----------------------
+NORIG=$(awk -F, 'NR>1 && $5=="CIFAR10" && $13=="0" && $8=="AdamW" && $9=="Adam" && $10=="1e-3" && $11=="1e-6"' "$CSVP" 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: $NORIG AUGMENT=0 comparison runs on disk (expected ~18)"
+[ "${NORIG:-0}" -ge 9 ] || guard_fail "guard 5: fewer than 9 comparison runs -- nothing to compare against"
+
+# --- GUARD 6: scorer is registered and passes (RULE 19) ---------------------
+if [ -f "$REPO/analysis/c88_scorers.py" ]; then
+  OUT="$(cd "$REPO" && python3 analysis/c88_scorers.py --selftest 2>&1 | tail -1)"
+  case "$OUT" in *PASS*) echo "guard 6: analysis/c88_scorers.py -- $OUT" ;;
+                 *) guard_fail "guard 6: scorer selftest did not pass: $OUT" ;; esac
+else
+  guard_fail "guard 6: analysis/c88_scorers.py absent -- RULE 19 requires the scorer BEFORE the runs"
+fi
+
+# --- GUARD 7: disk and queue ------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+echo "guard 7: ${FREE:-?} GB free vs ~1.4 GB needed"
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 7: pending=$PEND running=$RUN, adding 9"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 7: $PEND already pending, over the 40 cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing was submitted."; exit 2; }
+
+mkdir -p "$SAVE"
+N=0; REJ=0
+for S in $SEEDS; do
+  for G in $ARMS; do
+    case $G in scalar) SH=sc ;; resnet18_blocks) SH=b6 ;; layerwise) SH=ly ;; esac
+    CMD="sbatch --job-name=ub9-$SH-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=5,PROBE_DIR=$SAVE/probe_${SH}_ub9_s${S} \
+$RUNNER --optimizer HF --alg-base AdamW --normalizer-param-base 0.999 --momentum-param-base 0.9 \
+--weight-decay-base 0.1 --alg-meta Adam --normalizer-param-meta 0.999 --momentum-param-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET \
+--batch-size $BATCH --max-time 999:00:00 --gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 \
+--num-epochs $EPOCHS --stepsize-groups $G --seed $S --save-directory $SAVE --run-name ub9-$SH-s$S"
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; N=$((N+1)); fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+echo "---- AUGMENT=0 IS DELIBERATE: this is the PARENT'S OWN unaugmented setting. ----"
+echo "---- Score with: python3 analysis/c88_scorers.py --score ub9 ----"

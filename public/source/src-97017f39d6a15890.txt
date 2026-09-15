@@ -1,0 +1,87 @@
+"""Cycle-32 reducer: per-(family,granularity) mean+-sd of the agree2 statistics
+across seeds, plus the log-log drift-vs-m slope in BOTH windows, with a
+seed-level bootstrap CI on the slope.  Reuses agree2's inference verbatim."""
+import os, sys, glob, math, statistics as st, random, re
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, "/cluster/account_a/metaopt/bin")
+import agree2
+
+def stats_for(d, lo, hi):
+    recs = agree2.load(d)
+    if not recs: return None
+    nt = agree2.infer_ntot(recs)
+    s = agree2.block(recs, nt, lo, hi)
+    if not s or nt < 2: return None
+    s["ntot"] = nt
+    return s
+
+def ols(xs, ys):
+    n = len(xs)
+    if n < 2: return float("nan"), float("nan")
+    mx, my = sum(xs)/n, sum(ys)/n
+    sxx = sum((x-mx)**2 for x in xs)
+    if sxx == 0: return float("nan"), float("nan")
+    b = sum((x-mx)*(y-my) for x, y in zip(xs, ys))/sxx
+    a = my - b*mx
+    ss_res = sum((y-(a+b*x))**2 for x, y in zip(xs, ys))
+    ss_tot = sum((y-my)**2 for y in ys)
+    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else float("nan")
+    return b, r2
+
+def main(root, families, grans):
+    for lo, hi, wname in ((0.50, 1.00, "STEADY"), (0.00, 0.20, "STARTUP")):
+        print(f"\n===== {wname} window =====")
+        for fam in families:
+            rows = []
+            per_seed = {}   # gran -> list of (ntot, drift)
+            for g in grans:
+                ds = sorted(glob.glob(os.path.join(root, f"p7-{fam}-{g}-s*")))
+                vals = [stats_for(d, lo, hi) for d in ds]
+                vals = [v for v in vals if v]
+                if not vals: continue
+                nt = vals[0]["ntot"]
+                dr = [v["drift"] for v in vals]
+                sy = [100*v["agree_sys"] for v in vals]
+                ex = [100*(v["agree_step"]-v["null_step"]) for v in vals]
+                sd = lambda a: st.stdev(a) if len(a) > 1 else 0.0
+                rows.append((g, nt, len(vals), st.mean(dr), sd(dr),
+                             st.mean(sy), sd(sy), st.mean(ex), sd(ex)))
+                per_seed[g] = [(nt, v["drift"]) for v in vals]
+            if not rows: continue
+            print(f"\n--- {fam} ---")
+            print(f"{'gran':8s} {'m':>12} {'n':>3} {'drift/step':>12} {'+-':>10} "
+                  f"{'sys%':>8} {'+-':>7} {'step-null':>10} {'+-':>7}")
+            for g, nt, n, dm, ds_, sy, sys_, ex, exs in rows:
+                print(f"{g:8s} {nt:>12,} {n:>3} {dm:>12.4e} {ds_:>10.2e} "
+                      f"{sy:>8.3f} {sys_:>7.3f} {ex:>10.4f} {exs:>7.4f}")
+            # slope on per-seed points (every seed contributes a point)
+            xs, ys = [], []
+            for g, pts in per_seed.items():
+                for nt, dr in pts:
+                    if dr > 0:
+                        xs.append(math.log10(nt)); ys.append(math.log10(dr))
+            b, r2 = ols(xs, ys)
+            # bootstrap over seeds within each rung
+            random.seed(7)
+            bs = []
+            for _ in range(2000):
+                xs2, ys2 = [], []
+                for g, pts in per_seed.items():
+                    k = len(pts)
+                    for _ in range(k):
+                        nt, dr = pts[random.randrange(k)]
+                        if dr > 0:
+                            xs2.append(math.log10(nt)); ys2.append(math.log10(dr))
+                bb, _ = ols(xs2, ys2)
+                if bb == bb: bs.append(bb)
+            bs.sort()
+            lo_ci = bs[int(0.025*len(bs))] if bs else float("nan")
+            hi_ci = bs[int(0.975*len(bs))] if bs else float("nan")
+            print(f"  log-log slope (per-seed, N={len(xs)}): {b:+.4f}  R2={r2:.3f}  "
+                  f"95%CI [{lo_ci:+.4f}, {hi_ci:+.4f}]   sqrt(N) requires -0.500")
+
+if __name__ == "__main__":
+    root = sys.argv[1]
+    fams = sys.argv[2].split(",")
+    grans = sys.argv[3].split(",")
+    main(root, fams, grans)

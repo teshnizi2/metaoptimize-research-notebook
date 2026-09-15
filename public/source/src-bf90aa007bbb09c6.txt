@@ -1,0 +1,1198 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cA3_lsm1_score.py -- THE REGISTERED SCORER FOR `lsm1`, THE META-OPTIMISER
+#                      r-CURVE.  IS THE SURVIVING INTERIOR PEAK LION-SPECIFIC?
+#
+# STANDING RULE 21: this file is git-committed BEFORE any lsm1 run exists.  Every
+# band edge, every threshold, every refusal below is frozen here.  selftest()
+# asserts each constant against bin/cA3_lsm1_meta_r_curve.sh's OWN TEXT so the
+# registration and the batch cannot drift apart, and RE-DERIVES the noise floor
+# and every prior from results/all_runs.csv rather than quoting a number.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments is not editing it.  Once an lsm1 run exists this file is
+# frozen for good.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# HF.py's additive operator (PATCH_HIER, `_apply_hier`, layerwise branch) is
+#
+#     d      = beta_t - beta_{t-1}        the realised meta-update
+#     dm     = mean(d)                    its shared component
+#     beta_t := beta_{t-1} + dm + r * (d - dm)
+#
+# r = 1 is the arithmetic identity (plain layerwise); r = 0 freezes every
+# deviation.  The archived r-curve at this cell has an INTERIOR OPTIMUM: it
+# rises from r = 0 to a peak near r = 0.06 and falls to r = 1.  g4m has just
+# shown that optimising the meta-stepsize WITHIN each r does not remove it, so
+# "r is a meta-stepsize dial in a pooling costume" is dead.
+#
+# THE ACCOUNT THAT SURVIVED g4m, AND THE ONE THIS BATCH TESTS.  The audit's
+# mechanism was never about the meta-stepsize alone; it was about LION.  Read
+# from the LIVE tree, not from prose -- HF.py's two meta updates are
+#
+#     Lion_meta_update:  beta[i] -= ms * sign( b2*mom + (1-b2)*HtT_gradft )
+#     Adam_meta_update:  beta[i] -= ms * mom / sqrt( mu*trace + eps )
+#
+# (both shown with weight_decay_meta = 0, which is what this campaign runs).
+# Under LION every coordinate of d is EXACTLY +-ms.  The shared component is
+# therefore dm = ms * (2p - 1), where p is the fraction of groups stepping up:
+# pooling multiplies the shared motion by |2p - 1|, measured 8-10x smaller than
+# ms at layerwise.  The deviations d - dm, by contrast, stay of order ms.  On
+# that account the interior optimum sits where the two magnitudes balance --
+# r* ~ |2p - 1| ~ 0.10-0.125, against the archived argmax of 0.06-0.07, the
+# right order -- and the whole shape is an artefact of the sign quantisation.
+#
+# UNDER ADAM THERE IS NO SIGN QUANTISATION.  Increments have continuous,
+# heterogeneous magnitudes, the identity dm = ms*(2p-1) does not exist, and the
+# |2p - 1| balance that is supposed to place the optimum has nothing to place.
+# The account therefore predicts the INTERIOR PEAK VANISHES under Adam.  If it
+# does not vanish, the account is wrong and the interior optimum is a property
+# of the operator, not of Lion's sign.
+#
+# THE INFERENCE IS ASYMMETRIC AND THIS FILE SAYS SO IN ADVANCE.  Swapping Lion
+# for Adam changes more than the sign quantisation -- it changes the normaliser,
+# the momentum accumulation and the per-step magnitude too.  So:
+#   * PEAK SURVIVES  -> the sign account is REFUTED outright.  It predicted
+#     vanishing and the peak is there anyway; no auxiliary hypothesis rescues a
+#     prediction that ran the wrong way.
+#   * PEAK VANISHES  -> CONSISTENT WITH the sign account, and NOT proof of it.
+#     Any of the other Lion/Adam differences could have done it.  The registered
+#     wording for that branch says "consistent with", never "confirms".
+# A test whose two branches carry different evidential weight has to declare
+# that before the data, or the weaker branch gets read as the stronger one.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  24 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85) = 5.47, p 6.9e-13; SEED is null, F 1.21, p 0.213) -- is held
+# constant and EVERY contrast below is WITHIN this batch.
+# -----------------------------------------------------------------------------
+#   meta = Adam :  r in {0, 0.03, 0.06, 0.2, 1}   x seeds {0,1,2}   15 jobs
+#   meta = Lion :  r in {0,       0.06,      1}   x seeds {0,1,2}    9 jobs
+#   ResNet18 / CIFAR-10 / layerwise / SGDm base / alpha0 1e-6 / meta-stepsize
+#   1e-3 / 100 epochs / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 /
+#   AUGMENT=1 / PROBE=5 / SCHED=none / HIER=additive.
+#
+# WHY THE ADAM ARM IS SAMPLED MORE FINELY THAN THE LION ARM, AND WHY THAT IS THE
+# HONEST DIRECTION.  The registered prediction is that the ADAM peak vanishes.
+# A sparse Adam interior would make that prediction easier to satisfy by
+# construction -- the exact defect g4m's grid change was written to avoid.  So
+# the Adam interior carries THREE rungs (0.03, 0.06, 0.2) and the Lion interior
+# only ONE (0.06, the archived argmax).  The asymmetry can only make an Adam
+# peak EASIER to find, i.e. it works against the registered prediction.  The
+# headline interaction is nevertheless reported on the MATCHED sub-grid
+# {0, 0.06, 1} so that no part of it rests on the asymmetry.
+#
+# WHY THE LION ARM IS RUN AT ALL, GIVEN 57 ARCHIVED LION RUNS EXIST.  Because
+# BATCH is the unit of replication.  A cross-batch Lion comparator would put the
+# whole contrast across a boundary whose variance component is the largest in
+# the corpus.  The 9 Lion jobs buy a within-batch manifold gate (G3) and a
+# within-batch interaction; they are not a duplicate of the archive, they are
+# the control that makes the Adam arm readable.
+#
+# WHY meta-stepsize IS HELD AT 1e-3 AND NOT SWEPT.  Two reasons, both measured.
+# (i) The comparator is the LION curve at the SAME ms; a matched single-ms
+# contrast is the cleanest form of this question and g4m has already shown the
+# Lion peak is not an ms artefact.  (ii) Adam is demonstrably ALIVE and
+# RESPONSIVE at ms = 1e-3 at this exact cell: adam_prior_from_csv() re-derives
+# plain layerwise Adam at 90.532 (n = 9, 3 batches) against Lion's 90.906
+# (n = 17, 6 batches) -- the same regime -- and the archived `adg-A` Adam
+# additive cell at r = 0.03 reads 91.471, i.e. +0.939 pp ABOVE plain Adam.  The
+# Adam r-curve is therefore known to MOVE before this batch is submitted; a flat
+# result cannot be dismissed as a dead arm.  What is missing from the archive is
+# exactly and only the ENDPOINTS: `adg` ran r = 0.03 and r = 0.1 and neither
+# r = 0 nor r = 1, so the archived Adam data cannot form PEAK at all.  That gap
+# is what this batch fills.  SCOPE LIMIT, registered: nothing here speaks about
+# Adam at any other meta-stepsize.
+#
+# THE momentum-param-meta ASYMMETRY, DECLARED RATHER THAN HIDDEN.  The Lion arm
+# runs --momentum-param-meta 0.99 and the Adam arm 0.9, because those are the
+# canonical settings of each family in this corpus and each arm's archived
+# comparator was measured at its own value.  They are not interchangeable: in
+# the live tree Lion's momentum is an EMA (b*m + (1-b)*g) while Adam's is a bare
+# accumulator (b*m + g), so the same constant means different things.  This is
+# a real, deliberate, declared confound with the meta axis and it is listed
+# again under WHAT THIS SCORER WILL NOT DO.
+#
+# -----------------------------------------------------------------------------
+# THE PRIMARY STATISTIC, FROZEN
+# -----------------------------------------------------------------------------
+#   plateau5 = mean of the LAST 5 test epochs.  The CSV `plateau` column
+#   (mean-of-last-20) is BANNED as primary and is never read by this file;
+#   `best_test` is not a plateau and is never read either.
+#
+#   c(meta, r) = 3-seed mean plateau5 at that cell
+#   PEAK_A  = max_{r in 0.03,0.06,0.2} c(Adam,r) - max_{r in 0,1} c(Adam,r)
+#   PEAKm(meta) = c(meta,0.06) - max( c(meta,0), c(meta,1) )      matched grid
+#   DELTA   = PEAKm(Lion) - PEAKm(Adam)                           interaction
+#   SPAN(meta), ARGMAX(meta), POOL(meta) = c(meta,0) - c(meta,1)  descriptive
+#
+#   PEAK IS A LOWER BOUND ON THE TRUE INTERIOR LIFT.  Both endpoints are
+#   sampled exactly, so the subtrahend is not truncated; the interior maximum is
+#   taken over sampled rungs only, so the minuend can only be understated.  It
+#   follows that a SURVIVES verdict is never an artefact of the grid and only a
+#   VANISHES verdict can be -- which is why G2 below constrains only the latter.
+#
+# -----------------------------------------------------------------------------
+# THE BARS.  DERIVED FROM THE MEASURED NOISE FLOOR, FROZEN HERE
+# -----------------------------------------------------------------------------
+# noise_floor_from_csv() re-derives the pooled WITHIN-CELL standard deviation of
+# plateau5 over the 10 populated r-cells of the archived Lion additive r-curve at
+# this exact configuration (ResNet18 / CIFAR-10 / layerwise / alpha0 1e-6 /
+# SGDm+Lion / ms 1e-3 / box -15:-2.3026 / AUGMENT=1 / 100 ep / not collapsed /
+# complete / not superseded):
+#
+#     SIGMA_W = 0.1438 pp   (df = 47, n = 57 runs over 10 cells)
+#     SE of a 3-seed cell mean            = SIGMA_W / sqrt(3) = 0.0830 pp
+#     SE of a difference of two such      = SIGMA_W * sqrt(2/3) = 0.1174 pp
+#
+# SURVIVE_BAR = 0.50 pp.  PEAK_A >= 0.50 is 4.26 SE-of-difference at this n, and
+#   it is HALF the archived Lion interior lift at the same cell and the same
+#   meta-stepsize (prior_curve_from_csv(): 93.286 at r = 0.06 against 92.288 at
+#   r = 0 and 90.971 at r = 1, i.e. +0.997 over the better endpoint).  It is the
+#   SAME number g4m registered as its REFUTED_BAR, deliberately, so that the two
+#   batches' "the peak is still there" thresholds are one threshold.  Under a
+#   flat null the simulated false-SURVIVES rate at this grid is < 1e-4.
+#
+# VANISH_BAR = 0.20 pp.  Under the null "the ms-fixed Adam r-curve is flat",
+#   PEAK_A is (max of 3 iid 3-seed means) - (max of 2 iid 3-seed means) at
+#   SIGMA_W.  Its simulated 95th percentile is 0.176 pp (400k draws, reproduced
+#   by selftest() with a fixed seed), so declaring VANISHES at PEAK_A <= 0.20
+#   catches >= 95% of genuinely flat curves.  In the other direction, against a
+#   TRUE peak of archived Lion size (+0.997) the chance of observing
+#   PEAK_A <= 0.20 is below 1e-6, so this bar cannot manufacture a vanishing.
+#
+# Anything strictly between the two bars is UNRESOLVED and is reported as
+# UNRESOLVED.  There is no third reading of the gap and none will be invented
+# afterwards.  A half-strength Adam peak (+0.50 true) lands in the gap roughly
+# half the time, which is the correct behaviour and not a defect.
+#
+# -----------------------------------------------------------------------------
+# THE GATES, IN ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# -----------------------------------------------------------------------------
+#   G0  PROVENANCE, ABSOLUTELY GATING.  MEASURED from each run's OWN `ARGS:` and
+#       `ENV:` lines, never from its filename and never from the batch script's
+#       header (STANDING RULE 20).  Every run must carry: no repeated flag;
+#       --NN-name ResNet18; --dataset CIFAR10; --stepsize-groups layerwise;
+#       --alpha0 1e-6; --meta-stepsize 1e-3; --num-epochs 100; --batch-size 100;
+#       --gamma 1; --alg-base SGDm; --momentum-param-base 0.99;
+#       --weight-decay-base 0.1; HIER=additive; AUGMENT=1;
+#       BETA_CLIP=-15:-2.3026; PROBE=5; SCHED=none; 100 completed epochs; and an
+#       (meta, ETA_RATIO, seed) triple that is one of the 8 registered cells.
+#       THE META AXIS IS CHECKED AT FLAG LEVEL, NOT BY VALUE.  `ml2` and `sm3`
+#       were composed with a duplicated --alg-meta, ran to completion, and were
+#       reported before anyone read a run's own ARGS line; argparse keeps the
+#       LAST occurrence, so 24 runs labelled Adam/RMSProp in the corpus are in
+#       fact meta=Lion to this day.  This batch is a META-OPTIMISER contrast, so
+#       that exact bug would silently turn it into a null.  Therefore:
+#         * --alg-meta must appear EXACTLY ONCE and equal the cell's meta;
+#         * an Adam run MUST carry --normalizer-param-meta 0.999 and
+#           --momentum-param-meta 0.9 and MUST NOT carry --Lion-beta2-meta;
+#         * a Lion run MUST carry --Lion-beta2-meta 0.9 and
+#           --momentum-param-meta 0.99 and MUST NOT carry
+#           --normalizer-param-meta;
+#         * --weight-decay-meta 0 on both, since both update forms above are
+#           quoted at weight_decay = 0.
+#       A run failing any of these is dropped and named; if any registered CELL
+#       ends with fewer than 2 usable seeds the batch is VOID and nothing else
+#       is read.
+#   G1  THE NO-OP CONTROL, ONE PER META.  r = 1 additive is the arithmetic
+#       identity, so c(meta, 1) must reproduce the archived plain-layerwise
+#       HIER=none mean OF THE SAME META at the same cell.  Both comparators are
+#       GRAND MEANS OVER BATCHES, re-derived: Lion 90.906 (6 batches, 17 runs,
+#       between-batch sd 0.107) and Adam 90.532 (3 batches, 9 runs, between-batch
+#       sd 0.205).  The band is 3.0 * sqrt(between-batch sd^2 + SIGMA_W^2/3 +
+#       SE(prior mean)^2), re-derived per meta, which is 0.4263 pp for Lion and
+#       0.7518 pp for Adam.  A miss on EITHER means the operator is not the
+#       identity on the live tree, or the tree moved: batch VOID.
+#       G1 IS NOT THE META-IDENTITY CHECK AND MUST NOT BE READ AS ONE.  The two
+#       plain priors are only 0.374 pp apart, well inside the Adam band, so a
+#       swapped meta would pass G1.  G0's flag-level check is the meta-identity
+#       check; G1 only asks whether the tree still computes what it used to.
+#   G2  THE TRUNCATION GATE, AND IT CONSTRAINS ONLY A VANISHING.  PEAK_A is a
+#       lower bound (see above), so no grid artefact can manufacture a SURVIVES.
+#       It can hide one.  The registered risk is the unsampled interval
+#       (0, 0.03): if the Adam argmax over all five rungs is r = 0.03 -- the rung
+#       adjacent to that gap -- while PEAK_A <= VANISH_BAR, a taller peak may sit
+#       inside the gap and the vanishing is not established.  That one
+#       combination returns UNRESOLVED-TRUNCATED, and the prescribed fix is more
+#       rungs at r = 0.01 and 0.015, NOT a softer bar.  No other configuration
+#       triggers it, and it can never overturn a SURVIVES.
+#   G3  THE MANIFOLD GATE.  The LION arm of THIS batch must itself show the
+#       phenomenon: PEAKm(Lion) >= SURVIVE_BAR.  Without this a flat Adam curve
+#       cannot be told apart from "the effect was simply absent in this batch on
+#       this tree".  A miss is UNRESOLVED-NOMANIFOLD and NO verdict on the
+#       Lion-specificity question is issued.
+#   G4  THE NOISE GATE.  The pooled WITHIN-CELL SD of THIS batch, over its own 8
+#       cells, must be <= NOISE_MULT = 2.0 times the archived SIGMA_W.  The bars
+#       were computed at SIGMA_W; if the realised noise is twice that they are
+#       the wrong bars and the honest answer is UNRESOLVED-NOISY, not a verdict
+#       read off bars that no longer hold.
+#   G5  THE CROSS-BATCH REPRODUCIBILITY CHECK.  DESCRIPTIVE, NEVER GATING.
+#       c(Adam, 0.03) against the archived `adg-A` cell (91.471, n = 3, one
+#       batch).  A large gap says batch effects dominate and is disclosed as
+#       such; it CANNOT change G7, because every contrast in G7 is within-batch
+#       and carries no cross-batch floor.
+#   G6  THE BOX METER.  DESCRIPTIVE, NEVER GATING.  Per-cell rail occupancy from
+#       each run's own probe.jsonl (n_at_lo / n_at_hi over n_beta).  It CANNOT
+#       change G7.
+#   G7  THE PRIMARY.  PEAK_A against the two registered bars, with DELTA,
+#       SPAN, ARGMAX and POOL reported alongside as declared secondaries.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS SCORER WILL NOT DO
+# -----------------------------------------------------------------------------
+#   * It will not report the CSV `plateau` (last-20) column, or `best_test`.
+#   * It will not treat a VANISHING as proof of the sign mechanism.  The
+#     registered wording is "consistent with", because Lion and Adam differ in
+#     the normaliser, the momentum form and the per-step magnitude as well as in
+#     the sign quantisation, and because --momentum-param-meta differs between
+#     the arms BY DESIGN (0.99 Lion, 0.9 Adam) for the reason declared above.
+#   * It will not name an argmax r as "the optimum": the Adam grid has five
+#     rungs and the Lion grid three, and neither can locate one.
+#   * It will not pool lsm1 with any archived batch to raise n.  The archived
+#     curves enter only as G1's comparator, G3's registered reference and G5's
+#     descriptive check.
+#   * It will not claim anything about RMSProp, about any meta-stepsize other
+#     than 1e-3, about alpha0 = 1e-3, about ResNet34/50, about CIFAR-100, about
+#     any granularity other than layerwise, or about any operator other than
+#     `additive`.
+#   * It will not soften either bar after the fact.  If the answer lands in the
+#     gap, the deliverable is the word UNRESOLVED.
+#   * It will not read a run whose own ARGS line disagrees with its filename.
+#
+# -----------------------------------------------------------------------------
+# USAGE
+#   python3 analysis/cA3_lsm1_score.py --selftest
+#   python3 analysis/cA3_lsm1_score.py --runs /cluster/account_b/metaopt/runs
+#   python3 analysis/cA3_lsm1_score.py --runs <dir> --probes <dir>
+# =============================================================================
+
+from __future__ import print_function
+
+import os
+import re
+import csv
+import sys
+import glob
+import json
+import math
+import random
+import argparse
+import statistics
+import collections
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SCRIPT = os.path.join(REPO, "bin", "cA3_lsm1_meta_r_curve.sh")
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# --------------------------------------------------------------------------
+# THE REGISTERED DESIGN.  Asserted against the batch script's own text below.
+# --------------------------------------------------------------------------
+PREFIX = "lsm1"
+NET = "ResNet18"
+DSET = "CIFAR10"
+GRAN = "layerwise"
+ALPHA0 = "1e-6"
+MST = "1e-3"
+EPOCHS = 100
+BATCH = 100
+GAMMA = 1
+CLIP = "-15:-2.3026"
+AUG = "1"
+PROBE = "5"
+M_LAYERWISE = 62
+WALL = "01:40:00"
+
+RS_ADAM = ["0", "0.03", "0.06", "0.2", "1"]
+RS_LION = ["0", "0.06", "1"]
+SEEDS = ["0", "1", "2"]
+NJOBS = (len(RS_ADAM) + len(RS_LION)) * len(SEEDS)        # 24
+METAS = ["Adam", "Lion"]
+RS_BY_META = {"Adam": RS_ADAM, "Lion": RS_LION}
+
+R_ENDPOINTS = ("0", "1")
+R_INTERIOR_ADAM = ("0.03", "0.06", "0.2")
+R_MATCHED = ("0", "0.06", "1")
+R_GAP_ADJACENT = "0.03"        # the rung adjacent to the unsampled (0, 0.03)
+
+# --------------------------------------------------------------------------
+# THE REGISTERED BARS AND PRIORS.  Every one of these is RE-DERIVED from the
+# CSV at run time by the functions below; the literals are the registration and
+# selftest() fails if the re-derivation drifts away from them.
+# --------------------------------------------------------------------------
+SIGMA_W = 0.1438            # pooled within-cell SD of plateau5, df 47
+SIGMA_TOL = 0.005
+SURVIVE_BAR = 0.50          # PEAK_A >= this -> the peak is NOT Lion-specific
+VANISH_BAR = 0.20           # PEAK_A <= this -> consistent with the sign account
+NOISE_MULT = 2.0            # G4: this batch's own within-cell SD ceiling
+MIN_SEEDS = 2               # per cell, below which the batch is VOID
+
+PLAIN_PRIOR = {"Lion": 90.9060, "Adam": 90.5323}
+G1_BAND = {"Lion": 0.4263, "Adam": 0.7518}
+PRIOR_LION = {"0": 92.2880, "0.03": 92.6204, "0.06": 93.2855,
+              "0.2": 91.5187, "1": 90.9713}
+PRIOR_ADAM = {"0.03": 91.4713, "0.1": 91.1287}
+ARCHIVED_LION_PEAK = 0.9975     # 93.2855 - max(92.2880, 90.9713)
+G5_BAND = 0.45                  # descriptive only, never gating
+
+VOID = "VOID"
+UNRES = "UNRESOLVED"
+UNRES_TRUNC = "UNRESOLVED-TRUNCATED"
+UNRES_NOMAN = "UNRESOLVED-NOMANIFOLD"
+UNRES_NOISY = "UNRESOLVED-NOISY"
+SURVIVES = "SURVIVES"
+VANISHES = "VANISHES"
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+
+
+# --------------------------------------------------------------------------
+# re-derivation from the corpus.  NOTHING here is quoted from prose.
+# --------------------------------------------------------------------------
+def _batch_key(run):
+    """The BATCH a run belongs to.  Batch, not seed, is the unit of replication."""
+    return run.split("-")[0].split("_")[0]
+
+
+def _cell_rows(path, meta, hier):
+    """Archived rows at EXACTLY the lsm1 configuration, for one meta and one
+    value of the hier column ('' = plain, 'additive' = the operator)."""
+    out = []
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if (r["hier"] or "") != hier:
+                continue
+            if (r["network"] != NET or r["dataset"] != DSET
+                    or r["granularity"] != GRAN or r["alpha0"] != ALPHA0
+                    or r["base"] != "SGDm" or r["meta"] != meta
+                    or r["meta_stepsize"] != MST or r["beta_clip"] != CLIP
+                    or r["augment"] != AUG or r["batch_size"] != str(BATCH)
+                    or r["gamma"] != str(GAMMA)):
+                continue
+            if (r["epochs_requested"] != str(EPOCHS) or r["collapsed"] != "0"
+                    or r["complete"] != "1" or r["superseded"] != "0"
+                    or not r["plateau5"]):
+                continue
+            out.append(r)
+    return out
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN-CELL SD of plateau5 over the archived Lion additive
+    r-cells.  Returns (sigma, df, n_runs, n_cells)."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path, "Lion", "additive"):
+        by["%g" % float(r["eta_ratio"])].append(float(r["plateau5"]))
+    num = den = 0.0
+    n = 0
+    for v in by.values():
+        n += len(v)
+        if len(v) > 1:
+            s = statistics.stdev(v)
+            num += s * s * (len(v) - 1)
+            den += len(v) - 1
+    if den <= 0:
+        return None, 0, n, len(by)
+    return math.sqrt(num / den), int(den), n, len(by)
+
+
+def prior_curve_from_csv(path=CSV, meta="Lion"):
+    """The archived additive r-curve for one meta.  {r_string: (mean, n, nbatch)}."""
+    by = collections.defaultdict(list)
+    bt = collections.defaultdict(set)
+    for r in _cell_rows(path, meta, "additive"):
+        k = "%g" % float(r["eta_ratio"])
+        by[k].append(float(r["plateau5"]))
+        bt[k].add(_batch_key(r["run"]))
+    return dict((k, (statistics.mean(v), len(v), len(bt[k])))
+                for k, v in by.items())
+
+
+def plain_prior_from_csv(path=CSV, meta="Lion"):
+    """Plain layerwise HIER=none at the lsm1 cell for one meta, as a GRAND MEAN
+    OVER BATCHES.  Returns (grand_mean, between_batch_sd, n_batches, n_runs)."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path, meta, ""):
+        by[_batch_key(r["run"])].append(float(r["plateau5"]))
+    if not by:
+        return None, None, 0, 0
+    means = [statistics.mean(v) for v in by.values()]
+    nrun = sum(len(v) for v in by.values())
+    sd = statistics.stdev(means) if len(means) > 1 else 0.0
+    return statistics.mean(means), sd, len(means), nrun
+
+
+def g1_band_from_csv(path=CSV, meta="Lion"):
+    """The registered no-op band for one meta: 3.0 sigma on the combined
+    between-batch + 3-seed + prior-mean noise.  Re-derived, never quoted."""
+    gm, sd, nb, _n = plain_prior_from_csv(path, meta)
+    if gm is None or nb < 1:
+        return None
+    return 3.0 * math.sqrt(sd ** 2 + (SIGMA_W ** 2) / len(SEEDS)
+                           + (sd ** 2) / nb)
+
+
+def premise_endpoints_missing(path=CSV):
+    """THE PREMISE: the archived Adam additive curve has NO endpoint.  Returns
+    the sorted list of archived Adam r rungs so the caller can print it."""
+    return sorted(prior_curve_from_csv(path, "Adam"), key=float)
+
+
+def premise_adam_is_alive(path=CSV):
+    """THE FEASIBILITY PREMISE, measured: the Adam arm is not dead at this cell
+    and the operator MOVES it.  Returns (plain_adam, best_archived_additive)."""
+    gm, _sd, _nb, _n = plain_prior_from_csv(path, "Adam")
+    pc = prior_curve_from_csv(path, "Adam")
+    if gm is None or not pc:
+        return None, None
+    return gm, max(v[0] for v in pc.values())
+
+
+# --------------------------------------------------------------------------
+# reading the runs.  The cell of a run is MEASURED from its own ARGS/ENV.
+# --------------------------------------------------------------------------
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ = []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals = []
+            j = i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff = collections.OrderedDict()
+    seen = collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    dup = dict((f, v) for f, v in seen.items() if len(v) > 1)
+    return eff, dup
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    """{'args':.., 'dup':.., 'env':.., 'series':{ep: acc}} or None."""
+    args = env = None
+    ser = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    ser[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "series": ser, "path": path}
+
+
+def plateau5(series, budget=EPOCHS, w=5):
+    """Mean of the last 5 test epochs.  Epochs are 0-indexed in the .out."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# G0 -- PROVENANCE.  The meta axis is checked at FLAG level (the ml2/sm3 bug).
+# --------------------------------------------------------------------------
+META_FLAGS = {
+    "Adam": {"require": {"alg-meta": "Adam", "normalizer-param-meta": "0.999",
+                         "momentum-param-meta": "0.9", "weight-decay-meta": "0"},
+             "forbid": ["Lion-beta2-meta"]},
+    "Lion": {"require": {"alg-meta": "Lion", "Lion-beta2-meta": "0.9",
+                         "momentum-param-meta": "0.99", "weight-decay-meta": "0"},
+             "forbid": ["normalizer-param-meta"]},
+}
+
+
+def gate0(recs):
+    """Returns (cells, dropped) where cells maps (meta, r, seed) to plateau5."""
+    want_args = {"NN-name": NET, "dataset": DSET, "stepsize-groups": GRAN,
+                 "alpha0": ALPHA0, "meta-stepsize": MST,
+                 "num-epochs": str(EPOCHS), "batch-size": str(BATCH),
+                 "gamma": str(GAMMA), "alg-base": "SGDm",
+                 "momentum-param-base": "0.99", "weight-decay-base": "0.1"}
+    want_env = {"HIER": "additive", "AUGMENT": AUG, "BETA_CLIP": CLIP,
+                "PROBE": PROBE, "SCHED": "none"}
+    cells, dropped = {}, []
+    for rec in recs:
+        why = []
+        if rec["dup"]:
+            why.append("REPEATED FLAG %s (RULE 20)" % ",".join(sorted(rec["dup"])))
+        for f, w in want_args.items():
+            got = rec["args"].get(f)
+            if got is None:
+                why.append("--%s absent" % f)
+            elif norm_num(w) is not None and norm_num(got) is not None:
+                if norm_num(got) != norm_num(w):
+                    why.append("--%s=%s want %s" % (f, got, w))
+            elif got != w:
+                why.append("--%s=%s want %s" % (f, got, w))
+        for k, w in want_env.items():
+            got = rec["env"].get(k)
+            if got != w:
+                why.append("ENV %s=%s want %s" % (k, got, w))
+
+        meta = rec["args"].get("alg-meta")
+        if meta not in METAS:
+            why.append("--alg-meta=%s is not a registered arm" % meta)
+        else:
+            spec = META_FLAGS[meta]
+            for f, w in spec["require"].items():
+                got = rec["args"].get(f)
+                if got is None:
+                    why.append("--%s absent on a %s run" % (f, meta))
+                elif norm_num(got) != norm_num(w):
+                    why.append("--%s=%s want %s on a %s run" % (f, got, w, meta))
+            for f in spec["forbid"]:
+                if f in rec["args"]:
+                    why.append("--%s present on a %s run (wrong family)" % (f, meta))
+
+        r = norm_num(rec["env"].get("ETA_RATIO"))
+        sd = rec["args"].get("seed")
+        if meta in METAS:
+            if r is None or r not in [norm_num(x) for x in RS_BY_META[meta]]:
+                why.append("ETA_RATIO=%s is not a registered rung for %s"
+                           % (rec["env"].get("ETA_RATIO"), meta))
+        if sd not in SEEDS:
+            why.append("--seed=%s not a registered seed" % sd)
+        p5 = plateau5(rec["series"])
+        if p5 is None:
+            why.append("fewer than %d completed epochs (max ep %s)"
+                       % (EPOCHS, max(rec["series"]) if rec["series"] else "none"))
+        rn = rec["args"].get("run-name", "")
+        if rn and not os.path.basename(rec["path"]).startswith(rn + "-"):
+            why.append("filename disagrees with --run-name %s" % rn)
+        if why:
+            dropped.append((os.path.basename(rec["path"]), why))
+            continue
+        cells.setdefault((meta, r, sd), p5)
+    return cells, dropped
+
+
+def cell_means(cells):
+    """{(meta, r): (mean, n, [values])} keyed on NORMALISED rung strings."""
+    by = collections.defaultdict(list)
+    for (meta, r, _s), v in cells.items():
+        by[(meta, r)].append(v)
+    return dict((k, (statistics.mean(v), len(v), sorted(v)))
+                for k, v in by.items())
+
+
+def batch_noise(cells):
+    """Pooled WITHIN-CELL SD of THIS batch.  (sigma, df, n_cells)."""
+    by = collections.defaultdict(list)
+    for (meta, r, _s), v in cells.items():
+        by[(meta, r)].append(v)
+    num = den = 0.0
+    for v in by.values():
+        if len(v) > 1:
+            s = statistics.stdev(v)
+            num += s * s * (len(v) - 1)
+            den += len(v) - 1
+    if den <= 0:
+        return None, 0, len(by)
+    return math.sqrt(num / den), int(den), len(by)
+
+
+# --------------------------------------------------------------------------
+# probe rails -- G6, descriptive only
+# --------------------------------------------------------------------------
+def rails(probe_dir, frac_tail=0.5):
+    """(rec_lo, rec_hi) over the last `frac_tail` of records, or None."""
+    p = os.path.join(probe_dir, "probe.jsonl")
+    if not os.path.exists(p):
+        return None
+    recs = []
+    try:
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                if '"n_at_lo"' in line:
+                    recs.append(line)
+    except IOError:
+        return None
+    if not recs:
+        return None
+    lo = hi = tot = 0
+    for line in recs[int(len(recs) * (1 - frac_tail)):]:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        nb = d.get("n_beta") or 0
+        if not nb:
+            continue
+        lo += d.get("n_at_lo") or 0
+        hi += d.get("n_at_hi") or 0
+        tot += nb
+    if not tot:
+        return None
+    return lo / float(tot), hi / float(tot)
+
+
+# --------------------------------------------------------------------------
+# THE VERDICT.  Registered, and there is no further branch.
+# --------------------------------------------------------------------------
+def verdict(peak_a, manifold_ok, noise_ok, gap_risk):
+    if not noise_ok:
+        return UNRES_NOISY
+    if not manifold_ok:
+        return UNRES_NOMAN
+    if peak_a >= SURVIVE_BAR:
+        return SURVIVES
+    if peak_a <= VANISH_BAR:
+        return UNRES_TRUNC if gap_risk else VANISHES
+    return UNRES
+
+
+VERDICT_TEXT = {
+    SURVIVES: ("The interior peak SURVIVES under a non-sign meta-optimiser: "
+               "PEAK_A >= %.2f pp, at least half the archived Lion lift.  The "
+               "audit's |2p-1| sign account predicted it would vanish and it did "
+               "not, so that account is REFUTED as the explanation of the "
+               "interior optimum.  The optimum is a property of the additive "
+               "operator, not of Lion's sign quantisation." % SURVIVE_BAR),
+    VANISHES: ("The interior peak VANISHES under a non-sign meta-optimiser: "
+               "PEAK_A <= %.2f pp, inside the flat-curve null.  This is "
+               "CONSISTENT WITH the audit's |2p-1| sign account and is NOT proof "
+               "of it -- Lion and Adam differ in the normaliser, the momentum "
+               "form, the per-step magnitude and (by declared design) in "
+               "--momentum-param-meta as well as in the sign quantisation.  The "
+               "claim licensed is 'the interior optimum does not transfer to "
+               "Adam at this cell', not 'the sign mechanism is confirmed'."
+               % VANISH_BAR),
+    UNRES: ("PEAK_A lands strictly between the two registered bars.  Neither "
+            "branch is claimed.  Reported as UNRESOLVED."),
+    UNRES_TRUNC: ("PEAK_A is inside the vanishing band, but the Adam argmax sits "
+                  "on the rung adjacent to the unsampled interval (0, 0.03), so a "
+                  "taller peak may be hidden there and the vanishing is not "
+                  "established.  Reported as UNRESOLVED; the fix is rungs at "
+                  "r = 0.01 and 0.015, not a softer bar."),
+    UNRES_NOMAN: ("The LION arm of this batch does not itself show the interior "
+                  "lift, so this batch is not on the manifold where the "
+                  "phenomenon exists and the Lion-specificity question cannot be "
+                  "asked of it."),
+    UNRES_NOISY: ("This batch's own within-cell SD exceeds %.1f x the archived "
+                  "noise floor the bars were computed at.  The bars no longer "
+                  "hold and no verdict is read off them." % NOISE_MULT),
+    VOID: "Provenance failed.  Nothing is read and no number is quoted.",
+}
+
+
+# --------------------------------------------------------------------------
+def selftest():
+    src = open(SCRIPT).read() if os.path.exists(SCRIPT) else ""
+    # This file's header block is the REGISTRATION.  It is a `#` comment block,
+    # not a docstring, so it is read from the source and cut at the first line
+    # of code -- otherwise a check would match its own assertion line and be
+    # tautological.
+    doc = open(os.path.abspath(__file__)).read().split("from __future__")[0]
+    flat = " ".join(doc.split())
+    p = n = 0
+
+    def ok(label, cond):
+        nonlocal p, n
+        n += 1
+        p += bool(cond)
+        print("    %-74s %s" % (label, "ok" if cond else "FAIL"))
+
+    print("cA3_lsm1_score selftest")
+
+    print("  -- the design, asserted against the BATCH SCRIPT's own text --")
+    ok("the batch script exists", os.path.exists(SCRIPT))
+    ok("PREFIX matches the script", "PREFIX=%s" % PREFIX in src)
+    ok("NET matches the script", "NET=%s" % NET in src)
+    ok("DSET matches the script", "DSET=%s" % DSET in src)
+    ok("GRAN matches the script", "GRAN=%s" % GRAN in src)
+    ok("ALPHA0 matches the script", "ALPHA0=%s" % ALPHA0 in src)
+    ok("the meta-stepsize matches the script", "MST=%s" % MST in src)
+    ok("EPOCHS matches the script", "EPOCHS=%d" % EPOCHS in src)
+    ok("BATCH matches the script", "BATCH=%d" % BATCH in src)
+    ok("GAMMA matches the script", "GAMMA=%d" % GAMMA in src)
+    ok("the box matches the script", 'CLIP="%s"' % CLIP in src)
+    ok("AUGMENT matches the script", "AUG=%s" % AUG in src)
+    ok("PROBE matches the script", "PROBE=%s" % PROBE in src)
+    ok("the layerwise group count matches the script",
+       "M_LAYERWISE=%d" % M_LAYERWISE in src)
+    ok("the walltime matches the script", "WALL=%s" % WALL in src)
+    ok("the Adam rungs match the script", 'RS_ADAM="%s"' % " ".join(RS_ADAM) in src)
+    ok("the Lion rungs match the script", 'RS_LION="%s"' % " ".join(RS_LION) in src)
+    ok("the seeds match the script", 'SEEDS="%s"' % " ".join(SEEDS) in src)
+    ok("NJOBS matches the script", "NJOBS=%d" % NJOBS in src and NJOBS == 24)
+    ok("the script submits under the %s- run-name prefix" % PREFIX,
+       'RN="$PREFIX-${MTAG}-r${RTAG}-s${S}"' in src)
+    ok("the script's probe dir carries the %s tag" % PREFIX,
+       "probe_${MTAG}_${RTAG}_${PREFIX}_s${S}" in src)
+    ok("the script names THIS scorer as its registration",
+       "cA3_lsm1_score.py" in src)
+
+    print("  -- the bars, present and identically worded in both files --")
+    ok("SURVIVE_BAR is in the script", "SURVIVE_BAR=%.2f" % SURVIVE_BAR in src)
+    ok("VANISH_BAR is in the script", "VANISH_BAR=%.2f" % VANISH_BAR in src)
+    ok("SIGMA_W is in the script", "SIGMA_W=%.4f" % SIGMA_W in src)
+    ok("NOISE_MULT is in the script", "NOISE_MULT=%.1f" % NOISE_MULT in src)
+    ok("the Lion no-op band is in the script",
+       "G1_BAND_LION=%.4f" % G1_BAND["Lion"] in src)
+    ok("the Adam no-op band is in the script",
+       "G1_BAND_ADAM=%.4f" % G1_BAND["Adam"] in src)
+    ok("the bars are ordered SURVIVE > VANISH", SURVIVE_BAR > VANISH_BAR)
+    ok("the gap between the bars is registered as UNRESOLVED",
+       "no third reading of the gap" in flat)
+
+    print("  -- the gates, registered in BOTH files --")
+    for g in ("G0", "G1", "G2", "G3", "G4", "G5", "G6", "G7"):
+        ok("gate %s is registered in this scorer" % g, "#   %s " % g in doc)
+        ok("gate %s is registered in the batch script" % g, "#   %s " % g in src)
+
+    print("  -- the noise floor, RE-DERIVED from the corpus, not quoted --")
+    sig, df, nr, nc = noise_floor_from_csv()
+    ok("the CSV is present", os.path.exists(CSV))
+    ok("the pooled within-cell SD re-derives to %.4f (got %s)"
+       % (SIGMA_W, "%.4f" % sig if sig else "none"),
+       sig is not None and abs(sig - SIGMA_W) <= SIGMA_TOL)
+    ok("it rests on >= 40 df (got %d)" % df, df >= 40)
+    ok("it rests on >= 8 r-cells (got %d)" % nc, nc >= 8)
+
+    print("  -- the bars against the SIMULATED null, fixed seed --")
+    random.seed(20260904)
+    se = SIGMA_W / math.sqrt(len(SEEDS))
+    N = 200000
+    draws = []
+    for _ in range(N):
+        c = dict((r, random.gauss(0, se)) for r in RS_ADAM)
+        draws.append(max(c[r] for r in R_INTERIOR_ADAM)
+                     - max(c[r] for r in R_ENDPOINTS))
+    draws.sort()
+    q95 = draws[int(0.95 * N)]
+    p_false_survive = sum(1 for d in draws if d >= SURVIVE_BAR) / float(N)
+    p_catch_null = sum(1 for d in draws if d <= VANISH_BAR) / float(N)
+    print("       null PEAK_A p95 = %.3f pp;  P(>=SURVIVE_BAR) = %.5f;  "
+          "P(<=VANISH_BAR) = %.4f" % (q95, p_false_survive, p_catch_null))
+    ok("VANISH_BAR is at or above the simulated null p95", VANISH_BAR >= q95)
+    ok("VANISH_BAR catches >= 95% of genuinely flat curves", p_catch_null >= 0.95)
+    ok("the false-SURVIVES rate under a flat null is < 1e-3", p_false_survive < 1e-3)
+    ok("SURVIVE_BAR is >= 4 SE-of-difference",
+       SURVIVE_BAR / (SIGMA_W * math.sqrt(2.0 / len(SEEDS))) >= 4.0)
+    ok("SURVIVE_BAR is HALF the archived Lion lift",
+       abs(SURVIVE_BAR - ARCHIVED_LION_PEAK / 2.0) <= 0.01)
+
+    print("  -- the priors, RE-DERIVED per meta --")
+    for meta in METAS:
+        gm, bsd, nb, nrun = plain_prior_from_csv(meta=meta)
+        ok("%s plain-layerwise prior re-derives to %.4f (got %s)"
+           % (meta, PLAIN_PRIOR[meta], "%.4f" % gm if gm else "none"),
+           gm is not None and abs(gm - PLAIN_PRIOR[meta]) <= 0.002)
+        band = g1_band_from_csv(meta=meta)
+        ok("%s G1 band re-derives to %.4f (got %s)"
+           % (meta, G1_BAND[meta], "%.4f" % band if band else "none"),
+           band is not None and abs(band - G1_BAND[meta]) <= 0.002)
+        ok("%s prior rests on >= 3 distinct batches (got %d)" % (meta, nb), nb >= 3)
+    ok("the two plain priors are closer than the Adam band, so G1 CANNOT be "
+       "the meta-identity check",
+       abs(PLAIN_PRIOR["Lion"] - PLAIN_PRIOR["Adam"]) < G1_BAND["Adam"])
+    ok("that limitation is stated in this file",
+       "G1 IS NOT THE META-IDENTITY CHECK" in doc)
+
+    pc = prior_curve_from_csv(meta="Lion")
+    for k, want in sorted(PRIOR_LION.items()):
+        got = pc.get(k)
+        ok("archived Lion additive r=%-5s re-derives to %.4f (got %s)"
+           % (k, want, "%.4f" % got[0] if got else "absent"),
+           got is not None and abs(got[0] - want) <= 0.002)
+    lift = PRIOR_LION["0.06"] - max(PRIOR_LION["0"], PRIOR_LION["1"])
+    ok("the archived Lion interior lift re-derives to %.4f" % ARCHIVED_LION_PEAK,
+       abs(lift - ARCHIVED_LION_PEAK) <= 0.002)
+    ok("it is >= 2 x SURVIVE_BAR", lift >= 2 * SURVIVE_BAR - 0.01)
+
+    print("  -- THE PREMISE: the archived Adam curve has NO ENDPOINT --")
+    rungs = premise_endpoints_missing()
+    print("       archived Adam additive r rungs: %s" % rungs)
+    ok("the corpus has Adam additive rows at all", len(rungs) > 0)
+    ok("r = 0 is ABSENT from the archive", "0" not in rungs)
+    ok("r = 1 is ABSENT from the archive", "1" not in rungs)
+    ok("so PEAK cannot be formed from the archive alone",
+       not (set(R_ENDPOINTS) <= set(rungs)))
+    pa = prior_curve_from_csv(meta="Adam")
+    for k, want in sorted(PRIOR_ADAM.items()):
+        got = pa.get(k)
+        ok("archived Adam additive r=%-5s re-derives to %.4f (got %s)"
+           % (k, want, "%.4f" % got[0] if got else "absent"),
+           got is not None and abs(got[0] - want) <= 0.002)
+
+    print("  -- THE FEASIBILITY PREMISE: the Adam arm is ALIVE and RESPONSIVE --")
+    plain_a, best_a = premise_adam_is_alive()
+    print("       plain Adam %.3f   best archived Adam additive %.3f   lift %+.3f"
+          % (plain_a, best_a, best_a - plain_a))
+    ok("plain Adam is not a dead arm (> 85 pp)", plain_a > 85.0)
+    ok("plain Adam is within 1 pp of plain Lion at the same cell",
+       abs(PLAIN_PRIOR["Lion"] - plain_a) < 1.0)
+    ok("the operator already MOVES Adam by more than SURVIVE_BAR",
+       best_a - plain_a > SURVIVE_BAR)
+    ok("the feasibility argument is stated in this file",
+       "demonstrably ALIVE and" in doc)
+
+    print("  -- the asymmetries, declared in this file BEFORE the data --")
+    ok("the Adam interior is sampled more finely than the Lion interior",
+       len(R_INTERIOR_ADAM) > 1 and len(RS_ADAM) > len(RS_LION))
+    ok("and that asymmetry is declared to work AGAINST the prediction",
+       "works against the registered prediction" in flat)
+    ok("the asymmetric inference is declared",
+       "THE INFERENCE IS ASYMMETRIC AND THIS FILE SAYS SO IN ADVANCE" in doc)
+    ok("a vanishing is pre-committed to 'consistent with', never 'confirms'",
+       "CONSISTENT WITH the sign account, and NOT proof of it" in doc
+       and "CONSISTENT WITH the audit's |2p-1| sign account and is NOT proof"
+       in VERDICT_TEXT[VANISHES])
+    ok("the momentum-param-meta confound is declared",
+       "momentum-param-meta ASYMMETRY, DECLARED RATHER THAN HIDDEN" in doc)
+    ok("PEAK is declared a LOWER bound on the true lift",
+       "PEAK IS A LOWER BOUND ON THE TRUE INTERIOR LIFT" in doc)
+
+    print("  -- the verdict table, every branch reachable and distinct --")
+    ok("a big interior peak -> SURVIVES",
+       verdict(0.9, True, True, False) == SURVIVES)
+    ok("a flat Adam curve -> VANISHES",
+       verdict(0.05, True, True, False) == VANISHES)
+    ok("between the bars -> UNRESOLVED",
+       verdict(0.35, True, True, False) == UNRES)
+    ok("the gap risk KILLS a VANISHES",
+       verdict(0.05, True, True, True) == UNRES_TRUNC)
+    ok("the gap risk CANNOT touch a SURVIVES",
+       verdict(0.9, True, True, True) == SURVIVES)
+    ok("a failed manifold gate beats the primary",
+       verdict(0.9, False, True, False) == UNRES_NOMAN
+       and verdict(0.05, False, True, False) == UNRES_NOMAN)
+    ok("a failed noise gate beats everything",
+       verdict(0.9, True, False, False) == UNRES_NOISY
+       and verdict(0.05, False, False, True) == UNRES_NOISY)
+    ok("every verdict has registered prose",
+       all(k in VERDICT_TEXT for k in
+           (SURVIVES, VANISHES, UNRES, UNRES_TRUNC, UNRES_NOMAN,
+            UNRES_NOISY, VOID)))
+
+    print("  -- the reader, exercised on synthetic input --")
+    adam_line = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 "
+                 "--weight-decay-base 0.1 --alg-meta Adam "
+                 "--normalizer-param-meta 0.999 --momentum-param-meta 0.9 "
+                 "--weight-decay-meta 0 --dataset CIFAR10 --NN-name ResNet18 "
+                 "--batch-size 100 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+                 "--num-epochs 100 --stepsize-groups layerwise --seed 0")
+    lion_line = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 "
+                 "--weight-decay-base 0.1 --alg-meta Lion "
+                 "--momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+                 "--weight-decay-meta 0 --dataset CIFAR10 --NN-name ResNet18 "
+                 "--batch-size 100 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+                 "--num-epochs 100 --stepsize-groups layerwise --seed 0")
+    eff, dup = parse_args_line(adam_line)
+    ok("the ARGS parser finds no repeat in a clean Adam line", not dup)
+    ok("the ARGS parser reads alg-meta", eff["alg-meta"] == "Adam")
+    eff2, dup2 = parse_args_line(adam_line + " --alg-meta Lion")
+    ok("the ARGS parser CATCHES the ml2/sm3 duplicated --alg-meta",
+       "alg-meta" in dup2)
+    ok("and reports argparse's effective value", eff2["alg-meta"] == "Lion")
+
+    def rec_of(line, r, meta):
+        e, d = parse_args_line(line)
+        return {"args": e, "dup": d, "argsline": line,
+                "env": parse_env_line("AUGMENT=1 BETA_CLIP=%s HIER=additive "
+                                      "ETA_RATIO=%s SCHED=none PROBE=5"
+                                      % (CLIP, r)),
+                "series": dict((k, 90.0) for k in range(EPOCHS)),
+                "path": "/x/%s-%s-r%s-s0-1.out" % (PREFIX, meta, r)}
+
+    good = [rec_of(adam_line, "0.06", "A"), rec_of(lion_line, "0.06", "L")]
+    cells, drop = gate0(good)
+    ok("G0 admits a clean Adam run and a clean Lion run",
+       len(cells) == 2 and not drop)
+    bad_swap = rec_of(adam_line + " --alg-meta Lion", "0.06", "A")
+    _c, d = gate0([bad_swap])
+    ok("G0 REJECTS the duplicated --alg-meta", len(d) == 1
+       and any("REPEATED FLAG" in w for w in d[0][1]))
+    bad_family = rec_of(adam_line.replace("--normalizer-param-meta 0.999",
+                                          "--Lion-beta2-meta 0.9"), "0.06", "A")
+    _c, d = gate0([bad_family])
+    ok("G0 REJECTS an Adam run carrying Lion's family flags", len(d) == 1)
+    bad_rung = rec_of(lion_line, "0.03", "L")
+    _c, d = gate0([bad_rung])
+    ok("G0 REJECTS r=0.03 on the LION arm (not a registered Lion rung)",
+       len(d) == 1)
+    bad_rung_ok = rec_of(adam_line, "0.03", "A")
+    c, d = gate0([bad_rung_ok])
+    ok("G0 ADMITS r=0.03 on the ADAM arm", len(c) == 1 and not d)
+    bad_r = rec_of(adam_line, "0.5", "A")
+    _c, d = gate0([bad_r])
+    ok("G0 REJECTS an unregistered rung", len(d) == 1)
+
+    env = parse_env_line("AUGMENT=1 BETA_CLIP=%s HIER=additive ETA_RATIO=0.06 "
+                         "SCHED=none PROBE=5" % CLIP)
+    ok("the ENV parser reads ETA_RATIO", env["ETA_RATIO"] == "0.06")
+    ok("the ENV parser reads HIER", env["HIER"] == "additive")
+    ok("plateau5 is the mean of the LAST FIVE epochs",
+       abs(plateau5(dict((e, float(e)) for e in range(100))) - 97.0) < 1e-9)
+    ok("plateau5 REFUSES a short run",
+       plateau5(dict((e, 1.0) for e in range(97))) is None)
+    sg, sdf, snc = batch_noise({("Adam", "0", "0"): 90.0, ("Adam", "0", "1"): 90.2,
+                                ("Adam", "0", "2"): 90.1})
+    ok("the batch noise meter returns a pooled SD",
+       sg is not None and abs(sg - 0.1) < 1e-9 and sdf == 2 and snc == 1)
+
+    print("  -- the refusals, stated in this file --")
+    ok("the last-20 plateau column is banned",
+       "will not report the CSV `plateau`" in flat)
+    ok("a vanishing will not be called proof",
+       "will not treat a VANISHING as proof" in flat)
+    ok("no argmax r will be named an optimum", "will not name an argmax r" in flat)
+    ok("no pooling with archived batches",
+       "will not pool lsm1 with any archived batch" in flat)
+    ok("scope is fenced away from RMSProp and other meta-stepsizes",
+       "will not claim anything about RMSProp" in flat)
+    ok("the bars will not be softened",
+       "will not soften either bar after the fact" in flat)
+    ok("a filename/ARGS disagreement is refused",
+       "will not read a run whose own ARGS line" in flat)
+    ok("G5 and G6 are declared descriptive and non-gating",
+       "DESCRIPTIVE, NEVER GATING" in doc)
+
+    print("selftest: %d/%d %s" % (p, n, "PASS" if p == n else "FAIL"))
+    return 0 if p == n else 1
+
+
+# --------------------------------------------------------------------------
+def score(runs_dir, probes_dir):
+    files = sorted(glob.glob(os.path.join(runs_dir, PREFIX + "*.out")))
+    print("=" * 78)
+    print("cA3 -- lsm1: IS THE SURVIVING INTERIOR PEAK LION-SPECIFIC?")
+    print("%d .out files under %s" % (len(files), runs_dir))
+    print("%s / %s / %s / SGDm base / alpha0 %s / ms %s / %d ep / box %s / "
+          "AUGMENT=%s / PROBE=%s" % (NET, DSET, GRAN, ALPHA0, MST, EPOCHS,
+                                     CLIP, AUG, PROBE))
+    print("Adam r %s  x  seeds %s" % (",".join(RS_ADAM), ",".join(SEEDS)))
+    print("Lion r %s  x  seeds %s" % (",".join(RS_LION), ",".join(SEEDS)))
+    print("BARS (registered before any run existed): SURVIVES if PEAK_A >= "
+          "%.2f pp; VANISHES if PEAK_A <= %.2f pp; otherwise UNRESOLVED."
+          % (SURVIVE_BAR, VANISH_BAR))
+    print("=" * 78)
+
+    recs = [r for r in (read_out(f) for f in files) if r]
+
+    print("\n--- G0  PROVENANCE, from each run's OWN ARGS/ENV line (RULE 20)")
+    print("    the meta axis is checked at FLAG level: exactly one --alg-meta,")
+    print("    plus the family flags each meta must and must not carry.")
+    cells, dropped = gate0(recs)
+    for name, why in dropped:
+        print("    DROPPED %-38s %s" % (name, "; ".join(why)))
+    means = cell_means(cells)
+    want_cells = [(m, norm_num(r)) for m in METAS for r in RS_BY_META[m]]
+    thin = [k for k in want_cells if means.get(k, (0, 0, []))[1] < MIN_SEEDS]
+    print("    %d runs admitted, %d dropped, %d/%d cells populated"
+          % (len(cells), len(dropped), len(want_cells) - len(thin),
+             len(want_cells)))
+    if thin:
+        print("    !!! cells with fewer than %d usable seeds: %s"
+              % (MIN_SEEDS, ", ".join("%s/r=%s" % k for k in thin)))
+        print("\nVERDICT: %s -- %s" % (VOID, VERDICT_TEXT[VOID]))
+        return 2
+
+    print("\n--- the two r-curves, plateau5 (mean of the last 5 test epochs)")
+    allr = sorted(set(RS_ADAM) | set(RS_LION), key=float)
+    print("    %-6s" % "meta" + "".join("%12s" % ("r=" + r) for r in allr))
+    for m in METAS:
+        row = "    %-6s" % m
+        for r in allr:
+            mm = means.get((m, norm_num(r)))
+            row += "%12s" % ("%.3f" % mm[0] if mm else "--")
+        print(row)
+    print("    n per cell: " + ", ".join(
+        "%s/r=%s:%d" % (m, r, means[(m, norm_num(r))][1])
+        for m in METAS for r in RS_BY_META[m]))
+
+    # ---- G1 ---------------------------------------------------------------
+    print("\n--- G1  THE NO-OP CONTROL, ONE PER META  (r=1 additive IS plain)")
+    print("    NOTE: G1 asks whether the tree still computes what it used to.")
+    print("    It is NOT the meta-identity check -- the two plain priors are")
+    print("    only %.3f pp apart, inside the Adam band.  G0 is that check."
+          % abs(PLAIN_PRIOR["Lion"] - PLAIN_PRIOR["Adam"]))
+    g1_fail = False
+    for m in METAS:
+        gm, bsd, nb, nrun = plain_prior_from_csv(meta=m)
+        band = g1_band_from_csv(meta=m)
+        got = means[(m, norm_num("1"))][0]
+        d1 = got - gm
+        okg = abs(d1) <= band
+        g1_fail = g1_fail or not okg
+        print("    %-5s archived plain %.3f (%d batches, %d runs, between-batch "
+              "sd %.3f)" % (m, gm, nb, nrun, bsd))
+        print("    %-5s lsm1 r=1      %.3f   difference %+.3f pp   band +-%.4f   %s"
+              % (m, got, d1, band, "PASS" if okg else "FAIL"))
+    if g1_fail:
+        print("    The additive operator at r=1 is not the identity on this tree,")
+        print("    or the tree moved.  Nothing downstream is readable.")
+        print("\nVERDICT: %s -- %s" % (VOID, VERDICT_TEXT[VOID]))
+        return 2
+
+    # ---- G4 (computed early; it gates the primary) -------------------------
+    print("\n--- G4  THE NOISE GATE  (this batch's own within-cell SD)")
+    bsig, bdf, bnc = batch_noise(cells)
+    ceiling = NOISE_MULT * SIGMA_W
+    noise_ok = bsig is not None and bsig <= ceiling
+    print("    archived SIGMA_W %.4f pp (df 47, 10 cells) -- the bars were "
+          "computed at this" % SIGMA_W)
+    print("    this batch  %.4f pp (df %d, %d cells)   ceiling %.1f x = %.4f   %s"
+          % (bsig if bsig else float("nan"), bdf, bnc, NOISE_MULT, ceiling,
+             "PASS" if noise_ok else "FAIL"))
+
+    # ---- G2 ---------------------------------------------------------------
+    print("\n--- G2  THE TRUNCATION GATE  (constrains ONLY a vanishing)")
+    adam = dict((r, means[("Adam", norm_num(r))][0]) for r in RS_ADAM)
+    argmax_a = max(RS_ADAM, key=lambda r: adam[r])
+    gap_risk = (argmax_a == R_GAP_ADJACENT)
+    print("    Adam argmax over the 5 rungs is r=%s (%.3f)" % (argmax_a, adam[argmax_a]))
+    print("    the unsampled interval is (0, %s); risk flagged only when the "
+          "argmax sits on r=%s: %s" % (R_GAP_ADJACENT, R_GAP_ADJACENT, gap_risk))
+    print("    PEAK_A is a LOWER bound (both endpoints sampled exactly), so this")
+    print("    can only overturn a VANISHES, never a SURVIVES.")
+
+    # ---- G3 ---------------------------------------------------------------
+    print("\n--- G3  THE MANIFOLD GATE  (the LION arm must show the lift here)")
+    lion = dict((r, means[("Lion", norm_num(r))][0]) for r in RS_LION)
+    peakm_l = lion["0.06"] - max(lion["0"], lion["1"])
+    manifold = peakm_l >= SURVIVE_BAR
+    for r in RS_LION:
+        print("    Lion r=%-5s  %.3f      (archived %s)"
+              % (r, lion[r], "%.3f" % PRIOR_LION[r] if r in PRIOR_LION else "--"))
+    print("    PEAKm(Lion) = %+.3f pp   bar %.2f   %s   "
+          "(archived at this cell %+.3f)"
+          % (peakm_l, SURVIVE_BAR, "PASS" if manifold else "FAIL",
+             ARCHIVED_LION_PEAK))
+
+    # ---- G5 ---------------------------------------------------------------
+    print("\n--- G5  CROSS-BATCH REPRODUCIBILITY  (DESCRIPTIVE, never gating)")
+    pa = prior_curve_from_csv(meta="Adam")
+    got = adam["0.03"]
+    ref = pa.get("0.03")
+    if ref:
+        print("    lsm1 Adam r=0.03 %.3f  vs archived `adg` %.3f (n=%d, %d batch)"
+              "   difference %+.3f pp   [disclosure band +-%.2f]"
+              % (got, ref[0], ref[1], ref[2], got - ref[0], G5_BAND))
+        print("    %s.  Every contrast in G7 is WITHIN this batch, so this "
+              "cannot change it."
+              % ("within the disclosure band" if abs(got - ref[0]) <= G5_BAND
+                 else "OUTSIDE the disclosure band -- batch effects are large"))
+    else:
+        print("    no archived Adam r=0.03 cell in the CSV; check skipped.")
+
+    # ---- G6 ---------------------------------------------------------------
+    print("\n--- G6  THE BOX METER  (DESCRIPTIVE, cannot change the verdict)")
+    if probes_dir and os.path.isdir(probes_dir):
+        seen = 0
+        for d in sorted(glob.glob(os.path.join(probes_dir, "probe_*"))):
+            rr = rails(d)
+            if rr is None:
+                continue
+            seen += 1
+            print("    %-44s rec_lo %.4f  rec_hi %.4f"
+                  % (os.path.basename(d), rr[0], rr[1]))
+        if not seen:
+            print("    no readable probe.jsonl under %s" % probes_dir)
+    else:
+        print("    no probe directory given (--probes); the meter is skipped.")
+        print("    It is descriptive only, so skipping it changes nothing below.")
+
+    # ---- G7 ---------------------------------------------------------------
+    print("\n--- G7  THE PRIMARY")
+    peak_a = (max(adam[r] for r in R_INTERIOR_ADAM)
+              - max(adam[r] for r in R_ENDPOINTS))
+    span_a = max(adam.values()) - min(adam.values())
+    span_l = max(lion.values()) - min(lion.values())
+    peakm_a = adam["0.06"] - max(adam["0"], adam["1"])
+    delta = peakm_l - peakm_a
+    print("    PRIMARY")
+    print("      PEAK_A = best interior {%s} - best endpoint {%s} = %+.3f pp"
+          % (",".join(R_INTERIOR_ADAM), ",".join(R_ENDPOINTS), peak_a))
+    print("      [SURVIVES at >= %.2f | VANISHES at <= %.2f | else UNRESOLVED]"
+          % (SURVIVE_BAR, VANISH_BAR))
+    print("    SECONDARY, on the MATCHED sub-grid {%s} so it rests on no "
+          "asymmetry" % ",".join(R_MATCHED))
+    print("      PEAKm(Lion) = %+.3f   PEAKm(Adam) = %+.3f   DELTA = %+.3f pp"
+          % (peakm_l, peakm_a, delta))
+    print("    DESCRIPTIVE, declared in advance, never able to change the verdict")
+    print("      argmax  Adam r=%-5s  Lion r=%-5s"
+          % (argmax_a, max(RS_LION, key=lambda r: lion[r])))
+    print("      SPAN    Adam %.3f     Lion %.3f" % (span_a, span_l))
+    print("      POOL (c(r=0) - c(r=1))  Adam %+.3f   Lion %+.3f"
+          % (adam["0"] - adam["1"], lion["0"] - lion["1"]))
+
+    v = verdict(peak_a, manifold, noise_ok, gap_risk)
+    print("\n" + "=" * 78)
+    print("VERDICT: %s" % v)
+    print("  %s" % VERDICT_TEXT[v])
+    print("=" * 78)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runs", default=None)
+    ap.add_argument("--probes", default=None)
+    a = ap.parse_args()
+    if a.selftest or not a.runs:
+        return selftest()
+    return score(a.runs, a.probes)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

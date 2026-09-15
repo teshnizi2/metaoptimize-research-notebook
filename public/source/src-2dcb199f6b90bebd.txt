@@ -1,0 +1,467 @@
+#!/bin/bash
+# =============================================================================
+# cK1_cut_position_sweep.sh -- `cpk1`, THE CUT-POSITION SWEEP AT FIXED m = 2,
+#                              SUBMITTED AS ONE BATCH.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches /cluster/account_a and nothing is submitted to cluster_a.
+# Every guard and every scancel line below is filtered on the `cpk1-` prefix
+# alone, so no job this script did not submit can be affected.
+#
+# REGISTERED SCORER: analysis/cK1_cpk1_score.py, git-committed BEFORE this batch
+# is submitted (STANDING RULE 21).  Every bar quoted here is frozen there, and
+# that file's --selftest re-derives every archived number from
+# results/all_runs.csv, re-derives cbl1's own five cut positions from the
+# corpus, re-derives every partition from its own spec string and the frozen
+# per-tensor parameter table, and asserts each constant against THIS FILE'S own
+# text.
+#
+# NO CODE PATCH.  Optimizers/HF.py::polish_the_stepsize_groups already parses an
+# explicit int list given as the STRING "[a,b]" into CONTIGUOUS groups in
+# named_parameters() order.  GUARD 4 below re-proves that on the LIVE model at
+# submission time and writes PARTITION-MANIFEST.txt (sizes AND per-group
+# parameter counts), which the scorer REQUIRES.  The shared tree is not
+# modified by this batch in any way.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# `cbl1` found that at fixed m = 2 the POSITION of the cut decides, not the
+# balance: [45,17] and [17,45] have IDENTICAL normalised entropy and landed
+# 16.5 pp apart (R5 MIRROR-BREAK, t +20.71).  The registered balance statistic
+# was DISQUALIFIED by its own mirror control and was NOT replaced.  What is
+# left is five points on a curve nobody has drawn:
+#
+#     k    spec       CAPTURE (cbl1, its own in-batch anchors)
+#     17   [17,45]    +0.0679
+#     31   [31,31]    +0.2159
+#     45   [45,17]    +0.4202
+#     55   [55,7]     +0.0107
+#     60   [60,2]     +0.0451
+#
+# Between k = 45 and k = 55 -- ten of sixty-two tensors -- CAPTURE falls by
+# 0.409 and nothing has been measured in between.  This batch measures it.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  13 arms x 3 seeds = 39 jobs, ONE submission.
+#
+#   ANCHORS, run IN BATCH so CAPTURE is a within-batch quantity (batch, not
+#   seed, is the unit of replication here: F(62,85) = 5.47, p 6.9e-13 for
+#   batch; F 1.21, p 0.213 for seed):
+#     k01   scalar      m = 1
+#     k62   layerwise   m = 62
+#
+#   THE SWEEP, [k, 62-k] at eleven cut positions:
+#     k = 17  24  31  38  42  45  47  49  52  55  60
+#
+#   ResNet18_c100 has 62 parameter tensors in named_parameters() order (guard 4
+#   re-proves this on the live model):
+#     1-3 stem | 4-9 layer1.0 | 10-15 layer1.1 | 16-24 layer2.0 |
+#     25-30 layer2.1 | 31-39 layer3.0 | 40-45 layer3.1 | 46-54 layer4.0 |
+#     55-60 layer4.1 | 61-62 linear
+#   so STAGE boundaries fall at k = 3, 15, 30, 45, 60.  cbl1's maximum, k = 45,
+#   is EXACTLY the layer3|layer4 boundary.
+#
+#   WHY THESE ELEVEN:
+#     * 17, 31, 45, 55, 60 are cbl1's five, re-run IN BATCH.  15 of the 39 jobs
+#       buy a WITHIN-batch replication test (X5) instead of a cross-batch
+#       comparison that batch-level variance would make inadmissible.
+#     * spacing is 7 tensors on the left flank (17, 24, 31, 38), tightening to
+#       4, 3, 2, 2, 3, 3 across the claimed peak and the collapse
+#       (42, 45, 47, 49, 52, 55), opening to 5 in the dead tail (60).
+#       Resolution is spent where cbl1 says the derivative is largest.
+#     * k = 45 and k = 17 are cbl1's mirror pair, re-run in batch for free.
+#     * k = 24 and k = 38 are a SECOND mirror pair, [24,38] / [38,24], at
+#       identical B = 0.96290 and opposite cut position.  One mirror break is
+#       an anomaly; two, at different balances and different depths, is a
+#       property of the network.
+#     * k = 49 is the grid point closest to a 50/50 split of the PARAMETERS
+#       (56.28% / 43.72%) -- the one rival account named in advance, and four
+#       tensors away from k = 45, so the two accounts pick different grid
+#       points and one submission separates them.
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / ms 1e-3 / alpha0 1e-6 /
+#   100 ep / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 / AUGMENT=1 / HIER
+#   unset / PROBE=0.  Matched cell-for-cell to cbl1 and hb1 and to the archived
+#   CIFAR-100 rows, so the batches compose.
+#
+#   CAPTURE(arm) = ( M(arm) - M(k01) ) / ( M(k62) - M(k01) ) on plateau5, both
+#   anchors measured IN BATCH.
+#
+# PRE-REGISTERED PREDICTIONS, frozen in the scorer:
+#   P1  argmax k* = 45, the layer3|layer4 STAGE boundary (tested as "45 is in
+#       the PEAK SET", the arms within 0.05 CAPTURE of the best).
+#   P2  the curve is SINGLE-PEAKED over the grid.
+#   P3  RIGHT-COLLAPSE: CAPTURE < 0.10 at every k >= 52.
+#   P4  RANGE of CAPTURE over the eleven arms >= 0.30.
+#   P5  the parameter-balance rival LOSES: k* != 49.
+#   P6  BOTH mirror pairs break by more than 0.10 CAPTURE.
+#   Where the collapse between k = 45 and k = 55 begins is NOT predicted --
+#   that is the quantity this batch exists to measure.
+#
+# PRE-REGISTERED REFUTATION CONDITIONS, frozen in the scorer, checked in order:
+#   X1 NO-POSITION-EFFECT  RANGE of CAPTURE over the eleven m=2 arms < 0.10.
+#                          THE refutation of the headline: if moving the cut
+#                          across the whole network buys less than a tenth of
+#                          the gap, cut position is NOT the operative variable
+#                          and cbl1's mirror break was batch-local.  0.10 is
+#                          4.67 pp = 8.4 SE at the re-derived noise floor.
+#   X2 MULTIMODAL          a step > 0.05 against the hump on either flank.
+#   X3 PEAK-OFF-BOUNDARY   k = 45 is not in the PEAK SET.  Kills P1; the
+#                          measured argmax is reported as the answer.
+#   X4 BROAD-PLATEAU       5 or more of the eleven arms inside the PEAK SET;
+#                          position then resolves only coarsely and no argmax
+#                          may be named.
+#   X5 CBL1-ORDER-BREAK    any of the seven pairs cbl1 separated by more than
+#                          0.10 reverses sign here.  Does NOT void this batch
+#                          -- cpk1 is normalised on its own anchors -- but
+#                          withdraws the claim that it maps cbl1's curve.
+#
+# MAY NOT CLAIM: anything about the group COUNT m (every sweep arm is m = 2 and
+# the anchors are anchors, not rungs), about resnet18_blocks, CIFAR-10,
+# Tiny-ImageNet, ImageNet-489, ResNet-50, alpha0 1e-3, any meta-stepsize but
+# 1e-3, any optimiser pair but SGDm+Lion, or any hierarchical/shrinkage
+# operator.  Normalised entropy stays DISQUALIFIED by cbl1's R5 and is NOT
+# rehabilitated by this batch whichever way it falls.
+#
+# WALLTIME, MEASURED not guessed.  cbl1 ran this exact cell on this account:
+# its 33 jobs took 30-47 wallclock minutes (median 42, max 47), 0 TIMEOUT and
+# 0 FAILED.  02:30:00 is 3.2x the worst observed, is cbl1's own request, and
+# stays inside gpu-short's 4 h ceiling so no partition in the list is excluded.
+# Total cost of this batch: 39 jobs x ~45 min ~= 30 GPU-hours.
+#
+# USAGE   bash bin/cK1_cut_position_sweep.sh            # dry run, submits nothing
+#         bash bin/cK1_cut_position_sweep.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+# NOTE: bin/_lib_guards.sh re-assigns WS at source time from METAOPT_WS with a
+# /cluster/account_a default, which would clobber this value and point
+# guard_postlaunch at the wrong account's directory (it did exactly that to tn1
+# and to hb1).  Exporting METAOPT_WS here is the documented work-around; the
+# library is NOT patched while jobs are queued.
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cpk1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP="-15:-2.3026"; MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=02:30:00
+NTENS=62
+
+# ---- the registered grid and the registered specs, written out LITERALLY ----
+# Both forms are here on purpose: K_LIST is the grid the scorer cross-checks,
+# and the G_K* strings are the exact argv the jobs receive.  guard 4c below
+# proves they agree, so neither can drift from the other or from the scorer.
+K_LIST="17 24 31 38 42 45 47 49 52 55 60"
+G_K17='[17,45]'
+G_K24='[24,38]'
+G_K31='[31,31]'
+G_K38='[38,24]'
+G_K42='[42,20]'
+G_K45='[45,17]'
+G_K47='[47,15]'
+G_K49='[49,13]'
+G_K52='[52,10]'
+G_K55='[55,7]'
+G_K60='[60,2]'
+ARMS="k01 k17 k24 k31 k38 k42 k45 k47 k49 k52 k55 k60 k62"
+
+echo "=============================================================="
+echo " cpk1 -- CIFAR-100 CUT-POSITION sweep at fixed m = 2"
+echo " $DSET / $NET  box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG"
+echo " cut positions k = $K_LIST   plus scalar and layerwise anchors"
+echo " 13 arms x 3 seeds = 39 jobs, one submission"
+echo " scorer: analysis/cK1_cpk1_score.py (registered before any run exists)"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ------
+SC="$REPO/analysis/cK1_cpk1_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: scorer missing"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cK1_cpk1_score.py bin/cK1_cut_position_sweep.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires the scorer committed BEFORE any run exists: $DIRTY"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 was verified"
+  echo "          on the host that committed the scorer.  Not a pass, not a fail."
+fi
+python3 "$SC" --selftest >/tmp/cpk1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -25 /tmp/cpk1_selftest.$$; }
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^cpk1-' "$CSVP" && guard_fail "guard 2: cpk1-* already in the CSV" \
+                         || echo "guard 2: no cpk1-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/cpk1-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cpk1-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT cpk1-*.out files already exist"
+fi
+
+# ---- guard 3: the CIFAR-100 data is actually staged on THIS account ---------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4: EVERY PARTITION PROVEN ON THE LIVE MODEL, AND WRITTEN DOWN ----
+# No assumption about tensor ordering, tensor count or parameter count:
+# named_parameters() is read from the model this batch will actually train,
+# polish_the_stepsize_groups is called on it, the GROUP MEMBERSHIP of every arm
+# is printed in full, and the manifest records sizes AND per-group parameter
+# counts so the scorer's G1 can check both.
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+
+# guard 4c: the literal spec strings and the grid must agree, BEFORE the model
+# is ever built.  A typo in one of the eleven G_K* strings dies here.
+SPECS=""
+for K in $K_LIST; do
+  eval "LIT=\${G_K$K:-}"
+  WANT="[$K,$((NTENS-K))]"
+  if [ "$LIT" != "$WANT" ]; then
+    guard_fail "guard 4c: G_K$K is '$LIT', but the grid says '$WANT'"
+  fi
+  SPECS="$SPECS $LIT"
+done
+NK=$(echo $K_LIST | wc -w | tr -d ' ')
+NA=$(echo $ARMS | wc -w | tr -d ' ')
+[ "$NA" = "$((NK+2))" ] || guard_fail "guard 4c: $NA arms for $NK cut positions + 2 anchors"
+echo "guard 4c: $NK literal specs agree with the grid; $NA arms in total"
+# shellcheck disable=SC2086
+python3 - "$CIF" "$MANIFEST" "$NTENS" $SPECS <<'PYEOF' \
+  || guard_fail "guard 4: live partition check FAILED"
+import sys, os, math
+cif, out, ntens = sys.argv[1], sys.argv[2], int(sys.argv[3])
+specs = sys.argv[4:]
+sys.path.insert(0, cif)
+os.chdir(cif)
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network("ResNet18_c100", "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+numel = [int(p.numel()) for _, p in net.named_parameters()]
+tot = sum(numel)
+T = len(nps)
+lines = ["NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot]
+print("guard 4: live ResNet18_c100 has %d parameter tensors, %d parameters"
+      % (T, tot))
+if T != ntens:
+    print("!!! guard 4: the live model has %d tensors, the batch assumes %d"
+          % (T, ntens))
+    raise SystemExit(1)
+
+# the structural landmarks this batch's registration talks about, MEASURED
+groups, cur = [], None
+for i, (n, _) in enumerate(nps, 1):
+    key = n.split(".")[0]
+    if key.startswith("layer"):
+        key = ".".join(n.split(".")[:2])
+    if key != cur:
+        groups.append([key, i, i])
+        cur = key
+    else:
+        groups[-1][2] = i
+print("guard 4: named_parameters() structure, measured on the live model:")
+for name, lo, hi in groups:
+    print("         %-12s tensors %2d..%-2d  params %9d"
+          % (name, lo, hi, sum(numel[lo - 1:hi])))
+stages, cur = [], None
+for i, (n, _) in enumerate(nps, 1):
+    key = n.split(".")[0]
+    key = "stem" if key in ("conv1", "bn1") else key
+    if key != cur:
+        stages.append([key, i, i])
+        cur = key
+    else:
+        stages[-1][2] = i
+stage_ends = [hi for _, _, hi in stages]
+print("guard 4: TOP-LEVEL stages: %s"
+      % "  ".join("%s %d..%d" % (n, lo, hi) for n, lo, hi in stages))
+print("guard 4: STAGE boundaries at k = %s  (block boundaries at k = %s)"
+      % (stage_ends, [hi for _, _, hi in groups]))
+
+def B(sizes):
+    m = len(sizes)
+    if m <= 1:
+        return 1.0
+    s = float(sum(sizes))
+    h = -sum((x / s) * math.log(x / s) for x in sizes)
+    return h / math.log(m)
+
+bad = 0
+seen = {}
+for spec in specs:
+    g = HF.polish_the_stepsize_groups(None, spec, nps)
+    sizes = [len(x) for x in g]
+    if sum(sizes) != T:
+        print("!!! guard 4: %s does not cover the model (%d of %d)"
+              % (spec, sum(sizes), T))
+        bad += 1
+        continue
+    if len(g) != 2:
+        print("!!! guard 4: %s composed to m=%d, but every sweep arm must be m=2"
+              % (spec, len(g)))
+        bad += 1
+        continue
+    want = [int(x) for x in spec[1:-1].split(",")]
+    if sizes != want:
+        print("!!! guard 4: %s composed to sizes %s on the live model" % (spec, sizes))
+        bad += 1
+        continue
+    # per-group parameter counts, from the live model
+    pc, i = [], 0
+    for s in sizes:
+        pc.append(sum(numel[i:i + s]))
+        i += s
+    k = sizes[0]
+    lines.append("SPEC %s M %d SIZES %s PARAMS %s FIRSTGROUP %s LASTGROUP %s"
+                 % (spec, len(g), ",".join(str(s) for s in sizes),
+                    ",".join(str(s) for s in pc), " ".join(g[0]), " ".join(g[-1])))
+    onb = " <- ON a segment boundary" if k in stage_ends else ""
+    print("guard 4: %-9s m=2  sizes %-8s  B=%.5f  params %9d / %-9d  "
+          "share %.5f%s"
+          % (spec, str(sizes), B(sizes), pc[0], pc[1], pc[0] / float(tot), onb))
+    print("         group 1 (%d tensors) ends at   %s" % (k, g[0][-1]))
+    print("         group 2 (%d tensors) starts at %s" % (sizes[1], g[1][0]))
+    print("         FULL group 1 = %s" % " ".join(g[0]))
+    print("         FULL group 2 = %s" % " ".join(g[1]))
+    seen[k] = (B(sizes), pc[0] / float(tot))
+
+# the two registered mirror pairs must share balance and differ in param share
+for a, b in ((17, 45), (24, 38)):
+    if a in seen and b in seen:
+        okB = abs(seen[a][0] - seen[b][0]) < 1e-12
+        okP = abs(seen[a][1] - seen[b][1]) > 0.05
+        print("guard 4: MIRROR PAIR k=%d / k=%d  B %.5f vs %.5f (%s)  "
+              "param share %.5f vs %.5f (%s)"
+              % (a, b, seen[a][0], seen[b][0], "identical" if okB else "DIFFER",
+                 seen[a][1], seen[b][1], "differ" if okP else "TOO CLOSE"))
+        if not (okB and okP):
+            bad += 1
+    else:
+        print("!!! guard 4: mirror pair k=%d / k=%d is not both on the grid" % (a, b))
+        bad += 1
+
+# The anchors are NAMED, not listed: init_meta routes them by exact string
+# match and they never reach polish_the_stepsize_groups.  That is the confound
+# the scorer discloses (the anchors use the scalar/layerwise code paths while
+# every sweep arm uses blockwise), so the guard proves the routing on the LIVE
+# source rather than assuming it.
+import inspect, re as _re
+src = inspect.getsource(HF.init_meta)
+mm = _re.search(r"stepsize_groups\s+in\s+\[([^\]]*)\]", src)
+if not mm:
+    print("!!! guard 4: could not find init_meta's exact-match routing list")
+    bad += 1
+else:
+    named = [x.strip().strip("'\"") for x in mm.group(1).split(",")]
+    print("guard 4: init_meta routes these names away from blockwise: %s" % named)
+    for name in ("scalar", "layerwise"):
+        if name in named:
+            print("guard 4: anchor %-9s takes its OWN code path (not blockwise)" % name)
+        else:
+            print("!!! guard 4: anchor %s is NOT in init_meta's named list; it would "
+                  "fall through to blockwise" % name)
+            bad += 1
+    for spec in specs:
+        if spec in named:
+            print("!!! guard 4: sweep spec %s collides with a named granularity" % spec)
+            bad += 1
+
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: %d sweep specs verified; PARTITION-MANIFEST.txt written to %s"
+      % (len(specs), out))
+PYEOF
+[ -s "$MANIFEST" ] && echo "guard 4b: manifest is non-empty" || guard_fail "guard 4b: no manifest"
+
+# ---- guard 5: capacity ------------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 39"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01) G=scalar ;;
+      k17) G=$G_K17 ;;
+      k24) G=$G_K24 ;;
+      k31) G=$G_K31 ;;
+      k38) G=$G_K38 ;;
+      k42) G=$G_K42 ;;
+      k45) G=$G_K45 ;;
+      k47) G=$G_K47 ;;
+      k49) G=$G_K49 ;;
+      k52) G=$G_K52 ;;
+      k55) G=$G_K55 ;;
+      k60) G=$G_K60 ;;
+      k62) G=layerwise ;;
+      *)   echo "!!! unknown arm $ARM"; exit 2 ;;
+    esac
+    # NOTE the single quotes around $G below: "[45,17]" is a bash bracket GLOB.
+    # Unquoted, inside the eval, it would expand against the CWD if a file named
+    # 4 or 5 or , ever existed there.  Quoted, argv reaches train.py literally
+    # and the runner's `echo "ARGS: $@"` prints it unchanged for RULE 20.
+    CMD="sbatch --job-name=cpk1-$ARM-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups '$G' --seed $S --save-directory $SAVE --run-name cpk1-$ARM-s$S"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for cpk1-$ARM-s$S"
+      guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; echo; N=$((N+1)); fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cpk1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cpk1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cpk1- added to bin/PROTECTED.txt ----"
+  # jobs/run_cifar.sh hard-codes #SBATCH --output=$WS/runs/%x-%j.out, so the .out
+  # files land in $WS/runs, NOT in --save-directory.
+  guard_postlaunch "$WS/runs" "cpk1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cpk1 job started inside the window.  This is NOT"
+       echo "         a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name cpk1-" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cpk1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+fi

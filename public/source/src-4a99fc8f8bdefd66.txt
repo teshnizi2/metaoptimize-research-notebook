@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cV1_cpr1_score.py -- THE REGISTERED SCORER FOR BATCH `cpr1`,
+#                      THE NAME-LIST PERMUTATION CONTROL.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any `cpr1` run exists.
+# STANDING RULE 16: once committed it is NEVER edited.  If it is wrong, it is
+# wrong in public and a successor scorer says so.
+#
+# RUN
+#   python3 analysis/cV1_cpr1_score.py --selftest
+#   python3 analysis/cV1_cpr1_score.py <runsdir> [--manifest <PARTITION-MANIFEST.txt>]
+# `runsdir` is POSITIONAL (cS2's convention).  score() never opens the corpus CSV;
+# --selftest is the only thing that does.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS
+# -----------------------------------------------------------------------------
+# CORRECTIONS 161.7c(ii), re-derived there from the manifest's own name lists:
+# on `ResNet18_c100` the 62 parameter tensors are, at indices 1..60, exactly
+# twenty `(conv, bn.weight, bn.bias)` triples, so with {1: conv, 2: BN scale,
+# 0: BN shift} the identity `class == index mod 3` holds at EVERY index 1..60.
+# `--stepsize-groups [k, 62-k]` takes a CONTIGUOUS PREFIX.  Therefore moving a
+# tensor into the coarse group and advancing the cut ordinal are, on this
+# architecture, THE SAME OPERATION, and no prefix-cut batch can tell the two
+# apart.  161's sign census (conv 3/3 positive, BN scale 7/7 negative, BN shift
+# 2/2 null, 15/15 sign-consistent) is therefore explicitly NOT entitled to the
+# sentence "tensor class governs the partition response".
+#
+# `cpr1` breaks that alias by holding the group COUNT (m = 2) and BOTH GROUP
+# SIZES (49 and 13) fixed while EXCHANGING ONE TENSOR across the cut.  That is
+# expressible only with PATCH_NAMESETS (`patches/patch_namesets.py`), whose
+# backward compatibility is proved by `tests/test_namesets.py` against the
+# UNPATCHED code path on 50 specs drawn from the corpus's own `granularity`
+# column.
+#
+# -----------------------------------------------------------------------------
+# THE FIVE ARMS.  5 x 3 seeds = 15 runs, 100 epochs, ONE submission.
+# -----------------------------------------------------------------------------
+#   k01  `scalar`                        m = 1.  THE FLOOR ANCHOR, IN BATCH.
+#   kL   `[49,13]`                       the LEGACY grammar, the OLD code path.
+#   kP   `sets:1-49/50-62`               the NEW grammar, PROVEN (test N2/N3) to
+#                                        compose to the identical partition and
+#                                        the identical init_meta state as kL.
+#   kS   `sets:1-48,layer4.0.bn2.weight/layer4.0.conv2.weight,51-62`
+#                                        THE SWAP.  Coarse group is still 49
+#                                        tensors; `layer4.0.conv2.weight`
+#                                        (tensor 49, 2,359,296 params, a CONV)
+#                                        and `layer4.0.bn2.weight` (tensor 50,
+#                                        512 params, a BN SCALE) are exchanged.
+#   kC   `sets:1-48,layer4.0.shortcut.0.weight/layer4.0.conv2.weight,50-51,53-62`
+#                                        THE CLASS-MATCHED CONTROL.  Coarse group
+#                                        is still 49 tensors and the tensor that
+#                                        crosses is still a CONVOLUTION
+#                                        (`layer4.0.shortcut.0.weight`, tensor 52,
+#                                        131,072 params) -- but the partition is
+#                                        just as NON-CONTIGUOUS as kS's and its
+#                                        coarse-group MASS is within 3.3 % of
+#                                        kS's.
+#
+# WHY kL AND kP ARE BOTH RUN, AND WHY THAT IS NOT WASTE.  The batch's science
+# rests on a HARNESS CHANGE.  `tests/test_namesets.py` proves the change inert
+# STATICALLY (byte-identical group membership, byte-identical init_meta state).
+# kL vs kP converts that into a MEASURED equivalence at fixed seeds: same cell,
+# same seeds, same everything, two different spec strings for the same
+# partition.  Gate R-EQUIV below turns it into a stopping condition.  Its power
+# is stated rather than implied: with SE_ARM_DIFF ~ 0.75 pp it can only exclude
+# patch effects LARGER THAN ~1.5 pp, so it CORROBORATES the static proof and
+# does not replace it.
+#
+# WHY kC IS NOT OPTIONAL, AND WHAT THE BATCH COULD NOT CLAIM WITHOUT IT.  kS is
+# the only NON-CONTIGUOUS arm in a corpus of contiguous prefixes.  If kS alone
+# fell away from kP, four accounts would remain alive and indistinguishable:
+# (a) the CLASS of the tensor that crossed, (b) a MASS THRESHOLD on that tensor,
+# (c) the coarse group's TOTAL MASS, (d) CONTIGUITY itself -- "a coarse group
+# must be a prefix; any hole degrades it".  kC is non-contiguous and low-mass
+# like kS but CONV-crossing like kP, so kC ~ kP refutes (c) and (d) together and
+# kC ~ kS confirms them together.  WITHOUT kC, `cpr1` COULD NOT SAY
+# "CLASS-OPERATIVE" AT ALL; the most it could say is "the identity of the tensor
+# that crosses, or the contiguity of the partition, matters".
+#
+# WHAT `cpr1` STILL CANNOT SEPARATE, STATED IN ADVANCE.  CLASS and a MASS
+# THRESHOLD on the crossing tensor.  161.7c(i) established that on ResNet-18 the
+# smallest convolution is 131,072 parameters and the largest normalisation
+# tensor is 512 -- a 256x gap with no overlap -- so "is a convolution" and "is
+# above ~10^5 parameters" are the same predicate on this network, and no
+# partition of THIS model can pull them apart.  THE BRIEFING'S CLAIM THAT THE
+# SWAP "separates class from the mass threshold in the same stroke" IS WRONG,
+# and this scorer does not adopt it.  What the swap separates is TENSOR IDENTITY
+# (class-or-mass-threshold, jointly) from ORDINAL POSITION / GROUP SIZE / GROUP
+# COUNT; kC additionally separates it from COARSE-GROUP TOTAL MASS and from
+# CONTIGUITY.  The verdict string `CLASS-OPERATIVE` is therefore printed with
+# the rider attached, every time, and section SCOPE forbids dropping it.
+#
+# WHY 100 EPOCHS.  The estimand is the SIGN and EXISTENCE of a swap effect, not
+# an asymptote.  cpk3's 100-epoch readouts of the same cell are the anchors the
+# point prediction is built from, so 100 is the horizon-matched choice; and
+# CORRECTIONS 161.8 records that the 772-epoch objects in this window are still
+# attenuating, which is a reason to make no asymptotic claim, not a reason to
+# spend 8x the GPU to make one badly.  CONSEQUENCE, RECORDED IN ADVANCE: `cpr1`
+# may make NO claim at any horizon other than 100 epochs, and no claim about
+# whether the swap effect attenuates.
+#
+# WHY PROBE STAYS 0, AND WHAT THAT COSTS.  161.12 asked for a PROBE-enabled arm
+# so that 152.12's rival (c) could be tested with per-tensor <h,g>.  IT IS
+# DECLINED, and the reason is structural rather than budgetary: at m = 2
+# `HF.block_product` has ALREADY reduced <h,g> to one scalar PER GROUP before
+# `_probe` ever sees it, so no PROBE interval can recover a per-tensor quantity
+# from these arms (this is cts2's and cO1's reason, re-checked on the live
+# source by the launcher's guard 4g).  Delivering per-tensor <h,g> would need a
+# SECOND harness patch, of PATCH_PROBE7's pre-reduction shape, shipped in the
+# same batch as the grammar change -- two simultaneous harness changes under one
+# RULE 20 audit, which is precisely the unauditable thing RULE 20 exists to
+# prevent.  The block-level `beta_block{0,1}` traces that 161.7c actually used
+# are written to TensorBoard at PROBE=0 anyway, so the mechanism trace is not
+# lost.  CONSEQUENCE, RECORDED IN ADVANCE: `cpr1` MAY NOT CLAIM TO HAVE TESTED
+# `152.12` RIVAL (c) AS WRITTEN.  It remains untested.
+#
+# -----------------------------------------------------------------------------
+# THE NOISE FLOOR.  RE-DERIVED FROM THE LIVE CORPUS AT REGISTRATION TIME.
+# -----------------------------------------------------------------------------
+# CORRECTIONS 156 found cts3's sigma_w had drifted between registration and
+# scoring because scl1 landed in between; CORRECTIONS 159 predicted, and 161
+# measured, the same drift for cS2 after ITS OWN ingest.  NO sigma is copied
+# forward here.  Both horizons are re-derived with cR1's estimator -- the pooled
+# within-(batch x granularity) SD of plateau5 over m = 2 arms in this exact cell
+# -- and the frozen literal is SIGMA_W = max(SIGMA_100, SIGMA_772).
+#
+# EVERY CORPUS DERIVATION IN THIS FILE EXCLUDES ROWS WHOSE `run` BEGINS WITH
+# `cpr1-`.  That is the fix for the defect CORRECTIONS 161.9 recorded against
+# cS2: cS2's header claimed cR1's ingest-proof pattern but only its section F
+# was ingest-proof, and four of its checks became known-false the moment its own
+# rows landed.  Excluding the own prefix makes EVERY frozen premise below
+# invariant under cpr1's own ingest -- not "admits two states", but ACTUALLY
+# INVARIANT -- so a --selftest FAIL after cpr1 lands is never self-inflicted and
+# always means a FOREIGN batch moved the corpus.  That is the FAIL being useful.
+# The exclusion is not decorative: kL's granularity is the literal `[49,13]`, so
+# without it cpr1's own three kL rows would enter SIGMA_100's cell list.
+#
+# AT REGISTRATION (measured on results/all_runs.csv at 2,594 rows, cpr1 excluded):
+#     SIGMA_100 = 0.917280   df 58   cells 29   members 87    <-- the max, USED
+#     SIGMA_772 = 0.864841   df 26   cells 13   members 39
+#     SIGMA_W   = 0.917280
+# The 100 stratum is the HORIZON-MATCHED one AND the larger, so the choice is
+# conservative on both readings.  Every bar below derives from the FROZEN
+# literal, never from the live value.
+#
+# -----------------------------------------------------------------------------
+# THE POINT PREDICTIONS.  Both accounts, in the same units, with the bar.
+# -----------------------------------------------------------------------------
+# Estimand: DS = M(kS) - M(kP)  and  DC = M(kC) - M(kP), plateau5 at 100 epochs.
+#
+# H-CLASS (the registered point prediction).  Single-tensor moves are ADDITIVE,
+# so exchanging tensor 49 for tensor 50 in the coarse group moves the result by
+# the difference of their measured single-tensor steps:
+#     DS_pred = [M_cpk3(k50) - M_cpk3(k49)] - [M_cpk3(k49) - M_cpk3(k48)]
+#             = (30.752667 - 55.212000) - (55.212000 - 46.210000)
+#             = -24.459333 - 9.002000 = -33.461333 pp
+#     DC_pred = [M_cts1(k52) - M_cts1(k51)] - [M_cpk3(k49) - M_cpk3(k48)]
+#             =  7.706667 - 9.002000 = -1.295333 pp
+# H-POSITION (the named alternative).  Only the group COUNT and the group SIZES
+# matter, so DS_pred = DC_pred = 0 exactly.
+#
+# THE TWO ACCOUNTS ARE 33.461333 pp APART ON DS, WHICH IS 44.68 SE_ARM_DIFF.
+# The bar that separates them is SWAP_BAR = 2 * SE_ARM_DIFF = 1.497912 pp.
+#
+# PROVENANCE OF THE ANCHORS, STATED RATHER THAN BURIED.  cpk3's four 100-epoch
+# arm means are the epoch 95-99 readouts of cpk3's own 772-epoch runs, seeds
+# {6,7,8}; --selftest re-derives them from the raw `.out` files when they are
+# reachable and SKIPS (does not FAIL) when they are not.  cts1's two are corpus
+# rows at 100 epochs, seeds {0,1,2}, re-derived from the CSV.  BOTH ARE
+# CROSS-BATCH AND CROSS-SEED, so the point prediction is a forecast across a
+# batch boundary; THE BRANCH VERDICT IS NOT -- it is computed entirely from
+# cpr1's own five arms.
+#
+# THE FLOOR PROBLEM, REGISTERED IN ADVANCE RATHER THAN DISCOVERED AFTERWARDS.
+# H-CLASS predicts M(kS) ~ M(kP) + DS_pred ~ 55.212 - 33.461 = 21.751 pp, which
+# is BELOW this cell's m = 1 scalar floor (cpk3's own k01 read 22.818 at 100).
+# So if H-CLASS is right, kS is EXPECTED to be floor-saturated and its measured
+# |DS| will be TRUNCATED.  That does not block the branch, which turns on the
+# SIGN and on |DS| > SWAP_BAR, both of which survive truncation.  IT DOES
+# FORBID QUOTING |DS| AS AN EFFECT SIZE, and R-FLOOR enforces that: a
+# floor-saturated arm's difference is reported as a BOUND, never as a value.
+#
+# -----------------------------------------------------------------------------
+# THE GATES.  They fire IN ORDER; the first failure decides.
+# -----------------------------------------------------------------------------
+# G0 PROVENANCE.  15 runs, 5 arms x 3 seeds, 15 distinct job ids, 100 of 100
+#    epoch lines each, no repeated flag on any ARGS line, every run's NAME
+#    agreeing with its own ARGS `--run-name`, every arm's ARGS
+#    `--stepsize-groups` equal to its REGISTERED spec string, and exactly ONE
+#    distinct ENV line carrying AUGMENT=1 / BETA_CLIP=-15:-2.3026 / HIER=none /
+#    PROBE=0.  Failure -> UNRESOLVED-PROVENANCE.
+# G1 COMPARABILITY (needs --manifest).  On the LIVE model: 62 tensors,
+#    11,220,132 params; kL, kP, kS and kC all m = 2 with sizes exactly [49,13];
+#    kL and kP byte-identical in BOTH group name lists; the coarse-set symmetric
+#    difference kP^kS EXACTLY {layer4.0.conv2.weight, layer4.0.bn2.weight} and
+#    kP^kC EXACTLY {layer4.0.conv2.weight, layer4.0.shortcut.0.weight}.
+#    Failure -> UNRESOLVED-NOT-COMPARABLE.  This is the gate that catches "the
+#    arms differ in more than the intended swap".
+# R2 DIVERGENCE.  Fewer than 100 epoch lines, a non-finite metric, or plateau5
+#    <= DEAD_BAR = 5.00 -> UNRESOLVED-DIVERGED.
+# R3 NOISE.  Any arm's 3-seed SD above NOISY_BAR = 3 * SIGMA_W = 2.751840 pp ->
+#    UNRESOLVED-NOISY.
+# R-EQUIV THE HARNESS GATE.  |M(kP) - M(kL)| must be <= EQUIV_BAR = 1.497912 pp.
+#    Above it, the new grammar changed the run despite composing the identical
+#    partition, and NO swap comparison may be read -> UNRESOLVED-PATCH-NOT-INERT.
+# R-CTRL THE CELL-REPRODUCTION CONTROL, IN BATCH.  M(kL) - M(k01) must be >=
+#    CTRL_BAR = 16.197000 pp, HALF of cpk3's own k49 - k01 at 100 epochs
+#    (32.394000, re-derived by --selftest).  Failure -> UNRESOLVED-CONTROL:
+#    seeds {9,10,11} do not reproduce this cell and no claim may be made from
+#    them.  Note this is a WITHIN-batch statement; the cross-batch comparison to
+#    cpk3's 55.212 is printed as DESCRIPTIVE and gates nothing.
+# R-FLOOR SATURATION, per arm, IN BATCH.  An arm within FLOOR_BAR = 1.497912 pp
+#    of THIS batch's own k01 is NOT-INFORMATIVE: its LEVEL may be read (it is at
+#    the floor) but its difference from another arm MAY NOT BE QUOTED AS A
+#    MAGNITUDE, only as a bound.  If kP itself is NOT-INFORMATIVE ->
+#    UNRESOLVED-SATURATED and nothing may be read at all.
+#
+# THE BRANCH MAP.  Decided on DS and DC against SWAP_BAR.
+#   CLASS-OPERATIVE           DS < -SWAP_BAR  AND  |DC| <= SWAP_BAR
+#       The tensor that crosses decides; ordinal position, group size, group
+#       count, coarse-group total mass and contiguity are all refuted together.
+#       ALWAYS PRINTED WITH THE RIDER: class is NOT separable from a mass
+#       THRESHOLD on the crossing tensor on this architecture.
+#   POSITION-OR-MASS-OPERATIVE   |DS| <= SWAP_BAR  AND  |DC| <= SWAP_BAR
+#       Exchanging a 2.36M-parameter convolution for a 512-parameter BatchNorm
+#       scale at fixed group size changes nothing; the response is a function of
+#       the partition's SHAPE, not of which tensors are in it.
+#   CONTIGUITY-OR-COARSE-MASS-OPERATIVE
+#       DS < -SWAP_BAR AND DC < -SWAP_BAR AND |DS - DC| <= SWAP_BAR
+#       Both non-contiguous arms fall together, so what moved is the hole or the
+#       coarse mass, NOT the class of the crossing tensor.  CLASS IS NOT
+#       ENTITLED in this branch.
+#   UNRESOLVED-UNDERPOWERED
+#       The measured DS lies within SWAP_BAR of BOTH registered predictions
+#       (0 and DS_pred), so the batch cannot choose between them.  With the
+#       registered numbers this requires SE to have inflated by ~20x; it is a
+#       safety branch, not an expected outcome.
+#   UNRESOLVED-PATTERN-UNREGISTERED
+#       Anything else -- e.g. DS positive and large, or DC significant while DS
+#       is not.  The batch measured something real that no registered account
+#       predicted, and saying so is the honest outcome rather than picking the
+#       nearest branch after the fact.
+# =============================================================================
+
+from __future__ import print_function
+
+import os
+import re
+import sys
+import csv
+import glob
+import math
+import shlex
+import argparse
+import statistics
+import collections
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# ---- the cell.  Identical to cpk3's and cts1's, flag for flag. --------------
+PREFIX = "cpr1-"
+NET, DSET = "ResNet18_c100", "CIFAR100"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+MS, ALPHA0, GAMMA, AUG = "1e-3", "1e-6", "1", "1"
+CLIP_C = "-15:-2.3026"
+BATCH = 100
+EPOCHS = 100                     # THE ONLY HORIZON THIS BATCH SPEAKS AT
+SEEDS = (9, 10, 11)
+N_TENSORS = 62
+TOTAL_PARAMS = 11220132
+
+ANCHOR = "k01"
+ARMS = ("k01", "kL", "kP", "kS", "kC")
+SWEEP_ARMS = ("kL", "kP", "kS", "kC")
+N_RUNS = len(ARMS) * len(SEEDS)  # 15
+
+# ---- the registered spec strings.  The launcher composes from THESE; G0 checks
+# each run's own ARGS line against them.  Written once, here.
+SPEC = {
+    "k01": "scalar",
+    "kL": "[49,13]",
+    "kP": "sets:1-49/50-62",
+    "kS": "sets:1-48,layer4.0.bn2.weight/layer4.0.conv2.weight,51-62",
+    "kC": "sets:1-48,layer4.0.shortcut.0.weight/layer4.0.conv2.weight,50-51,53-62",
+}
+
+# ---- the tensors that cross, and their sizes.  MEASURED on the live model by
+# the launcher's guard 4 and re-checked against --manifest at score time.
+T_CONV2 = "layer4.0.conv2.weight"          # tensor 49, a CONVOLUTION
+T_BN2W = "layer4.0.bn2.weight"             # tensor 50, a BATCHNORM SCALE
+T_SC0W = "layer4.0.shortcut.0.weight"      # tensor 52, a CONVOLUTION
+NUMEL = {T_CONV2: 2359296, T_BN2W: 512, T_SC0W: 131072}
+COARSE_PARAMS = {"kL": 6315072, "kP": 6315072, "kS": 3956288, "kC": 4086848}
+
+# ---- the noise floor, RE-DERIVED FROM THE LIVE CORPUS AT REGISTRATION TIME,
+# with rows whose run begins `cpr1-` EXCLUDED so it is invariant under this
+# batch's own ingest.
+SIGMA_100 = 0.917280
+SIGMA_100_DF, SIGMA_100_CELLS, SIGMA_100_MEMBERS = 58, 29, 87
+SIGMA_772 = 0.864841
+SIGMA_772_DF, SIGMA_772_CELLS, SIGMA_772_MEMBERS = 26, 13, 39
+SIGMA_W = 0.917280               # = max(SIGMA_100, SIGMA_772), the frozen rule
+OTHER_HORIZON = 772              # the stratum SIGMA_772 is taken over
+
+# ---- the cross-batch anchors.  DESCRIPTIVE; they enter the PREDICTION only.
+CPK3_PREFIX = "cpk3-"
+CPK3_100 = {"k01": 22.818000, "k48": 46.210000, "k49": 55.212000,
+            "k50": 30.752667}
+CTS1_PREFIX = "cts1-"
+CTS1_100 = {"k51": 30.568000, "k52": 38.274667}
+
+# ---- the two named accounts, both re-derived by --selftest from the anchors. -
+DS_CLASS = -33.461333
+DC_CLASS = -1.295333
+DS_POSITION = 0.0
+DC_POSITION = 0.0
+PRED_BRANCH = "CLASS-OPERATIVE"
+
+
+def se_of_combo(coefs, sigma=SIGMA_W, n=len(SEEDS)):
+    return sigma * math.sqrt(sum(c * c for c in coefs) / float(n))
+
+
+SE_ARM_DIFF = se_of_combo((1, -1))
+SE_FLOOR = se_of_combo((1, -1))
+
+# ---- BARS.  --selftest quotes every one in SE units. ------------------------
+SWAP_BAR = 1.497912       # 2 * SE_ARM_DIFF
+EQUIV_BAR = 1.497912      # 2 * SE_ARM_DIFF
+FLOOR_BAR = 1.497912      # 2 * SE_FLOOR
+NOISY_BAR = 2.751840      # 3 * SIGMA_W
+DEAD_BAR = 5.00
+CTRL_BAR = 16.197000      # half of cpk3's own k49 - k01 at 100 epochs
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+NAME_RE = re.compile(r"^cpr1-(k01|kL|kP|kS|kC)-s(9|10|11)-(\d+)\.out$")
+
+
+# =============================================================================
+# .out parsing
+# =============================================================================
+def parse_argsline(line):
+    try:
+        toks = shlex.split(line)
+    except ValueError:
+        toks = line.split()
+    occ, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            f, vals, j = t.lstrip("-"), [], i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((f, " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    return occ
+
+
+def load_runs(runsdir):
+    recs = []
+    pats = [os.path.join(runsdir, PREFIX + "*.out"),
+            os.path.join(runsdir, "cpr1", PREFIX + "*.out")]
+    files = sorted(set(sum([glob.glob(p) for p in pats], [])))
+    for f in files:
+        m = NAME_RE.match(os.path.basename(f))
+        if not m:
+            recs.append({"file": f, "bad_name": True})
+            continue
+        arm, seed, job = m.group(1), int(m.group(2)), m.group(3)
+        te, tr, args, env, done = {}, {}, None, None, False
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                a = ARGS_RE.match(line)
+                if a and args is None:
+                    args = a.group(1)
+                e = ENV_RE.match(line)
+                if e and env is None:
+                    env = e.group(1).strip()
+                if line.strip() == "RUN_DONE":
+                    done = True
+                x = EP_RE.search(line)
+                if x:
+                    te[int(x.group(1))] = float(x.group(2))
+                y = EPTR_RE.search(line)
+                if y:
+                    tr[int(y.group(1))] = float(y.group(2))
+        occ = parse_argsline(args) if args else []
+        cnt = collections.Counter(f2 for f2, _ in occ)
+        eff = dict(occ)
+        recs.append({
+            "file": f, "bad_name": False, "arm": arm, "seed": seed, "job": job,
+            "args": args, "env": env, "occ": occ, "eff": eff,
+            "repeated": sorted([k for k, v in cnt.items() if v > 1]),
+            "run_done": done, "test": te, "train": tr,
+            "n_ep": len(te),
+            "p5": tail5(te, EPOCHS), "t5": tail5(tr, EPOCHS),
+        })
+    return recs
+
+
+def tail5(d, budget):
+    v = [d[e] for e in range(budget - 5, budget) if e in d]
+    return (sum(v) / 5.0) if len(v) == 5 else None
+
+
+# =============================================================================
+# the corpus.  Used ONLY by --selftest.  EVERY reader excludes cpr1's own rows.
+# =============================================================================
+def _csv_rows(path=CSV, exclude_own=True):
+    with open(path) as fh:
+        out = []
+        for r in csv.DictReader(fh):
+            if (r.get("superseded") or "0") == "1":
+                continue
+            if exclude_own and str(r.get("run") or "").startswith(PREFIX):
+                continue
+            out.append(r)
+        return out
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r, epochs):
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["meta_stepsize"] == MS and r["alpha0"] == ALPHA0
+            and r["gamma"] == GAMMA and r["augment"] == AUG
+            and r["beta_clip"] == CLIP_C and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH)
+            and r["epochs_done"] == str(epochs)
+            and r["collapsed"] == "0")
+
+
+M2_RE = re.compile(r"^\[\d+,\d+\]$")
+
+
+def noise_floor_from_csv(path=CSV, epochs=EPOCHS):
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not _in_cell(r, epochs) or not M2_RE.match(str(r["granularity"] or "")):
+            continue
+        try:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    ss, df, nc, nm = 0.0, 0, 0, 0
+    for v in cells.values():
+        nm += len(v)
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc, nm
+
+
+def batch_levels_from_csv(prefix, path=CSV):
+    g = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not str(r.get("run") or "").startswith(prefix):
+            continue
+        try:
+            g[str(r["granularity"] or "")].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    return dict((k, (statistics.mean(v), len(v))) for k, v in g.items())
+
+
+def cpk3_100_from_outs(runsdirs):
+    """cpk3's 100-epoch arm means, re-derived from the RAW .out files.  Returns
+    {} when the files are not reachable on this machine (SKIP, not FAIL)."""
+    g = collections.defaultdict(list)
+    for d in runsdirs:
+        for f in glob.glob(os.path.join(d, "cpk3-*.out")):
+            b = os.path.basename(f)
+            m = re.match(r"^cpk3-(k\d\d)-s[678]-\d+\.out$", b)
+            if not m:
+                continue
+            te = {}
+            with open(f, errors="ignore") as fh:
+                for line in fh:
+                    x = EP_RE.search(line)
+                    if x:
+                        te[int(x.group(1))] = float(x.group(2))
+            v = tail5(te, 100)
+            if v is not None:
+                g[m.group(1)].append(v)
+    return dict((k, statistics.mean(v)) for k, v in g.items() if len(v) == 3)
+
+
+def count_own_rows(path=CSV):
+    with open(path) as fh:
+        return sum(1 for r in csv.DictReader(fh)
+                   if str(r.get("run") or "").startswith(PREFIX))
+
+
+# =============================================================================
+# manifest
+# =============================================================================
+def read_manifest(path):
+    man = {"tensors": {}, "specs": {}, "raw": []}
+    with open(path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            man["raw"].append(line)
+            p = line.split()
+            if not p:
+                continue
+            if p[0] == "NUM_PARAM_TENSORS":
+                man["T"] = int(p[1])
+            elif p[0] == "TOTAL_PARAMS":
+                man["total"] = int(p[1])
+            elif p[0] == "TENSOR" and len(p) >= 4:
+                man["tensors"][int(p[1])] = (p[2], int(p[3]))
+            elif p[0] == "ARMSPEC":
+                # ARMSPEC <arm> SPEC <spec> M <m> SIZES a,b PARAMS x,y
+                #         FIRSTGROUP <names...> LASTGROUP <names...>
+                d = {}
+                arm = p[1]
+                i = 2
+                key = None
+                while i < len(p):
+                    if p[i] in ("SPEC", "M", "SIZES", "PARAMS", "FIRSTGROUP",
+                                "LASTGROUP"):
+                        key = p[i]
+                        d[key] = []
+                    elif key:
+                        d[key].append(p[i])
+                    i += 1
+                man["specs"][arm] = {
+                    "spec": d.get("SPEC", [""])[0],
+                    "m": int(d.get("M", ["0"])[0]),
+                    "sizes": [int(x) for x in d.get("SIZES", ["0"])[0].split(",")],
+                    "params": [int(x) for x in d.get("PARAMS", ["0"])[0].split(",")],
+                    "first": d.get("FIRSTGROUP", []),
+                    "last": d.get("LASTGROUP", []),
+                }
+    return man
+
+
+# =============================================================================
+def fmt(x, w=9, p=4):
+    return (" " * w) if x is None else ("%*.*f" % (w, p, x))
+
+
+def se_str(x):
+    return "%+6.2f SE" % (x / SE_ARM_DIFF)
+
+
+# =============================================================================
+# --selftest.  Every registration assertion is RE-DERIVED here, from the corpus
+# and from arithmetic, and checked against THIS FILE'S constants.
+#
+# EVERY CORPUS-DERIVED PREMISE EXCLUDES ROWS NAMED `cpr1-*`, so every one of
+# them is INVARIANT UNDER THIS BATCH'S OWN INGEST -- pre-registration, partial
+# ingest and post-ingest all give the identical answer.  CORRECTIONS 161.9
+# recorded that cS2 claimed this pattern but only 1 of its 6 failing checks was
+# actually ingest-proof; that is the defect this section exists not to repeat,
+# and the coverage is not partial: the row-count premise, both sigmas, the
+# duplicate-seed premise, the new-grammar premise and both anchor sets are all
+# read through the SAME excluding reader.
+#
+# The ORDERING claim RULE 21 really makes is not checkable from inside a python
+# file at all; it is proved by wall clock -- the git commit time of this file
+# against the earliest sacct Submit -- and that proof lives in the CORRECTIONS
+# entry, not here.
+# =============================================================================
+def selftest():
+    ok = True
+
+    def chk(cond, label, got="", want=""):
+        nonlocal ok
+        print("  %-4s %-62s %s%s" % ("PASS" if cond else "FAIL", label, got,
+                                     (" (want %s)" % want) if want else ""))
+        if not cond:
+            ok = False
+
+    print("cV1_cpr1_score.py --selftest")
+    print("-" * 78)
+
+    print("A. the arms, the specs and the run count")
+    chk(ARMS == ("k01", "kL", "kP", "kS", "kC"), "arms", " ".join(ARMS))
+    chk(N_RUNS == 15, "run count", str(N_RUNS), "15")
+    chk(SEEDS == (9, 10, 11), "seeds", str(SEEDS))
+    chk(EPOCHS == 100, "the ONLY horizon", str(EPOCHS))
+    chk(SPEC["kL"] == "[49,13]", "kL is the LEGACY grammar", SPEC["kL"])
+    chk(SPEC["kP"].startswith("sets:"), "kP is the NEW grammar", SPEC["kP"])
+    chk(SPEC["kS"].startswith("sets:") and T_BN2W in SPEC["kS"]
+        and T_CONV2 in SPEC["kS"], "kS names BOTH swapped tensors in its spec")
+    chk(SPEC["kC"].startswith("sets:") and T_SC0W in SPEC["kC"]
+        and T_CONV2 in SPEC["kC"], "kC names BOTH swapped tensors in its spec")
+    chk(len(set(SPEC.values())) == 5, "all five specs are distinct")
+
+    print("B. RULE 20 SAFETY of every registered spec string")
+    tok = re.compile(r"^[A-Za-z0-9_.,:/\[\]-]+$")
+    for a in ARMS:
+        s = SPEC[a]
+        good = (bool(tok.match(s)) and not s.startswith("-") and "=" not in s
+                and not any(c.isspace() for c in s)
+                and "'" not in s and '"' not in s)
+        chk(good, "%s spec is ONE shell token, no space/quote/=/leading-dash" % a, s)
+        rt = dict(parse_argsline("--dataset CIFAR100 --stepsize-groups %s --seed 9" % s))
+        chk(rt.get("stepsize-groups") == s and len(rt) == 3,
+            "%s round-trips through an ARGS line as ONE value" % a,
+            repr(rt.get("stepsize-groups")))
+
+    print("C. the tensors that cross, and the mass arithmetic")
+    chk(NUMEL[T_CONV2] == 2359296 and NUMEL[T_BN2W] == 512
+        and NUMEL[T_SC0W] == 131072, "the three crossing tensors' sizes",
+        "%d / %d / %d" % (NUMEL[T_CONV2], NUMEL[T_BN2W], NUMEL[T_SC0W]))
+    chk(COARSE_PARAMS["kP"] - NUMEL[T_CONV2] + NUMEL[T_BN2W] == COARSE_PARAMS["kS"],
+        "kS coarse mass = kP - conv2 + bn2.weight", str(COARSE_PARAMS["kS"]))
+    chk(COARSE_PARAMS["kP"] - NUMEL[T_CONV2] + NUMEL[T_SC0W] == COARSE_PARAMS["kC"],
+        "kC coarse mass = kP - conv2 + shortcut.0.weight", str(COARSE_PARAMS["kC"]))
+    dm = abs(COARSE_PARAMS["kS"] - COARSE_PARAMS["kC"])
+    chk(dm < 0.05 * COARSE_PARAMS["kS"],
+        "kS and kC coarse masses are within 5% of each other",
+        "%d params = %.2f%%" % (dm, 100.0 * dm / COARSE_PARAMS["kS"]))
+    print("       so a COARSE-GROUP-MASS account predicts kS ~ kC, and a CLASS")
+    print("       account predicts kC ~ kP.  That is the whole point of kC.")
+    print("       CLASS IS NOT SEPARABLE FROM A MASS THRESHOLD ON THIS NETWORK:")
+    print("       smallest conv %d = %.0fx the largest normalisation tensor %d"
+          % (NUMEL[T_SC0W], NUMEL[T_SC0W] / 512.0, 512))
+
+    print("D. the noise floor, RE-DERIVED from the corpus with cpr1 EXCLUDED")
+    if not os.path.exists(CSV):
+        chk(False, "results/all_runs.csv present", CSV)
+    else:
+        s1, d1, c1, m1 = noise_floor_from_csv(CSV, EPOCHS)
+        chk(abs(s1 - SIGMA_100) < 5e-5, "SIGMA_100 reproduces", "%.6f" % s1,
+            "%.6f" % SIGMA_100)
+        chk((d1, c1, m1) == (SIGMA_100_DF, SIGMA_100_CELLS, SIGMA_100_MEMBERS),
+            "SIGMA_100 df / cells / members reproduce", "%d / %d / %d" % (d1, c1, m1),
+            "%d / %d / %d" % (SIGMA_100_DF, SIGMA_100_CELLS, SIGMA_100_MEMBERS))
+        s2, d2, c2, m2 = noise_floor_from_csv(CSV, OTHER_HORIZON)
+        chk(abs(s2 - SIGMA_772) < 5e-5, "SIGMA_772 reproduces", "%.6f" % s2,
+            "%.6f" % SIGMA_772)
+        chk((d2, c2, m2) == (SIGMA_772_DF, SIGMA_772_CELLS, SIGMA_772_MEMBERS),
+            "SIGMA_772 df / cells / members reproduce", "%d / %d / %d" % (d2, c2, m2),
+            "%d / %d / %d" % (SIGMA_772_DF, SIGMA_772_CELLS, SIGMA_772_MEMBERS))
+        chk(abs(SIGMA_W - max(s1, s2)) < 5e-5,
+            "SIGMA_W IS the max of the two, by the frozen rule",
+            "%.6f" % max(s1, s2), "%.6f" % SIGMA_W)
+        print("       the 100 stratum is the HORIZON-MATCHED one AND the larger")
+        print("       (%.6f > %.6f), so the choice is conservative either way"
+              % (s1, s2))
+        print("       INGEST-PROOF: kL's granularity is the literal '[49,13]', so")
+        print("       without the cpr1 exclusion this batch's own 3 kL rows would")
+        print("       enter SIGMA_100's cell list and move the bar after the fact.")
+
+    print("E. the RULE 21 premises.  ALL of them, and ALL ingest-proof")
+    if os.path.exists(CSV):
+        n_own = count_own_rows(CSV)
+        chk(n_own in (0, N_RUNS),
+            "cpr1 rows in the corpus are 0 (pre-registration) or exactly %d" % N_RUNS,
+            "%d found -> %s" % (n_own, "PRE-REGISTRATION" if n_own == 0
+                                else "POST-INGEST"))
+        rows = _csv_rows(CSV)             # cpr1 EXCLUDED
+        dup = [r for r in rows if _in_cell(r, EPOCHS) and r["seed"] in ("9", "10", "11")]
+        chk(len(dup) == 0,
+            "no FOREIGN row in this cell carries seed 9, 10 or 11 (zero duplicates)",
+            "%d found" % len(dup))
+        newg = [r for r in rows if "sets:" in str(r.get("granularity") or "")]
+        chk(len(newg) == 0,
+            "no FOREIGN row uses the `sets:` grammar (it is new with this batch)",
+            "%d found" % len(newg))
+        kl = [r for r in rows if _in_cell(r, EPOCHS)
+              and str(r.get("granularity")) == SPEC["kL"]]
+        print("       FYI (not a gate): %d foreign rows exist at %s in this cell at"
+              % (len(kl), SPEC["kL"]))
+        print("       %d epochs; cpr1's kL arm is a NEW seed triple, not a re-run."
+              % EPOCHS)
+
+    print("F. the anchors and the two point predictions, re-derived")
+    if os.path.exists(CSV):
+        c1 = batch_levels_from_csv(CTS1_PREFIX)
+        got51 = c1.get("[51,11]")
+        got52 = c1.get("[52,10]")
+        chk(got51 is not None and abs(got51[0] - CTS1_100["k51"]) < 5e-5,
+            "cts1 [51,11] mean reproduces from the corpus",
+            "%.6f (n=%d)" % (got51[0], got51[1]) if got51 else "MISSING",
+            "%.6f" % CTS1_100["k51"])
+        chk(got52 is not None and abs(got52[0] - CTS1_100["k52"]) < 5e-5,
+            "cts1 [52,10] mean reproduces from the corpus",
+            "%.6f (n=%d)" % (got52[0], got52[1]) if got52 else "MISSING",
+            "%.6f" % CTS1_100["k52"])
+    outs = cpk3_100_from_outs([os.path.join(REPO, "..", "runs_cluster_b"),
+                               os.path.join(REPO, "..", "runs"),
+                               "/cluster/account_b/metaopt/runs"])
+    if outs:
+        for a in ("k01", "k48", "k49", "k50"):
+            chk(a in outs and abs(outs[a] - CPK3_100[a]) < 5e-5,
+                "cpk3 %s at 100 epochs re-derives from the raw .out files" % a,
+                "%.6f" % outs[a] if a in outs else "MISSING",
+                "%.6f" % CPK3_100[a])
+    else:
+        print("  SKIP cpk3's .out files are not reachable on this machine; the four")
+        print("       100-epoch anchors are the FROZEN literals and could not be")
+        print("       re-derived here.  This is a SKIP, not a PASS and not a FAIL.")
+    ds = (CPK3_100["k50"] - CPK3_100["k49"]) - (CPK3_100["k49"] - CPK3_100["k48"])
+    dc = (CTS1_100["k52"] - CTS1_100["k51"]) - (CPK3_100["k49"] - CPK3_100["k48"])
+    chk(abs(ds - DS_CLASS) < 5e-6, "DS_CLASS re-derives from the anchors",
+        "%.6f" % ds, "%.6f" % DS_CLASS)
+    chk(abs(dc - DC_CLASS) < 5e-6, "DC_CLASS re-derives from the anchors",
+        "%.6f" % dc, "%.6f" % DC_CLASS)
+    chk(DS_POSITION == 0.0 and DC_POSITION == 0.0,
+        "H-POSITION predicts EXACTLY zero for both contrasts")
+    sep = abs(DS_CLASS - DS_POSITION)
+    chk(sep > 10 * SWAP_BAR,
+        "the two accounts are separated on DS by more than 10 bars",
+        "%.4f pp = %.2f SE = %.1f bars" % (sep, sep / SE_ARM_DIFF, sep / SWAP_BAR))
+    chk(abs(DC_CLASS) < SWAP_BAR,
+        "H-CLASS predicts kC is INDISTINGUISHABLE from kP (|DC| < bar)",
+        "%.4f vs bar %.4f" % (abs(DC_CLASS), SWAP_BAR))
+    print("       so under H-CLASS the batch reads DS SIGNIFICANT and DC NULL;")
+    print("       under H-POSITION both are NULL; under CONTIGUITY-OR-COARSE-MASS")
+    print("       both are SIGNIFICANT and equal.  Three distinguishable patterns.")
+    lvl_kS = CPK3_100["k49"] + DS_CLASS
+    print("       FLOOR WARNING, REGISTERED IN ADVANCE: H-CLASS predicts")
+    print("       M(kS) ~ %.4f, BELOW cpk3's own m=1 floor %.4f, so kS is EXPECTED"
+          % (lvl_kS, CPK3_100["k01"]))
+    print("       to be floor-saturated and |DS| is EXPECTED to be TRUNCATED.")
+    print("       R-FLOOR reports it as a BOUND in that case, never as a value.")
+
+    print("G. the bars, every one in SE units")
+    chk(abs(SE_ARM_DIFF - SIGMA_W * math.sqrt(2.0 / 3.0)) < 1e-9,
+        "SE_ARM_DIFF = SIGMA_W * sqrt(2/3)", "%.6f" % SE_ARM_DIFF)
+    for nm, v, mult in (("SWAP_BAR", SWAP_BAR, 2.0), ("EQUIV_BAR", EQUIV_BAR, 2.0),
+                        ("FLOOR_BAR", FLOOR_BAR, 2.0)):
+        chk(abs(v - mult * SE_ARM_DIFF) < 5e-6, "%s = %.0f * SE_ARM_DIFF" % (nm, mult),
+            "%.6f pp" % v)
+    chk(abs(NOISY_BAR - 3 * SIGMA_W) < 5e-6, "NOISY_BAR = 3 * SIGMA_W",
+        "%.6f pp" % NOISY_BAR)
+    ctrl = CPK3_100["k49"] - CPK3_100["k01"]
+    chk(abs(CTRL_BAR - ctrl / 2.0) < 5e-5,
+        "CTRL_BAR = half of cpk3's own k49 - k01 at 100 epochs",
+        "%.6f" % (ctrl / 2.0), "%.6f" % CTRL_BAR)
+    print("       SWAP/EQUIV/FLOOR %8.4f pp = %5.2f SE_ARM_DIFF"
+          % (SWAP_BAR, SWAP_BAR / SE_ARM_DIFF))
+    print("       NOISY            %8.4f pp = %5.2f SIGMA_W" % (NOISY_BAR, 3.0))
+    print("       CTRL             %8.4f pp = %5.2f SE_ARM_DIFF"
+          % (CTRL_BAR, CTRL_BAR / SE_ARM_DIFF))
+    print("       DEAD             %8.4f pp" % DEAD_BAR)
+
+    print("H. the branch map is exhaustive and mutually exclusive")
+    cases = [(-40.0, 0.0, "CLASS-OPERATIVE"), (0.0, 0.0, "POSITION-OR-MASS-OPERATIVE"),
+             (-40.0, -40.0, "CONTIGUITY-OR-COARSE-MASS-OPERATIVE"),
+             (-20.0, -40.0, "UNRESOLVED-PATTERN-UNREGISTERED"),
+             (+40.0, 0.0, "UNRESOLVED-PATTERN-UNREGISTERED"),
+             (0.0, -40.0, "UNRESOLVED-PATTERN-UNREGISTERED")]
+    for ds_, dc_, want in cases:
+        chk(branch_of(ds_, dc_) == want,
+            "branch(DS=%+.1f, DC=%+.1f)" % (ds_, dc_), branch_of(ds_, dc_), want)
+    chk(branch_of(DS_CLASS, DC_CLASS) == PRED_BRANCH,
+        "the REGISTERED prediction maps to the registered branch",
+        branch_of(DS_CLASS, DC_CLASS), PRED_BRANCH)
+    chk(branch_of(DS_POSITION, DC_POSITION) == "POSITION-OR-MASS-OPERATIVE",
+        "H-POSITION maps to its own branch")
+
+    print("-" * 78)
+    print("SELFTEST %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+# =============================================================================
+def branch_of(ds, dc):
+    """The registered branch map.  Pure function of the two contrasts."""
+    s_sig, c_sig = abs(ds) > SWAP_BAR, abs(dc) > SWAP_BAR
+    if s_sig and ds < 0 and not c_sig:
+        return "CLASS-OPERATIVE"
+    if not s_sig and not c_sig:
+        return "POSITION-OR-MASS-OPERATIVE"
+    if s_sig and c_sig and ds < 0 and dc < 0 and abs(ds - dc) <= SWAP_BAR:
+        return "CONTIGUITY-OR-COARSE-MASS-OPERATIVE"
+    return "UNRESOLVED-PATTERN-UNREGISTERED"
+
+
+# =============================================================================
+def score(runsdir, manifest=None):
+    print("=" * 78)
+    print("cpr1 -- THE NAME-LIST PERMUTATION CONTROL.  %s / %s, %d epochs,"
+          % (DSET, NET, EPOCHS))
+    print("        seeds %s, %d arms x %d seeds = %d runs, PROBE=0"
+          % (",".join(str(s) for s in SEEDS), len(ARMS), len(SEEDS), N_RUNS))
+    print("        PRIMARY METRIC: plateau5 at %d epochs (mean of epochs %d-%d)."
+          % (EPOCHS, EPOCHS - 5, EPOCHS - 1))
+    print("        TRAIN is reported alongside TEST throughout.")
+    print("=" * 78)
+
+    recs = load_runs(runsdir)
+    verdicts = []
+
+    # ---------------- G0 PROVENANCE ----------------
+    print("\nG0 PROVENANCE")
+    bad = [r for r in recs if r.get("bad_name")]
+    good = [r for r in recs if not r.get("bad_name")]
+    g0 = True
+    print("  %d files matched %s*.out, %d of them name-parsed"
+          % (len(recs), PREFIX, len(good)))
+    if bad:
+        g0 = False
+        for r in bad[:5]:
+            print("  !!! unparseable run name: %s" % os.path.basename(r["file"]))
+    if len(good) != N_RUNS:
+        g0 = False
+        print("  !!! %d runs, expected %d" % (len(good), N_RUNS))
+    cells = collections.defaultdict(list)
+    for r in good:
+        cells[r["arm"]].append(r)
+    for a in ARMS:
+        n = len(cells.get(a, []))
+        if n != len(SEEDS):
+            g0 = False
+            print("  !!! arm %s has %d runs, expected %d" % (a, n, len(SEEDS)))
+    jobs = set(r["job"] for r in good)
+    if len(jobs) != len(good):
+        g0 = False
+        print("  !!! %d distinct job ids for %d runs" % (len(jobs), len(good)))
+    for r in good:
+        if r["repeated"]:
+            g0 = False
+            print("  !!! REPEATED FLAG in %s: %s"
+                  % (os.path.basename(r["file"]), ",".join(r["repeated"])))
+        if r["n_ep"] != EPOCHS:
+            g0 = False
+            print("  !!! %s has %d epoch lines, expected %d"
+                  % (os.path.basename(r["file"]), r["n_ep"], EPOCHS))
+        want = "%s%s-s%d" % (PREFIX, r["arm"], r["seed"])
+        if r["eff"].get("run-name") != want:
+            g0 = False
+            print("  !!! NAME/ARGS mismatch in %s: run-name=%r"
+                  % (os.path.basename(r["file"]), r["eff"].get("run-name")))
+        if r["eff"].get("stepsize-groups") != SPEC[r["arm"]]:
+            g0 = False
+            print("  !!! %s ran --stepsize-groups %r, REGISTERED %r"
+                  % (os.path.basename(r["file"]),
+                     r["eff"].get("stepsize-groups"), SPEC[r["arm"]]))
+        if r["eff"].get("num-epochs") != str(EPOCHS):
+            g0 = False
+            print("  !!! %s ran --num-epochs %r" % (os.path.basename(r["file"]),
+                                                    r["eff"].get("num-epochs")))
+        if not r["run_done"]:
+            g0 = False
+            print("  !!! %s has no RUN_DONE" % os.path.basename(r["file"]))
+    envs = set(r["env"] for r in good if r["env"])
+    print("  %d distinct ENV line(s)" % len(envs))
+    for e in sorted(envs):
+        print("      ENV: %s" % e)
+    if len(envs) != 1:
+        g0 = False
+        print("  !!! RULE 20: the ENV line must be identical across the batch")
+    else:
+        e = list(envs)[0]
+        for need in ("AUGMENT=1", "BETA_CLIP=" + CLIP_C, "HIER=none", "PROBE=0"):
+            if need not in e:
+                g0 = False
+                print("  !!! ENV does not carry %s" % need)
+    print("  G0 %s" % ("PASS" if g0 else "FAIL"))
+    if not g0:
+        verdicts.append("UNRESOLVED-PROVENANCE")
+
+    # ---------------- G1 COMPARABILITY ----------------
+    print("\nG1 COMPARABILITY -- THE LIVE-MODEL PARTITION MANIFEST")
+    g1 = True
+    if not manifest or not os.path.exists(manifest):
+        print("  !!! no --manifest given; comparability CANNOT be checked and the")
+        print("      swap contrast MAY NOT BE READ.")
+        g1 = False
+    else:
+        man = read_manifest(manifest)
+        if man.get("T") != N_TENSORS or man.get("total") != TOTAL_PARAMS:
+            g1 = False
+            print("  !!! manifest says T=%s TOTAL=%s, registered %d / %d"
+                  % (man.get("T"), man.get("total"), N_TENSORS, TOTAL_PARAMS))
+        else:
+            print("  live model: %d tensors, %d parameters -- ok"
+                  % (man["T"], man["total"]))
+        gm = {}
+        for a in SWEEP_ARMS:
+            d = man["specs"].get(a)
+            if not d:
+                g1 = False
+                print("  !!! no ARMSPEC line for %s" % a)
+                continue
+            if d["spec"] != SPEC[a]:
+                g1 = False
+                print("  !!! %s manifest spec %r != registered %r"
+                      % (a, d["spec"], SPEC[a]))
+            if d["m"] != 2 or d["sizes"] != [49, 13]:
+                g1 = False
+                print("  !!! %s composed to m=%d sizes %s, registered m=2 [49,13]"
+                      % (a, d["m"], d["sizes"]))
+            if len(d["first"]) + len(d["last"]) != N_TENSORS:
+                g1 = False
+                print("  !!! %s name lists cover %d tensors, expected %d"
+                      % (a, len(d["first"]) + len(d["last"]), N_TENSORS))
+            gm[a] = (set(d["first"]), set(d["last"]), d["params"])
+            print("  %-3s %-72s" % (a, d["spec"]))
+            print("      sizes %-9s params %9d / %-9d"
+                  % (str(d["sizes"]), d["params"][0], d["params"][1]))
+            print("      COARSE: %s" % " ".join(d["first"]))
+            print("      FINE  : %s" % " ".join(d["last"]))
+        if all(a in gm for a in SWEEP_ARMS):
+            if gm["kL"][0] != gm["kP"][0] or gm["kL"][1] != gm["kP"][1]:
+                g1 = False
+                print("  !!! kL and kP are NOT the same partition -- the patch is not")
+                print("      inert and NOTHING here may be read")
+            else:
+                print("  kL and kP compose to the IDENTICAL partition (both groups) -- ok")
+            dS = gm["kP"][0] ^ gm["kS"][0]
+            dC = gm["kP"][0] ^ gm["kC"][0]
+            if dS != {T_CONV2, T_BN2W}:
+                g1 = False
+                print("  !!! kP^kS = %s, registered {%s, %s}"
+                      % (sorted(dS), T_CONV2, T_BN2W))
+            else:
+                print("  kP -> kS swaps EXACTLY %s <-> %s -- ok" % (T_CONV2, T_BN2W))
+            if dC != {T_CONV2, T_SC0W}:
+                g1 = False
+                print("  !!! kP^kC = %s, registered {%s, %s}"
+                      % (sorted(dC), T_CONV2, T_SC0W))
+            else:
+                print("  kP -> kC swaps EXACTLY %s <-> %s -- ok" % (T_CONV2, T_SC0W))
+            szs = set(len(gm[a][0]) for a in SWEEP_ARMS)
+            if szs != {49}:
+                g1 = False
+                print("  !!! coarse group sizes differ across arms: %s" % sorted(szs))
+            else:
+                print("  all four coarse groups have the SAME SIZE (49) -- ok")
+            for a in SWEEP_ARMS:
+                if gm[a][2][0] != COARSE_PARAMS[a]:
+                    g1 = False
+                    print("  !!! %s coarse params %d, registered %d"
+                          % (a, gm[a][2][0], COARSE_PARAMS[a]))
+    print("  G1 %s" % ("PASS" if g1 else "FAIL"))
+    if not g1:
+        verdicts.append("UNRESOLVED-NOT-COMPARABLE")
+
+    # ---------------- the levels ----------------
+    print("\nTHE ARMS.  plateau5 at %d epochs.  TEST and TRAIN." % EPOCHS)
+    print("  arm  spec%-64s  n   TEST      sd     TRAIN" % "")
+    M, SD, MT = {}, {}, {}
+    for a in ARMS:
+        v = sorted([r["p5"] for r in cells.get(a, []) if r["p5"] is not None])
+        w = sorted([r["t5"] for r in cells.get(a, []) if r["t5"] is not None])
+        if v:
+            M[a] = statistics.mean(v)
+            SD[a] = statistics.stdev(v) if len(v) > 1 else 0.0
+        if w:
+            MT[a] = statistics.mean(w)
+        print("  %-4s %-68s %d %s %s %s"
+              % (a, SPEC[a], len(v), fmt(M.get(a)), fmt(SD.get(a), 7, 4),
+                 fmt(MT.get(a))))
+        if v:
+            print("       per-seed TEST %s" % "  ".join("%.4f" % x for x in v))
+
+    # ---------------- R2 ----------------
+    print("\nR2 DIVERGENCE (bar %.2f pp)" % DEAD_BAR)
+    dead = [r for r in good
+            if r["p5"] is None or not math.isfinite(r["p5"]) or r["p5"] <= DEAD_BAR
+            or r["n_ep"] != EPOCHS]
+    for r in dead:
+        print("  !!! DEAD %s p5=%s n_ep=%d"
+              % (os.path.basename(r["file"]), r["p5"], r["n_ep"]))
+    print("  %d of %d alive -- %s" % (len(good) - len(dead), len(good),
+                                      "PASS" if not dead else "FAIL"))
+    if dead:
+        verdicts.append("UNRESOLVED-DIVERGED")
+
+    # ---------------- R3 ----------------
+    print("\nR3 NOISE (bar %.4f pp = 3 * SIGMA_W)" % NOISY_BAR)
+    noisy = [a for a in ARMS if SD.get(a, 0.0) > NOISY_BAR]
+    for a in ARMS:
+        print("  %-4s sd %8.4f  %s" % (a, SD.get(a, float("nan")),
+                                       "NOISY" if a in noisy else "ok"))
+    if noisy:
+        verdicts.append("UNRESOLVED-NOISY")
+
+    # ---------------- R-EQUIV ----------------
+    print("\nR-EQUIV -- THE HARNESS GATE.  kP (new grammar) vs kL (legacy).")
+    eq = None
+    if "kP" in M and "kL" in M:
+        eq = M["kP"] - M["kL"]
+        print("  kL %.4f   kP %.4f   difference %+.4f pp = %s"
+              % (M["kL"], M["kP"], eq, se_str(eq)))
+        print("  bar %.4f pp (= 2 * SE_ARM_DIFF).  %s"
+              % (EQUIV_BAR, "PASS" if abs(eq) <= EQUIV_BAR else "FAIL"))
+        print("  TRAIN alongside: kL %s  kP %s  difference %s"
+              % (fmt(MT.get("kL"), 8), fmt(MT.get("kP"), 8),
+                 fmt((MT["kP"] - MT["kL"]) if "kP" in MT and "kL" in MT else None, 8)))
+        if abs(eq) > EQUIV_BAR:
+            verdicts.append("UNRESOLVED-PATCH-NOT-INERT")
+    else:
+        print("  !!! kL or kP missing")
+        verdicts.append("UNRESOLVED-PATCH-NOT-INERT")
+    print("  POWER, STATED: this gate can only exclude patch effects larger than")
+    print("  %.4f pp.  The PRIMARY inertness evidence is the static proof in"
+          % EQUIV_BAR)
+    print("  tests/test_namesets.py (byte-identical partition AND init_meta state),")
+    print("  which G1 re-checks on the live model.  This gate corroborates it.")
+
+    # ---------------- R-CTRL ----------------
+    print("\nR-CTRL -- DOES THIS SEED TRIPLE REPRODUCE THE CELL?  IN BATCH.")
+    if "kL" in M and ANCHOR in M:
+        d = M["kL"] - M[ANCHOR]
+        print("  kL %.4f - k01 %.4f = %+.4f pp  (bar %.4f = half of cpk3's own"
+              % (M["kL"], M[ANCHOR], d, CTRL_BAR))
+        print("  k49 - k01 at %d epochs).  %s" % (EPOCHS,
+                                                  "PASS" if d >= CTRL_BAR else "FAIL"))
+        if d < CTRL_BAR:
+            verdicts.append("UNRESOLVED-CONTROL")
+        print("  DESCRIPTIVE, CROSS-BATCH, GATES NOTHING: cpk3's k49 at %d epochs"
+              % EPOCHS)
+        print("  on seeds {6,7,8} read %.4f; cpr1's kL reads %.4f, a difference of"
+              % (CPK3_100["k49"], M["kL"]))
+        print("  %+.4f pp = %s.  Different batch AND different seeds."
+              % (M["kL"] - CPK3_100["k49"], se_str(M["kL"] - CPK3_100["k49"])))
+    else:
+        verdicts.append("UNRESOLVED-CONTROL")
+
+    # ---------------- R-FLOOR ----------------
+    print("\nR-FLOOR -- SATURATION AGAINST THIS BATCH'S OWN m=1 ANCHOR")
+    print("  k01 = %s pp.  bar %.4f pp (= 2 * SE_FLOOR)."
+          % (fmt(M.get(ANCHOR), 8), FLOOR_BAR))
+    informative = {}
+    for a in SWEEP_ARMS:
+        if a in M and ANCHOR in M:
+            above = M[a] - M[ANCHOR]
+            informative[a] = above > FLOOR_BAR
+            print("  %-4s %+8.4f above the floor  -> %s"
+                  % (a, above, "INFORMATIVE" if informative[a]
+                     else "NOT-INFORMATIVE (floor-saturated)"))
+    if not informative.get("kP", False):
+        verdicts.append("UNRESOLVED-SATURATED")
+        print("  !!! kP ITSELF is at the floor; nothing may be read from this batch")
+
+    # ---------------- THE CONTRAST ----------------
+    print("\nTHE SWAP CONTRASTS.  DS = kS - kP, DC = kC - kP.  bar %.4f pp = 2 SE"
+          % SWAP_BAR)
+    ds = dc = None
+    if "kS" in M and "kP" in M:
+        ds = M["kS"] - M["kP"]
+    if "kC" in M and "kP" in M:
+        dc = M["kC"] - M["kP"]
+    dst = (MT["kS"] - MT["kP"]) if ("kS" in MT and "kP" in MT) else None
+    dct = (MT["kC"] - MT["kP"]) if ("kC" in MT and "kP" in MT) else None
+    print("  contrast  crossing tensors                                "
+          "TEST        in SE   TRAIN")
+    print("  DS  kS-kP %-34s -> %-22s %s %s %s"
+          % (T_CONV2, T_BN2W, fmt(ds), se_str(ds) if ds is not None else "",
+             fmt(dst)))
+    print("  DC  kC-kP %-34s -> %-22s %s %s %s"
+          % (T_CONV2, T_SC0W, fmt(dc), se_str(dc) if dc is not None else "",
+             fmt(dct)))
+    print("\n  PREDICTED, REGISTERED BEFORE ANY RUN EXISTED:")
+    print("      H-CLASS     DS %+8.4f   DC %+8.4f" % (DS_CLASS, DC_CLASS))
+    print("      H-POSITION  DS %+8.4f   DC %+8.4f" % (DS_POSITION, DC_POSITION))
+    if ds is not None:
+        print("      residual vs H-CLASS     DS %+8.4f = %s"
+              % (ds - DS_CLASS, se_str(ds - DS_CLASS)))
+        print("      residual vs H-POSITION  DS %+8.4f = %s"
+              % (ds - DS_POSITION, se_str(ds - DS_POSITION)))
+    if ds is not None and not informative.get("kS", True):
+        bound = -(M["kP"] - M[ANCHOR] - FLOOR_BAR)
+        print("\n  !!! kS IS FLOOR-SATURATED, EXACTLY AS H-CLASS PREDICTED IN ADVANCE.")
+        print("      |DS| IS TRUNCATED AND MAY NOT BE QUOTED AS AN EFFECT SIZE.")
+        print("      The quotable statement is the BOUND: DS <= %+.4f pp." % bound)
+        print("      The SIGN and the > bar test are unaffected by truncation.")
+
+    # ---------------- THE VERDICT ----------------
+    print("\n" + "=" * 78)
+    if verdicts:
+        final = verdicts[0]
+        print("GATES FAILED, in order: %s" % " | ".join(verdicts))
+    elif ds is None or dc is None:
+        final = "UNRESOLVED-PATTERN-UNREGISTERED"
+    else:
+        near0 = abs(ds - DS_POSITION) <= SWAP_BAR
+        nearC = abs(ds - DS_CLASS) <= SWAP_BAR
+        final = "UNRESOLVED-UNDERPOWERED" if (near0 and nearC) else branch_of(ds, dc)
+    print("PREDICTED BRANCH (registered): %s" % PRED_BRANCH)
+    print("MEASURED  BRANCH:              %s" % final)
+    if final == "CLASS-OPERATIVE":
+        print("\nTHE RIDER, WHICH MAY NEVER BE DROPPED (CORRECTIONS 161.7c i):")
+        print("  On ResNet-18 the smallest convolution is %d parameters and the"
+              % NUMEL[T_SC0W])
+        print("  largest normalisation tensor is 512, a %.0fx gap with NO overlap."
+              % (NUMEL[T_SC0W] / 512.0))
+        print("  `is a convolution` and `is above ~1e5 parameters` are therefore THE")
+        print("  SAME PREDICATE on this network.  CLASS-OPERATIVE here means")
+        print("  CLASS-OR-MASS-THRESHOLD-OPERATIVE and nothing narrower.  Separating")
+        print("  them needs an architecture with a large normalisation tensor or a")
+        print("  small convolution; cpr1 is not that experiment.")
+    print("FINAL: %s" % final)
+    print("=" * 78)
+
+    print("\nSCOPE.  %s / %s / %s+%s / ms %s / alpha0 %s / gamma %s / batch %d /"
+          % (DSET, NET, BASE_ALG, META_ALG, MS, ALPHA0, GAMMA, BATCH))
+    print("  %d epochs / BETA_CLIP=%s / AUGMENT=1 / HIER unset / PROBE=0 /"
+          % (EPOCHS, CLIP_C))
+    print("  seeds %s / this one named_parameters() order."
+          % ",".join(str(s) for s in SEEDS))
+    print("  NO claim at any other horizon and NO claim about attenuation.")
+    print("  NO m claim: every sweep arm is m=2 and the anchor is an anchor.")
+    print("  NO CAPTURE: there is no layerwise anchor in this batch and one may")
+    print("  NOT be spliced in later.")
+    print("  NO separation of class from a MASS THRESHOLD on the crossing tensor;")
+    print("  that is structurally impossible on ResNet-18 (161.7c i).")
+    print("  NO test of 152.12 rival (c): PROBE=0, and at m=2 block_product has")
+    print("  already reduced <h,g> to one scalar per GROUP, so no per-tensor")
+    print("  quantity exists to log.  That rival remains UNTESTED.")
+    print("  NO generalisation outside layer4.0 and its boundary: the three")
+    print("  crossing tensors are tensors 49, 50 and 52 of 62.")
+    print("  The `scalar` anchor still takes a different code path (exact string")
+    print("  match in init_meta); it is a FLOOR REFERENCE ONLY and that confound")
+    print("  is NOT lifted.")
+    print("  Nothing here touches CIFAR-10, Tiny-ImageNet, ImageNet-489,")
+    print("  ResNet-50, resnet18_blocks, any other meta-stepsize or optimiser")
+    print("  pair, or any hierarchical or shrinkage operator.")
+    return 0
+
+
+# =============================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default=None)
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if not a.runsdir:
+        ap.error("runsdir is required unless --selftest is given")
+    return score(a.runsdir, a.manifest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

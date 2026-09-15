@@ -1,0 +1,752 @@
+# MAIN-IDEA LEDGER — everything that was tried on hierarchical / partially-pooled step sizes
+
+**Scope.** This document accounts for the ORIGINAL idea only: learn a scalar and a
+layerwise/blockwise set of step sizes jointly, and shrink the fine ones toward the coarse one
+with a tunable strength. It is not about the replacement paper (the count-matched partition
+audit). Every number below was re-derived at write time from `results/all_runs.csv`
+(2,177 rows) and, where the question is about a trajectory rather than an endpoint, from the
+raw Slurm `.out` epoch series on cluster_a (`/cluster/account_a/metaopt/runs/`). No number is
+quoted from prose, including from `docs/MASTER-TABLE.md`.
+
+**Metric discipline.** `plateau5` (mean of the last 5 test epochs) is PRIMARY throughout.
+The CSV column `plateau` is mean-of-last-20 and is BANNED as primary; `best_test` is not a
+plateau at all. **Almost every headline number the project published about this idea is on
+`plateau` or on `best_test`.** Where that is so, both values are given and the metric the
+original claim used is named. Unless stated otherwise, every cell is filtered to
+`superseded != 1`, `window_ok == 1`, `complete == 1`, with the 21 `dup_group` pairs collapsed
+to one row each (4 of those 21 groups are hierarchical: three `h2-blk6/h2-b-L0p1` block pairs
+and one `h2-l-L0p1_s2 / h2-lam01_s2` layerwise pair).
+
+**Replication unit.** BATCH, not seed (`F(62,85)=5.47, p=6.9e-13`; seed `F=1.21, p=0.213`).
+Seed-level standard errors below therefore UNDERSTATE uncertainty. The campaign's own
+cross-batch floor is **0.18–0.29 pp** (`docs/CLOSEOUT.md` §items 5, 2). Any contrast smaller
+than that, and any contrast whose two arms are drawn from different batch families, is not
+resolved no matter what its t-statistic says. The batch families behind each cell are named
+where it matters.
+
+---
+
+## 0. What was covered, and what it cost
+
+`hier` column over the whole CSV:
+
+| `hier` | rows | GPU-h (`wallclock_min`/60) | what it is |
+|---|---|---|---|
+| `''` (not hierarchical) | 1,540 | 1,148.7 | the rest of the campaign |
+| `additive` | 437 | 354.3 | M1 — the retention-ratio operator `r` |
+| `shrink` | 113 | 66.4 | M0 — pull each group's beta toward the group mean, every step |
+| `zpool` | 83 | 71.0 | the confound-free operator, pooling in meta-gradient space |
+| `zmpool` | 4 | 1.0 | a variant that exists only as 4 twenty-epoch gate runs |
+| **main idea, total** | **637** | **492.8** | 29.3% of runs, 30.0% of the campaign's 1,641.5 GPU-h |
+
+After collapsing the 4 hierarchical duplicate rows: **633 runs / 490.2 GPU-h.** These are the
+hierarchical ARMS only; the plain (`hier=''`) control arms they are differenced against are
+shared with the rest of the campaign and are not charged here.
+
+The 637 runs occupy **218 distinct configuration cells**
+(`hier` x `lam` x `eta_ratio` x network x dataset x granularity x `alpha0` x base x meta x
+epochs). Median n per cell = 3; **52 cells are n=1** and 45 are n=2.
+
+**One axis is entirely unexplored: all 637 hierarchical runs sit at `meta_stepsize = 1e-3`.**
+That matters more than anything else in this document, because the central mechanism finding
+(§M1-5) is that `r` *is* a meta-stepsize dial. The baselines were meta-stepsize-tuned; the
+hierarchical arms never were.
+
+**Operators, exactly as implemented** (`patches/HF_patched.py:380-410`, `patches/patch_zpool.py`):
+
+* **M0 `shrink`** — after each meta-step, `beta <- beta - lam * (beta - mean(beta))`.
+  Applied EVERY step. Contraction factor per step `(1-lam)`.
+* **M1 `additive`** — `beta <- beta_prev + mean(d) + r * (d - mean(d))`, where
+  `d = beta - beta_prev` is the realised increment. `r=1` is the identity; `r=0` gives every
+  group the shared increment. Acts on the realised increment, i.e. AFTER the meta-optimizer.
+* **`zpool`** — `z'_b = (1-r) * sum_j z_j + r * z_b` on the meta-GRADIENT, i.e. BEFORE the
+  meta-optimizer. Both endpoints are exact identities: `r=0` is exactly the scalar arm,
+  `r=1` is exactly the plain per-group arm.
+
+CIFAR-10 at batch 100 is 500 optimiser steps/epoch, so a 100-epoch run is **50,000 steps**
+and a 300-epoch run is 150,000.
+
+---
+
+## 1. M0 SHRINK — the proposal's own operator
+
+### M0-1. Is there a tunable shrink coefficient with an interior optimum?
+
+* **Varied:** `lam` over {1e-5, 3e-5, 1e-4, 1e-3, 0.01, 0.03, 0.1, 0.3, 0.5, 1.0}.
+* **Scale:** ResNet18 / CIFAR-10 / layerwise / `alpha0=1e-6` / SGDm base + Lion meta /
+  `ms=1e-3` / `beta_clip=-15:-2.3026` / augment=1 / batch 100 / 100 epochs.
+  n=2 on the three lowest rungs (`lp-*`), n=3 elsewhere, n=11 at `lam=0.1`.
+  Batch families: `lp` (1e-5, 3e-5, 1e-4), `h2` (1e-3, 0.01, 0.03, 0.5, 1.0),
+  `h2`+`hs`+`a0L`+`a0h` (0.1), `h2` (0.3).
+* **Result (re-derived, plateau5 | plateau | best_test):**
+
+| `lam` | n | plateau5 | plateau (banned) | best_test | plateau5 vs plain |
+|---|---|---|---|---|---|
+| — (plain layerwise) | 17 | 90.893 ±0.191 | 90.784 | 91.200 ±0.179 | — |
+| 1e-5 | 2 | 90.914 ±0.124 | 90.803 | 91.370 | +0.021 |
+| 3e-5 | 2 | 90.958 ±0.034 | 90.790 | 91.295 | +0.065 |
+| 1e-4 | 2 | 90.761 ±0.219 | 90.615 | 91.035 | −0.132 |
+| 1e-3 | 3 | 92.426 ±0.168 | 92.324 | 92.543 | **+1.533** |
+| 0.01 | 3 | **92.575 ±0.176** | 92.472 | 92.787 | **+1.682** |
+| 0.03 | 3 | 92.229 ±0.148 | 92.246 | 92.583 | +1.336 |
+| 0.1 | 11 | 92.321 ±0.105 | 92.293 | 92.594 | +1.428 |
+| 0.3 | 3 | 92.274 ±0.226 | 92.224 | 92.507 | +1.381 |
+| 0.5 | 3 | 92.255 ±0.133 | 92.196 | 92.500 | +1.362 |
+| 1.0 | 3 | 92.257 ±0.191 | 92.199 | 92.533 | +1.364 |
+
+  The ladder is a **step function, not a dial**. Below `lam=1e-3` the operator does nothing
+  (the three lowest rungs sit inside the plain arm's own seed band). At and above `lam=1e-3`
+  it is flat: one-way ANOVA over the seven rungs `lam` in [1e-3, 1.0] gives
+  **F(6,22)=2.138, p=0.089** (N=29), span 0.346 pp against a pooled within-cell sd of 0.148 —
+  and the span is itself below the 0.20–0.29 pp cross-batch floor. `lam=1.0` (full pooling)
+  ranks **fifth of seven on plateau5** and sixth of seven on best_test; it is not the optimum
+  and it is not distinguishable from any other rung above 1e-3.
+* **Verdict: WITHDRAWN.**
+  Not REFUTED, because the question was never actually put. The operator has one live decade,
+  [1e-4, 1e-3], and **zero runs sit inside it**. Above it the operator saturates; below it
+  the operator is inert. WITHDRAWN is the honest label for a claim whose supporting sweep
+  measured the same thing seven times.
+* **So what:** *hierarchical shrinkage with a tunable coefficient — the actual proposal — was
+  never tested.* Everything the project reported under the name "M0 shrink" is a measurement
+  of FULL pooling of the beta increments, reported seven times at seven labels.
+
+### M0-2. Why it saturates — the half-life arithmetic, checked against the data
+
+* **Varied:** nothing; this is the operator's own dynamics, cross-checked against M0-1.
+* **Result:** the shrink half-life in steps is `ln 2 / (-ln(1-lam))`: 6,931 steps at
+  `lam=1e-4`; **693 steps at `lam=1e-3`**; 69 at 0.01; 6.6 at 0.1; 1 at 0.5. A 100-epoch run
+  is 50,000 steps, so every `lam >= 1e-3` runs for **at least 72 half-lives**. The data agree
+  on the upper end and locate the knee one decade higher than pure contraction predicts:
+  `lam=1e-4` (7.2 half-lives, 99.3% contraction if the meta-gradient did nothing) still reads
+  as plain, because the meta-gradient re-separates the betas every step. The operator is
+  therefore a competition between shrinkage and re-separation whose transition sits somewhere
+  in [1e-4, 1e-3].
+* **Verdict: CONFIRMED** (saturation above 1e-3) **and NEVER-TESTED** (the transition decade).
+* **So what:** the sweep design was wrong by one decade at the bottom and three decades too
+  wide at the top. Six of the ten rungs run were uninformative by construction.
+
+### M0-3. How large is the shrink effect, and against what?
+
+* **Varied:** the reference arm.
+* **Record:** deltas "+1.17 to +1.46 pp", on `best_test`, against "plain layerwise
+  91.33 ±0.17 (n=6)".
+* **Re-derived:** the 13-axis-matched plain layerwise cell is **n=17**, `best_test`
+  91.200 ±0.179, `plateau5` 90.893 ±0.191, `plateau` 90.784 (batch families
+  `a0L/a0h/h2/mx/sc/zad`). The n=6 reference in the record cannot be uniquely reconstructed
+  from the CSV under any single-family or clip/augment filter. Against the matched cell the
+  deltas are **+1.30 to +1.59 pp on best_test** and **+1.34 to +1.68 pp on plateau5**.
+  Welch against the n=17 arm, plateau5: `lam=0.01` +1.682, se 0.112, t=15.07;
+  `lam=1.0` +1.364, se 0.120, t=11.41.
+* **Verdict: CONFIRMED as an effect; WITHDRAWN as evidence for the idea.**
+* **So what:** the effect is real and larger than published, but it is the effect of ONE
+  setting (full pooling of increments), and §M1-5 shows that setting is a meta-stepsize
+  reduction. Quoting the ladder's peak (+1.46, or +1.68 on the corrected reference) was and
+  remains a cherry-pick over a flat ladder.
+
+### M0-4. Does shrink survive a non-crippled initialisation?
+
+* **Varied:** `alpha0` in {1e-6, 1e-4, 1e-3} at `lam=0.1`, under BOTH meta-optimizers
+  (batches `a0L`, `a0h`, `a0A`, `h2A`).
+* **Scale:** R18/CIFAR-10, layerwise, 100 ep, n=2–11 per cell.
+* **Result (plateau5, shrink vs its own matched plain arm):**
+
+| meta | `alpha0` | shrink `lam=0.1` | plain layerwise | delta |
+|---|---|---|---|---|
+| Lion | 1e-6 | 92.321 (n=11) | 90.893 (n=17) | **+1.428** |
+| Lion | 1e-4 | 92.273 (n=4) | 90.949 (n=9) | **+1.324** |
+| Lion | 1e-3 | 92.226 (n=4) | 91.196 (n=14) | **+1.030** |
+| Adam | 1e-6 | 91.936 (n=6) | 90.446 (n=9) | **+1.490** |
+| Adam | 1e-4 | 91.750 (n=2) | 90.955 (n=2) | +0.795 |
+| Adam | 1e-3 | 92.008 (n=2) | 91.287 (n=2) | +0.721 |
+
+* **Verdict: CONFIRMED** — unlike M1's interior optimum (§M1-4), the M0 effect does NOT
+  vanish at a proper init; it attenuates by ~30% and stays above the 0.5 pp materiality bar
+  under Lion at every `alpha0`.
+* **So what:** this is the one place the M0 arm looks better than the M1 arm, and it is worth
+  saying plainly to avoid the impression that everything collapsed for the same reason. It
+  does not rescue the idea, because §M1-5 shows the same +1.0 pp is bought more cheaply and
+  more controllably by turning the meta-stepsize down one decade.
+
+### M0-5. Does the shrink gain survive a longer budget?
+
+* **Varied:** budget window E in {100, 205, 300} epochs, read off ONE 300-epoch trajectory per
+  seed (so this is three windows of one run, not three independent budgets — the defect
+  `CORRECTIONS 86.1` names).
+* **Scale:** R18/CIFAR-10, layerwise, `lam=0.1`, 300 epochs, n=2 seeds per arm, two families:
+  `e300-*` at `alpha0=1e-3` and `e3a-*` at `alpha0=1e-6`. Re-derived directly from the raw
+  `.out` epoch series (`e300-lsh01-s{0,1}`, `e300-lplain-s{0,1}`, `e3a-lsh01-s{0,1}`,
+  `e3a-lplain-s{0,1}`), plateau5 = mean of epochs E−5..E−1.
+* **Result (shrink `lam=0.1` minus plain layerwise, plateau5):**
+
+| family | `alpha0` | E=100 | E=205 | E=300 |
+|---|---|---|---|---|
+| `e300` | 1e-3 | **+0.682** | +0.271 | +0.158 |
+| `e3a` | 1e-6 | **+1.605** | +0.535 | **+0.062** |
+
+  For contrast, the granularity effect on the same trajectories does not decay
+  (`e300-lplain` minus `e300-scal`: +3.505 / +3.486 / +3.413 at E=100/205/300).
+* **Verdict: REFUTED.** The pooling gain is a speed effect. At `alpha0=1e-6` it is gone by
+  300 epochs (+0.062 pp, well inside one seed band).
+* **So what:** the parent paper's ImageNet null is a LONG-BUDGET null. An intervention whose
+  benefit halves every ~100 epochs is exactly the wrong shape to fix it. This single result,
+  n=2 though it is, is the most direct evidence against the idea's stated purpose.
+
+### M0-6. Does shrink transfer across granularity?
+
+* **Varied:** granularity in {blk6, nodewise, weightwise} at `lam` in {1e-5, 1e-4, 0.01, 0.1,
+  0.5, 1.0} (batches `h2`, `hs`, `n1`).
+* **Scale:** R18/CIFAR-10, `alpha0=1e-6`, 100 ep, n=2–3 per cell.
+* **Result (plateau5, vs the matched plain arm at the same granularity):**
+
+| granularity | plain | shrink | delta |
+|---|---|---|---|
+| `resnet18_blocks` (m=6) | 91.448 (n=12) | 91.723 @0.1 (n=3) / 91.793 @1.0 (n=2) | +0.275 / +0.345 |
+| `nodewise` (m=14,420) | 91.739 (n=8) | 92.351 @1.0 (n=2) | +0.612 |
+| `weightwise` (m=11.2M) | 79.183 (n=4) | 78.670 @1e-5 (n=2) | −0.513 |
+| `weightwise` | 79.183 | 69.905 @1e-4 (n=2) | −9.278 |
+| `weightwise` | 79.183 | 48.9 / 48.2 / 48.2 / 48.1 @{0.01,0.1,0.5,1.0} (n=2 each) | −30 to −31 |
+
+* **Verdict: REFUTED at weightwise; OPEN at blk6 and nodewise** (n=2–3, deltas of 0.28–0.61 pp
+  against a 0.20–0.29 pp cross-batch floor, single-family arms — not resolved either way).
+* **So what:** the operator that was supposed to RESCUE over-fine partitions destroys the
+  finest one. Whatever M0 does, it is not "make weightwise safe".
+
+### M0-7. Does shrink transfer to CIFAR-100?
+
+* **Varied:** dataset, at `lam=0.01`, `alpha0` in {1e-6, 1e-3} (batch `m0c`).
+* **Scale:** ResNet18_c100 / CIFAR-100 / layerwise / 100 ep / n=2–3.
+* **Result (plateau5):** 18.265 ±0.078 (a0=1e-6, n=2) and 16.118 ±0.585 (a0=1e-3, n=3),
+  against plain layerwise 69.302 (n=8) and 69.594 (n=8). A loss of **−51.0 and −53.5 pp**.
+* **Verdict: REFUTED.**
+* **So what:** on the harder dataset the operator does not attenuate, it collapses training.
+  Same sign and same magnitude as M1's CIFAR-100 failure (§M1-8), so this is a property of
+  pooling beta increments, not of one operator.
+
+### M0-8. The 20-epoch and 4-epoch gate runs
+
+* **What:** `p2` (4 granularities, a0=1e-6), `p3` (same, a0=1e-3), `p4`/`p5` (R10, R34,
+  ResNet18_c100 x 3 granularities, both `alpha0`), all at `lam=1.0`, 20 epochs, n=1 per cell;
+  plus `hv_lam0` / `hv_lam1` 4-epoch smoke tests.
+* **Result:** all 26 twenty-epoch rows have `window_ok = 0` — their `plateau` is the whole run,
+  not a tail — and none has a matched plain arm in its own batch. The 4-epoch smokes read
+  best_test 13.36–13.49 across every setting including the identities, i.e. they discriminate
+  nothing.
+* **Verdict: NEVER-TESTED.**
+* **So what:** these 30 runs are plumbing checks. They are correctly excluded from every
+  accuracy statement and must not be counted as transfer evidence.
+
+---
+
+## 2. M1 ADDITIVE — the retention ratio `r`
+
+### M1-1. Is there an interior pooling optimum on the home cell?
+
+* **Varied:** `r` in {0, 0.03, 0.04, 0.05, 0.06, 0.07, 0.1, 0.2, 0.3, 1}.
+* **Scale:** R18/CIFAR-10 / layerwise / `alpha0=1e-6` / SGDm+Lion / `ms=1e-3` / clip / 100 ep.
+  n=3–10 per cell; families `ad`, `mx`, `zad`, `sc`.
+* **Result (plateau5 | plateau | best_test):**
+
+| `r` | n | plateau5 | plateau (banned) | best_test |
+|---|---|---|---|---|
+| 0 | 6 | 92.288 ±0.117 | 92.228 | 92.528 |
+| 0.03 | 5 | 92.620 ±0.135 | 92.637 | 92.964 |
+| 0.04 | 5 | 92.894 ±0.141 | 92.862 | 93.178 |
+| 0.05 | 10 | 93.053 ±0.149 | 93.047 | 93.409 |
+| **0.06** | 8 | **93.285 ±0.119** | 93.262 | 93.536 |
+| 0.07 | 9 | 93.222 ±0.152 | 93.192 | 93.458 |
+| 0.1 | 5 | 92.598 ±0.160 | 92.626 | 92.862 |
+| 0.2 | 3 | 91.519 ±0.210 | 91.387 | 91.727 |
+| 0.3 | 3 | 91.167 ±0.147 | 90.957 | 91.397 |
+| 1 (identity) | 3 | 90.971 ±0.129 | 90.864 | 91.357 |
+| plain layerwise | 17 | 90.893 ±0.191 | 90.784 | 91.200 |
+
+  Monotone rise to a plateau at r in [0.05, 0.07], cliff on the high side. Interior optimum
+  over the better endpoint (r=0): **+0.997 pp**. Over the identity (r=1): +2.314 pp,
+  Welch se 0.063, t=38.23 vs plain.
+* **Verdict: CONFIRMED.** The curve is real, well-powered, and reproduces exactly. The
+  MASTER-TABLE's seven-cell version (92.200 / 92.637 / 93.086 / 93.217 / 92.626 / 91.387 /
+  90.957) is the `plateau` metric with slightly different family filters; on plateau5 the
+  shape is identical and the peak is 0.02–0.09 pp higher.
+* **So what:** this is the campaign's cleanest empirical shape, and it is the reason the idea
+  was pursued for as long as it was. Everything below is about what it is NOT.
+
+### M1-2. Does the identity control hold?
+
+* **Varied:** `r=1`, which is algebraically the plain arm.
+* **Result:** plateau5 90.971 ±0.129 (n=3, `zad`) vs plain layerwise 90.893 ±0.191 (n=17):
+  **+0.078 pp**. At `alpha0=1e-3`: 91.216 ±0.163 (n=5) vs 91.196 ±0.193 (n=14): **+0.020 pp**.
+  ResNet10: 91.241 (n=3) vs 91.333 (n=3): −0.092. ResNet34: 90.421 (n=3) vs 90.178 (n=5):
+  +0.243.
+* **Verdict: CONFIRMED.** The plumbing is correct; the operator is what it claims to be.
+* **So what:** rules out "the effect is a bug". It is not.
+
+### M1-3. Is `r=0` actually full pooling? (the granularity-invariance test)
+
+* **Varied:** granularity at `r=0` across 180,000x in group count `m`, with `zpool r=0` as
+  the reference operator.
+* **Scale:** R18/CIFAR-10, `alpha0=1e-6`, 100 ep, n=3–6.
+* **Result (plateau5 | plateau):**
+
+| granularity | m | `additive` r=0 | `zpool` r=0 |
+|---|---|---|---|
+| `resnet18_blocks` | 6 | 91.859 ±0.105 (n=3) \| 91.730 | not run |
+| `layerwise` | 62 | 92.288 ±0.117 (n=6) \| 92.228 | 87.880 ±0.157 (n=5) \| 87.740 |
+| `nodewise` | 14,420 | 92.359 ±0.055 (n=3) \| 91.984 | not run |
+| `weightwise` | 11,173,962 | 47.955 ±2.840 (n=3) \| 45.005 | 87.943 ±0.073 (n=5) \| 87.763 |
+
+  `additive r=0` spans **44.40 pp on plateau5** (47.19 pp on `plateau`) across the ladder.
+  `zpool r=0` spans **0.063 pp on plateau5** (0.032 pp on `plateau`) across the same 180,000x
+  range, and lands on plain scalar (87.879 ±0.158, n=12) to within 0.06 pp. Welch on the
+  zpool pair: −0.063, se 0.077, t=−0.82.
+* **Verdict: REFUTED.** A true full-pooling arm must be partition-independent. `zpool r=0` is;
+  `additive r=0` is not, by three orders of magnitude in the discrepancy.
+* **So what:** `additive r=0` is not a pooling baseline. Every claim of the form "even full
+  pooling helps (+1.4 pp)" read this cell and is therefore void.
+
+### M1-4. Does the interior optimum survive a non-crippled initialisation?
+
+* **Varied:** `alpha0` 1e-6 -> 1e-3 across the whole `r`-curve (families `ac`, `m1a3`, `p6`,
+  `mx`, `dc`).
+* **Scale:** R18/CIFAR-10, layerwise, 100 ep, n=5–12 per cell at 1e-3.
+* **Result (plateau5):**
+
+| `r` | a0=1e-6 | a0=1e-3 |
+|---|---|---|
+| 0 | 92.288 (n=6) | 92.217 (n=7) |
+| 0.03 | 92.620 (n=5) | 92.096 (n=7) |
+| 0.05 | 93.053 (n=10) | 92.100 (n=5) |
+| **0.06** | **93.285 (n=8)** | 92.106 (n=12) |
+| 0.07 | 93.222 (n=9) | 92.152 (n=5) |
+| **0.1** | 92.598 (n=5) | **92.403 (n=7)** |
+| 0.2 | 91.519 (n=3) | 92.017 (n=5) |
+| 1 | 90.971 (n=3) | 91.216 (n=5) |
+
+  Peak-over-`r=0` falls from **+0.997 pp to +0.186 pp** — 81% of the effect gone on plateau5
+  (the record's +1.011 -> +0.239, i.e. 76%, is the same contrast on the banned `plateau`).
+  What remains is far below the campaign's own 0.5 pp materiality bar. The argmax also moves,
+  0.06 -> 0.1, which a real optimum should not do under a change of initialisation. Over
+  r in [0, 0.07] the a0=1e-3 curve spans **0.296 pp on plateau5** across seven cells — below
+  the 0.5 pp materiality bar and at the edge of the 0.20–0.29 pp cross-batch floor.
+* **Verdict: REFUTED.**
+* **So what:** the sharp interior optimum is an escape-rate artefact of a deliberately
+  crippled `alpha0`. Do not overstate it: the FULL a0=1e-3 curve still spans 1.187 pp
+  (r=0.1 92.403 beats r=1 91.216), so "the whole curve flattens" is wrong — only its
+  interior does, and what is left is §M1-5's meta-stepsize effect.
+
+### M1-5. Is `r` a POOLING dial or a META-STEPSIZE dial? — the decisive test
+
+* **The mechanism.** Under Lion every realised beta increment is exactly `+-ms`, so the shared
+  component `mean_b(d_b) = ms*(2p-1)` where `p` is the cross-group sign agreement. Moving `r`
+  from 1 to 0 therefore divides the effective meta-stepsize by `|2p-1|`. Measured
+  `|2p-1|` per granularity (from `results/p7_c31.txt`, the `p7` steady window — this is a
+  probe measurement, NOT re-derivable from the CSV, and is reported here as record):
+  0.3947 (blk6, m=6) / 0.1277 (layerwise, 62) / 0.0152 (nodewise, 14,420) / 0.000331
+  (weightwise, 11.2M) — strictly monotone over six decades of `m`, giving `ms_eff` from
+  3.9e-4 down to 3.3e-7. `zpool`, which acts BEFORE Lion, has no such factor: its `ms_eff`
+  is `ms` at every `r`.
+* **The decisive contrast, fully axis-matched.** R18/CIFAR-10, `alpha0=1e-3`, SGDm+Lion,
+  augment=1, clip, batch 100, gamma=1, 100 epochs — everything identical except the two knobs
+  under test:
+
+| arm | `ms` | n | plateau5 |
+|---|---|---|---|
+| plain scalar | 1e-3 | 14 | 87.839 ±0.240 |
+| plain layerwise | 1e-3 | 14 | 91.196 ±0.193 |
+| `additive` r=0 (full pooling) | 1e-3 | 7 | 92.217 ±0.075 |
+| `additive` r=0.1 (best interior) | 1e-3 | 7 | 92.403 ±0.139 |
+| **plain scalar, meta-stepsize tuned** | **1e-4** | 5 | **92.262 ±0.222** |
+| **plain layerwise, meta-stepsize tuned** | **1e-4** | 11 | **92.887 ±0.173** |
+
+  A plain SCALAR step size with the meta-stepsize turned down one decade **matches the best
+  hierarchical arm**: `additive` r=0.1 minus tuned scalar = **+0.140 pp, se 0.112, t=1.25** —
+  not significant, and below the cross-batch floor. And a plain LAYERWISE arm with the same
+  one-decade meta-stepsize tune **beats** it: `additive` r=0.1 minus tuned layerwise =
+  **−0.484 pp, se 0.074, t=−6.53**.
+  Corroborating: plain scalar run at exactly the `ms_eff` the mechanism predicts for
+  additive-r=0-layerwise (1.277e-4) reads 91.849 ±0.131 (n=5); the whole scalar ms-response
+  is single-peaked around 1e-4 (87.839 at 1e-3, 88.744 at 3e-4, 92.262 at 1e-4, 91.672 at
+  3e-5, 90.838 at 1e-5, 90.451 at 1e-8).
+* **Verdict: REFUTED.**
+* **So what: THE HIERARCHICAL IDEA'S MECHANISM IS DEAD.** `r` is a meta-learning-rate dial
+  wearing a pooling costume. At a proper initialisation, everything the operator buys is
+  bought — and beaten — by turning one existing scalar knob. There is no diagnosis of "why
+  the expressive parameterisation loses" left to write, because the fine parameterisation was
+  never the thing being adjusted.
+
+### M1-6. Where does the surviving curve sit against a real baseline?
+
+* **Result (plateau5, 100 epochs, CIFAR-10):**
+
+| arm | value | n |
+|---|---|---|
+| `additive` best, R18 (r=0.06, a0=1e-6) | 93.285 ±0.119 | 8 |
+| best tuned plain META arm on R18 (`nodewise1d`, ms=3e-4, a0=1e-3) | 93.001 ±0.150 | 12 |
+| AdamW + cosine, no meta-learning, lr 3e-3 (`fxcos-3e-3`) | **94.817 ±0.141** | 3 |
+| `additive` best, R34 (r=0.025, a0=1e-6) | 93.967 ±0.127 | 3 |
+| AdamW + cosine, R34, lr 1e-3 (`f5cos-r34-1e-3`) | **94.823 ±0.060** | 3 |
+| `additive` r=0.06, R50 (a0=1e-3) | 92.678 ±0.257 | 2 |
+| AdamW + cosine, R50, lr 1e-3 (`f5cos-r50-1e-3`) | **95.047 ±0.190** | 3 |
+
+  (`nodewise1d`@3e-4 reads 93.153 ±0.108 at n=3 if the box-free `fa1` family is excluded per
+  `REGISTER-ideas-ABC` T3.3, and 93.001 ±0.150 at n=12 if it is pooled in; both are below the
+  `additive` best and both are ~1.7 pp below the non-meta baseline.)
+* **Verdict: REFUTED** (as a method). Deficits of **−1.53 / −0.86 / −2.37 pp** on
+  R18 / R34 / R50 against a plain tuned non-meta baseline.
+* **So what:** even at the idea's own best point, on its own home cell, the whole
+  MetaOptimize + hierarchy stack loses to AdamW with a cosine schedule. This is the number
+  that decides whether any of the rest matters.
+
+### M1-7. Does the interior optimum transfer across ARCHITECTURE?
+
+* **Varied:** network in {ResNet10, ResNet18, ResNet34}, full `r`-curves at `alpha0=1e-6`
+  (families `r10`, `r10b`, `ad`/`mx`/`sc`/`zad`, `r34r`, `r34f`); ResNet10 also at
+  `alpha0=1e-3` (`r10c`).
+* **Scale:** CIFAR-10, layerwise, 100 ep, n=3–10 per cell.
+* **Result (plateau5):**
+
+| net (params) | endpoints r=0 / r=1 | argmax | value at argmax | gain over the BETTER endpoint |
+|---|---|---|---|---|
+| ResNet10 (4.90M), a0=1e-6 | 82.180 / 90.743 | **r=0.1** | 91.605 ±0.153 (n=3) | **+0.862** |
+| ResNet18 (11.17M), a0=1e-6 | 92.288 / 90.971 | **r=0.06** | 93.285 ±0.119 (n=8) | **+0.997** |
+| ResNet34 (21.28M), a0=1e-6 | 93.073 / 90.421 | **r=0.025** | 93.967 ±0.127 (n=3) | **+0.894** |
+| ResNet10 (4.90M), a0=1e-3 | 82.237 / 91.241 | **r=1** (boundary) | 91.241 (n=3) | none |
+
+  Full ResNet34 curve (plateau5): 0.005 93.307 / 0.01 93.419 / 0.015 93.803 / 0.02 93.912 /
+  **0.025 93.967** / 0.03 93.849 / 0.04 93.494 / 0.05 93.065 / 0.06 92.805 / 0.08 92.327 /
+  0.1 91.777 / 0.2 90.589 / 1 90.421. The argmax is INTERIOR and BRACKETED.
+  The endpoint ordering inverts with scale: on R10 the fine endpoint wins by +8.563 pp;
+  on R18 and R34 the pooled endpoint wins by 1.317 / 2.652 pp.
+* **Verdict: CONFIRMED (at `alpha0=1e-6`), REFUTED (at `alpha0=1e-3`).**
+* **DISCREPANCY WITH THE RECORD, and it matters.** `MASTER-TABLE.md:77` reads "No interior
+  optimum anywhere", and the project's own summary of this work says the optimum "transfers
+  nowhere". **That is wrong as stated.** Row 77's scope is ResNet10@a0=1e-3 and CIFAR-100;
+  row 78 (the scale-law row) records the opposite for ResNet34, and the CSV confirms it.
+  The correct sentence is: **the interior optimum transfers cleanly along the ARCHITECTURE
+  axis at `alpha0=1e-6` (three of three networks, gains +0.86 to +1.00 pp), and fails along
+  the INITIALISATION axis and the DATASET axis.** That is a narrower and more interesting
+  failure than "it transfers nowhere", and Dr Salehkaleybar should have the accurate version.
+* **So what:** the effect is a property of the a0=1e-6 escape regime, not of the network. It
+  survives changing the thing the parent paper cared about (scale) and dies on the thing that
+  should not have mattered (where beta starts).
+
+### M1-8. Does it transfer to CIFAR-100?
+
+* **Varied:** dataset, full `r`-curves at both `alpha0` (families `rc6`, `rc100`, `c100`),
+  plus `cs`/`sa3` spot checks on ResNet10_c100 and ResNet34_c100.
+* **Scale:** ResNet18_c100 / CIFAR-100 / layerwise / 100 ep / n=2–4.
+* **Result (plateau5):**
+
+| `r` | a0=1e-6 | a0=1e-3 |
+|---|---|---|
+| 0 | 11.087 | 8.917 |
+| 0.05 | 43.458 | 17.373 |
+| 0.07 | 59.328 | 26.491 |
+| 0.1 | 68.818 | 42.788 |
+| 0.2 | **70.106** | 68.519 |
+| 0.4 | 69.687 | — |
+| 1 | 69.718 | **70.107** |
+| plain layerwise | 69.302 (n=8) | 69.594 (n=8) |
+
+  Monotone increase toward the identity at both `alpha0`. At a0=1e-6 there is a bump at
+  r=0.2 of +0.388 pp over r=1 — below the 0.5 pp materiality bar and inside the cross-batch
+  floor. Spot checks at the CIFAR-10 optimum r=0.06: ResNet10_c100 5.566 vs plain 68.524
+  (−62.96 pp); ResNet34_c100 57.697 vs plain 68.116 (−10.42 pp).
+* **Verdict: REFUTED.**
+* **So what:** the CIFAR-10 optimum r=0.06 lands where CIFAR-100 has lost 10–63 pp. There is
+  no setting of `r` that is safe to carry between datasets, which is fatal for anything that
+  wants to be called a method.
+
+### M1-9. Does it transfer across GRANULARITY?
+
+* **Varied:** granularity in {blk6, nodewise, weightwise} x `r` (families `gp`, `gc`, `ha`).
+* **Scale:** R18/CIFAR-10, 100 ep, n=3–5.
+* **Result (plateau5, a0=1e-6, vs each granularity's own r=1):**
+
+| granularity | best interior | value | r=1 | gain |
+|---|---|---|---|---|
+| `resnet18_blocks` | r=0.03 | 91.927 ±0.194 (n=3) | 91.459 (n=3) | +0.468 (flat; inside the floor) |
+| `layerwise` | r=0.06 | 93.285 ±0.119 (n=8) | 90.971 (n=3) | **+2.314** |
+| `nodewise` | r=0.06 | 93.225 ±0.071 (n=3) | 91.766 (n=3) | **+1.459** |
+| `weightwise` | none (monotone up) | 79.064 at r=1 | 79.064 (n=3) | 0 |
+
+  At `alpha0=1e-3`, `r=0` by granularity: layerwise 92.217 (+1.021 vs plain), nodewise 93.140
+  (+1.194), blk6 92.161 (+0.651), weightwise 90.710 (−0.387).
+* **Verdict: CONFIRMED at layerwise and nodewise; REFUTED at both ends of the ladder.**
+* **So what:** the interior optimum exists only in the middle of the granularity range, which
+  is exactly where `|2p-1|` is neither ~1 (blk6, no meta-stepsize reduction available) nor
+  ~0 (weightwise, beta cannot move at all). The granularity dependence is the mechanism's
+  fingerprint, not the idea's.
+
+### M1-10. Does it depend on the base / meta optimizer?
+
+* **Varied:** base in {SGDm, Lion, AdamW}, meta in {Lion, Adam} (families `bo`, `adg`, `dc`).
+* **Scale:** R18/CIFAR-10, layerwise, 100 ep, n=2–5.
+* **Result (plateau5):**
+
+| base + meta | `alpha0` | plain | additive | delta |
+|---|---|---|---|---|
+| Lion + Lion | 1e-6 | 91.281 (n=3) | **r=0: 93.925 (n=2)** / r=0.06: 93.224 / r=0.2: 92.334 | +2.644 at r=0 |
+| SGDm + Adam | 1e-6 | 90.451 (n=12) | r=0.03: 91.471 (n=3) / r=0.1: 91.129 (n=3) | +1.020 / +0.678 |
+| AdamW + Adam | 1e-3 | 91.342 (n=13) | r=0.06: 91.409 (n=5) | +0.067 |
+| AdamW + Adam | 1e-4 | 91.979 (n=6) | r=0.06: 92.688 (n=5) | +0.709 |
+
+* **Verdict: REFUTED (as a stable optimum).** Under a Lion BASE optimizer the `r`-curve is
+  **monotone decreasing** — the best point is the full-pooling endpoint r=0, not an interior
+  one. Under AdamW+Adam at a0=1e-3 the effect is 0.067 pp, i.e. nothing.
+* **So what:** the location of the optimum moves to the boundary when the base optimizer
+  changes. An "optimal pooling strength" that becomes 0 when you swap SGDm for Lion is not a
+  property of the partition structure.
+* **Caveat:** n=2 on the Lion-base arms, one family, no r-ladder below 0. This is a strong
+  signal, not a settled result — it is the single cheapest unrun follow-up in this document.
+
+### M1-11. Does the M1 gain survive a longer budget?
+
+* **Varied:** budget window E in {100, 205, 300} on one trajectory (`e3a`, a0=1e-6, n=2 per
+  arm), plus `bg300`/`bg600` at AdamW base / a0=1e-4 / r=0.06.
+* **Result (plateau5, from the raw `.out` series):**
+
+| contrast | E=100 | E=205 | E=300 |
+|---|---|---|---|
+| `additive` r=0.05 − r=0 | +0.781 | +0.831 | +0.960 |
+| `additive` r=0.1 − r=0 | +0.684 | +0.960 | +1.257 |
+
+  `bg300` (AdamW base, r=0.06, 300 ep) 93.040 ±0.140 (n=3); `bg600` 93.195 ±0.213 (n=3);
+  matched AdamW+cosine non-meta baselines at the same budgets read 95.020 (n=3, `bg300_cos`)
+  and 95.147 (n=3, `bg600_cos`).
+* **Verdict: OPEN.** Unlike M0 (§M0-5), the M1 interior gain does NOT decay with budget on the
+  one trajectory pair that was run — it grows. But n=2, one family, three windows of one
+  trajectory, and no matched plain-layerwise arm at E=205/300 in the same batch.
+* **So what:** the honest position is that the budget behaviour of M1 was never properly
+  measured. It is the second cheapest unrun follow-up. Note that the whole question is
+  downstream of §M1-5: if `r` is a meta-stepsize dial, "the gain grows with budget" just says
+  a smaller meta-stepsize needs longer to pay off.
+* **Also note:** `bg300`/`bg600` (6 runs, ~14 GPU-h) have **no matched plain-layerwise arm at
+  the same base/`alpha0`/budget anywhere in the CSV** — they can only be read against the
+  non-meta cosine baseline, which they lose to by ~2 pp.
+
+### M1-12. Is there a scale law for the optimum, `r* ~ 1/N`?
+
+* **Varied:** `r*` across R10 / R18 / R34 at `alpha0=1e-6`; `r34f` added the sub-0.02 rungs
+  specifically to bracket R34 downward.
+* **Result (plateau5):** r* = 0.10 (R10, 4.90M) / 0.06 (R18, 11.17M) / 0.025 (R34, 21.28M),
+  giving `r* x N` = 0.490M / 0.670M / 0.532M, log-log slope −0.930, R^2 0.952. But every one
+  of the three argmaxes is decided by a CROSS-FAMILY margin far below the floor: R34
+  r=0.025 (`r34f`) beats r=0.02 (`r34r`) by 0.055 pp and r=0.03 by 0.118 pp; R18 r=0.06 beats
+  r=0.07 by 0.063 pp across families {`mx`,`sc`} vs {`ad`,`mx`,`zad`}; R10 r=0.1 beats r=0.08
+  by 0.124 pp across `r10` vs `r10b`.
+* **Verdict: OPEN.**
+* **So what:** `r*` falls monotonically with N and any slope in roughly [−1.1, −0.8] fits, but
+  the grid spacing, not the seed count, is the binding limit, and the scope is `alpha0=1e-6`
+  only (at 1e-3 R10's interior optimum disappears entirely). Left open deliberately: a scale
+  law for a dial that turned out to be a meta-learning-rate knob is not worth compute.
+
+### M1-13. Was the M1 arm's own meta-stepsize ever tuned?
+
+* **Result:** **No. All 437 `additive` runs — and all 637 hierarchical runs — sit at
+  `meta_stepsize = 1e-3.`** The plain baselines were swept over
+  {1e-8, 3.3e-7, 1e-5, 1.5e-5, 3e-5, 1e-4, 1.28e-4, 3e-4, 3.9e-4, 1e-3, 3e-3, 1e-2}; the
+  hierarchical arms were not swept at all.
+* **Verdict: NEVER-TESTED.**
+* **So what:** this is the largest hole in the whole programme. Once §M1-5 established that
+  `r` moves the effective meta-stepsize, the only fair comparison is best-over-(`r`,`ms`)
+  versus best-over-`ms`, and half of that grid does not exist. The comparison in §M1-5 —
+  which the hierarchical arm loses — is against a baseline tuned on an axis the hierarchical
+  arm was never given.
+
+---
+
+## 3. zpool — the confound-free operator
+
+### Z-1. Do the endpoints reproduce their identities?
+
+* **Result (plateau5 | plateau):** layerwise `r=1` 91.037 ±0.176 (n=5) | 90.933, vs plain
+  layerwise 90.893 | 90.784 — +0.144 | +0.149. Weightwise `r=1` 79.235 ±0.345 (n=5) | 77.921,
+  vs plain weightwise 79.183 ±0.369 (n=4) | 77.822 — +0.052 | +0.099. `r=0` lands on plain
+  scalar (87.879 | 87.772) at BOTH granularities: layerwise 87.880 | 87.740, weightwise
+  87.943 | 87.763.
+* **Verdict: CONFIRMED.** This is the only operator in the programme whose both endpoints are
+  exact, and they verify.
+* **So what:** `zpool` is the instrument the other two should have been. Everything measured
+  with it is trustworthy in a way the M0/M1 numbers are not.
+
+### Z-2. Does true full pooling help?
+
+* **Result:** `zpool r=0` 87.880 ±0.157 (n=5, families `zsw`+`zsx`) vs plain layerwise
+  90.893 ±0.191 (n=17) = **−3.013 pp**, Welch se 0.084, t=−35.90. On the banned `plateau`
+  the same contrast reads −3.044 pp, which is the published figure.
+* **Verdict: REFUTED.**
+* **So what:** the claim that "even full pooling helps, +1.39 pp" — carried in the handoff
+  document for roughly twenty cycles — read the `additive r=0` cell, which §M1-3 shows is not
+  a pooling arm. Under the operator that actually pools, full pooling costs 3 pp.
+
+### Z-3. Does true pooling have an interior optimum at a good partition?
+
+* **Varied:** `r` in {0, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99, 1}, layerwise.
+* **Scale:** R18/CIFAR-10, a0=1e-6, 100 ep, n=1–6 (families `zsw`, `zsx`, `zrn`).
+* **Result (plateau5 | plateau):** 87.880 | 87.740 (r=0) / 89.728 | 89.471 / 89.677 | 89.476 /
+  89.361 | 89.170 / 89.235 | 89.100 / 90.335 | 90.196 / 90.454 | 90.435 /
+  **91.112 | 90.971 (r=0.99, n=1)** / 91.037 | 90.933 (r=1). Max interior is +0.075 pp over
+  r=1 on plateau5 (+0.038 on `plateau`), at **n=1**, inside the ±0.176 seed band.
+* **Verdict: REFUTED.**
+* **So what:** with the meta-stepsize confound removed, there is no interior optimum at
+  layerwise. The entire interior-optimum phenomenon lived in the confounded operators.
+
+### Z-4. Does true pooling rescue an over-fine partition?
+
+* **Varied:** the same `r` ladder at weightwise.
+* **Result (plateau5 | plateau):** 87.943 | 87.763 (r=0) / 87.986 / 88.094 / 88.004 / 88.256 /
+  88.614 / 88.905 / **89.272 ±0.229 | 89.052 (r=0.99, n=2)** / 79.235 | 77.921 (r=1).
+  The rescue is **+10.037 pp on plateau5** (Welch se 0.224, t=44.85) — the record's +11.13 pp
+  is the same contrast on the banned `plateau`, inflated by 1.09 pp because the plain
+  weightwise arm is still climbing at epoch 80.
+* **Verdict: CONFIRMED as a rescue, REFUTED as a fix.** The best true-pooling number anywhere
+  (89.272) is still **2.18 pp below plain `resnet18_blocks`** (91.448 ±0.168, n=12) and
+  1.62 pp below plain layerwise. It clears plain scalar by only +1.393 pp.
+* **So what:** the precise, defensible sentence about pooling is: *pooling rescues an
+  over-fine partition and never improves a good one.* You cannot get to a good partition by
+  pooling a bad one; you get there by choosing a good partition.
+* **Caveat the record already makes:** the INTERIOR of the zpool sweep is itself confounded —
+  the shared term carries a factor of `m`, so interior cells train at 3–35x smaller effective
+  step size. Only the two endpoints are clean.
+
+### Z-5. What zpool never covered
+
+* **Granularity:** only layerwise and weightwise. **No `zpool` run exists at `nodewise` or
+  `resnet18_blocks`** — i.e. the operator was never applied at the two partitions that
+  actually perform well.
+* **Initialisation:** 79 of 83 runs at `alpha0=1e-6`. The only `alpha0=1e-3` zpool runs are
+  4 twenty-epoch gates (`z3-*`, `window_ok=0`).
+* **Architecture / dataset:** ResNet18 / CIFAR-10 only. Zero transfer runs.
+* **Budget:** 100 epochs only. Zero long-budget runs.
+* **Verdict: NEVER-TESTED** on all four axes.
+* **So what:** the one trustworthy operator got 83 runs and 71 GPU-h, against 437 runs and
+  354 GPU-h for the operator that turned out to be measuring something else. The programme
+  spent 5x more compute on the confounded instrument than on the clean one, and built the
+  clean one last.
+
+---
+
+## 4. zmpool
+
+* **What exists:** four runs — `zm0-l-r0`, `zm0-l-r1`, `zm0-w-r0`, `zm0-w-r1`. All at
+  20 epochs, `alpha0=1e-6`, R18/CIFAR-10, n=1, `window_ok=0` (their `plateau` is the whole
+  run, not a tail). plateau5: 61.112 / 63.384 / 60.952 / 39.324. Total cost 1.0 GPU-h.
+* **Verdict: NEVER-TESTED.** There is no `zmpool` sweep, no interior grid, no `n>=2` cell,
+  no 100-epoch run, and no matched control.
+* **So what:** if anyone reads a `zmpool` claim anywhere in the corpus, it is not supported.
+  The variant was gated and then dropped when the underlying mechanism died.
+
+---
+
+## 5. Where the CSV and the record disagree
+
+Reported in full, CSV winning, per the working rule.
+
+1. **The metric, everywhere.** Every headline hierarchical number in `MASTER-TABLE.md`,
+   `FINDINGS.md` and `CORRECTIONS.md` is on the BANNED `plateau` (mean-of-last-20) or on
+   `best_test`. Confirmed by exact reproduction of the `plateau` column: 90.784 / 92.228 /
+   93.262 / 92.199 / 87.740 / 87.763 / 90.933 / 90.971 / 89.052 / 77.921 / 45.005 all match to
+   three decimals. On plateau5 the numbers move by up to **1.314 pp** (zpool weightwise
+   r=1: 77.921 -> 79.235). Directions are unchanged in every case; magnitudes are not.
+2. **`additive r=0` layerwise, n=8, is base-contaminated.** `FINDINGS 33.1 / 33.3 / 33.4` and
+   `MASTER-TABLE` row 71 quote 92.587 ±0.674 (n=8). Two of those eight rows
+   (`bo-lion-r0-s0`, `bo-lion-r0-s1`) have **`base = Lion`, not SGDm**. The clean SGDm cell is
+   n=6: `plateau` 92.228 ±0.087, plateau5 92.288 ±0.117. `FINDINGS 34.3` noticed the variance
+   ("the ±0.674 was heterogeneous pooling") but did not name the base axis, and `33.3`'s
+   headline "+1.803 pp vs plain" is still computed from the contaminated cell. Corrected:
+   **+1.444 pp on `plateau`, +1.395 pp on plateau5.** The same two rows also inflate the
+   published `r=0.03`, `r=0.1` and `r=0.2` cells (sd 0.60–0.84 instead of 0.13–0.21).
+3. **M0's published deltas use an unreconstructable reference.** The record differences the
+   shrink ladder against "plain layerwise 91.33 ±0.17 (n=6)" on `best_test`. The 13-axis
+   matched cell is n=17 at `best_test` 91.200 ±0.179. Corrected deltas: **+1.30 to +1.59 pp**
+   (best_test) and **+1.34 to +1.68 pp** (plateau5), i.e. 0.13–0.22 pp larger than published.
+4. **`lam=1.0`'s rank.** The record says "sixth of seven". True on `best_test`; on plateau5 it
+   is **fifth of seven**. More importantly, the seven rungs are not separable at all:
+   ANOVA F(6,22)=2.138, p=0.089.
+5. **The 300-epoch pooling decay does not reproduce numerically.** `MASTER-TABLE` row 59
+   quotes shrink-minus-plain +0.844 / +0.288 / +0.169 at E=100/205/300. Re-derived from the
+   raw `.out` epoch series: the `e300` family (a0=1e-3) gives **+0.682 / +0.271 / +0.158** and
+   the `e3a` family (a0=1e-6) gives **+1.605 / +0.535 / +0.062**. Neither reproduces +0.844;
+   the E=100 value is 0.162 pp off against `e300`. The CONCLUSION (decay) survives and is
+   stronger at a0=1e-6, where the gain is gone by 300 epochs.
+6. **"It transfers nowhere" is false.** See §M1-7. At `alpha0=1e-6` the interior optimum is
+   present and bracketed on **all three** architectures (R10 +0.862, R18 +0.997, R34 +0.894 pp
+   over the better endpoint). `MASTER-TABLE` row 77's "No interior optimum anywhere" is scoped
+   to R10@a0=1e-3 and CIFAR-100 and is contradicted by row 78 in the same file. The accurate
+   statement is that it transfers across architecture and fails across initialisation and
+   dataset.
+7. **A positive transfer result nobody scored.** ResNet50, r=0.06 vs matched plain layerwise:
+   **+3.357 pp** at a0=1e-6 (91.511 vs 88.154) and **+2.303 pp** at a0=1e-3 (92.678 vs
+   90.375), n=2 per cell (`sc50-*`). No MASTER-TABLE row covers ResNet50 pooling. It does not
+   change the verdict — the same arm is 2.37 pp behind AdamW+cosine on R50 — but it was run
+   and never reported.
+8. **`MASTER-TABLE.md` is stale.** Its header reports "1761 runs / 1175.8 GPU-hours" and it is
+   current only to cycle 73; the CSV now holds **2,177 rows / 1,641.5 GPU-h** and the repo is
+   at cycle 116. Its row 30 quotes tuned plain layerwise `92.867 (n=8)`; the 13-axis matched
+   cell at a0=1e-3 is **n=11, plateau5 92.887 ±0.173**.
+9. **Not re-derivable from this repo.** The `|2p-1|` probe measurements (0.3947 / 0.1277 /
+   0.0152 / 0.000331) come from `results/p7_c31.txt` and the `runs/zb/probe_*` files, which
+   are not in this backup. They are reported above as RECORD, not as re-derived. The
+   `frac_neg`-based "10.3x" and the `p7`-based "7.8x" are two different scales for the same
+   quantity; the second is the better-powered one.
+
+---
+
+## 6. The gap list — what was never tried
+
+Ordered by how much it would have changed the conclusion. This is the part that is most
+worth arguing with.
+
+1. **The proposal's own regime: `lam` in (1e-4, 1e-3).** Zero runs. This is the ONLY decade in
+   which M0's shrink coefficient does anything other than nothing or everything. Cost to
+   close: ~6 runs (3 seeds x 2 rungs at 3e-4 and 6e-4), ~4 GPU-h. **Nothing in this programme
+   is cheaper or more directly aimed at the original question.**
+2. **The hierarchical arms' own meta-stepsize.** All 637 runs at `ms=1e-3`. Since `r` is a
+   meta-stepsize dial, the only fair comparison is best-over-(`r`,`ms`) vs best-over-`ms`, and
+   the first grid does not exist. Cost: ~30 runs.
+3. **`zpool` at a good partition.** No `zpool` run at `nodewise` or `resnet18_blocks`. Every
+   trustworthy pooling number in the corpus is at layerwise or weightwise. Cost: ~30 runs.
+4. **`zpool` at `alpha0=1e-3`.** Four 20-epoch gates only. The entire clean-operator story is
+   measured inside the crippled-init regime that §M1-4 showed manufactures the effect.
+5. **`zmpool`, entirely.** 4 gate runs, 1 GPU-h.
+6. **The Lion-base inversion (§M1-10).** n=2, one family, and it says the optimum moves to the
+   boundary when the base optimizer changes. If true it is a mechanism result; it was never
+   followed up.
+7. **M1's budget behaviour.** One trajectory pair, n=2, no matched plain arm at E=205/300.
+   M0's decay is measured; M1's is not.
+8. **ResNet34 at `alpha0=1e-3`.** One cell (r=0.06, n=3), no curve. The `alpha0` control that
+   killed the R18 optimum was never run on the architecture where the optimum is sharpest.
+9. **Any dataset other than CIFAR-10/100.** No ImageNet, no downscaled ImageNet, nothing.
+   The idea was proposed to explain an ImageNet result and was never tested at a scale where
+   that result appears.
+10. **A shrink operator applied on a SCHEDULE rather than every step.** The saturation in
+    §M0-2 is a consequence of applying the contraction 50,000 times. An operator applied
+    once per epoch, or with a strength annealed over training, is a different operator and
+    was never built.
+
+---
+
+## 7. Bottom line
+
+637 runs and 492.8 GPU-hours went into the main idea, across four operators.
+
+* The **empirical curve is real** (M1-1): an interior optimum at r ~ 0.05–0.07 on
+  ResNet18/CIFAR-10, +0.997 pp over its better endpoint, and it reproduces on ResNet10 and
+  ResNet34.
+* The **mechanism is not** (M1-5). Under Lion the additive operator divides the effective
+  meta-stepsize by `|2p-1|`; a plain SCALAR step size with the meta-stepsize turned down one
+  decade matches the best hierarchical arm to +0.140 pp (t=1.25), and a plain LAYERWISE arm
+  with the same tune beats it by 0.484 pp (t=−6.53), on a fully axis-matched cell.
+* Under the **operator that actually pools** (zpool), full pooling costs 3.0 pp, there is no
+  interior optimum at a good partition, and the best true-pooling number anywhere is 2.2 pp
+  below plain blk6.
+* The **proposal's own knob was never turned.** M0's shrink coefficient has one live decade,
+  [1e-4, 1e-3], and no run sits in it. Everything published as "M0 shrink with tunable lambda"
+  is full pooling measured seven times.
+* And at its own best point the whole stack **loses to AdamW + cosine** by 0.86–2.37 pp on
+  ResNet18/34/50.
+
+The honest summary is not "the idea failed". It is: **the idea was never tested in the form it
+was proposed, and the two operators that WERE tested for 550 runs turned out to be measuring
+the meta-learning rate.** The one clean instrument was built last, given 83 runs, and never
+applied to a partition that works.

@@ -1,0 +1,437 @@
+#!/bin/bash
+# =============================================================================
+# cO1_cliff_horizon.sh -- `cts3`, BUYING THE HORIZON ON THE k = 49 -> k = 50
+#                         CLIFF.  ONE SUBMISSION, 6 JOBS, 772 EPOCHS.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches the other account, nothing is submitted to cluster_a, and
+# every guard and scancel line below is filtered on the `cts3-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cO1_cts3_score.py, git-committed BEFORE this
+# batch is submitted (STANDING RULE 21).  Every bar is frozen there and its
+# --selftest re-derives the noise floor, cts1's own cliff, the horizon fit and
+# its full sensitivity, and the float32 clamp arithmetic, from the corpus and
+# from arithmetic rather than from prose.
+#
+# NO CODE PATCH.  The only thing that differs from cts2's CLAMPED cells is
+# --num-epochs.  BETA_CLIP is left at the campaign standard.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION -- THE STANDING RISK RECORDED AT CORRECTIONS 150
+# -----------------------------------------------------------------------------
+# cts2's own epoch lines give terminal 20-epoch OLS slopes over epochs 80-99:
+#     k49-C +0.00426   k49-R -0.00310      k50-C +0.04847   k50-R +0.04758
+# The WINNING arm has converged and the LOSING arm has not.  The 24.834 pp
+# cliff of CORRECTIONS 147 is therefore a snapshot of a rising curve at one
+# arm, and no ResNet18_c100 run anywhere in the corpus exceeds 100 epochs.
+# hz3 already cost the programme a finding to exactly this failure.
+#
+# -----------------------------------------------------------------------------
+# THE HORIZON, DERIVED FROM THE MEASURED SLOPES
+# -----------------------------------------------------------------------------
+# ASSUMPTION, STATED: the k50 terminal slope decays as s(t) = A t^-p.  Fitted
+# on cts2's own k50-C rolling 20-epoch windows with midpoint >= 49.5:
+#     A = 8.1380   p = 1.1362
+# CRITERION: the k50 arm is converged when its own terminal slope falls to
+# +0.00426 pp/epoch -- the slope at which CORRECTIONS 150 declared the k49 arm
+# converged.  That gives E = (A/s*)^(1/p) = 772 epochs.
+# THE FIT IS NOT STABLE AND THE SCORER SAYS SO IN FULL: across six defensible
+# window subsets E ranges over [414, 1821], the 1821 coming from a three-point
+# tail fit with p = 0.8220 < 1, a regime with no finite convergence epoch at
+# all.  E = 772 IS THEREFORE NOT CLAIMED TO REACH CONVERGENCE.  Gate R4
+# settles that empirically on the runs' own terminal slope, and R4 has
+# headroom under all six variants (worst predicted slope at E is 0.008724
+# against a bar of 0.024235).
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  2 cuts x 3 seeds = 6 jobs, ONE submission.
+#   factor A  cut  k49 = [49,13]  |  k50 = [50,12]
+#   clamp     C = BETA_CLIP -15:-2.3026, the campaign standard, HELD FIXED.
+#
+# WHY ONE CLAMP, AND WHY THE CLAMPED ONE.  cts2 measured the clamp x cut
+# interaction at 0.3953 pp = 0.38 SE_INT: the clamp axis is inert for this
+# cliff at 100 epochs.  Carrying it would double the cost to re-answer that.
+# The level kept is the campaign standard -- the regime CORRECTIONS 147 is
+# stated in.  It is also the only ARITHMETICALLY AVAILABLE level here:
+# 772 epochs x 500 iterations = 386000 meta-steps and |dbeta| <= 1e-3 per
+# step, so beta can reach -399.815511; cts2's RELEASED floor of -80 was
+# justified as unreachable at 50000 meta-steps and IS reachable at 386000; and
+# alpha = exp(beta) is float32, which underflows to EXACTLY ZERO below
+# ln(1.401298e-45) = -103.278930.  At this horizon either the clamp binds or
+# the stepsize becomes exactly 0.  cts3 claims NOTHING about the released
+# floor at long budget and that gap is stated, not hidden.
+#
+# THE 100-EPOCH CONTROL IS IN BATCH, IN THE SAME RUNS, AT ZERO COST -- and
+# guard 4f PROVES the precondition on the LIVE train.py rather than asserting
+# it.  args.num_epochs occurs in exactly two places in train.py: the argparse
+# declaration and `for epoch in range(args.num_epochs)`.  There is no
+# schedule, no total-step count and no warmup keyed to it; SCHED=none, and
+# --max-time 999:00:00 keeps train.py's own time-based break from firing.  So
+# the epoch-99 readout of a 772-epoch run IS a 100-epoch run of an identical
+# configuration.  Six separate 100-epoch control jobs would cost 4.5 GPU-hours
+# to buy a WEAKER control: a between-run comparison instead of a within-run
+# paired one.  They are not run, and that is a saving, not an omission.
+# WHAT IT IS NOT: a bit-replicate of cts2's C arms -- different job, possibly
+# different GPU, cuDNN nondeterminism.  And cts3 shares seeds {0,1,2} and
+# every non-horizon flag with cts1/cts2/cpk1, so it is a FOURTH CORRELATED
+# BATCH.  "Reproduces in an independent batch" may not be written.
+#
+# NO ANCHORS, NO CAPTURE.  The estimand is a difference of two arm means in
+# percentage points and needs neither.  The scorer computes no CAPTURE and
+# forbids one being computed from cts3 afterwards.
+#
+# PROBE STAYS 0, for cts2's reasons verbatim: at m = 2 HF.block_product has
+# already reduced <h,g> to one scalar per group before _probe() sees it, so
+# there is no per-tensor quantity to log; PROBE is an INTERVAL, so PROBE=1
+# would write 386000 records per run and change wall-clock; and with PROBE_DIR
+# unset it appends to the SHARED source tree from 6 concurrent jobs.
+#
+# -----------------------------------------------------------------------------
+# WALLTIME AND PARTITIONS -- MEASURED, AND THE TRAP AVOIDED
+# -----------------------------------------------------------------------------
+# Per-epoch cost of THIS cell, measured over every ResNet18_c100 run on this
+# account (seconds/epoch, worst observed per node):
+#     gpu-2080ti-11g  [HOST_a46179829a] 70.8  [HOST_e5f7f0d5f9] 69.6  [HOST_8d6ba568b8] 68.4  [HOST_2739ecbbce] 55.8
+#     gpu-l4-24g      [HOST_7b4dd78541]-886   27.0 - 31.2
+#     gpu-mig-40g     [HOST_0315e55916]-869   27.6 - 36.6
+#     gpu-a100-80g    [HOST_82468b95f4]-876   21.6 - 29.4
+# 772 epochs on the 2080ti nodes would be 15.2 h; on the other three GPU
+# partitions the worst observed rate gives 7.85 h.  gpu-short has a 4 h
+# ceiling and is excluded by arithmetic, not by choice.  So:
+#     PARTS = gpu-l4-24g,gpu-mig-40g,gpu-a100-80g   (all 7-day partitions)
+#     WALL  = 11:00:00   -- 1.40x the worst observed rate, 2.04x the expected
+# The physical nodes are the SAME machines gpu-short exposes; only the 4 h
+# queue lane is given up.  QUEUE DEPTH CHECKED BEFORE COMMITTING: at
+# submission time these three partitions held 47 running and 16 pending jobs,
+# with other users' 7-day and 5-day jobs RUNNING, so long walltimes are not
+# priority-starved here -- an 11 h request backfills easily.  This is the hz3
+# failure mode (unschedulable at 10 h) and it was checked, not assumed.
+#
+# COST: 6 jobs x 5.4-7.9 h = 32-47 GPU-hours.
+#
+# USAGE   bash bin/cO1_cliff_horizon.sh            # dry run, submits nothing
+#         bash bin/cO1_cliff_horizon.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+# bin/_lib_guards.sh re-assigns WS at source time from METAOPT_WS with a
+# default pointing at the OTHER account; exporting it here is the documented
+# work-around (RULE 20).  The library is NOT patched while jobs are queued.
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cts3
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+MST=1e-3; ALPHA0=1e-6; EPOCHS=772; CTRL_EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="0 1 2"
+PARTS=gpu-l4-24g,gpu-mig-40g,gpu-a100-80g
+WALL=11:00:00
+NTENS=62
+
+K_LIST="49 50"
+G_K49='[49,13]'
+G_K50='[50,12]'
+ARMS="k49 k50"
+
+echo "=============================================================="
+echo " cts3 -- DOES THE k=49 -> k=50 CLIFF SURVIVE BUDGET?"
+echo " $DSET / $NET  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  PROBE=0"
+echo " clamp held at the campaign standard $CLIP_C"
+echo " horizon $EPOCHS epochs; the ${CTRL_EPOCHS}-epoch control is the SAME runs' own"
+echo " epoch-$((CTRL_EPOCHS-1)) readout (guard 4f proves the precondition)"
+echo " cuts k = $K_LIST ; 2 cuts x 3 seeds = 6 jobs, one submission"
+echo " partitions $PARTS   walltime $WALL"
+echo " scorer: analysis/cO1_cts3_score.py (registered before any run exists)"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ------
+SC="$REPO/analysis/cO1_cts3_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: scorer missing"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cO1_cts3_score.py bin/cO1_cliff_horizon.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires the scorer committed BEFORE any run exists: $DIRTY"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 was verified"
+  echo "          on the host that committed the scorer.  Not a pass, not a fail."
+fi
+python3 "$SC" --selftest >/tmp/cts3_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -40 /tmp/cts3_selftest.$$; }
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^cts3-' "$CSVP" && guard_fail "guard 2: cts3-* already in the CSV" \
+                         || echo "guard 2: no cts3-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/cts3-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cts3-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT cts3-*.out files already exist"
+fi
+
+# ---- guard 3: the CIFAR-100 data is actually staged on THIS account ---------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4: LIVE-MODEL partition manifest + the horizon's own arithmetic --
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+
+SPECS=""
+for K in $K_LIST; do
+  eval "LIT=\${G_K$K:-}"
+  WANT="[$K,$((NTENS-K))]"
+  [ "$LIT" = "$WANT" ] || guard_fail "guard 4c: G_K$K is '$LIT', but the grid says '$WANT'"
+  SPECS="$SPECS $LIT"
+done
+NK=$(echo $K_LIST | wc -w | tr -d ' ')
+NA=$(echo $ARMS | wc -w | tr -d ' ')
+[ "$NA" = "$NK" ] || guard_fail "guard 4c: $NA arms for $NK cut positions and no anchors"
+PREV=""
+for K in $K_LIST; do
+  if [ -n "$PREV" ] && [ "$K" != "$((PREV+1))" ]; then
+    guard_fail "guard 4c: the grid is not consecutive ($PREV -> $K); the step would not be single-tensor"
+  fi
+  PREV=$K
+done
+echo "guard 4c: $NK literal specs agree with the grid; $NA arms, 1 clamp level"
+
+# shellcheck disable=SC2086
+python3 - "$CIF" "$MANIFEST" "$NTENS" "$CLIP_C" "$EPOCHS" "$BATCH" $SPECS <<'PYEOF' \
+  || guard_fail "guard 4: live partition / clamp / horizon check FAILED"
+import sys, os, math, inspect
+cif, out, ntens = sys.argv[1], sys.argv[2], int(sys.argv[3])
+clip_c = sys.argv[4]
+epochs, bsz = int(sys.argv[5]), int(sys.argv[6])
+specs = sys.argv[7:]
+sys.path.insert(0, cif)
+os.chdir(cif)
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network("ResNet18_c100", "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in net.named_parameters()]
+numel = [int(p.numel()) for _, p in net.named_parameters()]
+tot = sum(numel)
+T = len(nps)
+lines = ["NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "CLIP_C %s" % clip_c, "EPOCHS %d" % epochs]
+print("guard 4: live ResNet18_c100 has %d parameter tensors, %d parameters"
+      % (T, tot))
+if T != ntens:
+    print("!!! guard 4: the live model has %d tensors, the batch assumes %d"
+          % (T, ntens))
+    raise SystemExit(1)
+
+print("guard 4: the layer4.0 block, tensor by tensor -- this is where the cut sits:")
+for i in range(45, 54):
+    print("         %2d  %-32s %9d" % (i + 1, names[i], numel[i]))
+
+bad = 0
+seen = {}
+for spec in specs:
+    g = HF.polish_the_stepsize_groups(None, spec, nps)
+    sizes = [len(x) for x in g]
+    if sum(sizes) != T:
+        print("!!! guard 4: %s does not cover the model (%d of %d)"
+              % (spec, sum(sizes), T)); bad += 1; continue
+    if len(g) != 2:
+        print("!!! guard 4: %s composed to m=%d, but every arm must be m=2"
+              % (spec, len(g))); bad += 1; continue
+    want = [int(x) for x in spec[1:-1].split(",")]
+    if sizes != want:
+        print("!!! guard 4: %s composed to sizes %s on the live model" % (spec, sizes))
+        bad += 1; continue
+    k = sizes[0]
+    if list(g[0]) != names[:k] or list(g[-1]) != names[k:]:
+        print("!!! guard 4: %s does not split named_parameters() at %d BY NAME"
+              % (spec, k)); bad += 1; continue
+    pc, i = [], 0
+    for s in sizes:
+        pc.append(sum(numel[i:i + s])); i += s
+    lines.append("SPEC %s M %d SIZES %s PARAMS %s FIRSTGROUP %s LASTGROUP %s"
+                 % (spec, len(g), ",".join(str(s) for s in sizes),
+                    ",".join(str(s) for s in pc), " ".join(g[0]), " ".join(g[-1])))
+    print("guard 4: %-9s m=2  sizes %-8s  params %9d / %-9d  share %.6f"
+          % (spec, str(sizes), pc[0], pc[1], pc[0] / float(tot)))
+    print("         FULL first  = %s" % " ".join(g[0]))
+    print("         FULL second = %s" % " ".join(g[1]))
+    seen[k] = (set(g[-1]), pc[0])
+
+ks = sorted(seen)
+print("guard 4d: the single-tensor step, MEASURED on the live model:")
+for a, b in zip(ks, ks[1:]):
+    moved = [n for n in names if n in seen[a][0] and n not in seen[b][0]]
+    dp = seen[b][1] - seen[a][1]
+    flag = "" if len(moved) == 1 else "   <<< NOT A SINGLE TENSOR"
+    print("         k=%d -> k=%d moves %-30s %8d params%s"
+          % (a, b, " ".join(moved), dp, flag))
+    if len(moved) != 1:
+        bad += 1
+    lines.append("STEP %d %d MOVED %s PARAMS %d" % (a, b, " ".join(moved), dp))
+
+# guard 4e: the CLAMP on the live source, and the horizon's own arithmetic.
+src_init = inspect.getsource(HF.__init__)
+if "BETA_CLIP" in src_init and "_beta_lo" in src_init and "split(':')" in src_init.replace('"', "'"):
+    print("guard 4e: BETA_CLIP is parsed from the environment into "
+          "(_beta_lo, _beta_hi) on the live source")
+else:
+    print("!!! guard 4e: the live HF.__init__ does not parse BETA_CLIP as assumed")
+    bad += 1
+src_step, _m = "", None
+for _m in ("step", "update", "__call__"):
+    if hasattr(HF, _m):
+        _s = inspect.getsource(getattr(HF, _m))
+        if "_beta_lo" in _s:
+            src_step = _s
+            break
+if "clamp(self._beta_lo,self._beta_hi)" in "".join(src_step.split()):
+    print("guard 4e: the clamp is applied to beta AFTER the meta update, in HF.%s" % _m)
+else:
+    print("!!! guard 4e: could not find beta.clamp(_beta_lo, _beta_hi) in the live update path")
+    bad += 1
+src_lion = inspect.getsource(HF.Lion_meta_update)
+if "torch.sign" in src_lion and "meta_stepsize" in src_lion:
+    steps = epochs * (50000 // bsz)
+    lo = -13.815511 - 1e-3 * steps
+    uf = math.log(1.401298464324817e-45)
+    print("guard 4e: Lion_meta_update moves beta by meta_stepsize*sign(.), so")
+    print("          |dbeta| <= 1e-3 per meta-step.  At %d epochs that is %d"
+          % (epochs, steps))
+    print("          meta-steps and a worst-case reachable beta of %.6f." % lo)
+    print("          alpha=exp(beta) is float32 and underflows to 0 below %.6f," % uf)
+    print("          so cts2's RELEASED floor -80.0 is BOTH reachable here and")
+    print("          unreplaceable by a lower one.  The standard floor %s is kept:"
+          % clip_c.split(":")[0])
+    print("          alpha at the floor is exp(-15) = %.4e, a normal float32."
+          % math.exp(-15.0))
+    lines.append("META_STEPS %d REACHABLE_MIN %.6f F32_UNDERFLOW_BETA %.6f"
+                 % (steps, lo, uf))
+    if not (lo < -80.0 and lo < uf):
+        print("!!! guard 4e: the horizon arithmetic does not hold as registered")
+        bad += 1
+else:
+    print("!!! guard 4e: Lion_meta_update is not the sign-bounded update assumed")
+    bad += 1
+
+# guard 4f: THE LOAD-BEARING CLAIM.  num_epochs must touch NOTHING but the
+# loop bound, or the epoch-99 readout of a long run is not a 100-epoch run and
+# the in-batch control is void.
+tp = os.path.join(cif, "train.py")
+src = open(tp).read().split("\n")
+hits = [(i + 1, l.strip()) for i, l in enumerate(src)
+        if "num_epochs" in l or "num-epochs" in l]
+print("guard 4f: every occurrence of num_epochs in the LIVE %s:" % tp)
+for ln, txt in hits:
+    print("          %4d  %s" % (ln, txt))
+decl = [h for h in hits if "add_argument" in h[1]]
+loop = [h for h in hits if h[1].startswith("for epoch in range(")]
+other = [h for h in hits if h not in decl and h not in loop]
+if len(hits) == 2 and len(decl) == 1 and len(loop) == 1 and not other:
+    print("          OK -- argparse declaration + loop bound ONLY.  The epoch-99")
+    print("          readout of a %d-epoch run IS a 100-epoch run of the same" % epochs)
+    print("          configuration, so the control is in batch and in run.")
+    lines.append("NUM_EPOCHS_USES 2 DECL %d LOOP %d" % (decl[0][0], loop[0][0]))
+else:
+    print("!!! guard 4f: num_epochs is used somewhere other than the loop bound;")
+    print("    the free in-batch 100-epoch control is NOT valid.  %d other uses."
+          % len(other))
+    bad += 1
+sched = [ (i+1, l.strip()) for i, l in enumerate(src)
+          if "scheduler" in l.lower() or "lr_scheduler" in l ]
+if sched:
+    print("!!! guard 4f: train.py mentions a scheduler; check it is not epoch-keyed:")
+    for ln, txt in sched:
+        print("          %4d  %s" % (ln, txt))
+
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: %d cut specs verified; PARTITION-MANIFEST.txt written to %s"
+      % (len(specs), out))
+PYEOF
+[ -s "$MANIFEST" ] && echo "guard 4b: manifest is non-empty" || guard_fail "guard 4b: no manifest"
+
+# ---- guard 5: capacity, AND the walltime/partition arithmetic ---------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 6"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  TL=$(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)
+  R=$(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+  D=$(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 5b: $P timelimit $TL   running $R   pending $D"
+  case "$TL" in
+    *-*) : ;;   # a d-hh:mm:ss limit is necessarily above 11 h
+    *) guard_fail "guard 5b: $P has a sub-day time limit ($TL) and cannot take $WALL" ;;
+  esac
+done
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k49) G=$G_K49 ;;
+      k50) G=$G_K50 ;;
+      *)   echo "!!! unknown arm $ARM"; exit 2 ;;
+    esac
+    # NOTE the single quotes around $G: "[50,12]" is a bash bracket GLOB.
+    CMD="sbatch --job-name=cts3-$ARM-C-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups '$G' --seed $S --save-directory $SAVE --run-name cts3-$ARM-C-s$S"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for cts3-$ARM-C-s$S"
+      guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; echo; N=$((N+1)); fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cts3-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cts3-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cts3- present in bin/PROTECTED.txt ----"
+  # jobs/run_cifar.sh hard-codes #SBATCH --output=$WS/runs/%x-%j.out, so the
+  # .out files land in $WS/runs, NOT in --save-directory.
+  guard_postlaunch "$WS/runs" "cts3-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cts3 job started inside the window.  This is NOT"
+       echo "         a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name cts3-" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cts3-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+fi

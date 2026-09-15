@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""c58_horizon_reversal.py -- is CORRECTIONS 86.3's horizon reversal a GENERAL shape
+or an ms=1e-3 coincidence?
+
+86.3 measured `nodewise - layerwise` at matched-k plateau, paired within seed, in two
+40-epoch batches at ms=1e-3, and found a unanimous sign reversal between epoch 15 and 25.
+It is the campaign's strongest claim and it rests on ONE meta-stepsize.
+
+This instrument re-derives that curve from the raw .out series (STANDING RULE 1) and then
+asks the same question of every other family on disk that contains a within-seed matched
+nodewise/layerwise pair, at whatever ms that family happens to sit at.
+
+Modes
+  --control    reproduce 86.3's published table from br6+bl5 (validation of this script)
+  --inventory  every config cell on disk with >=1 within-seed node/lay pair
+  --slopes     d(node-lay)/d(epoch) over a window, per cell, across all families
+  --curve FAM  the full paired node-lay curve for one family
+  --selftest   run selftests
+
+Metric: matched-k plateau, k=5. plateau_at(e) = mean(tests[e-5:e]) on the 1-indexed epoch
+series, i.e. the mean of the 5 test accuracies ending at epoch e. Requires e>=5 and
+e<=epochs_done. A cell is only reported at epoch e if EVERY run in the pair reaches e.
+"""
+
+import csv
+import os
+import re
+import sys
+from collections import defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+CSV = os.path.join(ROOT, "results", "all_runs.csv")
+RUNDIRS = [os.path.join(ROOT, "..", "runs"), os.path.join(ROOT, "..", "runs_cluster_b")]
+
+K = 5  # matched-k plateau width, per CORRECTIONS 86.2/86.3
+
+# The config keys that must match for two runs to be comparable. `granularity` and `seed`
+# are deliberately excluded -- they are the contrast and the pairing key.
+CONFIG_KEYS = ["network", "dataset", "batch_size", "base", "meta", "meta_stepsize",
+               "alpha0", "gamma", "augment", "beta_clip", "hier", "lam", "eta_ratio",
+               "epochs_requested"]
+
+
+# ---------------------------------------------------------------- raw series
+
+_out_index = None
+
+
+def out_index():
+    """run-name -> path of its .out file, built once. run_cifar.sh writes
+    runs/<jobname>-<jobid>.out in the ROOT of runs/, never in --save-directory."""
+    global _out_index
+    if _out_index is None:
+        _out_index = {}
+        for d in RUNDIRS:
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if not fn.endswith(".out"):
+                    continue
+                m = re.match(r"^(.*)-(\d+)\.out$", fn)
+                if not m:
+                    continue
+                _out_index.setdefault(m.group(1), os.path.join(d, fn))
+    return _out_index
+
+
+def series(run):
+    """Test-accuracy series for a run name, or None. Same regex as aggregate.py:110."""
+    p = out_index().get(run)
+    if p is None:
+        return None
+    with open(p, "r", errors="replace") as fh:
+        txt = fh.read()
+    v = [float(x) for x in re.findall(r"Test Accuracy: ([0-9.]+)", txt)]
+    return v or None
+
+
+def plateau_at(tests, e, k=K):
+    """Mean of the k test accuracies ending at 1-indexed epoch e. None if unavailable."""
+    if e < k or e > len(tests):
+        return None
+    return sum(tests[e - k:e]) / k
+
+
+# ---------------------------------------------------------------- pairing
+
+def load_rows():
+    with open(CSV) as fh:
+        return list(csv.DictReader(fh))
+
+
+def cells(rows, grans=("nodewise", "layerwise"), pool=False):
+    """Group runs into config cells; return {cellkey: {gran: {seed: run}}} keeping only
+    cells that have at least one seed present in BOTH granularities.
+
+    pool=False (default): the batch family is part of the cell key, so runs from two
+    different batches never pair even at identical config. This is the safe default --
+    two batches can share every CSV column and still differ in their root (the uc5
+    failure, CORRECTIONS 68/71).
+
+    pool=True: family is DROPPED from the key, so config-identical runs from different
+    batches pair. Only legitimate when the operating points have been DIFFED, not
+    assumed -- see guard 3 of bin/c58_tuned_horizon.sh."""
+    g = defaultdict(lambda: defaultdict(dict))
+    for r in rows:
+        if r["granularity"] not in grans:
+            continue
+        fam = r["run"].split("-")[0]
+        key = ("*pooled*" if pool else fam,) + tuple(r[k] for k in CONFIG_KEYS)
+        slot = g[key][r["granularity"]]
+        prev = slot.get(r["seed"])
+        # Under pool=True two families can supply the same (config, gran, seed). Keep the
+        # LONGER run: a truncated run's plateau is a plateau at its own epochs_done
+        # (CORRECTIONS 86.5 / FINDINGS 57.1), so the short one is never the right pick.
+        ed = int(r["epochs_done"] or 0)
+        if prev is None or ed > prev[1]:
+            slot[r["seed"]] = (r["run"], ed)
+    out = {}
+    for key, byg in g.items():
+        if len(byg) < 2:
+            continue
+        shared = set(byg[grans[0]]) & set(byg[grans[1]])
+        if shared:
+            runs = {gr: {s: v[0] for s, v in d.items()} for gr, d in byg.items()}
+            out[key] = {"pairs": sorted(shared), "runs": runs}
+    return out
+
+
+def paired_diff(cell, e, grans=("nodewise", "layerwise")):
+    """Per-seed (gran0 - gran1) at epoch e. Returns list of (seed, diff); a seed is
+    dropped if EITHER of its two runs does not reach epoch e."""
+    out = []
+    for s in cell["pairs"]:
+        a = series(cell["runs"][grans[0]][s])
+        b = series(cell["runs"][grans[1]][s])
+        if a is None or b is None:
+            continue
+        pa, pb = plateau_at(a, e), plateau_at(b, e)
+        if pa is None or pb is None:
+            continue
+        out.append((s, pa - pb))
+    return out
+
+
+def mean_sd(v):
+    n = len(v)
+    if n == 0:
+        return None, None
+    m = sum(v) / n
+    if n == 1:
+        return m, 0.0
+    var = sum((x - m) ** 2 for x in v) / (n - 1)
+    return m, var ** 0.5
+
+
+def label(key):
+    fam = key[0]
+    d = dict(zip(CONFIG_KEYS, key[1:]))
+    return (f"{fam:6s} {d['network']:9s} {d['dataset']:9s} ms={d['meta_stepsize']:<7s} "
+            f"a0={d['alpha0']:<6s} aug={d['augment']} ep={d['epochs_requested']:>3s}")
+
+
+# ---------------------------------------------------------------- modes
+
+def mode_control():
+    """Reproduce CORRECTIONS 86.3. br6 (n=4) + bl5 (n=3), pooled n=7, ms=1e-3, 40 ep."""
+    rows = [r for r in load_rows() if r["run"].split("-")[0] in ("br6", "bl5")]
+    cs = cells(rows)
+    print("CONTROL -- reproduction of CORRECTIONS 86.3 from raw .out (STANDING RULE 1)")
+    print(f"cells found: {len(cs)}")
+    for key in sorted(cs, key=label):
+        print("  " + label(key) + f"  pairs={cs[key]['pairs']}")
+    print()
+    pub = {10: -3.946, 15: -1.194, 20: 0.035, 25: 0.725, 30: 1.067, 40: 1.258}
+    print(f"{'epoch':>5} {'pooled':>9} {'sd':>7} {'n':>3} {'fav node':>9} "
+          f"{'published':>10} {'delta':>8}")
+    ok = True
+    for e in (10, 15, 20, 25, 30, 40):
+        allv = []
+        for key in cs:
+            allv += [d for _, d in paired_diff(cs[key], e)]
+        m, sd = mean_sd(allv)
+        if m is None:
+            continue
+        fav = sum(1 for x in allv if x > 0)
+        delta = m - pub[e]
+        if abs(delta) > 0.002:
+            ok = False
+        print(f"{e:>5} {m:>9.3f} {sd:>7.3f} {len(allv):>3} {fav:>4}/{len(allv):<4} "
+              f"{pub[e]:>10.3f} {delta:>8.3f}")
+    print()
+    print("REPRODUCED EXACTLY" if ok else "*** MISMATCH vs published 86.3 ***")
+    return ok
+
+
+def mode_inventory():
+    cs = cells(load_rows())
+    print(f"{len(cs)} config cells on disk with >=1 within-seed nodewise/layerwise pair\n")
+    print(f"{'cell':<62} {'pairs':>5}  seeds")
+    for key in sorted(cs, key=label):
+        c = cs[key]
+        n = 0
+        for s in c["pairs"]:
+            if series(c["runs"]["nodewise"][s]) and series(c["runs"]["layerwise"][s]):
+                n += 1
+        print(f"{label(key):<62} {n:>5}  {','.join(c['pairs'])}")
+
+
+def mode_slopes(lo=10, hi=20):
+    """The generality test. 86.3 says node-lay RISES with horizon. If that is a general
+    shape, d(node-lay)/d(epoch) over [lo,hi] is positive in every cell regardless of ms."""
+    cs = cells(load_rows())
+    print(f"GENERALITY OF 86.3's SHAPE -- paired (node - lay) at epochs {lo} and {hi}\n")
+    print(f"{'cell':<62} {'n':>3} {'@'+str(lo):>8} {'@'+str(hi):>8} "
+          f"{'rise':>8} {'sd':>7} {'up':>6}")
+    rises, cellinfo = [], []
+    for key in sorted(cs, key=label):
+        dlo = dict(paired_diff(cs[key], lo))
+        dhi = dict(paired_diff(cs[key], hi))
+        shared = sorted(set(dlo) & set(dhi))
+        if not shared:
+            continue
+        vlo = [dlo[s] for s in shared]
+        vhi = [dhi[s] for s in shared]
+        per = [dhi[s] - dlo[s] for s in shared]
+        mlo, _ = mean_sd(vlo)
+        mhi, _ = mean_sd(vhi)
+        mr, sdr = mean_sd(per)
+        up = sum(1 for x in per if x > 0)
+        rises.append(mr)
+        cellinfo.append((label(key), len(shared), mlo, mhi, mr, up))
+        print(f"{label(key):<62} {len(shared):>3} {mlo:>8.3f} {mhi:>8.3f} "
+              f"{mr:>8.3f} {sdr:>7.3f} {up:>3}/{len(shared):<3}")
+    if rises:
+        pos = sum(1 for x in rises if x > 0)
+        print(f"\ncells with a POSITIVE rise: {pos}/{len(rises)}")
+        m, sd = mean_sd(rises)
+        print(f"mean cell-level rise over epochs {lo}->{hi}: {m:.3f} (sd {sd:.3f})")
+    return cellinfo
+
+
+def crossing(c, maxe):
+    """[POST-HOC] Descriptive summary of the paired (node-lay) curve for one cell:
+    (min_epoch, min_value, cross_epoch, end_epoch, end_value, n_at_end).
+
+    cross_epoch = the first epoch AFTER the minimum at which the paired mean turns
+    positive AND stays positive through the last epoch measured. None if it never does.
+    This is a description of a measured curve, not a fitted threshold."""
+    pts = []
+    for e in range(K, maxe + 1):
+        d = [x for _, x in paired_diff(c, e)]
+        if d:
+            pts.append((e, sum(d) / len(d), len(d)))
+    if not pts:
+        return None
+    emin, vmin, _ = min(pts, key=lambda p: p[1])
+    cross = None
+    for i, (e, v, _) in enumerate(pts):
+        if e > emin and v > 0 and all(p[1] > 0 for p in pts[i:]):
+            cross = e
+            break
+    ee, ev, en = pts[-1]
+    return emin, vmin, cross, ee, ev, en
+
+
+def mode_crossing():
+    """[POST-HOC] The crossing epoch against the meta-stepsize, every cell on disk."""
+    cs = cells(load_rows())
+    print("[POST-HOC] CROSSING OF THE PAIRED (nodewise - layerwise) CURVE, per cell\n")
+    print(f"{'cell':<62} {'n':>3} {'min@':>5} {'minval':>8} "
+          f"{'cross':>6} {'end@':>5} {'endval':>8}")
+    out = []
+    for key in sorted(cs, key=lambda k: (float(dict(zip(CONFIG_KEYS, k[1:]))
+                                               ['meta_stepsize']), label(k))):
+        c = cs[key]
+        maxe = 0
+        for s in c["pairs"]:
+            for g in ("nodewise", "layerwise"):
+                v = series(c["runs"][g][s])
+                if v:
+                    maxe = max(maxe, len(v))
+        r = crossing(c, maxe)
+        if r is None:
+            continue
+        emin, vmin, cross, ee, ev, en = r
+        cs_s = str(cross) if cross else ("none" if ev <= 0 else "?")
+        print(f"{label(key):<62} {en:>3} {emin:>5} {vmin:>8.3f} "
+              f"{cs_s:>6} {ee:>5} {ev:>8.3f}")
+        d = dict(zip(CONFIG_KEYS, key[1:]))
+        out.append((key[0], float(d["meta_stepsize"]), d["alpha0"], cross, ee, ev, en))
+    return out
+
+
+def mode_curve(fam, epochs=None):
+    rows = [r for r in load_rows() if r["run"].split("-")[0] == fam]
+    cs = cells(rows)
+    if not cs:
+        print(f"no matched node/lay pairs in family {fam}")
+        return
+    for key in sorted(cs, key=label):
+        print(label(key))
+        c = cs[key]
+        maxe = 0
+        for s in c["pairs"]:
+            for g in ("nodewise", "layerwise"):
+                v = series(c["runs"][g][s])
+                if v:
+                    maxe = max(maxe, len(v))
+        eps = epochs or [e for e in range(K, maxe + 1) if e % 5 == 0]
+        print(f"  {'epoch':>5} {'node-lay':>9} {'sd':>7} {'n':>3} {'fav node':>9}")
+        for e in eps:
+            d = [x for _, x in paired_diff(c, e)]
+            if not d:
+                continue
+            m, sd = mean_sd(d)
+            print(f"  {e:>5} {m:>9.3f} {sd:>7.3f} {len(d):>3} "
+                  f"{sum(1 for x in d if x > 0):>4}/{len(d):<4}")
+        print()
+
+
+# ---------------------------------------------------------------- selftests
+
+def selftest():
+    n = p = 0
+
+    def chk(name, cond):
+        nonlocal n, p
+        n += 1
+        if cond:
+            p += 1
+        else:
+            print(f"  FAIL: {name}")
+
+    t = [float(i) for i in range(1, 21)]  # 1..20
+    chk("plateau_at end", plateau_at(t, 20) == sum([16, 17, 18, 19, 20]) / 5)
+    chk("plateau_at mid", plateau_at(t, 10) == sum([6, 7, 8, 9, 10]) / 5)
+    chk("plateau_at k boundary", plateau_at(t, 5) == 3.0)
+    chk("plateau_at below k", plateau_at(t, 4) is None)
+    chk("plateau_at past end", plateau_at(t, 21) is None)
+    chk("plateau_at k=1 is last", plateau_at(t, 7, k=1) == 7.0)
+
+    chk("mean_sd empty", mean_sd([]) == (None, None))
+    chk("mean_sd single", mean_sd([3.0]) == (3.0, 0.0))
+    m, sd = mean_sd([1.0, 3.0])
+    chk("mean_sd two mean", abs(m - 2.0) < 1e-12)
+    chk("mean_sd two sd", abs(sd - 2 ** 0.5) < 1e-12)
+
+    # pairing must exclude granularity and seed, and include every other config key
+    chk("granularity not a config key", "granularity" not in CONFIG_KEYS)
+    chk("seed not a config key", "seed" not in CONFIG_KEYS)
+    chk("ms is a config key", "meta_stepsize" in CONFIG_KEYS)
+    chk("epochs_requested is a config key", "epochs_requested" in CONFIG_KEYS)
+    chk("augment is a config key", "augment" in CONFIG_KEYS)
+
+    # cells() on a synthetic corpus
+    def row(run, gran, seed, ms="1e-3", ep="40", done="40"):
+        d = {k: "x" for k in CONFIG_KEYS}
+        d.update({"run": run, "granularity": gran, "seed": seed,
+                  "meta_stepsize": ms, "epochs_requested": ep, "epochs_done": done})
+        return d
+
+    syn = [row("f-n-s0", "nodewise", "0"), row("f-l-s0", "layerwise", "0"),
+           row("f-n-s1", "nodewise", "1")]
+    c = cells(syn)
+    chk("cells finds one cell", len(c) == 1)
+    chk("cells pairs only shared seeds", list(c.values())[0]["pairs"] == ["0"])
+
+    syn2 = syn + [row("f-n-s0b", "nodewise", "0", ms="1e-4"),
+                  row("f-l-s0b", "layerwise", "0", ms="1e-4")]
+    chk("cells splits on ms", len(cells(syn2)) == 2)
+
+    syn3 = [row("f-n-s0", "nodewise", "0"), row("f-l-s9", "layerwise", "9")]
+    chk("cells drops unpaired cell", len(cells(syn3)) == 0)
+
+    syn4 = [row("f-n-s0", "nodewise", "0"), row("f-n-s1", "nodewise", "1")]
+    chk("cells needs both granularities", len(cells(syn4)) == 0)
+
+    syn5 = syn + [row("g-n-s0", "nodewise", "0"), row("g-l-s0", "layerwise", "0")]
+    chk("cells splits on family", len(cells(syn5)) == 2)
+    chk("pool=True merges families", len(cells(syn5, pool=True)) == 1)
+    chk("pool=True keeps both seeds", cells(syn5, pool=True)[("*pooled*",) +
+        tuple("x" if k not in ("meta_stepsize", "epochs_requested") else
+              {"meta_stepsize": "1e-3", "epochs_requested": "40"}[k]
+              for k in CONFIG_KEYS)]["pairs"] == ["0"])
+
+    # pool collision: the LONGER run must win, whichever order the rows arrive in
+    short = row("g-n-s0", "nodewise", "0", done="40")
+    long_ = row("h-n-s0", "nodewise", "0", done="100")
+    lay = row("g-l-s0", "layerwise", "0", done="100")
+    c_a = cells([short, long_, lay], pool=True)
+    c_b = cells([long_, short, lay], pool=True)
+    chk("pool collision keeps longer (short first)",
+        list(c_a.values())[0]["runs"]["nodewise"]["0"] == "h-n-s0")
+    chk("pool collision keeps longer (long first)",
+        list(c_b.values())[0]["runs"]["nodewise"]["0"] == "h-n-s0")
+    chk("pool=False does not merge the collision", len(cells([short, long_, lay])) == 1)
+
+    # out_index must key on the name with the job id stripped
+    m = re.match(r"^(.*)-(\d+)\.out$", "br6-node-c2-s0-4702521.out")
+    chk("out name strip", m and m.group(1) == "br6-node-c2-s0")
+    chk("out id strip", m and m.group(2) == "4702521")
+    chk("out non-out ignored", re.match(r"^(.*)-(\d+)\.out$", "probe.jsonl") is None)
+
+    # the real index must be populated and must contain a known run
+    idx = out_index()
+    chk("index non-empty", len(idx) > 500)
+    chk("index has br6-node-c2-s0", "br6-node-c2-s0" in idx)
+
+    s = series("br6-node-c2-s0")
+    chk("series parses", s is not None and len(s) >= 40)
+    chk("series values plausible", s is None or all(0 <= x <= 100 for x in s))
+
+    # crossing() on synthetic curves, via a stub cell whose paired_diff is known
+    class StubCell(dict):
+        pass
+
+    global paired_diff
+    real_pd = paired_diff
+    try:
+        # U-shaped: down to -3 at e=8, positive from e=12 onward
+        curve = {e: (-3.0 if e == 8 else (-1.0 if e < 12 else 1.0)) for e in range(5, 21)}
+        paired_diff = lambda c, e, grans=None: [("0", curve[e])] if e in curve else []
+        r = crossing(StubCell(), 20)
+        chk("crossing min epoch", r[0] == 8)
+        chk("crossing min value", r[1] == -3.0)
+        chk("crossing epoch", r[2] == 12)
+        chk("crossing end epoch", r[3] == 20)
+
+        # never crosses
+        curve = {e: -1.0 for e in range(5, 21)}
+        r = crossing(StubCell(), 20)
+        chk("crossing none when always negative", r[2] is None)
+
+        # a transient positive that does not persist must NOT count as the crossing
+        curve = {e: (1.0 if e in (12, 13) else -1.0) for e in range(5, 21)}
+        r = crossing(StubCell(), 20)
+        chk("crossing rejects non-persistent flip", r[2] is None)
+
+        # monotone rising, crosses once and stays
+        curve = {e: float(e) - 10.0 for e in range(5, 21)}
+        r = crossing(StubCell(), 20)
+        chk("crossing on monotone rise", r[2] == 11)
+        chk("crossing min at first epoch", r[0] == 5)
+    finally:
+        paired_diff = real_pd
+
+    # paired_diff must drop a seed whose partner is short
+    chk("paired_diff empty on missing runs",
+        paired_diff({"pairs": ["0"],
+                     "runs": {"nodewise": {"0": "nope"},
+                              "layerwise": {"0": "nope"}}}, 10) == [])
+
+    print(f"selftest: {p}/{n} passed")
+    return p == n
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if not a or a[0] == "--selftest":
+        sys.exit(0 if selftest() else 1)
+    if a[0] == "--control":
+        sys.exit(0 if mode_control() else 1)
+    if a[0] == "--inventory":
+        mode_inventory()
+    elif a[0] == "--slopes":
+        lo = int(a[1]) if len(a) > 1 else 10
+        hi = int(a[2]) if len(a) > 2 else 20
+        mode_slopes(lo, hi)
+    elif a[0] == "--crossing":
+        mode_crossing()
+    elif a[0] == "--curve":
+        mode_curve(a[1])
+    else:
+        print(__doc__)

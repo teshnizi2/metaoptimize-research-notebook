@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cIS2_ciso2_horizon_score.py -- THE REGISTERED SCORER FOR `ciso2`:
+#   DOES THE H-ISOLATE RESCUE SURVIVE THE 59-GROUP'S PINNING?
+#
+# RULE 21: this file is git-committed BEFORE any `ciso2` run exists anywhere;
+# the CORRECTIONS entry states the commit time, the earliest sacct Submit and
+# the margin in seconds.  RULE 16: it is run UNEDITED; if it is broken it is
+# FROZEN and a successor is registered (precedent cN1/cN2 at 149, cdn1/cdn2 at
+# 175, cTD1/cTD2 at 182).
+#
+# THE DOCUMENTED INVOCATION (no second argument to forget; --manifest and
+# --csv are OPTIONAL and DEFAULTED, CORRECTIONS 164.2 / 165.7):
+#     python3 analysis/cIS2_ciso2_horizon_score.py <runsdir>
+#     python3 analysis/cIS2_ciso2_horizon_score.py --selftest [--runsdir <runsdir>]
+#
+# =============================================================================
+# THE QUESTION, STATED BEFORE ANY NUMBER IT PRODUCES IS READ
+# =============================================================================
+# `ciso1` (CORRECTIONS 185/187) isolated the three carrier BatchNorm scales
+# (tensors 50, 53, 59 -- layer4.0.bn2.weight, layer4.0.shortcut.1.weight,
+# layer4.1.bn2.weight; 1,536 of 11,220,132 parameters) into their own step-size
+# group at the standard CIFAR-100 cell and recovered the WHOLE in-batch
+# scalar->layerwise gap at 100 epochs.  Its verdict was `UNRESOLVED-PARTIAL`,
+# and 187.7 said exactly why: the registered freedom bar failed only on its
+# terminal-value half, because the 100-epoch horizon cuts the 59-group's
+# descent MID-FLIGHT.  Re-derived here from ciso1's own 1,500 probe records
+# before this file was committed (numbers reproduced digit for digit by an
+# independent numpy parser; see DISCLOSURE):
+#
+#   ISO beta[0] (the 59-group)  seed 21 / 22 / 23
+#     peak            -4.9524 / -5.0084 / -4.8924   at record 89 / 89 / 90
+#     terminal       -14.3847 / -14.9450 / -14.7329
+#     terminal slope  -0.02645 / -0.03580 / -0.02925 nats per record (OLS,
+#                     last 50 records; the last-100 OLS agrees to 0.003)
+#     distance to the -15.0 clamp: 0.6153 / 0.0550 / 0.2671 nats
+#     ==> LINEAR EXTRAPOLATION: pins at epoch 104.7 / 100.3 / 101.8
+#         (the descent is ACCELERATING -- per-100-record OLS slopes
+#          -0.0188, -0.0153, -0.0232, -0.0263 for seed 21 -- so a linear
+#          extrapolation of the terminal slope pins NO LATER than this.)
+#
+#   ISO beta[1] (the three isolated carriers) is ALREADY pinned: it reaches
+#     -15.0 at record 112 / 116 / 118 = epoch 22.4 / 23.2 / 23.6 and sits there
+#     with floor occupancy 0.7760 / 0.7680 / 0.7640.
+#     ==> when the 59-group pins too, EVERY parameter tensor in ISO is on a
+#         step size of exp(-15) = 3.06e-07.  THE WHOLE NETWORK FREEZES.
+#
+#   The floored arms say what freezing does: k01 and CTRL reach -15.0 at record
+#     184 = epoch 36.8, and their trailing-5-epoch test accuracy is inside
+#     +-0.5 pp of its terminal value from epoch 37 onward and FLAT for the
+#     remaining 63.2 epochs.  Pinning's effect on accuracy is IMMEDIATE and
+#     PERMANENT at this cell; it is not a slow decay.
+#
+#   ONE beta[0] (its 61-group) never reaches the floor by 100 epochs: terminal
+#     -11.8497 / -11.9077 / -11.7617, terminal slope -0.01323 / -0.01025 /
+#     -0.00789 per record ==> pins at epoch 147.6 / 160.3 / 182.1 (last-50) or
+#     145.1 / 149.6 / 154.0 (last-100).  ONE's own isolated beta[1] is pinned
+#     from epoch 22.0 / 22.8 / 23.2.  So ONE freezes LATER than ISO -- and yet
+#     at 100 epochs ONE scores 5.4613 pp BELOW ISO.  That ordering is the
+#     batch's sharpest falsifiable prediction: see ORDER-HELD / CROSSOVER.
+#
+#   k62 (layerwise) will NOT pin inside this horizon: its beta[0] terminal is
+#     -10.0810 / -10.1290 / -10.2171 with last-100 slopes -0.001517 / -0.002676
+#     / +0.000473 per record, i.e. pin epoch 749 / 464 / never.  The ceiling arm
+#     keeps training while ISO freezes.  THAT IS PRE-REGISTERED HERE because it
+#     makes the ratio D_ISO/D_CEIL fall even if ISO does not move one point --
+#     which is why the ratio is a STAMP and the PRIMARY is the absolute
+#     retention against this batch's OWN 100-epoch readout.
+#
+# THE HYPOTHESIS, IN ONE SENTENCE.  If ISO's rescue is a real change of regime,
+# it survives its own group pinning; if it is only a DELAY of the scalar
+# collapse, then ISO is a network that trains for ~104 epochs and then stops,
+# and its 250-epoch accuracy equals its ~105-epoch accuracy.  Both readings
+# predict SURVIVE on the primary bar; they are separated by the FROZEN-AT-PIN /
+# DECAYS-AFTER-PIN / IMPROVES-AFTER-PIN stamp and by ONE's timing.
+#
+# =============================================================================
+# THE DESIGN.  4 ARMS x 3 SEEDS = 12 JOBS, ONE SUBMISSION, 250 EPOCHS.
+# =============================================================================
+#   k01   scalar                              m=1    FLOOR anchor, in batch
+#   k62   layerwise                           m=1x62 CEILING anchor, in batch
+#   ISO   sets:<59 others>/<50,53,59>         m=2 [59,3]   THE ARM
+#   ONE   sets:<61 others>/<50>               m=2 [61,1]   THE TIMING ARM
+#   Seeds 31, 32, 33 -- FRESH: the corpus carries no row at any network with
+#   seed 31, 32 or 33, so ciso2's free 100-epoch readout is an INDEPENDENT seed
+#   triple, not a re-run of ciso1's 21/22/23.
+#
+#   CTRL IS NOT CARRIED, AND THAT IS A TRADE, NOT AN OVERSIGHT.  At 100 epochs
+#   CTRL is statistically indistinguishable from k01 (D_CTRL -0.0633 pp =
+#   -0.08 SE), reaches the floor at the SAME record (184) as k01, and its
+#   seed-pair beta[0] differences are 0.006-0.108 nats -- a near-replicate of
+#   the floor.  A second floor arm at a longer horizon buys nothing this batch
+#   asks about, and the identity-vs-depth question CTRL half-answers is the
+#   DEPTH arm's job (187.4), not this one's.  The three saved jobs pay for the
+#   longer horizon.
+#
+#   THE 100-EPOCH CONTROL IS FREE AND IS READ IN-RUN.  `num_epochs` occurs in
+#   exactly TWO places in the live train.py (the argparse declaration at line
+#   42 and `for epoch in range(args.num_epochs)` at line 135; verified on the
+#   live file, sha256 3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1
+#   ebddfcab7, before this file was committed).  There is no schedule, no
+#   total-step count and no warmup keyed to it; SCHED=none and
+#   --max-time 999:00:00 keeps train.py's own time break from firing.  So the
+#   epoch-95..99 readout of a 250-epoch run IS a 100-epoch run of an identical
+#   configuration -- the cts3 / cpk2 / cpk3 precedent (CORRECTIONS 152/158/161),
+#   and a WITHIN-RUN paired control instead of a between-run one.  Twelve
+#   separate 100-epoch jobs are NOT submitted; that is a saving, not an
+#   omission.
+#
+# =============================================================================
+# THE HORIZON, DERIVED FROM THE MEASURED DESCENT RATHER THAN CHOSEN ROUND
+# =============================================================================
+#   1. ISO's 59-group pins at epoch <= 104.7 (linear on its own terminal slope;
+#      the descent is accelerating, so this is an upper bound).
+#   2. ONE's 61-group pins at epoch <= 182.1 (the most conservative of the six
+#      per-seed extrapolations: seed 23, last-50 slope).
+#   3. ciso1's own pinned arms are observed for 63.2 epochs after they pin
+#      (epoch 36.8 -> 100) and are flat throughout.  That 63.2-epoch window is
+#      the only post-pin observation window this campaign has ever measured, so
+#      it is the window the LATEST-pinning arm here must also get.
+#   ==> E = 250 gives ONE 250 - 182.1 = 67.9 post-pin epochs (>= 63.2) and ISO
+#       250 - 104.7 = 145.3 post-pin epochs.  E = 240 would give ONE only 57.9
+#       and is rejected; E = 772 (the cts3 horizon) would cost 3.1x this batch
+#       and buys no extra decision, because the accuracy consequence of pinning
+#       at this cell is measured to be immediate, not asymptotic.
+#
+#   PRICE, from ciso1's OWN 15 runs (100 epochs each) on this exact cell:
+#     nodes 874/880-887/863  37-48 min  = 22.2-28.8 s/epoch  (the 7-day pool)
+#     node 851 (2080ti, reached via gpu-short) 81-94 min = 48.6-56.4 s/epoch
+#     corpus-worst on the 7-day pool (CORRECTIONS 152's table) 36.6 s/epoch
+#   250 epochs x 12 jobs:  expected 25.5 s/ep -> 21.3 GPU-h
+#                          ciso1-worst 28.8   -> 24.0 GPU-h
+#                          corpus-worst 36.6  -> 30.5 GPU-h
+#   gpu-short is excluded BY ARITHMETIC, not by choice: a 2080ti node at the
+#   corpus-worst 70.8 s/epoch would need 4.92 h at 250 epochs against
+#   gpu-short's 4:00:00 MaxTime.  WALL=05:00:00 therefore drops it through
+#   bin/_lib_guards.sh's own composer, with no PARTS_NO_SHORT_REASON override.
+#
+# =============================================================================
+# THE NOISE FLOOR, RE-DERIVED AT REGISTRATION AGAINST THE LIVE 2,761-ROW CSV,
+# ciso2's OWN ROWS EXCLUDED FROM EVERY READER (the 165.4 / cW1 pattern)
+# =============================================================================
+#   cR1's estimator, pooled within-(batch x granularity) SD of plateau5 in this
+#   exact cell, superseded and collapsed rows dropped.  FOUR defensible
+#   variants were computed and the MAXIMUM is registered:
+#     100 ep, m=2 NARROW  (^\[\d+,\d+\]$)          0.925518  df 60  30 cells
+#     100 ep, m=2 WIDE    (+ sets: with one '/')   0.863472  df 84  42 cells
+#     772 ep, m=2 (narrow == wide at that horizon) 0.864841  df 26  13 cells
+#     772 ep, ALL granularities                    0.813024  df 30  15 cells
+#     SIGMA_W = max = 0.925518
+#   NOTE, DISCLOSED: the corpus owns NO 250-epoch row, so SIGMA_W is an
+#   extrapolation in horizon.  The 772-epoch stratum -- the only long-horizon
+#   evidence there is -- gives a SMALLER sigma (0.8648) than the 100-epoch one,
+#   so taking the 100-epoch maximum is the CONSERVATIVE choice, and that is
+#   checked, not assumed.  --selftest re-derives all four.
+#     SE_ARM_DIFF = SIGMA_W * sqrt(2/3) = 0.7556823 (3-seed arm vs 3-seed arm)
+#     READ_BAR    = 2 * SE_ARM_DIFF     = 1.5113646
+#   ciso1's OWN pooled within-arm SD of plateau5 was 0.446954 (df 10), i.e.
+#   2.07x smaller than SIGMA_W: the registered bars have margin over the
+#   in-batch scatter.  --selftest prints ciso2's own once the runs exist.
+#
+# =============================================================================
+# THE BARS, FROZEN, IN pp AND IN SE
+# =============================================================================
+#   P100(arm) = mean TEST accuracy over epochs 95..99 of that run   (in-run)
+#   P250(arm) = mean TEST accuracy over epochs 245..249 of that run
+#   T100/T250 = the same on TRAIN accuracy.
+#   D_ISO_h  = P_h(ISO) - P_h(k01);  D_ONE_h, D_CEIL_h likewise.  ALL IN BATCH.
+#   RHO      = D_ISO_250 / D_ISO_100   -- the RETENTION, the primary quantity.
+#
+#   SURVIVE_FRAC = 0.80.  RATIONALE, corpus-anchored, not round: at ciso1's
+#     measured D_ISO_100 = 46.9307 pp, 0.80 x D_ISO_100 = 37.5446 pp, which is
+#     ABOVE the best rescue any two-group partition of this cell has ever
+#     produced -- k49 (pooled [49,13] and sets:1-49/50-62, n 21) at 55.4688
+#     against the scalar mean 22.9141 = +32.5547 pp.  So RESCUE-SURVIVES means
+#     "ISO still beats the corpus's best m=2 partition", a substantive claim.
+#     The tolerated loss, 0.20 x D_ISO_100 = 9.3861 pp, is 12.42 SE -- far
+#     outside noise, so this bar is a SCIENTIFIC threshold, not a statistical
+#     one, and it is stated as such.
+#   SUPPORT_BAR = 25.0 pp = 33.08 SE.  Carried UNCHANGED from ciso1 so the two
+#     horizons are read on one scale.  Required jointly with SURVIVE_FRAC.
+#   REFUTE_BAR  = 5.0 pp = 6.62 SE.  Carried unchanged from ciso1: below the
+#     ladder's own worst non-floor m=2 state (k50, +7.50 over the floor).
+#   READ_BAR    = 1.5113646 pp = 2 SE.  Used for every stamp-level comparison.
+#   DEAD_BAR    = 5.00 pp: a within-arm seed RANGE above it in k01 or ISO at
+#     either horizon is UNRESOLVED-DIVERGED (a bimodal arm is reported, not
+#     averaged).
+#   PIN_OCC_MIN = 0.50 floor occupancy over the LAST QUARTER of the records.
+#   Anchor bands (re-derived at score time, ciso2 excluded, K = 4 SD):
+#     k01 P100 inside 22.9141 +- 4 x 0.5709 = [20.6306, 25.1976]  (n 35)
+#     k62 P100 inside 69.4436 +- 4 x 0.5120 = [67.3954, 71.4918]  (n 29)
+#     There is NO corpus anchor at 250 epochs; the 250-epoch levels are read
+#     against the IN-BATCH floor only, and that is stated in the output.
+#
+# =============================================================================
+# THE BRANCH MAP, FIRST MATCH WINS
+# =============================================================================
+#   UNRESOLVED-MANIFEST-MISMATCH  no manifest; the live model is not the frozen
+#                                 62 (name or numel); any arm's composed group
+#                                 index set, sizes or numels differ from the
+#                                 registered ones.
+#   UNRESOLVED-PROVENANCE         any run's own ARGS / ENV / PROBE_TENSOR line
+#                                 is not the registered one; run count != 12;
+#                                 missing probe records; record count != 1250;
+#                                 block_sizes disagree with the manifest; the
+#                                 decomposition (per-group sums of z_tensor and
+#                                 m_tensor against the harness's own z_agg and
+#                                 mom_pre) fails on > 1 % of records.
+#   UNRESOLVED-DIVERGED           any run without RUN_DONE or with < 250 epoch
+#                                 lines or a traceback; k01 or k62 outside its
+#                                 100-epoch corpus band; seed RANGE > DEAD_BAR
+#                                 in k01 or ISO at either horizon.
+#   UNRESOLVED-NOT-PINNED         ISO's 59-group has NOT pinned by E on >= 2 of
+#                                 3 seeds (no record at BETA_LO + PIN_EPS, or
+#                                 last-quarter floor occupancy < PIN_OCC_MIN).
+#                                 THIS IS INFORMATIVE, NOT A FAILURE: the
+#                                 registered extrapolation says the group is
+#                                 0.055-0.615 nats from the clamp and closing at
+#                                 0.026-0.036 nats per record.  If 750 further
+#                                 records do not close it, the descent
+#                                 DECELERATES near the floor, `ISO-59-NEITHER`
+#                                 is a PERMANENT state rather than a mid-flight
+#                                 cut, and 187.7's reading of the verdict is
+#                                 wrong in a way that changes the mechanism.
+#   RESCUE-COLLAPSES              D_ISO_250 <= REFUTE_BAR.
+#   RESCUE-SURVIVES               D_ISO_250 >= SURVIVE_FRAC * D_ISO_100  AND
+#                                 D_ISO_250 >= SUPPORT_BAR.
+#   RESCUE-ATTENUATES             otherwise.  Sub-stamped ATTENUATE-MILD
+#                                 (RHO >= 0.50) or ATTENUATE-SEVERE (RHO < 0.50).
+#
+#   STAMPS (never the branch).
+#     FROZEN-AT-PIN | DECAYS-AFTER-PIN | IMPROVES-AFTER-PIN -- on
+#       END - POST, where POST is ISO's mean test accuracy over the five epochs
+#       [E_pin+5, E_pin+9] and END is P250(ISO); bar READ_BAR.  PREDICTED:
+#       FROZEN-AT-PIN, from k01's measured behaviour and from beta[1] already
+#       being pinned since epoch ~23.
+#     CEIL-TRACKS | CEIL-BELOW | CEIL-ABOVE -- |P250(ISO) - P250(k62)| vs
+#       READ_BAR.  At 100 epochs ciso1 was CEIL-TRACKS (+1.1840, inside 1.5114).
+#     ORDER-HELD | ORDER-TIED | CROSSOVER -- P250(ISO) - P250(ONE) vs READ_BAR.
+#       PREDICTED: ORDER-HELD with the gap SHRINKING from +5.4613 toward ~+3.
+#       CROSSOVER (ONE overtakes ISO) is what a pure "pinning destroys the
+#       rescue" account predicts, because ONE pins 43-77 epochs later.
+#     ONE-PINS-BY-E | ONE-NOT-PINNED (the latter also stamps
+#       CROSSOVER-UNTESTED, because the timing contrast then has no contrast).
+#     CEIL-STILL-TRAINING | CEIL-PINNED -- k62's own beta[0].  PREDICTED:
+#       CEIL-STILL-TRAINING.
+#     FLOOR-HOLDS | FLOOR-DRIFTS -- |P250(k01) - P100(k01)| vs READ_BAR.  This
+#       is the batch's NULL MODEL: if a pinned arm drifts over 150 further
+#       epochs, nothing else in this batch is attributable to isolation.
+#     ISO-TRAIN-FROZEN | ISO-TRAIN-MOVES -- |T250(ISO) - T100(ISO)| vs READ_BAR.
+#     TRAIN-GAP-WIDENS | TRAIN-GAP-HELD | TRAIN-GAP-NARROWS -- on
+#       [T(k62) - T(ISO)]_250 minus [T(k62) - T(ISO)]_100, bar READ_BAR.
+#       PREDICTED: TRAIN-GAP-WIDENS.  187.5 recorded, unstamped and
+#       unexplained, that ISO matches the ceiling on TEST with 4.612 pp LESS
+#       TRAIN at 100 epochs.  The registered account here EXPLAINS it: ISO stops
+#       fitting when it freezes while k62 keeps fitting at +0.083 to +0.097
+#       TRAIN pp/epoch, so the gap must widen.  A NARROWING gap refutes that
+#       account.
+#     REPLICATES-CISO1 | DIFFERS-FROM-CISO1 -- |D_ISO_100(here) - 46.9307| vs
+#       READ_BAR.  BETWEEN-BATCH and therefore DESCRIPTIVE AND NON-GATING:
+#       BATCH is the unit of replication (F(62,85) = 5.47) and no ciso1 arm may
+#       be spliced into any ciso2 contrast.  It is printed because a fresh seed
+#       triple reproducing +46.93 pp is worth knowing either way.
+#     FLOOR-NOT-INGESTED -- the CSV carries no ciso2 row.  The levels are read
+#       from the raw .out files either way; the CSV is never the primary source
+#       and its `plateau` column is not read anywhere in this file.
+#
+# =============================================================================
+# EVERY ARM'S PREDICTED LEVEL UNDER EVERY REGISTERED ACCOUNT, AND ITS MARGIN
+# OVER THE IN-BATCH m=1 FLOOR (the cpr1 rule, CORRECTIONS 164)
+# =============================================================================
+#   The in-batch m=1 floor is k01 itself, predicted 23.28 (it has been pinned
+#   since epoch 36.8 and its accuracy is measured flat for the 63 epochs after).
+#   k01 IS the floor, so its own margin is 0 by construction -- disclosed.
+#
+#   arm  | SURVIVE account | ATTENUATE account | COLLAPSE account | floor margin
+#   -----+-----------------+-------------------+------------------+--------------
+#   k01  | 23.3            | 23.3              | 23.3             | 0 (is floor)
+#   k62  | 69-73           | 69-73             | 69-73            | >= +45.7 pp
+#        |                 |                   |                  |   = 60.5 SE
+#   ISO  | 70.2 [68.5,     | 35-60             | <= 28.3          | +46.9 pp
+#        |  71.5]          |                   |                  |   = 62.1 SE
+#   ONE  | 65.0-68.0       | 35-60             | <= 28.3          | >= +41.7 pp
+#        |                 |                   |                  |   = 55.2 SE
+#
+#   NO ARM IS PREDICTED AT OR NEAR THE FLOOR UNDER THE ACCOUNT BEING TESTED.
+#   Under the account this batch registers (SURVIVE / FROZEN-AT-PIN) ISO sits
+#   46.9 pp = 62.1 SE above the in-batch floor and has 46.9 pp of room to fall
+#   before it reaches it, so RESCUE-COLLAPSES is reachable by the data, not
+#   excluded by the design.  Under the COLLAPSE account ISO lands at the floor
+#   -- but that is the REFUTATION branch, and a refutation is allowed to land
+#   there; the cpr1 defect was a TREATMENT arm saturated under its OWN account.
+#   The ceiling arm k62 is nowhere near either boundary in any account.
+#
+# =============================================================================
+# DISCLOSURE
+# =============================================================================
+#   Visible when this file was written: ciso1's 15 .out files and 15 probe
+#   directories, its PARTITION-MANIFEST.txt and PROVENANCE.txt, CORRECTIONS
+#   184-187, the 2,761-row CSV, the live train.py and HF.py on cluster_b, and
+#   bin/cIS1_isolate_carriers.sh.  Every ciso1 number quoted above was
+#   RE-DERIVED here with an independent parser from the raw probe records and
+#   .out files, not copied from CORRECTIONS prose, and each re-derivation
+#   reproduced the CORRECTIONS value digit for digit (plateau5: k01 23.2807,
+#   k62 69.0273, ISO 70.2113, CTRL 23.2173, ONE 64.7500; train5 ISO 94.2373,
+#   k62 98.8493).  --selftest re-derives the corpus premises here.
+#   NO ciso2 RUN EXISTED ANYWHERE WHEN THIS FILE WAS COMMITTED.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# ---- the design ------------------------------------------------------------
+BATCH = "ciso2"
+PREFIX = BATCH + "-"
+SEEDS = (31, 32, 33)
+ARMS = ("k01", "k62", "ISO", "ONE")
+EPOCHS = 250
+CTRL_EPOCHS = 100
+BATCH_SIZE = 100
+META_STEPS = EPOCHS * (50000 // BATCH_SIZE)        # 125,000
+PROBE_EVERY = 100
+N_RECORDS = META_STEPS // PROBE_EVERY              # 1,250
+REC_PER_EPOCH = (50000 // BATCH_SIZE) // PROBE_EVERY   # 5
+CLIP_C = "-15:-2.3026"
+BETA_LO, BETA_HI = -15.0, -2.3026
+MS, A0 = "1e-3", "1e-6"
+MP, B2 = 0.99, 0.9
+N_TENSORS, N_PARAMS = 62, 11220132
+NET, DSET = "ResNet18_c100", "CIFAR100"
+
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+
+# the registered spec strings, LITERAL and IDENTICAL to ciso1's, so the
+# intervention is the same object at a different horizon.  bin/cIS2_isolate_
+# horizon.sh holds the same four and its guard 4c' proves the two agree.
+SPEC = {
+    "k01": "scalar",
+    "k62": "layerwise",
+    "ISO": "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight",
+    "ONE": "sets:1-49,51-62/layer4.0.bn2.weight",
+}
+PT_TYPE = {"k01": "scalar", "k62": "layerwise", "ISO": "blockwise", "ONE": "blockwise"}
+ISOLATED = {"ISO": (50, 53, 59), "ONE": (50,)}
+SIZES = {"ISO": (59, 3), "ONE": (61, 1)}
+PARAMS = {"ISO": (11218596, 1536), "ONE": (11219620, 512)}
+M2_ARMS = ("ISO", "ONE")
+N_JOBS = len(ARMS) * len(SEEDS)                    # 12
+
+# ---- the noise floor and the bars, frozen ----------------------------------
+SIGMA_100_NARROW = 0.925518    # df 60, 30 cells
+SIGMA_100_WIDE = 0.863472      # df 84, 42 cells
+SIGMA_772_M2 = 0.864841        # df 26, 13 cells
+SIGMA_772_ALL = 0.813024       # df 30, 15 cells
+SIGMA_W = 0.925518
+SE_ARM_DIFF = 0.7556823        # SIGMA_W * sqrt(2/3)
+READ_BAR = 1.5113646           # 2 * SE_ARM_DIFF
+SUPPORT_BAR = 25.0
+REFUTE_BAR = 5.0
+SURVIVE_FRAC = 0.80
+ATTEN_MILD_FRAC = 0.50
+DEAD_BAR = 5.0
+BAND_K = 4.0
+PIN_EPS = 1e-6
+PIN_OCC_MIN = 0.50
+DECOMP_TOL = 1e-4
+DECOMP_FAIL_MAX = 0.01
+
+# ---- registered corpus anchors (descriptive; re-derived at score time) -----
+L_FLOOR, L_FLOOR_SD, L_FLOOR_N = 22.9141, 0.5709, 35
+L_CEIL, L_CEIL_SD, L_CEIL_N = 69.4436, 0.5120, 29
+L_K49, L_K49_N = 55.4688, 21
+BEST_M2_RESCUE = 32.5547       # L_K49 - L_FLOOR
+CISO1_D_ISO_100 = 46.9307      # between-batch reference, NON-GATING
+CISO1_ISO_MINUS_ONE = 5.4613
+CISO1_TRAIN_GAP_100 = 4.6120   # T(k62) - T(ISO) at 100 epochs in ciso1
+
+# registered point predictions (descriptive, non-gating)
+PRED_PIN_ISO = (100.3, 104.7)
+PRED_PIN_ONE = (145.1, 182.1)
+PRED_LEVEL = {"k01": (22.5, 24.0), "k62": (69.0, 73.0),
+              "ISO": (68.5, 71.5), "ONE": (65.0, 68.0)}
+
+# ---- the live ResNet18_c100, 1-based order, verified name-by-name against
+# ---- ciso1's PARTITION-MANIFEST.txt written by the live model -------------
+TENSOR_NAMES = (
+    "conv1.weight", "bn1.weight", "bn1.bias",
+    "layer1.0.conv1.weight", "layer1.0.bn1.weight", "layer1.0.bn1.bias",
+    "layer1.0.conv2.weight", "layer1.0.bn2.weight", "layer1.0.bn2.bias",
+    "layer1.1.conv1.weight", "layer1.1.bn1.weight", "layer1.1.bn1.bias",
+    "layer1.1.conv2.weight", "layer1.1.bn2.weight", "layer1.1.bn2.bias",
+    "layer2.0.conv1.weight", "layer2.0.bn1.weight", "layer2.0.bn1.bias",
+    "layer2.0.conv2.weight", "layer2.0.bn2.weight", "layer2.0.bn2.bias",
+    "layer2.0.shortcut.0.weight", "layer2.0.shortcut.1.weight", "layer2.0.shortcut.1.bias",
+    "layer2.1.conv1.weight", "layer2.1.bn1.weight", "layer2.1.bn1.bias",
+    "layer2.1.conv2.weight", "layer2.1.bn2.weight", "layer2.1.bn2.bias",
+    "layer3.0.conv1.weight", "layer3.0.bn1.weight", "layer3.0.bn1.bias",
+    "layer3.0.conv2.weight", "layer3.0.bn2.weight", "layer3.0.bn2.bias",
+    "layer3.0.shortcut.0.weight", "layer3.0.shortcut.1.weight", "layer3.0.shortcut.1.bias",
+    "layer3.1.conv1.weight", "layer3.1.bn1.weight", "layer3.1.bn1.bias",
+    "layer3.1.conv2.weight", "layer3.1.bn2.weight", "layer3.1.bn2.bias",
+    "layer4.0.conv1.weight", "layer4.0.bn1.weight", "layer4.0.bn1.bias",
+    "layer4.0.conv2.weight", "layer4.0.bn2.weight", "layer4.0.bn2.bias",
+    "layer4.0.shortcut.0.weight", "layer4.0.shortcut.1.weight", "layer4.0.shortcut.1.bias",
+    "layer4.1.conv1.weight", "layer4.1.bn1.weight", "layer4.1.bn1.bias",
+    "layer4.1.conv2.weight", "layer4.1.bn2.weight", "layer4.1.bn2.bias",
+    "linear.weight", "linear.bias",
+)
+TENSOR_NUMELS = (
+    1728, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64,
+    73728, 128, 128, 147456, 128, 128, 8192, 128, 128, 147456, 128, 128,
+    147456, 128, 128, 294912, 256, 256, 589824, 256, 256, 32768, 256, 256,
+    589824, 256, 256, 589824, 256, 256, 1179648, 512, 512, 2359296, 512, 512,
+    131072, 512, 512, 2359296, 512, 512, 2359296, 512, 512, 51200, 100,
+)
+
+_N_PASS = _N_FAIL = _N_SKIP = 0
+
+
+def chk(cond, label, extra=""):
+    global _N_PASS, _N_FAIL
+    if cond:
+        _N_PASS += 1
+        print("  PASS %s%s" % (label, (" -- " + extra) if extra else ""))
+    else:
+        _N_FAIL += 1
+        print("  FAIL %s%s" % (label, (" -- " + extra) if extra else ""))
+    return bool(cond)
+
+
+def skip(label, extra=""):
+    global _N_SKIP
+    _N_SKIP += 1
+    print("  SKIP %s%s" % (label, (" -- " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def se_str(d):
+    return "n/a" if d is None else "%+.2f SE" % (d / SE_ARM_DIFF)
+
+
+def spec_to_groups(spec, names=TENSOR_NAMES):
+    """Compose a registered spec into 1-based index groups WITHOUT torch, so the
+    scorer can check the launcher's manifest on any host."""
+    if spec == "scalar":
+        return [list(range(1, len(names) + 1))]
+    if spec == "layerwise":
+        return [[i] for i in range(1, len(names) + 1)]
+    if not spec.startswith("sets:"):
+        raise ValueError("unparsable spec %r" % spec)
+    body = spec[len("sets:"):]
+    if body.count("/") != 1:
+        raise ValueError("spec %r is not a two-group sets: spec" % spec)
+    coarse, fine = body.split("/")
+    g0 = []
+    for part in coarse.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            g0.extend(range(int(a), int(b) + 1))
+        else:
+            g0.append(int(part))
+    g1 = []
+    for nm in fine.split(","):
+        nm = nm.strip()
+        if nm not in names:
+            raise ValueError("spec names %r, which is not on the model" % nm)
+        g1.append(names.index(nm) + 1)
+    return [g0, g1]
+
+
+# =============================================================================
+# readers -- EVERY corpus reader excludes rows named ciso2-* (ingest-invariant)
+# =============================================================================
+def _csv_rows(path, exclude_own=True):
+    out = []
+    if not os.path.isfile(path):
+        return out
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if (r.get("superseded") or "0") == "1":
+                continue
+            if exclude_own and str(r.get("run") or "").startswith(PREFIX):
+                continue
+            out.append(r)
+    return out
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r, epochs):
+    return (r.get("network") == NET and r.get("dataset") == DSET
+            and r.get("base") == "SGDm" and r.get("meta") == "Lion"
+            and r.get("meta_stepsize") == MS and r.get("alpha0") == A0
+            and r.get("gamma") == "1" and r.get("augment") == "1"
+            and r.get("beta_clip") == CLIP_C and not (r.get("hier") or "").strip()
+            and r.get("batch_size") == str(BATCH_SIZE)
+            and r.get("epochs_done") == str(epochs) and r.get("collapsed") == "0")
+
+
+M2_NARROW = re.compile(r"^\[\d+,\d+\]$")
+
+
+def _is_m2(g, wide):
+    g = str(g or "")
+    if M2_NARROW.match(g):
+        return True
+    if wide and g.startswith("sets:"):
+        return g.count("/") == 1
+    return False
+
+
+def noise_floor_from_csv(path, epochs, wide, m2_only=True):
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not _in_cell(r, epochs):
+            continue
+        if m2_only and not _is_m2(r.get("granularity"), wide):
+            continue
+        try:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(float(r["plateau5"]))
+        except (TypeError, ValueError, KeyError):
+            pass
+    ss, df, nc, nm = 0.0, 0, 0, 0
+    for v in cells.values():
+        nm += len(v)
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc, nm
+
+
+def cell_level(path, grans, epochs=CTRL_EPOCHS):
+    v = []
+    for r in _csv_rows(path):
+        if _in_cell(r, epochs) and str(r.get("granularity")) in grans:
+            try:
+                v.append(float(r["plateau5"]))
+            except (TypeError, ValueError, KeyError):
+                pass
+    if not v:
+        return None
+    return {"n": len(v), "mean": statistics.mean(v),
+            "sd": statistics.stdev(v) if len(v) > 1 else float("nan")}
+
+
+def band(path, gran):
+    L = cell_level(path, (gran,))
+    if L is None or L["n"] < 2:
+        return None
+    return {"n": L["n"], "mean": L["mean"], "sd": L["sd"],
+            "lo": L["mean"] - BAND_K * L["sd"], "hi": L["mean"] + BAND_K * L["sd"]}
+
+
+def own_rows(path):
+    return sum(1 for r in _csv_rows(path, exclude_own=False)
+               if str(r.get("run") or "").startswith(PREFIX))
+
+
+def resolve_manifest(runsdir, explicit=None):
+    if explicit:
+        return (explicit, "explicit --manifest") if os.path.isfile(explicit) else (None, "explicit --manifest MISSING")
+    for cand, how in ((os.path.join(runsdir, BATCH, "PARTITION-MANIFEST.txt"), "<runsdir>/%s/PARTITION-MANIFEST.txt" % BATCH),
+                      (os.path.join(runsdir, PREFIX + "PARTITION-MANIFEST.txt"), "<runsdir>/%sPARTITION-MANIFEST.txt" % PREFIX)):
+        if os.path.isfile(cand):
+            return cand, "default: " + how
+    return None, "default resolution found nothing"
+
+
+def read_manifest(path):
+    tens, arms, iso = [], {}, {}
+    head = {}
+    with open(path) as fh:
+        for line in fh:
+            p = line.split()
+            if not p:
+                continue
+            if p[0] == "TENSOR":
+                tens.append((int(p[1]), p[2], int(p[3])))
+            elif p[0] == "ARMSPEC":
+                # ARMSPEC <arm> SPEC <spec> M <m> SIZES a,b PARAMS a,b GROUP0 ... GROUP1 ...
+                d, i = {}, 2
+                d["arm"] = p[1]
+                while i < len(p):
+                    k = p[i]
+                    if k in ("SPEC", "M", "SIZES", "PARAMS"):
+                        d[k] = p[i + 1]
+                        i += 2
+                    elif k in ("GROUP0", "GROUP1"):
+                        j = i + 1
+                        vals = []
+                        while j < len(p) and p[j] not in ("GROUP0", "GROUP1"):
+                            vals.append(p[j])
+                            j += 1
+                        d[k] = vals
+                        i = j
+                    else:
+                        i += 1
+                arms[d["arm"]] = d
+            elif p[0] == "ISOLATED":
+                iso[p[1]] = tuple(int(x) for x in p[2].split(","))
+            elif p[0] in ("NUM_PARAM_TENSORS", "TOTAL_PARAMS", "EPOCHS", "META_STEPS", "CLIP_C"):
+                head[p[0]] = p[1]
+    return {"tensors": tens, "arms": arms, "isolated": iso, "head": head}
+
+
+EPOCH_RE = re.compile(r"^Epoch (\d+), Train Accuracy: ([-\d.]+) %, Test Accuracy: ([-\d.]+) %")
+RUN_RE = re.compile(r"^(%s([A-Za-z0-9]+)-s(\d+))-(\d+)\.out$" % re.escape(PREFIX))
+
+
+def load_outs(runsdir):
+    runs = {}
+    for path in sorted(glob.glob(os.path.join(runsdir, PREFIX + "*.out"))):
+        m = RUN_RE.match(os.path.basename(path))
+        if not m:
+            continue
+        rn, arm, seed, jid = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        d = {"run": rn, "arm": arm, "seed": seed, "job": jid, "path": path,
+             "args": None, "env": None, "pt": None, "node": None,
+             "train": {}, "test": {}, "done": False, "traceback": False}
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if line.startswith("ARGS:"):
+                    d["args"] = line.rstrip("\n")
+                elif line.startswith("ENV:"):
+                    d["env"] = line.rstrip("\n")
+                elif line.startswith("PROBE_TENSOR:"):
+                    d["pt"] = line.rstrip("\n")
+                elif line.startswith("NODE="):
+                    d["node"] = line.split("|")[0].strip()
+                elif line.startswith("RUN_DONE"):
+                    d["done"] = True
+                elif "Traceback (most recent call last)" in line:
+                    d["traceback"] = True
+                else:
+                    em = EPOCH_RE.match(line)
+                    if em:
+                        e = int(em.group(1))
+                        d["train"][e] = float(em.group(2))
+                        d["test"][e] = float(em.group(3))
+        runs[rn] = d
+    return runs
+
+
+def load_probes(runsdir):
+    out = {}
+    for d in sorted(glob.glob(os.path.join(runsdir, BATCH, "probe_" + PREFIX + "*"))):
+        rn = os.path.basename(d)[len("probe_"):]
+        pj, bs, pt = os.path.join(d, "probe.jsonl"), os.path.join(d, "block_sizes.json"), os.path.join(d, "probe_tensor.json")
+        if not os.path.isfile(pj):
+            continue
+        recs = []
+        with open(pj) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        recs.append(json.loads(line))
+                    except ValueError:
+                        pass
+        e = {"dir": d, "recs": recs, "block": None, "pt": None}
+        for key, path in (("block", bs), ("pt", pt)):
+            if os.path.isfile(path):
+                try:
+                    e[key] = json.load(open(path))
+                except ValueError:
+                    pass
+        out[rn] = e
+    return out
+
+
+def window_mean(acc, end_epoch):
+    """mean over epochs end_epoch-5 .. end_epoch-1 (plateau5 at that horizon)."""
+    v = [acc[e] for e in range(end_epoch - 5, end_epoch) if e in acc]
+    return (sum(v) / 5.0) if len(v) == 5 else None
+
+
+def arm_mean(runs, arm, end_epoch, key="test"):
+    v = [window_mean(runs[r][key], end_epoch) for r in runs if runs[r]["arm"] == arm]
+    v = [x for x in v if x is not None]
+    if len(v) != len(SEEDS):
+        return None, None, v
+    return statistics.mean(v), (max(v) - min(v)), v
+
+
+def beta_series(recs, k=0):
+    out = []
+    for r in recs:
+        b = r.get("beta")
+        if isinstance(b, list) and len(b) > k:
+            out.append(float(b[k]))
+    return out
+
+
+def first_pin_record(b):
+    for i, v in enumerate(b):
+        if v <= BETA_LO + PIN_EPS:
+            return i
+    return None
+
+
+def tail_occupancy(b, frac=0.25):
+    if not b:
+        return float("nan")
+    n = max(1, int(len(b) * frac))
+    t = b[-n:]
+    return sum(1 for v in t if v <= BETA_LO + PIN_EPS) / float(len(t))
+
+
+def ols_slope(y, x0=0):
+    n = len(y)
+    if n < 2:
+        return float("nan")
+    xs = list(range(x0, x0 + n))
+    mx, my = sum(xs) / n, sum(y) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    return (sum((xs[i] - mx) * (y[i] - my) for i in range(n)) / den) if den else float("nan")
+
+
+def decompose_check(rec, groups):
+    """per-group sums of z_tensor / m_tensor against the harness's own z_agg /
+    mom_pre.  Returns (n_checked, n_failed, worst_rel)."""
+    zt, mt = rec.get("z_tensor"), rec.get("m_tensor")
+    za, mp = rec.get("z_agg"), rec.get("mom_pre")
+    if not (isinstance(zt, list) and isinstance(mt, list) and za and mp):
+        return 0, 0, 0.0
+    za = za[0] if isinstance(za[0], list) else za
+    mp = mp[0] if isinstance(mp[0], list) else mp
+    nch = nfa = 0
+    worst = 0.0
+    for k, g in enumerate(groups):
+        if k >= len(za) or k >= len(mp):
+            continue
+        for arr, ref in ((zt, za[k]), (mt, mp[k])):
+            s = sum(arr[i - 1] for i in g)
+            d = abs(s - ref)
+            rel = d / max(1e-30, abs(ref))
+            worst = max(worst, rel if abs(ref) > 1e-12 else d)
+            nch += 1
+            if (rel if abs(ref) > 1e-12 else d) > DECOMP_TOL:
+                nfa += 1
+    return nch, nfa, worst
+
+
+# =============================================================================
+# tokens
+# =============================================================================
+def free_state(occ, term, tag):
+    if occ >= PIN_OCC_MIN:
+        return tag + "-PINS"
+    if occ <= 0.10 and term > BETA_LO + 2.0:
+        return tag + "-FREE"
+    return tag + "-NEITHER"
+
+
+def three_way(delta, lo_tag, mid_tag, hi_tag, bar=READ_BAR):
+    if delta is None:
+        return "UNMEASURED"
+    if delta <= -bar:
+        return lo_tag
+    if delta >= bar:
+        return hi_tag
+    return mid_tag
+
+
+# =============================================================================
+# the scorer
+# =============================================================================
+def score(runsdir, csv_path, manifest=None):
+    global _N_PASS, _N_FAIL, _N_SKIP
+    _N_PASS = _N_FAIL = _N_SKIP = 0
+    stamps = []
+    print("=" * 78)
+    print(" cIS2 -- ciso2: DOES THE H-ISOLATE RESCUE SURVIVE THE 59-GROUP PINNING?")
+    print(" runsdir %s" % runsdir)
+    print(" csv     %s" % csv_path)
+    print(" design  %d arms x %d seeds = %d jobs, %d epochs, PROBE=%d -> %d records"
+          % (len(ARMS), len(SEEDS), N_JOBS, EPOCHS, PROBE_EVERY, N_RECORDS))
+    print("=" * 78)
+
+    # ---- [G1] the manifest, on the live model -----------------------------
+    print("\n[G1] MANIFEST -- the live model and every registered partition")
+    mpath, how = resolve_manifest(runsdir, manifest)
+    print("  manifest resolution: %s -> %s" % (how, mpath))
+    if not mpath:
+        return finish("UNRESOLVED-MANIFEST-MISMATCH", ["NO-MANIFEST"])
+    M = read_manifest(mpath)
+    ok = chk(len(M["tensors"]) == N_TENSORS, "manifest has %d TENSOR lines" % N_TENSORS,
+             "got %d" % len(M["tensors"]))
+    if ok:
+        nm_ok = all(M["tensors"][i][0] == i + 1 and M["tensors"][i][1] == TENSOR_NAMES[i]
+                    and M["tensors"][i][2] == TENSOR_NUMELS[i] for i in range(N_TENSORS))
+        ok &= chk(nm_ok, "every tensor matches the frozen name AND numel at its 1-based index")
+        ok &= chk(sum(t[2] for t in M["tensors"]) == N_PARAMS, "total parameters == %d" % N_PARAMS,
+                  "got %d" % sum(t[2] for t in M["tensors"]))
+    for arm in ARMS:
+        a = M["arms"].get(arm)
+        if not a:
+            ok &= chk(False, "manifest carries ARMSPEC %s" % arm)
+            continue
+        ok &= chk(a.get("SPEC") == SPEC[arm], "%s SPEC is the registered string" % arm,
+                  "manifest %r" % a.get("SPEC"))
+        if arm in M2_ARMS:
+            g0 = [TENSOR_NAMES.index(n) + 1 for n in a.get("GROUP0", []) if n in TENSOR_NAMES]
+            g1 = [TENSOR_NAMES.index(n) + 1 for n in a.get("GROUP1", []) if n in TENSOR_NAMES]
+            ok &= chk(tuple(sorted(g1)) == tuple(sorted(ISOLATED[arm])),
+                      "%s isolates exactly %s (1-based)" % (arm, ISOLATED[arm]), "got %s" % sorted(g1))
+            ok &= chk((len(g0), len(g1)) == SIZES[arm], "%s group sizes are %s" % (arm, SIZES[arm]),
+                      "got %s" % ((len(g0), len(g1)),))
+            pc = (sum(TENSOR_NUMELS[i - 1] for i in g0), sum(TENSOR_NUMELS[i - 1] for i in g1))
+            ok &= chk(pc == PARAMS[arm], "%s parameter counts are %s" % (arm, PARAMS[arm]), "got %s" % (pc,))
+            ok &= chk(sorted(g0 + g1) == list(range(1, N_TENSORS + 1)),
+                      "%s GROUP0 u GROUP1 is exactly the 62 tensors, no gap, no duplicate" % arm)
+            comp = spec_to_groups(SPEC[arm])
+            ok &= chk(sorted(comp[0]) == sorted(g0) and sorted(comp[1]) == sorted(g1),
+                      "%s: the registered SPEC string re-composes to the manifest's own groups" % arm)
+    ok &= chk(M["head"].get("EPOCHS") == str(EPOCHS), "manifest EPOCHS == %d" % EPOCHS,
+              "got %s" % M["head"].get("EPOCHS"))
+    ok &= chk(M["head"].get("CLIP_C") == CLIP_C, "manifest CLIP_C == %s" % CLIP_C)
+    if not ok:
+        return finish("UNRESOLVED-MANIFEST-MISMATCH", ["MANIFEST-FAIL"])
+
+    # ---- [G0] provenance ---------------------------------------------------
+    print("\n[G0] PROVENANCE -- every run's OWN ARGS / ENV / PROBE_TENSOR line")
+    runs = load_outs(runsdir)
+    probes = load_probes(runsdir)
+    pok = chk(len(runs) == N_JOBS, "exactly %d ciso2 runs on disk" % N_JOBS, "got %d" % len(runs))
+    want = {("%s%s-s%d" % (PREFIX, a, s)) for a in ARMS for s in SEEDS}
+    pok &= chk(set(runs) == want, "the run names are exactly the registered %d" % N_JOBS,
+               "missing %s / extra %s" % (sorted(want - set(runs)), sorted(set(runs) - want)))
+    for rn in sorted(runs):
+        d = runs[rn]
+        a = d["args"] or ""
+        need = ["--dataset %s" % DSET, "--NN-name %s" % NET, "--batch-size %d" % BATCH_SIZE,
+                "--meta-stepsize %s" % MS, "--alpha0 %s" % A0, "--num-epochs %d" % EPOCHS,
+                "--alg-base SGDm", "--alg-meta Lion", "--gamma 1",
+                "--stepsize-groups %s" % SPEC[d["arm"]], "--seed %d" % d["seed"]]
+        miss = [n for n in need if n not in a]
+        pok &= chk(not miss, "%s ARGS carries every registered flag" % rn, "missing %s" % miss)
+        dup = [f for f, c in collections.Counter(re.findall(r"(--[a-z0-9-]+)", a)).items() if c > 1]
+        pok &= chk(not dup, "%s ARGS has no repeated flag (RULE 20)" % rn, "repeated %s" % dup)
+        e = d["env"] or ""
+        pok &= chk(("BETA_CLIP=%s" % CLIP_C) in e and ("PROBE=%d" % PROBE_EVERY) in e
+                   and "SCHED=none" in e and "AUGMENT=1" in e,
+                   "%s ENV carries AUGMENT=1 BETA_CLIP=%s PROBE=%d SCHED=none" % (rn, CLIP_C, PROBE_EVERY),
+                   e[:120])
+        p = d["pt"] or ""
+        pok &= chk(("type=%s" % PT_TYPE[d["arm"]]) in p and ("tensors=%d" % N_TENSORS) in p
+                   and ("every=%d" % PROBE_EVERY) in p,
+                   "%s PROBE_TENSOR line is on, type=%s, tensors=%d" % (rn, PT_TYPE[d["arm"]], N_TENSORS),
+                   p[:120])
+        pr = probes.get(rn)
+        if pr is None:
+            pok &= chk(False, "%s has probe records" % rn)
+            continue
+        pok &= chk(len(pr["recs"]) == N_RECORDS, "%s has exactly %d probe records" % (rn, N_RECORDS),
+                   "got %d" % len(pr["recs"]))
+        if d["arm"] in M2_ARMS and pr["block"]:
+            nb = pr["block"].get("n_b")
+            pok &= chk(tuple(nb or ()) == PARAMS[d["arm"]],
+                       "%s block_sizes n_b == %s" % (rn, PARAMS[d["arm"]]), "got %s" % (nb,))
+    # decomposition
+    print("\n[A] DECOMPOSITION -- per-group sums of z_tensor / m_tensor vs the harness's own")
+    tot = fail = 0
+    worst = 0.0
+    for rn in sorted(runs):
+        if runs[rn]["arm"] not in M2_ARMS:
+            continue
+        pr = probes.get(rn)
+        if not pr:
+            continue
+        groups = spec_to_groups(SPEC[runs[rn]["arm"]])
+        for rec in pr["recs"]:
+            c, f, w = decompose_check(rec, groups)
+            tot += c
+            fail += f
+            worst = max(worst, w)
+    if tot:
+        pok &= chk(fail <= DECOMP_FAIL_MAX * tot,
+                   "group sums reproduce z_agg and mom_pre on >= %.0f %% of checks"
+                   % (100 * (1 - DECOMP_FAIL_MAX)),
+                   "%d/%d fail, worst rel %.3e" % (fail, tot, worst))
+    else:
+        skip("decomposition -- no m=2 probe records readable")
+    if not pok:
+        return finish("UNRESOLVED-PROVENANCE", ["PROVENANCE-FAIL"])
+
+    # ---- [C] completion and the 100-epoch anchors --------------------------
+    print("\n[C] COMPLETION AND THE 100-EPOCH CORPUS ANCHORS")
+    cok = True
+    for rn in sorted(runs):
+        d = runs[rn]
+        cok &= chk(d["done"] and not d["traceback"] and len(d["test"]) >= EPOCHS,
+                   "%s RUN_DONE, no traceback, %d epoch lines" % (rn, EPOCHS),
+                   "done=%s tb=%s epochs=%d node=%s" % (d["done"], d["traceback"], len(d["test"]), d["node"]))
+    P100, P250, T100, T250, R100, R250 = {}, {}, {}, {}, {}, {}
+    for arm in ARMS:
+        P100[arm], R100[arm], v1 = arm_mean(runs, arm, CTRL_EPOCHS, "test")
+        P250[arm], R250[arm], v2 = arm_mean(runs, arm, EPOCHS, "test")
+        T100[arm], _, _ = arm_mean(runs, arm, CTRL_EPOCHS, "train")
+        T250[arm], _, _ = arm_mean(runs, arm, EPOCHS, "train")
+        print("  %-4s TEST  @100 %s (seeds %s, range %s)   @%d %s (seeds %s, range %s)"
+              % (arm, fmt(P100[arm]), " ".join(fmt(x, 3) for x in v1), fmt(R100[arm], 3),
+                 EPOCHS, fmt(P250[arm]), " ".join(fmt(x, 3) for x in v2), fmt(R250[arm], 3)))
+        print("       TRAIN @100 %s                                    @%d %s"
+              % (fmt(T100[arm]), EPOCHS, fmt(T250[arm])))
+    for arm, gran, reg in (("k01", "scalar", (L_FLOOR, L_FLOOR_SD, L_FLOOR_N)),
+                           ("k62", "layerwise", (L_CEIL, L_CEIL_SD, L_CEIL_N))):
+        b = band(csv_path, gran)
+        if b is None:
+            skip("%s corpus band (%s)" % (arm, gran))
+            continue
+        print("  corpus %s band (ciso2 excluded): n %d mean %.4f sd %.4f -> [%.4f, %.4f]  (registered %.4f/%.4f/n%d)"
+              % (gran, b["n"], b["mean"], b["sd"], b["lo"], b["hi"], reg[0], reg[1], reg[2]))
+        if P100[arm] is not None:
+            cok &= chk(b["lo"] <= P100[arm] <= b["hi"],
+                       "%s's IN-RUN 100-epoch readout is inside the corpus %s band" % (arm, gran),
+                       "%.4f vs [%.4f, %.4f]" % (P100[arm], b["lo"], b["hi"]))
+    for arm in ("k01", "ISO"):
+        for h, R in ((CTRL_EPOCHS, R100), (EPOCHS, R250)):
+            if R[arm] is not None:
+                cok &= chk(R[arm] <= DEAD_BAR, "%s seed range at %d ep <= DEAD_BAR %.2f" % (arm, h, DEAD_BAR),
+                           "range %.4f" % R[arm])
+    if not cok:
+        return finish("UNRESOLVED-DIVERGED", ["COMPLETION-OR-ANCHOR-FAIL"])
+
+    # ---- [P] the beta trajectories and the pin epochs ----------------------
+    print("\n[P] BETA -- when does each group pin, and does the accuracy move after it does?")
+    pin_epoch = {}
+    for arm in ARMS:
+        for k in (0, 1):
+            rows = []
+            for s in SEEDS:
+                rn = "%s%s-s%d" % (PREFIX, arm, s)
+                pr = probes.get(rn)
+                if not pr:
+                    continue
+                b = beta_series(pr["recs"], k)
+                if not b:
+                    continue
+                fp = first_pin_record(b)
+                occ_all = sum(1 for v in b if v <= BETA_LO + PIN_EPS) / float(len(b))
+                occ_tail = tail_occupancy(b)
+                sl = ols_slope(b[-50:])
+                rows.append((s, max(b), b[-1], fp, occ_all, occ_tail, sl))
+            if not rows:
+                continue
+            print("  %-4s beta[%d]: %s" % (arm, k, "" if k == 0 else "(isolated group)"))
+            for (s, mx, tm, fp, oa, ot, sl) in rows:
+                print("     s%-3d max %8.4f  terminal %9.4f  first pin rec %-7s (epoch %-7s)  occ %.4f  tail-occ %.4f  slope(last50) %+.5f/rec"
+                      % (s, mx, tm, fp if fp is not None else "never",
+                         ("%.1f" % (fp / float(REC_PER_EPOCH))) if fp is not None else "never", oa, ot, sl))
+            if k == 0:
+                pins = [(r[3] / float(REC_PER_EPOCH)) for r in rows if r[3] is not None
+                        and r[5] >= PIN_OCC_MIN]
+                pin_epoch[arm] = pins
+                tag = free_state(statistics.mean([r[5] for r in rows]),
+                                 statistics.mean([r[2] for r in rows]), arm + "-BIG")
+                print("     -> %s ; pinned-and-held on %d/%d seeds%s"
+                      % (tag, len(pins), len(rows),
+                         ("; mean pin epoch %.1f" % statistics.mean(pins)) if pins else ""))
+    iso_pins = pin_epoch.get("ISO", [])
+    one_pins = pin_epoch.get("ONE", [])
+    if len(iso_pins) < 2:
+        stamps.append("ISO-59-NOT-PINNED-AT-%d" % EPOCHS)
+        print("  ISO's 59-group has NOT pinned and held on >= 2 seeds by epoch %d." % EPOCHS)
+        print("  Registered extrapolation said epoch %.1f-%.1f.  The descent must decelerate"
+              % PRED_PIN_ISO)
+        print("  near the floor; ISO-59-NEITHER is then a PERMANENT state, not a mid-flight cut.")
+        return finish("UNRESOLVED-NOT-PINNED", stamps)
+    E_pin = statistics.mean(iso_pins)
+    stamps.append("ISO-PIN-EPOCH:%.1f" % E_pin)
+    stamps.append("ONE-PINS-BY-E" if len(one_pins) >= 2 else "ONE-NOT-PINNED")
+    if one_pins:
+        stamps.append("ONE-PIN-EPOCH:%.1f" % statistics.mean(one_pins))
+    k62_pins = pin_epoch.get("k62", [])
+    stamps.append("CEIL-PINNED" if len(k62_pins) >= 2 else "CEIL-STILL-TRAINING")
+
+    # POST vs END on ISO
+    post, end = [], []
+    for s in SEEDS:
+        rn = "%sISO-s%d" % (PREFIX, s)
+        acc = runs[rn]["test"]
+        e0 = int(math.ceil(E_pin)) + 5
+        w = [acc[e] for e in range(e0, e0 + 5) if e in acc]
+        if len(w) == 5:
+            post.append(sum(w) / 5.0)
+        v = window_mean(acc, EPOCHS)
+        if v is not None:
+            end.append(v)
+    if len(post) == len(SEEDS) and len(end) == len(SEEDS):
+        d_pp = statistics.mean(end) - statistics.mean(post)
+        print("  ISO post-pin window (epochs %d..%d) %.4f  vs  end (epochs %d..%d) %.4f  delta %+.4f (%s)"
+              % (int(math.ceil(E_pin)) + 5, int(math.ceil(E_pin)) + 9, statistics.mean(post),
+                 EPOCHS - 5, EPOCHS - 1, statistics.mean(end), d_pp, se_str(d_pp)))
+        stamps.append(three_way(d_pp, "DECAYS-AFTER-PIN", "FROZEN-AT-PIN", "IMPROVES-AFTER-PIN"))
+    else:
+        skip("post-pin window on ISO -- not enough epochs after the pin")
+
+    # ---- [B] the levels, the contrasts and the branch ----------------------
+    print("\n[B] CONTRASTS -- all IN BATCH, plateau5 from the runs' own .out files")
+    D_ISO_100 = (P100["ISO"] - P100["k01"]) if None not in (P100["ISO"], P100["k01"]) else None
+    D_ISO_250 = (P250["ISO"] - P250["k01"]) if None not in (P250["ISO"], P250["k01"]) else None
+    D_ONE_100 = (P100["ONE"] - P100["k01"]) if None not in (P100["ONE"], P100["k01"]) else None
+    D_ONE_250 = (P250["ONE"] - P250["k01"]) if None not in (P250["ONE"], P250["k01"]) else None
+    D_CEIL_100 = (P100["k62"] - P100["k01"]) if None not in (P100["k62"], P100["k01"]) else None
+    D_CEIL_250 = (P250["k62"] - P250["k01"]) if None not in (P250["k62"], P250["k01"]) else None
+    for lab, v in (("D_ISO  @100", D_ISO_100), ("D_ISO  @%d" % EPOCHS, D_ISO_250),
+                   ("D_ONE  @100", D_ONE_100), ("D_ONE  @%d" % EPOCHS, D_ONE_250),
+                   ("D_CEIL @100", D_CEIL_100), ("D_CEIL @%d" % EPOCHS, D_CEIL_250)):
+        print("  %-12s %s pp  (%s)" % (lab, fmt(v), se_str(v)))
+    RHO = (D_ISO_250 / D_ISO_100) if (D_ISO_100 and D_ISO_250 is not None) else None
+    frac_ceil_100 = (D_ISO_100 / D_CEIL_100) if (D_CEIL_100 and D_ISO_100 is not None) else None
+    frac_ceil_250 = (D_ISO_250 / D_CEIL_250) if (D_CEIL_250 and D_ISO_250 is not None) else None
+    print("  RHO = D_ISO@%d / D_ISO@100 = %s   (SURVIVE needs >= %.2f AND D_ISO@%d >= %.1f pp)"
+          % (EPOCHS, fmt(RHO), SURVIVE_FRAC, EPOCHS, SUPPORT_BAR))
+    print("  D_ISO/D_CEIL: @100 %s   @%d %s   (STAMP ONLY -- k62 keeps training while ISO freezes,"
+          % (fmt(frac_ceil_100), EPOCHS, fmt(frac_ceil_250)))
+    print("                 so this ratio falls even if ISO does not move; pre-registered.)")
+    print("  best m=2 rescue on the corpus (k49 - scalar, 100 ep) = %+.4f pp; SURVIVE threshold here = %s pp"
+          % (BEST_M2_RESCUE, fmt(SURVIVE_FRAC * D_ISO_100 if D_ISO_100 else None)))
+
+    # stamps that do not gate
+    if None not in (P250["ISO"], P250["k62"]):
+        d = P250["ISO"] - P250["k62"]
+        print("  ISO - k62 @%d = %+.4f pp (%s)" % (EPOCHS, d, se_str(d)))
+        stamps.append(three_way(d, "CEIL-BELOW", "CEIL-TRACKS", "CEIL-ABOVE"))
+    if None not in (P250["ISO"], P250["ONE"]):
+        d = P250["ISO"] - P250["ONE"]
+        print("  ISO - ONE @%d = %+.4f pp (%s)   [@100 = %+.4f; ciso1 measured %+.4f]"
+              % (EPOCHS, d, se_str(d), (P100["ISO"] - P100["ONE"]), CISO1_ISO_MINUS_ONE))
+        stamps.append(three_way(d, "CROSSOVER", "ORDER-TIED", "ORDER-HELD"))
+        if "ONE-NOT-PINNED" in stamps:
+            stamps.append("CROSSOVER-UNTESTED")
+    if None not in (P250["k01"], P100["k01"]):
+        d = P250["k01"] - P100["k01"]
+        print("  NULL MODEL  k01 @%d - k01 @100 = %+.4f pp (%s)" % (EPOCHS, d, se_str(d)))
+        stamps.append("FLOOR-HOLDS" if abs(d) < READ_BAR else "FLOOR-DRIFTS")
+    if None not in (T250["ISO"], T100["ISO"]):
+        d = T250["ISO"] - T100["ISO"]
+        print("  ISO TRAIN @%d - @100 = %+.4f pp" % (EPOCHS, d))
+        stamps.append("ISO-TRAIN-FROZEN" if abs(d) < READ_BAR else "ISO-TRAIN-MOVES")
+    if None not in (T250["k62"], T250["ISO"], T100["k62"], T100["ISO"]):
+        g100 = T100["k62"] - T100["ISO"]
+        g250 = T250["k62"] - T250["ISO"]
+        print("  TRAIN gap k62-ISO: @100 %+.4f  @%d %+.4f  change %+.4f  [ciso1 @100 %+.4f]"
+              % (g100, EPOCHS, g250, g250 - g100, CISO1_TRAIN_GAP_100))
+        stamps.append(three_way(g250 - g100, "TRAIN-GAP-NARROWS", "TRAIN-GAP-HELD", "TRAIN-GAP-WIDENS"))
+    if D_ISO_100 is not None:
+        d = D_ISO_100 - CISO1_D_ISO_100
+        print("  BETWEEN-BATCH, NON-GATING: D_ISO@100 here %.4f vs ciso1's %.4f, delta %+.4f (%s)"
+              % (D_ISO_100, CISO1_D_ISO_100, d, se_str(d)))
+        print("     BATCH is the unit of replication (F(62,85)=5.47); no ciso1 arm enters any contrast above.")
+        stamps.append("REPLICATES-CISO1" if abs(d) < READ_BAR else "DIFFERS-FROM-CISO1")
+    if own_rows(csv_path) == 0:
+        stamps.append("FLOOR-NOT-INGESTED")
+
+    # registered point predictions, scored
+    print("\n  REGISTERED POINT PREDICTIONS (descriptive, non-gating):")
+    for arm in ARMS:
+        lo, hi = PRED_LEVEL[arm]
+        v = P250[arm]
+        print("    %-4s predicted [%.1f, %.1f] at %d ep, measured %s -> %s"
+              % (arm, lo, hi, EPOCHS, fmt(v), "IN" if (v is not None and lo <= v <= hi) else "OUT"))
+    print("    ISO pin epoch predicted [%.1f, %.1f], measured %.1f -> %s"
+          % (PRED_PIN_ISO[0], PRED_PIN_ISO[1], E_pin,
+             "IN" if PRED_PIN_ISO[0] <= E_pin <= PRED_PIN_ISO[1] else "OUT"))
+    if one_pins:
+        m = statistics.mean(one_pins)
+        print("    ONE pin epoch predicted [%.1f, %.1f], measured %.1f -> %s"
+              % (PRED_PIN_ONE[0], PRED_PIN_ONE[1], m,
+                 "IN" if PRED_PIN_ONE[0] <= m <= PRED_PIN_ONE[1] else "OUT"))
+
+    # ---- the branch --------------------------------------------------------
+    if D_ISO_250 is None or D_ISO_100 is None:
+        return finish("UNRESOLVED-DIVERGED", stamps + ["LEVELS-UNREADABLE"])
+    if D_ISO_250 <= REFUTE_BAR:
+        return finish("RESCUE-COLLAPSES", stamps)
+    if D_ISO_250 >= SURVIVE_FRAC * D_ISO_100 and D_ISO_250 >= SUPPORT_BAR:
+        return finish("RESCUE-SURVIVES", stamps)
+    stamps.append("ATTENUATE-MILD" if (RHO is not None and RHO >= ATTEN_MILD_FRAC) else "ATTENUATE-SEVERE")
+    return finish("RESCUE-ATTENUATES", stamps)
+
+
+def finish(branch, stamps):
+    print("\n" + "=" * 78)
+    print("GATES: %d PASS  %d FAIL  %d SKIP" % (_N_PASS, _N_FAIL, _N_SKIP))
+    seen, out = set(), []
+    for s in stamps:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    print("FINAL: " + " | ".join([branch] + out))
+    print("=" * 78)
+    return 0
+
+
+# =============================================================================
+# selftest -- re-derives every corpus premise this file was registered on
+# =============================================================================
+def selftest(csv_path, runsdir):
+    global _N_PASS, _N_FAIL, _N_SKIP
+    _N_PASS = _N_FAIL = _N_SKIP = 0
+    print("=" * 78)
+    print(" cIS2 SELFTEST -- every registered premise re-derived, ciso2 excluded")
+    print("=" * 78)
+
+    print("\n[S1] the corpus and the noise floor")
+    rows = _csv_rows(csv_path)
+    chk(len(rows) > 2000, "CSV readable", "%d usable rows at %s" % (len(rows), csv_path))
+    chk(own_rows(csv_path) == 0 or True, "ciso2 rows currently in the CSV: %d (excluded from every reader above)"
+        % own_rows(csv_path))
+    got = {}
+    for lab, ep, wide, m2 in (("100/NARROW", CTRL_EPOCHS, False, True),
+                              ("100/WIDE", CTRL_EPOCHS, True, True),
+                              ("772/M2", 772, True, True),
+                              ("772/ALL", 772, True, False)):
+        s, df, nc, nm = noise_floor_from_csv(csv_path, ep, wide, m2)
+        got[lab] = s
+        print("  sigma %-10s = %.6f  df %d  cells %d  members %d" % (lab, s, df, nc, nm))
+    chk(abs(got["100/NARROW"] - SIGMA_100_NARROW) < 5e-6,
+        "sigma 100/NARROW re-derives to the registered %.6f" % SIGMA_100_NARROW,
+        "got %.6f" % got["100/NARROW"])
+    chk(abs(got["100/WIDE"] - SIGMA_100_WIDE) < 5e-6,
+        "sigma 100/WIDE re-derives to the registered %.6f" % SIGMA_100_WIDE, "got %.6f" % got["100/WIDE"])
+    chk(abs(got["772/M2"] - SIGMA_772_M2) < 5e-6,
+        "sigma 772/M2 re-derives to the registered %.6f" % SIGMA_772_M2, "got %.6f" % got["772/M2"])
+    chk(abs(got["772/ALL"] - SIGMA_772_ALL) < 5e-6,
+        "sigma 772/ALL re-derives to the registered %.6f" % SIGMA_772_ALL, "got %.6f" % got["772/ALL"])
+    chk(abs(max(got.values()) - SIGMA_W) < 5e-6,
+        "SIGMA_W is the MAXIMUM of the four variants (%.6f)" % SIGMA_W)
+    chk(got["772/M2"] < got["100/NARROW"],
+        "the long-horizon sigma is SMALLER than the registered one -- the extrapolation is conservative",
+        "%.6f < %.6f" % (got["772/M2"], got["100/NARROW"]))
+    chk(abs(SE_ARM_DIFF - SIGMA_W * math.sqrt(2.0 / 3.0)) < 1e-6, "SE_ARM_DIFF = SIGMA_W * sqrt(2/3)")
+    chk(abs(READ_BAR - 2 * SE_ARM_DIFF) < 1e-6, "READ_BAR = 2 SE")
+
+    print("\n[S2] the corpus levels the bars are grounded on")
+    fl = cell_level(csv_path, ("scalar",))
+    ce = cell_level(csv_path, ("layerwise",))
+    k49 = cell_level(csv_path, ("[49,13]", "sets:1-49/50-62"))
+    for lab, L, reg in (("scalar", fl, L_FLOOR), ("layerwise", ce, L_CEIL), ("k49", k49, L_K49)):
+        if L is None:
+            skip("%s level" % lab)
+            continue
+        print("  %-10s n %2d mean %.4f sd %.4f  (registered %.4f)" % (lab, L["n"], L["mean"], L["sd"], reg))
+        chk(abs(L["mean"] - reg) < 5e-4, "%s level re-derives to the registered %.4f" % (lab, reg))
+    if fl and k49:
+        chk(abs((k49["mean"] - fl["mean"]) - BEST_M2_RESCUE) < 1e-3,
+            "best m=2 rescue on the corpus re-derives to %.4f pp" % BEST_M2_RESCUE)
+        chk(SURVIVE_FRAC * CISO1_D_ISO_100 > (k49["mean"] - fl["mean"]),
+            "the SURVIVE threshold is ABOVE the corpus's best m=2 rescue",
+            "%.4f > %.4f" % (SURVIVE_FRAC * CISO1_D_ISO_100, k49["mean"] - fl["mean"]))
+
+    print("\n[S3] the registered specs compose to the registered partitions")
+    for arm in M2_ARMS:
+        g = spec_to_groups(SPEC[arm])
+        chk((len(g[0]), len(g[1])) == SIZES[arm], "%s composes to sizes %s" % (arm, SIZES[arm]),
+            "got %s" % ((len(g[0]), len(g[1])),))
+        chk(tuple(sorted(g[1])) == tuple(sorted(ISOLATED[arm])), "%s isolates %s" % (arm, ISOLATED[arm]))
+        chk(sorted(g[0] + g[1]) == list(range(1, N_TENSORS + 1)),
+            "%s covers the 62 tensors with no gap and no duplicate" % arm)
+        pc = (sum(TENSOR_NUMELS[i - 1] for i in g[0]), sum(TENSOR_NUMELS[i - 1] for i in g[1]))
+        chk(pc == PARAMS[arm], "%s parameter counts %s" % (arm, PARAMS[arm]), "got %s" % (pc,))
+    chk(set(spec_to_groups(SPEC["ISO"])[1]) - set(spec_to_groups(SPEC["ONE"])[1]) == {53, 59},
+        "ISO isolates exactly {53,59} more than ONE does")
+    chk(tuple(TENSOR_NAMES[i - 1] for i in ISOLATED["ISO"]) == CARRIERS,
+        "the isolated indices are the three carriers by NAME")
+    chk(sum(TENSOR_NUMELS) == N_PARAMS, "the frozen numels sum to %d" % N_PARAMS)
+
+    print("\n[S4] the design arithmetic")
+    chk(META_STEPS == 125000, "META_STEPS = %d epochs x 500 = 125,000" % EPOCHS)
+    chk(N_RECORDS == 1250, "N_RECORDS = META_STEPS / PROBE = 1,250")
+    chk(REC_PER_EPOCH == 5, "records per epoch = 5")
+    chk(N_JOBS == 12, "12 jobs")
+    print("  the 250-epoch horizon: ISO pins <= %.1f, ONE pins <= %.1f, post-pin window for ONE = %.1f epochs"
+          % (PRED_PIN_ISO[1], PRED_PIN_ONE[1], EPOCHS - PRED_PIN_ONE[1]))
+    chk(EPOCHS - PRED_PIN_ONE[1] >= 63.2,
+        "the LATEST-pinning arm still gets >= 63.2 post-pin epochs (ciso1's own measured window)",
+        "%.1f epochs" % (EPOCHS - PRED_PIN_ONE[1]))
+
+    print("\n[S5] ciso1's records, if they are reachable on this host")
+    c1 = os.path.join(runsdir, "ciso1")
+    if not os.path.isdir(c1):
+        skip("ciso1 premise re-derivation", "no %s on this host" % c1)
+    else:
+        for arm, want in (("ISO", 70.2113), ("k01", 23.2807), ("k62", 69.0273), ("ONE", 64.7500)):
+            v = []
+            for s in (21, 22, 23):
+                p = glob.glob(os.path.join(runsdir, "ciso1-%s-s%d-*.out" % (arm, s)))
+                if not p:
+                    continue
+                acc = {}
+                for line in open(p[0], errors="replace"):
+                    m = EPOCH_RE.match(line)
+                    if m:
+                        acc[int(m.group(1))] = float(m.group(3))
+                w = window_mean(acc, CTRL_EPOCHS)
+                if w is not None:
+                    v.append(w)
+            if len(v) == 3:
+                chk(abs(statistics.mean(v) - want) < 5e-4,
+                    "ciso1 %s plateau5 re-derives to %.4f" % (arm, want), "got %.4f" % statistics.mean(v))
+            else:
+                skip("ciso1 %s plateau5" % arm)
+        for s in (21, 22, 23):
+            d = os.path.join(c1, "probe_ciso1-ISO-s%d" % s)
+            if not os.path.isfile(os.path.join(d, "probe.jsonl")):
+                skip("ciso1 ISO-s%d beta" % s)
+                continue
+            recs = [json.loads(x) for x in open(d + "/probe.jsonl") if x.strip()]
+            b0 = beta_series(recs, 0)
+            b1 = beta_series(recs, 1)
+            sl = ols_slope(b0[-50:])
+            print("     ISO-s%d beta[0] terminal %.4f slope(last50) %+.5f/rec -> pins at epoch %.1f ; "
+                  "beta[1] first pin rec %s (epoch %s)"
+                  % (s, b0[-1], sl, CTRL_EPOCHS + ((b0[-1] + 15.0) / (-sl)) / REC_PER_EPOCH if sl < 0 else float("nan"),
+                     first_pin_record(b1), "%.1f" % (first_pin_record(b1) / float(REC_PER_EPOCH))
+                     if first_pin_record(b1) is not None else "never"))
+            chk(sl < 0 and b0[-1] > BETA_LO,
+                "ciso1 ISO-s%d's 59-group is still descending and NOT pinned at 100 epochs" % s)
+            chk(first_pin_record(b1) is not None,
+                "ciso1 ISO-s%d's ISOLATED group IS pinned well before 100 epochs" % s)
+
+    print("\n" + "=" * 78)
+    print("SELFTEST: %d PASS  %d FAIL  %d SKIP" % (_N_PASS, _N_FAIL, _N_SKIP))
+    print("=" * 78)
+    return 1 if _N_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="registered scorer for ciso2 (H-ISOLATE at a long horizon)")
+    ap.add_argument("runsdir", nargs="?", default=None,
+                    help="the directory holding ciso2-*.out and ciso2/ (the documented single argument)")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default=None, help="same, for --selftest")
+    ap.add_argument("--csv", default=DEFAULT_CSV, help="defaults to the repo's results/all_runs.csv")
+    ap.add_argument("--manifest", default=None,
+                    help="OPTIONAL: defaults to <runsdir>/ciso2/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    rd = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, rd or ".")
+    if not rd:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    return score(rd, a.csv, a.manifest)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

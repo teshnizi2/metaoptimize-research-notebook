@@ -1,0 +1,295 @@
+"""PATCH_VGGBN -- `VGG11_bn` / `VGG11_bn_c100`: a PLAIN (NON-RESIDUAL) BatchNorm
+convolutional network, AND NOTHING ELSE CHANGED.  Patches `build_network.py` ONLY.
+**NO OPTIMISER CHANGE.  `Optimizers/HF.py` IS NOT TOUCHED BY THIS PATCH.  Neither is
+`train.py`, `load_data.py`, `Optimizers/build_optimizer.py` or anything under
+`analysis/`.**
+
+=============================================================================
+WHY -- THE SCOPE LIMIT, AND THE STRUCTURAL READING THAT MAKES *THIS* NET THE TEST
+=============================================================================
+Every row of `results/all_runs.csv` is a ResNet.  Re-derived at registration on the
+2,761-row corpus, `cvg1-` excluded: eleven distinct `network` values
+(ResNet18 1854, ResNet18_c100 518, ResNet34 141, ResNet10 110, ResNet50 67,
+resnet18 26, ResNet18_gn 17, ResNet10_c100 9, ResNet18_tin 9, ResNet34_c100 9,
+ResNet101 1), and ZERO rows whose `network` does not match `^[Rr]es[Nn]et`.  That is
+the campaign's single largest scope limit and it is the objection every granularity
+finding shares.
+
+It bites hardest on the tensor-level result.  CORRECTIONS 187 reports that on the
+standard CIFAR-100 cell, moving three named 512-parameter layer4 BatchNorm SCALES --
+1-based indices 50, 53, 59 -- out of the shared step-size group lifts plateau5 from
+23.2807 to 70.2113, the whole in-batch scalar-to-layerwise gap, while the same move
+on their layer-2 structural homologues (20, 23, 29) gives -0.0633 pp.
+
+RE-DERIVED HERE ON THE LIVE `ResNet18_c100` (62 tensors, 11,220,132 parameters), the
+five 512-wide 1-D `*.weight` tensors -- every 512-wide BatchNorm scale in the whole
+model -- are at 47, 50, 53, 56, 59:
+
+    47  layer4.0.bn1.weight          NOT a carrier
+    50  layer4.0.bn2.weight          CARRIER
+    53  layer4.0.shortcut.1.weight   CARRIER
+    56  layer4.1.bn1.weight          NOT a carrier
+    59  layer4.1.bn2.weight          CARRIER
+
+Read that against `BasicBlock.forward`, which is, verbatim from the live source:
+
+    out = F.relu(self.bn1(self.conv1(x)))
+    out = self.bn2(self.conv2(out))
+    out += self.shortcut(x)
+    out = F.relu(out)
+
+The three CARRIERS are EXACTLY the 512-wide BN scales whose output is a SUMMAND OF A
+RESIDUAL ADDITION -- `bn2` on the residual branch of each of layer4's two blocks, and
+`shortcut.1` on the identity branch of the one block that has a projection.  The two
+NON-CARRIERS are EXACTLY the two `bn1` scales, which sit mid-branch behind a ReLU and
+feed no addition.  The split is 3/2 and it is perfect.
+
+That is a re-derivation from the live manifest plus the live source, not a quotation,
+and it is stated here as a HYPOTHESIS ABOUT THE CARRIER SET, not as an established
+result: nothing in the corpus has manipulated residual structure, so "the carriers are
+the BN scales that feed a residual add" and "the carriers are the deepest, widest BN
+scales" are the same measurement seen twice.  ResNet cannot separate them, because on
+a ResNet the deepest BN scales ALL feed adds.
+
+    A NET WITH NO RESIDUAL ADDITION SEPARATES THEM.  On a plain conv stack, NO BN
+    scale feeds an addition, and the deepest 512-wide BN scales still exist.
+
+=============================================================================
+WHAT THIS PATCH MAKES POSSIBLE, AND WHAT IT DOES NOT
+=============================================================================
+IT IS A TEST OF: does the scalar-to-layerwise plateau5 gap -- the gap the whole
+    granularity programme is about -- exist AT ALL on a non-residual architecture,
+    and does the architecture expose a carrier set at all?
+
+IT IS **NOT** a one-variable ablation of the residual connection.  VGG11_bn differs
+from ResNet18 in depth (8 weighted conv layers vs 20), in channel schedule, in
+downsampling (max-pool vs strided conv), and in having no projection shortcuts.  It is
+a DIFFERENT FAMILY that happens to lack residual additions.  Anyone writing this up as
+"the residual connection is the carrier" is over-reading it, and this docstring is part
+of that prohibition.  The clean one-variable ablation is a separate, cheaper object --
+ResNet18 with `out += self.shortcut(x)` deleted -- and it is NOT built here, on
+purpose: it is priced and named as the follow-on in CORRECTIONS 188 so that this patch
+adds exactly one testable thing.
+
+WHY VGG11_bn AND NOT THE ALTERNATIVES.
+  * A **plain CNN with NO normalisation** removes BatchNorm and residuals at once, and
+    an 8-to-11-layer unnormalised conv net under a meta-learned step size bounded above
+    by exp(-2.3026) = 0.1 is a serious training-failure risk.  A batch whose arms both
+    land at the floor decides nothing, and the campaign forbids predicting an arm at
+    the floor.  REJECTED.
+  * An **MLP** removes convolutions, BatchNorm and residuals at once, so the finding is
+    not even STATABLE on it (no BN scales exist to isolate), and its CIFAR-100 plateau
+    is low enough that the scalar arm risks the floor.  REJECTED.
+  * A **small ViT** keeps residual additions and swaps BatchNorm for LayerNorm -- a
+    genuinely interesting object, but it does NOT test the residual reading, it is the
+    largest build of the four, and a from-scratch ViT on CIFAR-100 at 100 epochs is
+    weak enough that arm levels are unpredictable.  REJECTED FOR NOW; priced in 188.
+  * **VGG11_bn** keeps convolutions, keeps BatchNorm, keeps a 512-wide deepest stage --
+    so the three-BN-scale finding is STATABLE and FALSIFIABLE on it -- and removes
+    residual additions.  CHOSEN.
+
+=============================================================================
+WHAT IT ADDS -- TWO ADDITIVE REGIONS, NO EXISTING BEHAVIOUR ALTERED
+=============================================================================
+  REGION A (dispatch, 2 lines of logic).  Two `if network_name == ...` returns,
+    inserted after the `ResNet18_tin` dispatch inside `build_network`.  Reachable ONLY
+    by an exact `--NN-name VGG11_bn` or `--NN-name VGG11_bn_c100`, neither of which any
+    prior batch used (verified against the `network` column of results/all_runs.csv:
+    eleven values, all ResNet).  Every pre-existing name reaches its own `return`
+    BEFORE region A, so no existing dispatch is even evaluated differently.
+  REGION B (the class), appended at END OF FILE, below `ResNet_tin`.  It defines
+    `VGG_CFG11`, `_vgg_make` and `class VGG_bn(nn.Module)`.  It references nothing in
+    the file except `nn` and `F`, and NOTHING IN THE FILE REFERENCES IT except region A.
+
+  NO EXISTING LINE IS EDITED.  The patch is two pure insertions; deleting the two
+  inserted regions reproduces the pre-patch file BYTE FOR BYTE, and
+  `tests/test_vggbn.py` V0 asserts exactly that against the on-disk `.pre_vggbn`
+  backup rather than against my reading of the diff.
+
+=============================================================================
+THE MODEL, AND WHY ITS PARAMETER LIST IS SHAPED THE WAY IT IS
+=============================================================================
+Standard VGG11 convolutional configuration, CIFAR formulation:
+
+    cfg = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
+
+Eight 3x3 convolutions (`bias=False`), each followed by `nn.BatchNorm2d` and ReLU;
+five 2x2 max-pools take 32 -> 16 -> 8 -> 4 -> 2 -> 1, so the final feature map is
+1x1x512 and the head is a SINGLE `nn.Linear(512, num_classes)`.
+
+  * `bias=False` on every conv MATCHES ResNet18's convs, so the 1-D tensors of this
+    model are EXACTLY the BatchNorm scales and shifts plus `linear.bias` -- the same
+    sentence that is true of ResNet18.  That keeps `nodewise` / `nodewise1d` /
+    `chunk<K>` meaning on this net what they mean on ResNet18.
+  * The single-Linear head MATCHES ResNet18's `self.linear`, and deliberately does NOT
+    use torchvision VGG's three-FC classifier, which would add >100M parameters and
+    make the head dominate every partition statistic.
+  * The sub-modules are registered as `conv1, bn1, conv2, bn2, ..., conv8, bn8, linear`
+    by explicit `setattr` in construction order, NOT inside an `nn.Sequential`.  That is
+    load-bearing twice over: `named_parameters()` yields readable names that the
+    `sets:` grammar can address BY NAME, and it reproduces ResNet18's
+    `(conv, bn.weight, bn.bias)` TRIPLE structure, so the identity
+    `class == index mod 3` holds at EVERY index from 1 to 24 with zero exceptions --
+    the same property CORRECTIONS 161.7c establishes for ResNet18's indices 1..60.
+
+Derived (asserted on the live model by `tests/test_vggbn.py` V2, not trusted here):
+
+    VGG11_bn_c100   26 parameter tensors | 9,274,532 parameters | 17 one-D tensors
+                    four 512-wide BN scales, at 1-based indices 14, 17, 20, 23
+    VGG11_bn        26 parameter tensors | 9,228,362 parameters (10-way head)
+
+`HF.init_meta` is driven entirely by `[(name, p.data.size()) for name, p in
+net.named_parameters()]` and contains NO architecture logic whatsoever; `train.py`
+touches the network only through `build_network(args.NN_name, args.device)`;
+`analysis/argsline_guard.py` and `bin/_lib_guards.sh` contain no tensor-count
+assumption.  So `scalar`, `layerwise`, `nodewise`, `nodewise1d`, `weightwise`,
+`chunk<K>`, `permnode<S>`, `[a,b,...]` and `sets:<g>/<g>` all compose on this net with
+NO further patch.  `resnet18_blocks` and `resnet50_blocks` remain what they always
+were: literal strings whose block lengths sum to 62 and 161, so they raise this file's
+own `0/0` on a 26-tensor model -- loudly, which is correct.
+
+=============================================================================
+DECLARED CONFOUNDS, WRITTEN BEFORE ANY RUN EXISTS
+=============================================================================
+  (i)  FAMILY, NOT VARIABLE.  See above: depth, channel schedule and downsampling all
+       move with the residual connection.  A null here does NOT license "residuals
+       cause the gap"; a positive here does NOT license "residuals are irrelevant".
+  (ii) MISTUNING (RULE 11).  This batch runs a NEW network at a cell whose argmax was
+       located on ResNet18_c100.  No argmax is located on VGG11_bn by this batch, so a
+       SMALL gap is ambiguous between "no gap on this family" and "wrong cell for this
+       family", and the scorer's stamp vocabulary says so explicitly.  A LARGE gap is
+       clean, because mistuning can only suppress a gap, not manufacture one.
+  (iii) FLOOR.  If BOTH arms land near chance the batch is a statement about the
+       harness, not about architecture.  The scorer gates on this in advance
+       (HARNESS-UNSOUND) and forbids a gap claim under it.
+
+STANDING RULE 20 is observed by the suite: it runs on CPU, and the two new NN-name
+strings are single shell tokens of [A-Za-z0-9_] with no `=`, no quote and no leading
+`-`.
+
+=============================================================================
+APPLY (OPERATOR STEP -- this repo does NOT ship the patched cluster file)
+=============================================================================
+    ssh cluster_b
+    cd /cluster/account_b/metaopt
+    D=MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+    cp $D/build_network.py $D/build_network.py.pre_vggbn
+    python3 hierarchical-metaoptimize/patches/patch_vggbn.py
+    module load Python/3.10.4-GCCcore-11.3.0 && source envs/mo/bin/activate
+    cd hierarchical-metaoptimize && python3 tests/test_vggbn.py \\
+        --pre  $METAOPT_WS/$D/build_network.py.pre_vggbn \\
+        --post $METAOPT_WS/$D/build_network.py
+
+VERIFY WITHOUT TOUCHING THE LIVE TREE:
+    BUILD_NET_PATH=<scratch copy>/build_network.py python3 patches/patch_vggbn.py
+"""
+import os
+import sys
+
+P = os.environ.get(
+    "BUILD_NET_PATH",
+    "/cluster/account_b/metaopt/MetaOptimize/codes/Supervised_tasks/"
+    "MetaOptimize/cifar10/build_network.py")
+
+src = open(P).read()
+
+# --- 0. idempotency.  Re-running must not double-patch. ------------------------------
+if "PATCH_VGGBN" in src:
+    print("PATCH_VGGBN already applied to", P, "-- nothing to do")
+    sys.exit(0)
+
+# Cheap sanity line; the real guard is that each anchor occurs EXACTLY ONCE.
+if "class ResNet(nn.Module):" not in src or "def build_network(" not in src:
+    sys.exit("refusing to patch: %s is not a MetaOptimize build_network.py" % P)
+
+# --- REGION A: the dispatch. ---------------------------------------------------------
+# Inserted immediately AFTER the ResNet18_tin dispatch, i.e. still inside
+# build_network() and above its terminal `0/0`.  Every pre-existing network_name
+# returns before reaching this point, so no existing dispatch changes.
+aA = """    if network_name == 'ResNet18_tin':
+        return ResNet_tin(BasicBlock, [2, 2, 2, 2], num_classes=200).to(device)
+"""
+assert src.count(aA) == 1, "anchor A count=%d -- refusing to patch" % src.count(aA)
+
+REGION_A = """
+    # --- PATCH_VGGBN: the ONLY new names.  A PLAIN (non-residual) BatchNorm conv
+    # stack: no shortcut, no addition, but BatchNorm scales and a 512-wide deepest
+    # stage retained, so a carrier-isolation contrast is statable on it.  Reachable
+    # only by an exact --NN-name, neither of which any prior batch used. ---
+    if network_name == 'VGG11_bn':
+        return VGG_bn(VGG_CFG11, num_classes=10).to(device)
+    if network_name == 'VGG11_bn_c100':
+        return VGG_bn(VGG_CFG11, num_classes=100).to(device)
+"""
+src = src.replace(aA, aA + REGION_A, 1)
+
+# --- REGION B: the class, appended at END OF FILE. -----------------------------------
+# Depends on nothing in the file but `nn` and `F`; nothing in the file depends on it
+# except REGION A.
+REGION_B = '''
+
+# --- PATCH_VGGBN ----------------------------------------------------------------
+# A plain VGG11-with-BatchNorm in the CIFAR formulation.  Present so that the
+# campaign has ONE architecture with NO residual addition anywhere, while keeping
+# BatchNorm, convolutions and a 512-wide deepest stage -- the three things the
+# tensor-level finding is stated in terms of.
+#
+# Sub-modules are registered by explicit setattr in construction order, NOT inside an
+# nn.Sequential, for two reasons that are load-bearing rather than cosmetic:
+#   (1) named_parameters() then yields conv1.weight / bn1.weight / bn1.bias / ... ,
+#       names the `sets:` grammar (PATCH_NAMESETS) can address BY NAME;
+#   (2) it reproduces ResNet18's (conv, bn.weight, bn.bias) TRIPLE structure, so
+#       `class == index mod 3` holds at every index 1..24 with zero exceptions.
+# Convs carry bias=False, exactly as ResNet18's do, so the 1-D tensors of this model
+# are exactly the BatchNorm scales and shifts plus linear.bias.
+# Five max-pools take 32 -> 16 -> 8 -> 4 -> 2 -> 1, so the head is a single Linear,
+# matching ResNet's self.linear rather than torchvision VGG's three-FC classifier.
+VGG_CFG11 = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
+
+
+def _vgg_make(cfg):
+    """(channel list, pool-after-conv-index set) from a VGG cfg. Pure, no torch."""
+    chans, pools, k = [], set(), 0
+    for v in cfg:
+        if v == 'M':
+            if k == 0:
+                0/0  # a cfg may not begin with a pool -- fail loudly
+            pools.add(k)
+        else:
+            chans.append(int(v))
+            k += 1
+    return chans, pools
+
+
+class VGG_bn(nn.Module):
+    def __init__(self, cfg, num_classes=10):
+        super(VGG_bn, self).__init__()
+        chans, pools = _vgg_make(cfg)
+        self.n_conv = len(chans)
+        self.pools = pools
+        in_c = 3
+        for i, c in enumerate(chans, 1):
+            setattr(self, 'conv%d' % i,
+                    nn.Conv2d(in_c, c, kernel_size=3, stride=1, padding=1, bias=False))
+            setattr(self, 'bn%d' % i, nn.BatchNorm2d(c))
+            in_c = c
+        self.linear = nn.Linear(in_c, num_classes)
+
+    def forward(self, x):
+        out = x
+        for i in range(1, self.n_conv + 1):
+            out = F.relu(getattr(self, 'bn%d' % i)(getattr(self, 'conv%d' % i)(out)))
+            if i in self.pools:
+                out = F.max_pool2d(out, 2)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+'''
+assert src.endswith("        return out\n"), "anchor B: unexpected end of file"
+src = src + REGION_B
+
+open(P, "w").write(src)
+print("PATCH_VGGBN applied to", P)
+print("  REGION A: 2 dispatch names (VGG11_bn, VGG11_bn_c100) after the ResNet18_tin branch")
+print("  REGION B: VGG_CFG11, _vgg_make, class VGG_bn appended at end of file")
+print("  now run: python3 tests/test_vggbn.py --pre <backup> --post", P)

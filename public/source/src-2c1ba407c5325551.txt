@@ -1,0 +1,67 @@
+#!/bin/bash
+# =============================================================================
+# in489_smoke.sh -- PHASE 1 smoke test for ImageNet-489.
+#
+# Runs the three ladder arms (scalar / layerwise / nodewise) SEQUENTIALLY inside
+# ONE GPU allocation.  Two reasons, both deliberate:
+#   1. Comparability.  Per-step overhead of a granularity is only meaningful
+#      against the other granularities on the SAME GPU.  One allocation makes
+#      that automatic instead of hoping the scheduler lands three jobs on
+#      identical hardware.
+#   2. Schedulability.  The cluster's GPUs were fully allocated when this was
+#      written; one allocation beats three in the queue.
+#
+# Each arm still writes its OWN .out file beginning with NODE= / ARGS: / ENV:,
+# so analysis/argsline_guard.py (RULE 20) and aggregate.py both work per-file
+# exactly as they do for the CIFAR batches.  Do NOT merge the arms into one
+# file: aggregate.py's ARGS regex takes the FIRST match only.
+#
+# This is a SMOKE TEST, not science.  Its epochs are truncated
+# (--steps-per-epoch), so no accuracy from it is a plateau number and none of it
+# may be scored.  It exists to prove the pipeline and to measure throughput.
+# =============================================================================
+#SBATCH --partition=gpu-short
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=40G
+#SBATCH --time=02:30:00
+#SBATCH --output=/cluster/account_a/metaopt/runs/in489smoke-driver-%j.out
+
+set -e
+WS=/cluster/account_a/metaopt
+module load Python/3.10.4-GCCcore-11.3.0
+source $WS/envs/mo/bin/activate
+cd $WS/imagenet489
+
+export PYTHONUNBUFFERED=1
+export BETA_CLIP=-15:-2.3026          # campaign standard (as in the g4m batch)
+
+# Leave 2 cores for the main process; qos-interactive/qos-testing cap a user at
+# cpu=12,gpu=1, and those are the only partitions with no queue right now.
+NW=$(( ${SLURM_CPUS_PER_TASK:-4} - 2 ))
+
+BASE="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 \
+--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 \
+--gamma 1 --meta-stepsize 3e-2 --alpha0 1e-6 \
+--NN-name resnet18 --num-classes 489 --data $WS/data/imagenet489 \
+--batch-size 256 --num-workers ${NW} --steps-per-epoch 400 --num-epochs 3 \
+--max-time 00:40:00 --seed 1"
+
+echo "DRIVER node=$(hostname) job=${SLURM_JOB_ID} cpus=${SLURM_CPUS_PER_TASK} workers=${NW}"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+for G in scalar layerwise nodewise; do
+  OUT=$WS/runs/in489smoke-$G-s1-${SLURM_JOB_ID}.out
+  ARGS="$BASE --stepsize-groups $G --save-directory $WS/runs/in489smoke --run-name in489smoke-$G-s1"
+  {
+    echo "NODE=$(hostname) | JOB=in489smoke-$G-s1 ${SLURM_JOB_ID}"
+    echo "ARGS: $ARGS"
+    echo "ENV: AUGMENT=1 BETA_CLIP=${BETA_CLIP} HIER=none LAM=na ETA_RATIO=na SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=0 PROBE_DIR=none DATASET=imagenet489 CPUS=${SLURM_CPUS_PER_TASK}"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    python -u train_in489.py $ARGS
+    echo "RUN_DONE"
+  } > $OUT 2>&1
+  echo "ARM $G finished -> $OUT"
+  tail -3 $OUT
+done
+echo "SMOKE_DONE"

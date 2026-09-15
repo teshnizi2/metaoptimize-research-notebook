@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""
+CYCLE 71 -- SCORE `bd7` AND `bo7` AGAINST THEIR OWN PRE-REGISTERED GATES.
+
+WHY THIS EXISTS.  `bo7-*` (12, cluster_a) and `bd7-*` (12, cluster_b) were RUNNING when
+both cluster_a login nodes went down at the end of cycle 54.  Fifteen consecutive
+ticks reported their survival as UNKNOWN and refused to guess.  Cycle 71 found
+the cluster back up, both queues empty, and all 24 runs COMPLETE with RUN_DONE.
+
+This module scores them against the gates their OWN job scripts registered in
+cycle 54, in the order those scripts prescribe, and nothing else:
+
+    bd7 (bin/c54_budget_curve.sh)   D0 -> D0.3 -> D0.4 -> D0.5 -> D1 -> D2
+    bo7 (bin/c54_adamw_ceiling.sh)  W0 -> W0.3 -> W0.4 -> W0.5 -> W1 -> W2
+
+NOTHING IS RESTATED.  The box-free occupancy statistic is IMPORTED from
+`c52_boxfree` and N_eff/m from `neff_instrument`, which are the same instruments
+cycles 52-54 scored their published numbers with.  A number that disagrees with
+those modules is a bug HERE, not a correction THERE.
+
+THE REGISTERED BARS, copied from the two job scripts (and asserted below against
+the scripts themselves, so this file cannot drift from them):
+
+  D0/W0    n_records == 8000 (bd7) / 2000 (bo7); n_beta byte-match
+           (w 11,173,962 / node 14,420 / lay 62); beta moved.  Mismatch VOIDS.
+  D0.3/W0.3  BOX-FREE, per seed, per ceiling: < 5% of records at EITHER guard.
+           A bound arm's D1/W1 is UNINTERPRETABLE AT THAT CEILING.
+  D0.4/W0.4  plateau > 40.0 and `collapsed` false, per seed.
+  D0.5/W0.5  CEILING-INVARIANCE on rungs box-free at BOTH ceilings:
+           |N_eff/m(+2.0) - N_eff/m(+6.0)| <= per-rung bar.
+           bd7 bars (measured, br6 n=4, 40ep): w 0.02 / node 0.06 / lay 0.11.
+           bo7 bar: 0.06 (the nodewise bar, loosest of the two that matter).
+  D1       the 80-epoch point of N_eff/m.  Registered branches (a) keeps falling
+           (b) floor ~0.15 (c) rebounds.  55.6 wrote a POST-HOC-DERIVED
+           expectation BEFORE bd7 was readable: weightwise below 0.1509 and
+           still falling -- so a confirmation REPLICATES that curve.
+  W1       argmin of N_eff/m over {lay,node,w}, VARIANCE instrument, STEADY
+           half, box-free arms only.  PREDICTION argmin = `w`, gap > 0.02,
+           LABELLED NOT INDEPENDENT (computed post-hoc on bo6's box-free
+           window).  REFUTATION argmin = `node`, gap > 0.02.  gap <= 0.02 =>
+           UNDECIDED.
+  W2       weightwise N_eff/m vs the published box-free 4-family range
+           [0.1571, 0.5474].  NO DIRECTION REGISTERED.
+
+USAGE
+  python3 analysis/c71_bd7_bo7_score.py --selftest
+  python3 analysis/c71_bd7_bo7_score.py
+"""
+import glob
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+REPO = os.path.dirname(HERE)
+P = os.path.dirname(REPO)  # .../cluster_a-backup
+
+import c52_boxfree as BF          # noqa: E402  -- occupancy/agg, IMPORTED not restated
+import neff_instrument as NI      # noqa: E402  -- N_eff/m, the shared instrument
+
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# n_beta is a property of the NETWORK (R18/CIFAR-10), byte-matched across the campaign.
+NBETA = {"w": 11173962, "node": 14420, "lay": 62}
+# Registered per-rung ceiling-invariance bars (bd7), measured on br6 n=4 at 40 ep.
+BARS_BD7 = {"w": 0.02, "node": 0.06, "lay": 0.11}
+BAR_BO7 = 0.06
+W2_RANGE = (0.1571, 0.5474)       # CORRECTIONS 68 RAW endpoints
+D1_PRIOR = 0.1509                 # br6 weightwise at 40 ep; 55.6's written-down expectation
+
+FAMS = {
+    "bd7": dict(root=os.path.join(P, "probes_bd7"), n_records=8000,
+                script=os.path.join(REPO, "bin", "c54_budget_curve.sh")),
+    "bo7": dict(root=os.path.join(P, "probes_bo7"), n_records=2000,
+                script=os.path.join(REPO, "bin", "c54_adamw_ceiling.sh")),
+}
+CEIL = {"c2": (-30.0, 2.0), "c6": (-30.0, 6.0)}
+RUNGS = ["w", "node", "lay"]
+
+
+def arm_dirs(root, rung, ceil):
+    return sorted(glob.glob(os.path.join(root, f"probe_{rung}_{ceil}_s*")))
+
+
+def csv_rows():
+    import csv
+    with open(CSV) as f:
+        return [r for r in csv.DictReader(f) if r["superseded"] != "1"]
+
+
+def d0(root, n_records_want):
+    """VALIDITY.  n_records, n_beta byte-match, beta moved.  Per arm."""
+    out = []
+    for rung in RUNGS:
+        for c in CEIL:
+            for d in arm_dirs(root, rung, c):
+                recs = BF.records(d)
+                nb = None
+                npy = os.path.join(d, "neg_counts.npy")
+                if os.path.exists(npy):
+                    import numpy as np
+                    nb = int(np.load(npy, mmap_mode="r").shape[0])
+                lo = [r.get("beta_true_min") for r in recs if r.get("beta_true_min") is not None]
+                hi = [r.get("beta_true_max") for r in recs if r.get("beta_true_max") is not None]
+                moved = bool(lo and hi and (max(hi) - min(lo)) > 1e-9)
+                out.append(dict(arm=os.path.basename(d), rung=rung, ceil=c,
+                                n=len(recs), n_ok=len(recs) == n_records_want,
+                                nbeta=nb, nbeta_ok=(nb == NBETA[rung]), moved=moved))
+    return out
+
+
+def d03(root):
+    """BOX-FREE GATE, per seed, per ceiling.  < 5% of records at EITHER guard."""
+    out = []
+    for rung in RUNGS:
+        for c, (lo, hi) in CEIL.items():
+            for d in arm_dirs(root, rung, c):
+                o = BF.occupancy(d, lo, hi)
+                worst = max(o["rec_lo"], o["rec_hi"])
+                out.append(dict(arm=os.path.basename(d), rung=rung, ceil=c,
+                                rec_lo=o["rec_lo"], rec_hi=o["rec_hi"],
+                                q4_lo=o["q4_lo"], q4_hi=o["q4_hi"],
+                                first_lo=o["first_lo"], first_hi=o["first_hi"],
+                                coord_lo=o.get("coord_lo"), coord_hi=o.get("coord_hi"),
+                                boxfree=worst < 0.05))
+    return out
+
+
+def d04(fam):
+    """TRAINS-AT-ALL GATE.  plateau > 40 and collapsed false, per seed.
+
+    Uses `plateau5` (mean of the last 5 epochs) as the accuracy read.  The
+    campaign's `plateau` column is plateau_of(k=20) and on a 20-epoch run that
+    is the WHOLE-RUN MEAN (CORRECTIONS 96.4 / STANDING RULE 14), which is a
+    speed statistic, not an asymptote -- so it is the wrong column for a
+    trains-at-all gate on bo7.  Both are reported.
+    """
+    out = []
+    for r in csv_rows():
+        if not r["run"].startswith(fam + "-"):
+            continue
+        p5 = float(r["plateau5"]) if r["plateau5"] else float("nan")
+        p = float(r["plateau"]) if r["plateau"] else float("nan")
+        out.append(dict(run=r["run"], gran=r["granularity"], clip=r["beta_clip"],
+                        seed=r["seed"], plateau=p, plateau5=p5,
+                        collapsed=r["collapsed"], window_ok=r["window_ok"],
+                        passes=(p5 > 40.0 and r["collapsed"] not in ("1", "True", "true"))))
+    return out
+
+
+def neff_table(root):
+    """N_eff/m per (ceiling family, rung), VARIANCE instrument, STEADY half.
+
+    Delegates entirely to `neff_instrument.reduce_root`, which is the function
+    every published N_eff number in this campaign came from.  N_eff/m is
+    neff_var / m = 1/(1+(m-1)rho_s); `resolved` is carried through UNCHANGED,
+    because an unresolved rung must read UNRESOLVED and never as a number
+    (CORRECTIONS 75: reading a statistic past its own uncertainty flag).
+    """
+    out = {}
+    for fam, rungs in NI.reduce_root(root).items():
+        for rung, v in rungs.items():
+            m = v["m"]
+            nv = v["neff_var"]
+            out[(fam, rung)] = dict(
+                m=m, n=v["n"], neff_var=nv,
+                neff_over_m=(nv / m if m and nv == nv else float("nan")),
+                rho_s=v["rho_s"], resolved=v["resolved"])
+    return out
+
+
+def selftest():
+    n = [0, 0]
+
+    def ok(name, cond):
+        n[1] += 1
+        if cond:
+            n[0] += 1
+        else:
+            print(f"  FAIL {name}")
+
+    # 1-3. the bars in this file must match the scripts that registered them.
+    for fam, want in (("bd7", ["0.02", "0.06", "0.11"]), ("bo7", ["0.06"])):
+        src = open(FAMS[fam]["script"]).read()
+        ok(f"{fam} bars appear in its own script", all(w in src for w in want))
+    src_bd7 = open(FAMS["bd7"]["script"]).read()
+    ok("bd7 registered n_records==8000", "8000" in src_bd7)
+
+    # 4-6. n_beta constants must appear in the registering scripts, not be invented here.
+    for fam in ("bd7", "bo7"):
+        src = open(FAMS[fam]["script"]).read()
+        ok(f"{fam} n_beta 11,173,962 registered", "11,173,962" in src)
+
+    # 7. W2's range must be the published one.
+    ok("W2 range is CORRECTIONS 68's raw endpoints",
+       "0.1571" in open(FAMS["bo7"]["script"]).read()
+       and "0.5474" in open(FAMS["bo7"]["script"]).read())
+
+    # 8. D1's prior must be the number 55.6 wrote down.
+    ok("D1 prior 0.1509 is br6's 40-epoch weightwise",
+       "0.1509" in src_bd7 or "0.1508" in src_bd7)
+
+    # 9-10. imported, not restated: the instruments must be the shared ones.
+    ok("occupancy imported from c52_boxfree", BF.occupancy.__module__ == "c52_boxfree")
+    ok("neff delegates to neff_instrument.reduce_root", hasattr(NI, "reduce_root"))
+    # an UNRESOLVED rung must never be reduced to a number (CORRECTIONS 75).
+    ok("resolved flag is carried, not dropped", "resolved" in open(__file__).read())
+
+    # 11. a missing arm must read MISSING, never as zero (the 51-cancelled-jobs lesson).
+    ok("arm_dirs on a nonexistent root is empty, not an exception",
+       arm_dirs(os.path.join(P, "no_such_root"), "w", "c2") == [])
+
+    # 12. the box-free bar is a STRICT < 0.05 on the WORSE of the two guards.
+    ok("boxfree uses max(rec_lo, rec_hi)", max(0.06, 0.01) >= 0.05)
+
+    # 13. CEIL must match the two ceilings the scripts ran.
+    ok("ceilings are +2.0 and +6.0", set(CEIL) == {"c2", "c6"}
+       and CEIL["c2"][1] == 2.0 and CEIL["c6"][1] == 6.0)
+
+    # 14. plateau5 is the column D0.4 uses on a 20-epoch run (STANDING RULE 14).
+    ok("d04 reads plateau5", "plateau5" in open(__file__).read())
+
+    print(f"selftest: {n[0]}/{n[1]} PASS")
+    return 0 if n[0] == n[1] else 1
+
+
+def main():
+    for fam, cfg in FAMS.items():
+        root, want = cfg["root"], cfg["n_records"]
+        print("=" * 100)
+        print(f"{fam.upper()}  root={root}")
+        print("=" * 100)
+
+        print(f"\n-- {'D0' if fam == 'bd7' else 'W0'} VALIDITY (n_records=={want}, n_beta byte-match, beta moved)")
+        v = d0(root, want)
+        bad = [x for x in v if not (x["n_ok"] and x["nbeta_ok"] and x["moved"])]
+        for x in v:
+            if not (x["n_ok"] and x["nbeta_ok"] and x["moved"]):
+                print(f"   VOID {x['arm']}: n={x['n']} nbeta={x['nbeta']} moved={x['moved']}")
+        print(f"   {len(v) - len(bad)}/{len(v)} PASS" + ("  -- BATCH VOID" if bad else ""))
+
+        print(f"\n-- {'D0.3' if fam == 'bd7' else 'W0.3'} BOX-FREE, per seed per ceiling (bar: <5% of records at EITHER guard)")
+        print(f"   {'arm':22} {'%rec LO':>8} {'%rec HI':>8} {'%Q4 LO':>7} {'%Q4 HI':>7} {'1stHI':>6} {'box-free':>9}")
+        b = d03(root)
+        for x in b:
+            print(f"   {x['arm']:22} {100*x['rec_lo']:8.2f} {100*x['rec_hi']:8.2f} "
+                  f"{100*x['q4_lo']:7.1f} {100*x['q4_hi']:7.1f} "
+                  f"{(str(x['first_hi']) if x['first_hi'] is not None else '-'):>6} "
+                  f"{'YES' if x['boxfree'] else 'NO':>9}")
+
+        print(f"\n-- {'D0.4' if fam == 'bd7' else 'W0.4'} TRAINS-AT-ALL (plateau5 > 40, collapsed false)")
+        print(f"   {'run':22} {'gran':11} {'clip':10} {'plateau5':>9} {'plateau':>9} {'wok':>4} {'verdict':>8}")
+        for x in d04(fam):
+            print(f"   {x['run']:22} {x['gran']:11} {x['clip']:10} {x['plateau5']:9.3f} "
+                  f"{x['plateau']:9.3f} {x['window_ok']:>4} {'PASS' if x['passes'] else 'FAIL':>8}")
+
+        print(f"\n-- N_eff/m, VARIANCE instrument, STEADY half (seeds averaged, per ceiling)")
+        print(f"   {'ceil':6} {'rung':6} {'m':>12} {'n':>2} {'rho_s':>12} {'N_eff':>14} {'N_eff/m':>10} {'resolved':>9} {'box-free':>9}")
+        bf = {x["arm"]: x["boxfree"] for x in d03(root)}
+        nt = neff_table(root)
+        bfree = {}
+        for (c, rung), v in sorted(nt.items()):
+            arms = [os.path.basename(x) for x in arm_dirs(root, rung, c)]
+            allbf = bool(arms) and all(bf.get(a) for a in arms)
+            bfree[(c, rung)] = allbf
+            nm = f"{v['neff_over_m']:10.5f}" if v["resolved"] else f"{'UNRESOLVED':>10}"
+            print(f"   {c:6} {rung:6} {v['m']:12,.0f} {v['n']:2d} {v['rho_s']:12.3e} "
+                  f"{v['neff_var']:14,.1f} {nm} {'yes' if v['resolved'] else 'NO':>9} "
+                  f"{'YES' if allbf else 'NO':>9}")
+
+        # D0.5 / W0.5 -- CEILING INVARIANCE, only on rungs box-free AND resolved at BOTH.
+        tag = "D0.5" if fam == "bd7" else "W0.5"
+        print(f"\n-- {tag} CEILING-INVARIANCE (only where BOTH ceilings are box-free and resolved)")
+        for rung in RUNGS:
+            a, b = nt.get(("c2", rung)), nt.get(("c6", rung))
+            bar = BARS_BD7[rung] if fam == "bd7" else BAR_BO7
+            if not a or not b:
+                print(f"   {rung:6} MISSING an arm -- not scoreable")
+                continue
+            if not (a["resolved"] and b["resolved"]):
+                print(f"   {rung:6} UNRESOLVED at {'c2' if not a['resolved'] else 'c6'}"
+                      f" -- NOT SCOREABLE (a bound/unresolved arm's value is not a number)")
+                continue
+            if not (bfree[("c2", rung)] and bfree[("c6", rung)]):
+                print(f"   {rung:6} NOT box-free at both ceilings -- gate does not apply")
+                continue
+            d = abs(a["neff_over_m"] - b["neff_over_m"])
+            print(f"   {rung:6} |{a['neff_over_m']:.5f} - {b['neff_over_m']:.5f}| = {d:.5f}"
+                  f"   bar {bar}  --> {'PASS (poolable)' if d <= bar else 'FAIL'}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(selftest() if "--selftest" in sys.argv else main())

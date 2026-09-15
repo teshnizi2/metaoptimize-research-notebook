@@ -1,0 +1,290 @@
+"""RULE 13 -- rl3's guards, tested in BOTH DIRECTIONS.  The real configuration
+must PASS and an injected violation must FAIL.  A green guard is evidence of
+nothing until it has been shown to go red.
+
+THE TWO GUARDS THIS BATCH ACTUALLY RESTS ON, and therefore the two whose red
+direction matters most:
+
+  GUARD 4  THE BETA-ALLOCATION GUARD.  Everything rl3 claims about RULE 10 --
+           "m is held fixed across the three stepsizes" -- is exactly what
+           guard 4 measures, and a wrong K silently produces a different
+           partition that still runs to completion and still writes a number.
+           It needs torch and the LIVE build_network, so its red direction can
+           only be exercised ON THE CLUSTER; off-cluster it is SKIPPED loudly
+           rather than reported as passing.  That distinction is the whole
+           lesson of the previous build's five aborts.
+
+  GUARD 8  THE BOX GUARD.  At ms=1e-3 and 3e-3 nothing is provably box-free, so
+           the box is the single largest threat to every number rl3 produces.
+           It is pure CSV arithmetic and runs anywhere.
+
+Nothing here invokes --submit or sbatch: the guard bodies are extracted from the
+script and driven directly as pure python.
+"""
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SCRIPT = os.path.join(REPO, "bin", "c87_rule11_ladder.sh")
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+src = open(SCRIPT).read()
+PASS = FAIL = SKIP = 0
+
+
+def report(name, ok, detail=""):
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print("  PASS  %s" % name)
+    else:
+        FAIL += 1
+        print("  FAIL  %s   %s" % (name, detail))
+
+
+def skip(name, why):
+    global SKIP
+    SKIP += 1
+    print("  SKIP  %s   (%s)" % (name, why))
+
+
+def block(marker, delim="PYEOF"):
+    """Extract the heredoc body that follows `marker`."""
+    i = src.index(marker)
+    j = src.index("<<'%s'" % delim, i)
+    k = src.index("\n", j) + 1
+    e = src.index("\n%s\n" % delim, k)
+    return src[k:e]
+
+
+def run_py(body, args, expect_fail, env=None):
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write(body)
+        path = fh.name
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    try:
+        r = subprocess.run([sys.executable, path] + args, capture_output=True,
+                           text=True, env=e)
+        out = (r.stdout + r.stderr).strip()
+        last = out.splitlines()[-1] if out else ""
+        ok = (r.returncode != 0) if expect_fail else (r.returncode == 0)
+        return ok, last
+    finally:
+        os.unlink(path)
+
+
+WS = os.environ.get("METAOPT_WS", "/cluster/account_a/metaopt")
+HAVE_TORCH = os.path.isdir(os.path.join(WS, "MetaOptimize"))
+try:
+    import torch  # noqa: F401
+except Exception:
+    HAVE_TORCH = False
+
+print("=" * 76)
+print("RULE 13 -- rl3's guards, BOTH DIRECTIONS")
+print("workspace %s   torch+tree available: %s" % (WS, HAVE_TORCH))
+print("=" * 76)
+
+# =========================================================================
+# GUARD 4 -- THE BETA-ALLOCATION GUARD.  m MEASURED, AT EVERY STEPSIZE.
+# =========================================================================
+print("\n-- GUARD 4  the beta-allocation guard (m measured off the ALLOCATED beta)")
+g4 = block("--- GUARD 4 --")
+
+
+def g4args(m_node="14420", m_chd="14421", m_n1d="4851", m_chg="4851",
+           kd="777", kg="2325", n_ten="62", n_1d="41", max1d="512",
+           singles="9610", nparam="11173962", mstl="3e-4 1e-3 3e-3"):
+    return [WS, "ResNet18", kd, kg, m_node, m_chd, m_n1d, m_chg,
+            n_ten, n_1d, max1d, singles, nparam, "1e-3", mstl]
+
+
+if HAVE_TORCH:
+    ok, msg = run_py(g4, g4args(), expect_fail=False)
+    report("GREEN: the registered m, all four arms x all three stepsizes", ok, msg)
+    ok, msg = run_py(g4, g4args(m_node="14421"), expect_fail=True)
+    report("RED: m(nodewise) off by ONE -> REFUSES", ok and "GUARD FAIL" in msg, msg)
+    ok, msg = run_py(g4, g4args(m_chg="4852"), expect_fail=True)
+    report("RED: the G leg's EXACT count match broken by one -> REFUSES",
+           ok and "GUARD FAIL" in msg, msg)
+    ok, msg = run_py(g4, g4args(kg="256"), expect_fail=True)
+    report("RED: a chunk K BELOW the largest 1-D tensor (256 < 512) -> REFUSES, "
+           "because that comparator would SPLIT the very tensors whose merging "
+           "is the prescription", ok and "GUARD FAIL" in msg, msg)
+    ok, msg = run_py(g4, g4args(singles="9600"), expect_fail=True)
+    report("RED: the degenerate tail mis-registered -> REFUSES",
+           ok and "GUARD FAIL" in msg, msg)
+    ok, msg = run_py(g4, g4args(mstl="3e-4"), expect_fail=False)
+    report("GREEN: a single rung still passes (the ms loop is not load-bearing "
+           "for the check itself, only for its coverage)", ok, msg)
+else:
+    skip("GUARD 4, BOTH DIRECTIONS",
+         "no torch / no live tree on this host.  THIS IS NOT A PASS.  Guard 4 "
+         "lives behind a torch import and MUST be exercised on the cluster "
+         "before submission -- that is precisely the class of defect that "
+         "aborted the previous build five times")
+
+# =========================================================================
+# GUARD 8 -- THE BOX GUARD.  ALGEBRA + STRICT WIDENING + EMPIRICAL SATURATION.
+# =========================================================================
+print("\n-- GUARD 8  the box guard (EVERY emitted rung must be provably free)")
+g8 = block("--- GUARD 8 --")
+
+
+def g8args(clip="-30:9.0", mstl="1e-4 3e-4", bar="0.15", ep="100"):
+    return [clip, "1e-3", mstl, ep, "500", CSV, "ResNet18", "CIFAR10", bar]
+
+
+ok, msg = run_py(g8, g8args(), expect_fail=False)
+report("GREEN: CLIP=-30:9.0 with the {1e-4, 3e-4} ladder -> both rails PROVABLY "
+       "unreachable at both rungs (binding slack 0.9078 nats)", ok, msg)
+
+# THE REDESIGN, TESTED IN THE FAILING DIRECTION.  The rungs the build shipped
+# must now be refused by the same guard, in the same box.
+ok, msg = run_py(g8, g8args(mstl="3e-4 1e-3"), expect_fail=True)
+report("RED (8a): the build's ms=1e-3 rung -> REFUSED.  Travel is 50 nats "
+       "against a 15.91-nat ceiling; a free ceiling would need +43.1, a step "
+       "size of 5e18", ok and "NOT provably box-free" in msg, msg)
+ok, msg = run_py(g8, g8args(mstl="3e-4 3e-3"), expect_fail=True)
+report("RED (8a): and ms=3e-3 (150 nats) -> REFUSED",
+       ok and "NOT provably box-free" in msg, msg)
+ok, msg = run_py(g8, g8args(clip="-30:2.0"), expect_fail=True)
+report("RED (8a): the BUILD'S OWN BOX -30:2.0 -> REFUSED at ms=3e-4.  The "
+       "ceiling is 8.91 nats above beta_0 against 15.0 nats of travel, which is "
+       "why the ceiling moved to +9.0",
+       ok and "NOT provably box-free" in msg, msg)
+ok, msg = run_py(g8, g8args(clip="-30:8.0"), expect_fail=True)
+report("RED (8a): a ceiling of +8.0 -- only 0.09 nats short -> STILL REFUSED. "
+       "The edge is exact, not approximate",
+       ok and "NOT provably box-free" in msg, msg)
+
+ok, msg = run_py(g8, g8args(clip="-15:-2.3026"), expect_fail=True)
+report("RED (8a): the ANCHORS' box -15:-2.3026 -> REFUSED at the very first "
+       "rung.  Note what that means for the published corpus: at ms=1e-4 the "
+       "travel is 5.00 nats against a ceiling only 4.61 nats away, so cc1, mm1, "
+       "pp1 and g3m were never in a PROVABLY free box either -- they were "
+       "measured clean, which is not the same thing",
+       ok and "GUARD FAIL" in msg and "NOT provably box-free" in msg, msg)
+
+ok, msg = run_py(g8, g8args(clip="-30:-2.3026"), expect_fail=True)
+report("RED (8a): the box the -2.3026 ceiling gives -> REFUSED at ms=3e-4",
+       ok and "NOT provably box-free" in msg, msg)
+
+# 8c IS NO LONGER A REFUSAL, AND THAT DEMOTION IS ITSELF TESTED IN BOTH
+# DIRECTIONS: a saturation bar that used to condemn the box must now only
+# REPORT, because 8a has already PROVED both rails unreachable.
+ok, msg = run_py(g8, g8args(bar="0.02"), expect_fail=False)
+report("GREEN: a 0.02 pp saturation bar no longer REFUSES -- 8c is demoted to "
+       "supporting evidence once 8a proves the box free (CORRECTIONS 117.3). "
+       "The demotion is visible in the guard's own output", ok, msg)
+ok, msg = run_py(g8, g8args(clip="-60:9.0"), expect_fail=False)
+report("GREEN: an even wider box -60:9.0 also passes -- the algebraic test does "
+       "not depend on a precedent row existing for the exact box", ok, msg)
+
+# =========================================================================
+# The remaining guards, one direction each, as regression cover.
+# =========================================================================
+print("\n-- GUARD 1b  the ENV/ARGS pin check (against the emitter region only)")
+g1b = block("--- GUARD 1b --")
+
+
+def g1bargs(clip="-30:9.0", mstl="1e-4 3e-4", seeds="0 1 2"):
+    return [SCRIPT, clip, "100", "1e-3", "100", "ResNet18", "CIFAR10", "1", "5",
+            mstl, seeds]
+
+
+ok, msg = run_py(g1b, g1bargs(), expect_fail=False)
+report("GREEN: the real emitter region", ok, msg)
+ok, msg = run_py(g1b, g1bargs(clip="-30"), expect_fail=True)
+report("RED: BETA_CLIP with no colon -> REFUSES (the runner would parse no box "
+       "and every occupancy number would be a fiction)",
+       ok and "NO COLON" in msg, msg)
+ok, msg = run_py(g1b, g1bargs(mstl="1e-4 3e-4 1e-3"), expect_fail=True)
+report("RED: three rungs -> REFUSES.  The third one cannot be measured box-free "
+       "at this budget and the registration knows only two",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g1b, g1bargs(mstl="3e-4 1e-4"), expect_fail=True)
+report("RED: rungs DESCENDING -> REFUSES (EDGE-LOW/EDGE-HIGH would be inverted)",
+       ok and "ASCENDING" in msg, msg)
+ok, msg = run_py(g1b, g1bargs(mstl="1e-4 1e-3"), expect_fail=True)
+report("RED: a rung no published D was measured at -> REFUSES.  A RULE-11 "
+       "ladder that leaves the measured regime tests two things at once",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g1b, g1bargs(mstl="1e-4 1.2e-4"), expect_fail=True)
+report("RED: rungs 0.079 decades apart -> REFUSES (closer than the grid this "
+       "campaign tunes on, so it would not be a tuning test)",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g1b, g1bargs(seeds="0 1"), expect_fail=True)
+report("RED: the build's two seeds, which the redesigned registration and "
+       "NJOBS do not know about -> REFUSES", ok and "GUARD FAIL" in msg, msg)
+
+print("\n-- GUARD 7  throughput headroom (measured, not projected)")
+g7 = block("--- GUARD 7 --")
+ok, msg = run_py(g7, [CSV, "ResNet18", "03:50:00", "100", "777", "2325", "1.40"],
+                 expect_fail=False, env={"RL3_PARTS": "gpu-short,gpu-l4-24g"})
+report("GREEN: 03:50:00 against the binding arm's worst 114 min = 2.02x", ok, msg)
+ok, msg = run_py(g7, [CSV, "ResNet18", "02:00:00", "100", "777", "2325", "1.40"],
+                 expect_fail=False, env={"RL3_PARTS": "gpu-short,gpu-l4-24g"})
+report("RED: a 2:00:00 wall gives 1.05x -> REFUSES", not ok, msg)
+ok, msg = run_py(g7, [CSV, "ResNet34", "03:50:00", "100", "777", "2325", "1.40"],
+                 expect_fail=True)
+report("RED: pointed at ResNet34, whose arms this batch has not measured -> "
+       "REFUSES rather than projecting", ok and "GUARD FAIL" in msg, msg)
+
+print("\n-- GUARD 2  the CSV preconditions")
+g2 = block("--- GUARD 2 --")
+
+
+def g2args(mstl="1e-4 3e-4", clip="-30:9.0", sd="0.1785", gc="93.140",
+           flat="92.254", split="0.886", tag="rl3", seeds="0 1 2"):
+    return [CSV, "ResNet18", "CIFAR10", "100", "1e-3", clip, mstl, sd, "0.30",
+            "14420", "14421", "4851", "4851", gc, flat, split, "0.697", "0.629",
+            "0.29149", "0.41223", "0.05814", "0.15", tag, seeds]
+
+
+ok, msg = run_py(g2, g2args(), expect_fail=False)
+report("GREEN: the premise, the anchors, the split and the planning sd all "
+       "re-derive", ok, msg)
+ok, msg = run_py(g2, g2args(mstl="1e-4 1e-3"), expect_fail=True)
+report("RED (2f): a ladder containing ms=1e-3 -> REFUSES.  That rung carries the "
+       "gc-/flat split, in a different box, and a batch that touched it would "
+       "invite exactly the claim CORRECTIONS 117.8 forbids",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g2, g2args(seeds="0 1"), expect_fail=True)
+report("RED (2g): the build's n=2 -> REFUSES, because MIN_GAP/SELECT_BIAS/"
+       "DD_DECLARABLE are all functions of n and would no longer re-derive",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g2, g2args(split="1.19"), expect_fail=True)
+report("RED: the brief's 1.19 pp split (which averages in a 40-epoch run) -> "
+       "REFUSES.  This is the guard that makes the correction mechanical",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g2, g2args(sd="0.1200"), expect_fail=True)
+report("RED: an optimistic planning sd -> REFUSES", ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g2, g2args(tag="cc1"), expect_fail=True)
+report("RED: a tag that already exists in the CSV -> REFUSES (name collision)",
+       ok and "GUARD FAIL" in msg, msg)
+
+print("\n-- GUARD 3  the box registration in c55 (RULE 19 drift)")
+g3 = block("--- GUARD 3 --")
+ok, msg = run_py(g3, [REPO, "-30:9.0", "rl3"], expect_fail=False)
+report("GREEN: c55 registers rl3 as (-30.0, 9.0)", ok, msg)
+ok, msg = run_py(g3, [REPO, "-30:2.0", "rl3"], expect_fail=True)
+report("RED: the BUILD'S box, while c55 now says +9.0 -> REFUSES (drift)",
+       ok and "GUARD FAIL" in msg, msg)
+ok, msg = run_py(g3, [REPO, "-30:9.0", "sl1"], expect_fail=True)
+report("RED: the KILLED sl1 tag -> REFUSES (unregistered by design)",
+       ok and "GUARD FAIL" in msg, msg)
+
+print("")
+print("=" * 76)
+print("RULE 13 SUMMARY: %d PASS, %d FAIL, %d SKIP" % (PASS, FAIL, SKIP))
+if SKIP:
+    print("**A SKIP IS NOT A PASS.**  Re-run this file ON THE CLUSTER inside the "
+          "project venv before submitting: guard 4 is unreachable from anywhere "
+          "else and it is the guard RULE 10 rests on.")
+print("=" * 76)
+sys.exit(1 if FAIL else 0)

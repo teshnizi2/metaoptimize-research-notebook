@@ -1,0 +1,258 @@
+#!/bin/bash
+# =============================================================================
+# cI1_in489g1_ladder.sh -- launch `in489g1`, the ImageNet-489 granularity ladder.
+#
+# THE BATCH.  4 arms x 3 seeds = 12 jobs, ONE submission, so BATCH -- the unit
+# of replication in this corpus (SEED is null, F 1.21, p 0.213) -- is held
+# constant and every contrast is WITHIN this batch.
+#
+#     scalar           m =     1
+#     resnet18_blocks  m =     6   <- the PARENT'S OWN contrast vs scalar
+#     layerwise        m =    62
+#     nodewise         m = 15378
+#
+# All four m values were verified on the LIVE 489-class model before this file
+# was written, by constructing the real torchvision resnet18(num_classes=489)
+# and the campaign's real HF and reading m off the live beta.
+#
+# THE SCORER IS ALREADY REGISTERED AND COMMITTED (RULE 21):
+#     analysis/cI1_in489g1_score.py   (selftest 32/32 PASS at registration)
+# It was committed BEFORE this launcher, and before any in489g1 run existed.
+# Run it UNEDITED (RULE 16):
+#     python3 analysis/cI1_in489g1_score.py --runs /cluster/account_a/metaopt/runs
+#
+# SCOPE, MANDATORY WITH ANY NUMBER THIS BATCH PRODUCES.  ImageNet-489, NEVER
+# "ImageNet": 489 of 1000 train classes, 627,329 train images; validation
+# 24,450 images at exactly 50 per class whose labels were RECOVERED FROM THE
+# PER-IMAGE XML ANNOTATIONS, not from a devkit; chance top-1 = 0.2045%.
+# No number here is comparable to a published ImageNet-1k result.
+#
+# -----------------------------------------------------------------------------
+# WHY meta-stepsize 1e-3 AND NOT THE PHASE-1 SMOKE'S 3e-2.  Re-derived from
+# results/all_runs.csv: the campaign's CIFAR-10 corpus at this alpha0 and this
+# BETA_CLIP is at 1e-3, and 1e-3 is ALSO the parent's own ImageNet value.  There
+# is no scalar-vs-layerwise CIFAR-10 ladder at 3e-2 anywhere in the corpus, so
+# 3e-2 would have left this batch with no matched control on either side.
+#
+# WHY 84 EPOCHS.  Re-derived from the parent's own code, not from memory:
+# build_optimizer.py hard-codes total_steps=422000 at batch 256, and
+# ImageNet-1k is 1,281,167/256 = 5,004 steps/epoch, so 422000/5004 = 84.3.
+# Matching EPOCHS on ImageNet-489 = 84 epochs = 84 x 2450 = 205,800 steps.
+#
+# WHY gpu-l4-24g AND NOT gpu-short.  gpu-short's TIMELIMIT is 4:00:00, so any
+# job longer than that is unschedulable there FOREVER -- that, and not a
+# priority penalty, is what stranded an earlier 10 h job for a week where a 7 h
+# job ran.  gpu-l4-24g's limit is 7-00:00:00, so a 34 h wall is ordinary there.
+# The campaign's 54 concurrent g4m/a2g3 jobs are all on gpu-short under
+# qos-short-gpu, a DIFFERENT QoS pool from qos-gpu-l4, so this batch does not
+# compete with them for a QoS slot.  NONE of those jobs is touched by this file.
+#
+# WHY --mem=80G AND --cpus-per-task=24.  An L4 node is 128 CPU / 384 GB / 4 GPU,
+# so the per-GPU fair share is 32 CPU / 96 GB.  Asking the full 96 GB would let
+# exactly 4 jobs fill a node's memory to the byte and leave nothing for the OS,
+# which schedules WORSE, not better; 80 GB x 4 = 320 GB leaves 64 GB of headroom.
+# 24 CPUs is set by the measured input pipeline: 24 workers deliver ~815 img/s
+# on cold BeeGFS, comfortably above the ~700 img/s GPU ceiling, and 44 workers
+# buy nothing because the run is GPU-bound once fed.
+#
+# WALLTIME.  Measured 15.9 min/epoch on an L4 (15.5 train + 0.4 val).
+# 84 x 15.9 min = 22.3 h; +50% = 33.4 h -> --time=34:00:00.  --max-time is set
+# to 32:00:00 so the loop stops ITSELF with an epoch to spare and flushes every
+# per-epoch line, rather than being killed mid-epoch by Slurm.
+#
+# TRUNCATION IS SURVIVABLE BY DESIGN.  The harness writes no checkpoints but
+# flushes a per-epoch accuracy line, and the registered scorer reads every arm
+# at a COMMON HORIZON, so unequal run lengths cannot bias any contrast.  Seeds
+# are submitted SEED-MAJOR (all four arms at seed 0, then seed 1, then seed 2)
+# so that if only part of the batch is ever scheduled, what exists is a
+# COMPLETE 4-arm ladder at n=1 rather than three seeds of one arm.
+#
+# USAGE
+#   bash bin/cI1_in489g1_ladder.sh --dry-run   # print + guard every line, submit nothing
+#   bash bin/cI1_in489g1_ladder.sh --submit
+# =============================================================================
+set -euo pipefail
+
+WS=/cluster/account_a/metaopt
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+BATCH=in489g1
+RUNS=$WS/runs
+JOBS=$WS/jobs/run_in489.sh
+# The registered RULE 20 guard lives in the repo checkout, NOT in $WS/analysis
+# (which is a small working dir).  An earlier revision of this file pointed at
+# $WS/analysis and, because it guarded the call with `[ -f ... ]`, SILENTLY
+# SKIPPED every per-line RULE 20 check while still printing a PASS.  That is the
+# precise failure mode RULE 20 exists to prevent, so a missing guard is now a
+# REFUSAL, never a skip.  Verified sha256-identical to the committed guard.
+GUARD=$WS/hierarchical-metaoptimize/analysis/argsline_guard.py
+DATA=$WS/data/imagenet489
+
+PARTITION=gpu-l4-24g
+CPUS=24
+MEM=80G
+WALL=34:00:00
+MAXTIME=32:00:00
+EPOCHS=84
+BS=256
+NW=24
+ETA=1e-3
+A0=1e-6
+export BETA_CLIP=-15:-2.3026
+
+ARMS=(scalar resnet18_blocks layerwise nodewise)
+SEEDS=(0 1 2)
+
+MODE=${1:---dry-run}
+case "$MODE" in
+  --dry-run|--submit) ;;
+  *) echo "usage: $0 [--dry-run|--submit]" >&2; exit 2 ;;
+esac
+
+echo "=============================================================================="
+echo "BATCH $BATCH -- ImageNet-489 granularity ladder      MODE=$MODE"
+echo "  arms:  ${ARMS[*]}"
+echo "  seeds: ${SEEDS[*]}   -> $(( ${#ARMS[@]} * ${#SEEDS[@]} )) jobs"
+echo "  partition=$PARTITION cpus=$CPUS mem=$MEM wall=$WALL max-time=$MAXTIME"
+echo "  epochs=$EPOCHS batch=$BS workers=$NW meta-stepsize=$ETA alpha0=$A0"
+echo "  BETA_CLIP=$BETA_CLIP"
+echo "  data=$DATA"
+echo "  SCOPE: ImageNet-489 (489/1000 classes), NOT ImageNet. chance 0.2045%."
+echo "=============================================================================="
+
+# --- preflight: the live tree, not a table ----------------------------------
+if [ ! -d "$DATA/train" ] || [ ! -d "$DATA/validation" ]; then
+  echo "REFUSE: $DATA does not hold train/ and validation/" >&2; exit 1
+fi
+NTR=$(ls "$DATA/train" | wc -l)
+NVA=$(ls "$DATA/validation" | wc -l)
+echo "PREFLIGHT: train class dirs=$NTR  validation class dirs=$NVA"
+if [ "$NTR" -ne 489 ] || [ "$NVA" -ne 489 ]; then
+  echo "REFUSE: expected 489/489 class dirs, got $NTR/$NVA" >&2; exit 1
+fi
+if [ ! -x "$JOBS" ] && [ ! -f "$JOBS" ]; then
+  echo "REFUSE: missing $JOBS" >&2; exit 1
+fi
+# RULE 20 is unenforceable without the guard, so its absence REFUSES the batch.
+if [ ! -f "$GUARD" ]; then
+  echo "REFUSE: RULE 20 guard not found at $GUARD -- refusing to compose a batch" >&2
+  echo "        that cannot be checked.  A missing guard is never a skip." >&2
+  exit 1
+fi
+echo "PREFLIGHT: RULE 20 guard $GUARD"
+echo "PREFLIGHT: guard sha256 $(sha256sum "$GUARD" | cut -d" " -f1)"
+# RULE 21: refuse to launch if the batch already has runs on disk.
+EXIST=$(ls "$RUNS"/${BATCH}-*.out 2>/dev/null | wc -l || true)
+if [ "$EXIST" -ne 0 ] && [ "$MODE" = "--submit" ]; then
+  echo "REFUSE: $EXIST ${BATCH}-*.out already exist; this batch is not fresh." >&2
+  exit 1
+fi
+echo "PREFLIGHT: existing ${BATCH}-*.out = $EXIST"
+echo
+
+LINES=$(mktemp)
+N=0
+# SEED-MAJOR: a partial allocation still yields a complete 4-arm ladder.
+for S in "${SEEDS[@]}"; do
+  for A in "${ARMS[@]}"; do
+    NAME="${BATCH}-${A}-s${S}"
+    ARGS="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1"
+    ARGS="$ARGS --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0"
+    ARGS="$ARGS --gamma 1 --meta-stepsize $ETA --alpha0 $A0"
+    ARGS="$ARGS --NN-name resnet18 --num-classes 489 --data $DATA"
+    ARGS="$ARGS --batch-size $BS --num-workers $NW --num-epochs $EPOCHS --max-time $MAXTIME"
+    ARGS="$ARGS --seed $S --stepsize-groups $A"
+    ARGS="$ARGS --save-directory $RUNS/$BATCH --run-name $NAME"
+    N=$((N+1))
+    printf '%s\n' "$ARGS" >> "$LINES"
+    echo "[$N] sbatch --partition=$PARTITION --cpus-per-task=$CPUS --mem=$MEM --time=$WALL \\"
+    echo "      --job-name=$NAME $JOBS \\"
+    echo "      $ARGS"
+    python3 "$GUARD" --cmdline "$ARGS" --quiet \
+      --expect meta-stepsize=$ETA --expect alpha0=$A0 --expect num-epochs=$EPOCHS \
+      --expect stepsize-groups=$A --expect seed=$S --expect num-classes=489 \
+      --expect batch-size=$BS \
+      || { echo "REFUSE: argsline_guard rejected job $N ($NAME)" >&2; exit 1; }
+    echo
+  done
+done
+
+echo "------------------------------------------------------------------------------"
+echo "RULE 20 pre-submission batch-consistency across all $N composed lines."
+# NOTE: argsline_guard's --stdin reads the WHOLE stream as ONE command line, so
+# piping 12 lines into it would report every flag as 12x repeated and refuse for
+# the wrong reason.  The per-line check above is the guard's correct use; the
+# cross-line check is done here by stripping the declared axes and asserting the
+# remainder is byte-identical across the batch.
+python3 - "$LINES" <<'PY' || { echo "REFUSE: batch-consistency failed" >&2; exit 1; }
+import re, sys
+AXES = {'seed', 'stepsize-groups', 'run-name', 'save-directory'}
+lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+def strip_axes(s):
+    toks, out, i = s.split(), [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith('--'):
+            flag, val = t[2:], None
+            if i + 1 < len(toks) and not toks[i + 1].startswith('--'):
+                val = toks[i + 1]; i += 1
+            if flag not in AXES:
+                out.append((flag, val))
+        i += 1
+    return out
+base = strip_axes(lines[0])
+bad = False
+for k, l in enumerate(lines[1:], start=2):
+    cur = strip_axes(l)
+    if cur != base:
+        bad = True
+        print('  MISMATCH at line %d:' % k)
+        for a, b in zip(base, cur):
+            if a != b:
+                print('    %s -> %s' % (a, b))
+seen = {}
+for l in lines:
+    m = re.search(r'--stepsize-groups (\S+)', l); s = re.search(r'--seed (\S+)', l)
+    key = (m.group(1), s.group(1))
+    if key in seen:
+        bad = True; print('  DUPLICATE CELL %s' % (key,))
+    seen[key] = 1
+print('  %d lines, %d distinct (arm,seed) cells, %d non-axis flags held identical'
+      % (len(lines), len(seen), len(base)))
+print('  VERDICT: ' + ('FAIL' if bad else 'PASS'))
+sys.exit(1 if bad else 0)
+PY
+echo "------------------------------------------------------------------------------"
+
+if [ "$MODE" = "--dry-run" ]; then
+  echo "DRY RUN -- nothing submitted.  $N command lines composed and guarded."
+  rm -f "$LINES"; exit 0
+fi
+
+mkdir -p "$RUNS/$BATCH"
+IDS=""
+for S in "${SEEDS[@]}"; do
+  for A in "${ARMS[@]}"; do
+    NAME="${BATCH}-${A}-s${S}"
+    ARGS="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1"
+    ARGS="$ARGS --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0"
+    ARGS="$ARGS --gamma 1 --meta-stepsize $ETA --alpha0 $A0"
+    ARGS="$ARGS --NN-name resnet18 --num-classes 489 --data $DATA"
+    ARGS="$ARGS --batch-size $BS --num-workers $NW --num-epochs $EPOCHS --max-time $MAXTIME"
+    ARGS="$ARGS --seed $S --stepsize-groups $A"
+    ARGS="$ARGS --save-directory $RUNS/$BATCH --run-name $NAME"
+    JID=$(sbatch --parsable --partition=$PARTITION --cpus-per-task=$CPUS --mem=$MEM \
+                 --time=$WALL --job-name="$NAME" "$JOBS" $ARGS)
+    echo "SUBMITTED $JID  $NAME"
+    IDS="$IDS $JID"
+  done
+done
+rm -f "$LINES"
+echo
+echo "JOBIDS:$IDS"
+echo "$IDS" | tr ' ' '\n' | grep -E '^[0-9]+$' > "$RUNS/$BATCH/JOBIDS.txt"
+echo "wrote $RUNS/$BATCH/JOBIDS.txt"
+echo
+echo "NEXT (RULE 20, post-launch): verify from Slurm's own SubmitLine record and"
+echo "scancel THIS BATCH ONLY on mismatch.  Never scancel a job you did not submit."

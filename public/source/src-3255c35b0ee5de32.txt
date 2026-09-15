@@ -1,0 +1,451 @@
+#!/bin/bash
+# =============================================================================
+# cAU1_unaug_denominator.sh -- `cau1`: DOES THE DENOMINATOR SURVIVE IN THE
+#   PARENT PAPER'S OWN, UNAUGMENTED SETTING?
+#   ONE SUBMISSION, 27 JOBS (7 SGD+cosine rungs + 2 MetaOptimize arms, x 3
+#   seeds), ResNet18 / CIFAR-10 / batch 100 / 100 epochs / AUGMENT=0,
+#   SEEDS {50,51,52} (the block pre-assigned to this track).
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here
+# touches `cluster_a` (Saber's shared account); every guard, audit and scancel
+# line below is filtered on the `cau1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cAU1_unaug_denominator_score.py, git-committed
+# BEFORE this batch is submitted (STANDING RULE 21).  The question, the
+# PRIMARY and why it is an endpoint, every bar in SE units from a noise floor
+# re-derived with cau1- excluded, the branch map (including the REVERSAL in the
+# method's favour), the floor gate and the unconditional scope stamps are
+# frozen THERE.  This script IMPORTS it and proves, line by line, that every
+# composed command is the design the scorer will check (guard 6b).
+#
+# THE DOCUMENTED SCORER INVOCATION -- one argument, nothing to forget:
+#     python3 analysis/cAU1_unaug_denominator_score.py <WS>/runs
+#
+# -----------------------------------------------------------------------------
+# THE ARMS
+#   cau1-lr{0005,001,002,005,01,02,04}-s{50,51,52}   21 jobs.  --optimizer SGD
+#       (Optimizers/build_optimizer.py, class SGD_optimizer, UNPATCHED: SGD_WD
+#       5e-4, SGD_MOM 0.9, cosine with warmup) -- cdn1's arm-A recipe, i.e.
+#       the DENOMINATOR's baseline family.  COS_TOTAL=50000 (100 ep x 500
+#       steps), COS_WARMUP=1000.  LR ladder {0.005 .. 0.4}.
+#   cau1-m6-s{50,51,52}    3 jobs.  THE PARENT'S OWN CONFIG: AdamW + Adam,
+#       alpha0 1e-6, eta 1e-3, gamma 1, resnet18_blocks, BETA_CLIP=-60:6.0,
+#       PROBE=5.  Byte-identical to bin/c88_ub9_widebox.sh's `ub9-b6` line
+#       except seed / names / directories.
+#   cau1-m6t-s{50,51,52}   3 jobs.  THE CIFAR-10 DENOMINATOR'S OWN META CELL:
+#       alpha0 3e-4, BETA_CLIP=-15:-2.3026 -- bin/c45's `i3b-3e4` with
+#       AUGMENT=0 and PROBE=5 (instrument, inert by FINDINGS 74.2).
+#
+# SGD_WD AND SGD_MOM ARE NOT ECHOED BY run_cifar.sh.  A value inherited from
+# the submitting shell through --export=ALL would change the baseline and be
+# INVISIBLE in every log.  So this script REPORTS any such variable it finds
+# and then UNSETS it, together with every other variable the runner echoes,
+# so that --export=ALL carries nothing but what is composed below.  The
+# defaults are then pinned by build_optimizer.py's sha256 (guard 3c).
+#
+# -----------------------------------------------------------------------------
+# WALLTIME AND PARTITIONS -- MEASURED, NOT GUESSED (results/all_runs.csv,
+# wallclock_min, 100-epoch rows of the same harness and cell):
+#   SGD+cosine   bl-sgd (20) + cdn1-lr (18): median 29 min, worst 67 ([HOST_3c1b003035], 2080ti)
+#   MetaOptimize ub9 (9, AUGMENT=0)       : median 41 min, worst 83 ([HOST_e5f7f0d5f9])
+#                i3b-3e4 / i3b-1e6 (6)    : median 43 min, worst 93 ([HOST_3c1b003035])
+#   corpus-worst 70.8 s/epoch on the 2080ti nodes -> 100 epochs = 1.97 h.
+# WALL=03:00:00 is 1.52x the corpus-worst and 1.94x the worst observed run,
+# and it FITS gpu-short's 4:00:00 MaxTime, so _lib_guards.sh's composer ADDS
+# gpu-short.  PARTS is never hard-coded (CORRECTIONS 178).
+# COST: expected 21 x 29 + 6 x 42 min = 14.4 GPU-h; worst observed per family
+#       21 x 67 + 6 x 93 = 32.8 GPU-h; corpus-worst 27 x 1.97 = 53.1 GPU-h;
+#       HARD BOUND = WALL x 27 = 81 GPU-h.
+#
+# USAGE   bash bin/cAU1_unaug_denominator.sh              # DRY RUN, submits NOTHING
+#         bash bin/cAU1_unaug_denominator.sh --dry-run    # identical, explicit
+#         bash bin/cAU1_unaug_denominator.sh --envaudit   # AFTER launch: ENV audit
+#         bash bin/cAU1_unaug_denominator.sh --submit     # the ONLY submitting form
+# =============================================================================
+set -u
+SUBMIT=0; MODE=dry
+case "${1:-}" in
+  --submit)          SUBMIT=1; MODE=submit ;;
+  ""|--dry-run)      SUBMIT=0; MODE=dry ;;
+  --envaudit)        SUBMIT=0; MODE=envaudit ;;
+  *) echo "usage: $0 [--dry-run|--submit|--envaudit]"; exit 2 ;;
+esac
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+# ---- environment hygiene: REPORT, then UNSET, everything the runner echoes --
+LEAK=""
+for V in SGD_WD SGD_MOM; do
+  [ -n "${!V+x}" ] && LEAK="$LEAK $V=${!V}"
+done
+unset SGD_WD SGD_MOM AUGMENT BETA_CLIP HIER LAM ETA_RATIO COS_TOTAL COS_WARMUP \
+      SCHED SCHED_TOTAL SCHED_WARMUP SCHED_MIN PROBE PROBE_DIR PROBE5 \
+      PROBE5_WRITE_EVERY PROBE_TENSOR EB_RHO EB_LOG
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cau1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+SC="$REPO/analysis/cAU1_unaug_denominator_score.py"
+CSVP="$REPO/results/all_runs.csv"
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+EPOCHS=100; BATCH=100; AUG=0; GAMMA=1; MST=1e-3
+NET=ResNet18; DSET=CIFAR10
+SEEDS="50 51 52"
+LRS="0.005:0005 0.01:001 0.02:002 0.05:005 0.1:01 0.2:02 0.4:04"
+COS_T=50000; COS_W=1000
+M6_A0=1e-6;  M6_CLIP="-60:6.0"
+M6T_A0=3e-4; M6T_CLIP="-15:-2.3026"
+PROBE_M=5
+NJOBS=27
+# pins -- the live files these arms depend on
+BOPT_SHA=25a899b3745e9d66fbf630795a1202c6075e2067daffa077e4a54c28e54c7ec2   # cdn1's pin (175)
+LOAD_SHA=b52b58a35dcecd80ce6d8f8033b09c20dad9f4827b808f4ea2a828ce88138c46   # read 2026-09-10
+WALL=03:00:00
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+# =============================================================================
+# post-launch ENV audit (RULE 20's SEPARATE half: AUGMENT, BETA_CLIP, PROBE and
+# COS_* ride the ENVIRONMENT, not the ARGS line, so argsline_guard cannot see
+# them).  Reads each run's own ENV line and checks it against the SCORER's
+# expected_env(), so the audit and the scorer cannot disagree.
+# =============================================================================
+if [ "$MODE" = envaudit ]; then
+  echo "=== cau1 ENV-LINE AUDIT (separate from RULE 20's ARGS audit) ==="
+  python3 - "$SC" "$WS/runs" <<'PYEOF'
+import sys, os, re, importlib.util
+spec = importlib.util.spec_from_file_location("cau1", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+runs, dups = m.read_runs(sys.argv[2])
+bad = n = 0
+fam = {}
+for (a, s), rec in sorted(runs.items()):
+    n += 1
+    if len(rec["env"]) != 1:
+        print("  %s: %d ENV lines" % (rec["file"], len(rec["env"]))); bad += 1; continue
+    got = m.parse_env_line(rec["env"][0])
+    for k, w in m.expected_env(a, s).items():
+        if not m._match(w, got.get(k)):
+            print("  %s: %s=%s want %s" % (rec["file"], k, got.get(k), w)); bad += 1
+    key = "lr" if a.startswith("lr") else a
+    fam.setdefault(key, set()).add(re.sub(r" PROBE_DIR=\S+", "", rec["env"][0]))
+for k, v in sorted(fam.items()):
+    print("  family %-4s %d distinct ENV line(s) (PROBE_DIR stripped)" % (k, len(v)))
+    for x in sorted(v):
+        print("      " + x)
+for d in dups:
+    print("  NOTE duplicate .out: %s s%d %s / %s" % d)
+print("  %d/%d runs read, %d violations" % (n, m.NJOBS if hasattr(m, "NJOBS") else 27, bad))
+print("ENV AUDIT VERDICT: %s" % ("PASS" if bad == 0 and n == 27 else
+                                 ("FAIL" if bad else "UNVERIFIED (%d/27 present)" % n)))
+sys.exit(0 if bad == 0 and n == 27 else (1 if bad else 2))
+PYEOF
+  exit $?
+fi
+
+echo "=============================================================="
+echo " cau1 -- THE DENOMINATOR IN THE PARENT'S OWN SETTING (AUGMENT=0)"
+echo " $DSET / $NET / batch $BATCH / $EPOCHS epochs / seeds $SEEDS"
+echo "   lr*   SGD+cosine, COS_TOTAL=$COS_T COS_WARMUP=$COS_W, ladder $(echo $LRS | sed 's/:[0-9]*//g')"
+echo "   m6    AdamW+Adam blk6, alpha0 $M6_A0,  box $M6_CLIP      (the parent's config)"
+echo "   m6t   AdamW+Adam blk6, alpha0 $M6T_A0, box $M6T_CLIP  (the denominator's meta cell)"
+echo " 9 arms x 3 seeds = $NJOBS jobs, ONE submission"
+echo " partitions $PARTS   walltime $WALL"
+echo " PRIMARY: GAP_END = plateau5(best rung) - plateau5(better meta arm), IN BATCH"
+echo " MODE: $MODE"
+echo "=============================================================="
+
+# ---- guard 0: environment hygiene -------------------------------------------
+if [ -n "$LEAK" ]; then
+  echo "guard 0: the submitting shell carried$LEAK -- REPORTED and UNSET; the baseline"
+  echo "         now runs at build_optimizer.py's pinned defaults (5e-4 / 0.9)"
+else
+  echo "guard 0: SGD_WD / SGD_MOM were not set in the submitting shell"
+fi
+echo "guard 0b: every variable run_cifar.sh echoes was UNSET before composition"
+[ -f "$CSVP" ] && echo "guard 0c: CSV present ($(wc -l < "$CSVP") lines)" \
+               || guard_fail "guard 0c: no CSV at $CSVP"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ----
+[ -f "$SC" ] || guard_fail "guard 1a: missing $SC"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cAU1_unaug_denominator_score.py \
+          bin/cAU1_unaug_denominator.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: the scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires them committed BEFORE any run exists: $DIRTY"
+  DEL=$(git -C "$REPO" diff HEAD --numstat -- analysis/ 2>/dev/null | awk '$2+0>0{print}')
+  [ -z "$DEL" ] && echo "guard 1b2: no uncommitted DELETIONS under analysis/ (RULE 16)" \
+               || guard_fail "guard 1b2: analysis/ has uncommitted deletions: $DEL"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 is verified on the"
+  echo "          committing host by wall clock (git %ct) against the earliest sacct Submit."
+fi
+ST=/tmp/cau1_selftest.$$
+if python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$ST" 2>&1; then
+  echo "guard 1c: scorer --selftest PASSES: $(tail -1 "$ST")"
+else
+  guard_fail "guard 1c: scorer --selftest FAILED"; grep -E '^  FAIL|FAILED|Traceback' "$ST" | head -20
+fi
+grep -q "^  PASS B1' from the RAW ub9 .out" "$ST" \
+  && echo "guard 1c2: B1' (the PRIMARY's justification) RAN on this host's raw ub9 .out, not skipped" \
+  || guard_fail "guard 1c2: B1' did not run -- ub9's raw .out not reachable under $WS/runs"
+grep -q "^  PASS ZERO rows outside cau1- carry seed 50-54" "$ST" \
+  && echo "guard 1c3: the scorer's own fresh-seed check ran and passed" \
+  || guard_fail "guard 1c3: the scorer's fresh-seed check did not pass"
+echo "guard 1c: scorer sha256 $( (sha256sum "$SC" 2>/dev/null || shasum -a 256 "$SC") | awk '{print $1}')"
+
+# ---- guard 1d: this script's design IS the scorer's design ------------------
+python3 - "$SC" "$LRS" "$SEEDS" "$COS_T" "$COS_W" "$M6_A0" "$M6_CLIP" "$M6T_A0" "$M6T_CLIP" \
+          "$EPOCHS" "$NJOBS" <<'PYEOF' || guard_fail "guard 1d: the launcher and the scorer disagree on the design"
+import sys, importlib.util
+sc, lrs, seeds, ct, cw, a6, c6, a6t, c6t, ep, nj = sys.argv[1:12]
+spec = importlib.util.spec_from_file_location("cau1", sc)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+mine = [tuple(x.split(":")) for x in lrs.split()]
+bad = []
+if mine != m.LADDER: bad.append("ladder %s vs %s" % (mine, m.LADDER))
+if tuple(int(s) for s in seeds.split()) != tuple(m.SEEDS): bad.append("seeds")
+if (ct, cw) != (m.COS_TOTAL, m.COS_WARMUP): bad.append("cosine horizon")
+if (a6, c6) != (m.META["m6"]["alpha0"], m.META["m6"]["clip"]): bad.append("m6")
+if (a6t, c6t) != (m.META["m6t"]["alpha0"], m.META["m6t"]["clip"]): bad.append("m6t")
+if int(ep) != m.EPOCHS or int(nj) != len(m.arm_names()): bad.append("epochs / job count")
+if bad:
+    print("!!! guard 1d: " + "; ".join(bad)); sys.exit(1)
+print("guard 1d: ladder, seeds, cosine horizon, both meta cells, epochs and the %d names"
+      " are IDENTICAL in this script and the scorer" % len(m.arm_names()))
+PYEOF
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ----------
+grep -q '^cau1-' "$CSVP" 2>/dev/null && guard_fail "guard 2: cau1-* already in the CSV" \
+                                     || echo "guard 2: no cau1-* name in the corpus"
+NOUT=$(ls "$WS/runs"/cau1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cau1-*.out on disk" \
+                     || guard_fail "guard 2b: $NOUT cau1-*.out files already exist"
+NSEED=$(grep -l -E -- '--seed (50|51|52|53|54)( |$)' "$WS"/runs/*.out "$WS"/runs/*/*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2c: ZERO .out files under \$WS/runs carry --seed 50-54" \
+                      || guard_fail "guard 2c: $NSEED .out files already carry a seed in 50-54"
+NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cau1-')
+[ "${NQ:-0}" = 0 ] && echo "guard 2d: no cau1-* job in the queue" \
+                   || guard_fail "guard 2d: $NQ cau1-* jobs already queued"
+
+# ---- guard 3: the live tree -------------------------------------------------
+[ -f "$RUNNER" ] && echo "guard 3: runner $RUNNER present" || guard_fail "guard 3: no runner"
+grep -q 'ARGS: \$@' "$RUNNER" 2>/dev/null && echo "guard 3a: runner echoes the ARGS line" \
+  || guard_fail "guard 3a: runner does not echo ARGS -- RULE 20 unauditable"
+for K in AUGMENT BETA_CLIP COS_TOTAL COS_WARMUP PROBE SCHED HIER; do
+  grep -q "ENV: .*$K=" "$RUNNER" 2>/dev/null || guard_fail "guard 3a: runner ENV line lacks $K"
+done
+echo "guard 3a: runner ENV line carries AUGMENT BETA_CLIP COS_TOTAL COS_WARMUP PROBE SCHED HIER"
+LD="$CIF/load_data.py"
+GOT=$( (sha256sum "$LD" 2>/dev/null || shasum -a 256 "$LD") | awk '{print $1}')
+[ "$GOT" = "$LOAD_SHA" ] && echo "guard 3b: load_data.py sha256 matches the pin" \
+                         || guard_fail "guard 3b: load_data.py sha256 $GOT, pinned $LOAD_SHA"
+python3 - "$LD" <<'PYEOF' || guard_fail "guard 3b2: AUGMENT=0 does not provably disable augmentation"
+import sys, re
+src = open(sys.argv[1]).read()
+blk = src.split('elif dataset_name == "CIFAR10":', 1)[1].split("elif dataset_name", 1)[0]
+ok = ('os.environ.get("AUGMENT", "0") == "1"' in blk and "train_transform = test_transform" in blk
+      and "RandomCrop" in blk and blk.index('== "1"') < blk.index("RandomCrop")
+      < blk.index("train_transform = test_transform"))
+print("guard 3b2: CIFAR10 branch: RandomCrop/Flip ONLY under AUGMENT == \"1\"; otherwise the"
+      " TRAIN transform IS the TEST transform: %s" % ok)
+sys.exit(0 if ok else 1)
+PYEOF
+BO="$CIF/Optimizers/build_optimizer.py"
+GOT=$( (sha256sum "$BO" 2>/dev/null || shasum -a 256 "$BO") | awk '{print $1}')
+[ "$GOT" = "$BOPT_SHA" ] && echo "guard 3c: build_optimizer.py sha256 matches cdn1's pin (SGD path unpatched)" \
+                         || guard_fail "guard 3c: build_optimizer.py sha256 $GOT, pinned $BOPT_SHA"
+grep -q "if args.optimizer == 'SGD'" "$BO" && grep -q "SGD_WD', 5e-4" "$BO" \
+  && grep -q "SGD_MOM', 0.9" "$BO" && grep -q "COS_TOTAL" "$BO" && grep -q "COS_WARMUP" "$BO" \
+  && echo "guard 3c2: SGD branch present; SGD_WD default 5e-4, SGD_MOM default 0.9, COS_* read" \
+  || guard_fail "guard 3c2: the SGD branch or its documented defaults are not there"
+HFLIVE="$CIF/Optimizers/HF.py"
+grep -q "BETA_CLIP" "$HFLIVE" 2>/dev/null && echo "guard 3d: live HF.py reads BETA_CLIP" \
+  || guard_fail "guard 3d: live HF.py does not read BETA_CLIP"
+[ -d "$CIF/data/cifar-10-batches-py" ] && echo "guard 3e: cifar-10-batches-py staged under $CIF/data" \
+  || guard_fail "guard 3e: CIFAR-10 is not staged at $CIF/data/cifar-10-batches-py"
+HFSHA=$( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')
+TRSHA=$( (sha256sum "$CIF/train.py" 2>/dev/null || shasum -a 256 "$CIF/train.py") | awk '{print $1}')
+
+# ---- guard 4: provenance ------------------------------------------------------
+# A DRY RUN WRITES NOTHING UNDER $WS/runs.  Its provenance goes to /tmp.
+if [ "$SUBMIT" = 1 ]; then PROV="$SAVE/PROVENANCE.txt"; mkdir -p "$SAVE"; else PROV=/tmp/cau1_PROVENANCE.$$; fi
+{ echo "BATCH cau1"; echo "MODE $( [ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN )";
+  echo "STAMP_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+  [ "$SUBMIT" = 1 ] && echo "SUBMIT_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+  echo "SCORER_SHA256 $( (sha256sum "$SC" 2>/dev/null || shasum -a 256 "$SC") | awk '{print $1}')";
+  echo "HF_SHA256 $HFSHA"; echo "TRAIN_SHA256 $TRSHA";
+  echo "BUILD_OPTIMIZER_SHA256 $BOPT_SHA"; echo "LOAD_DATA_SHA256 $LOAD_SHA";
+  echo "SEEDS $SEEDS"; echo "LADDER $LRS"; echo "EPOCHS $EPOCHS"; echo "AUGMENT $AUG";
+  echo "M6 $M6_A0 $M6_CLIP"; echo "M6T $M6T_A0 $M6T_CLIP"; echo "WALL $WALL"; echo "PARTS $PARTS";
+  echo "SHELL_LEAK ${LEAK:-none}"; } > "$PROV"
+echo "guard 4: provenance -> $PROV   (HF.py $HFSHA, train.py $TRSHA)"
+
+# ---- guard 5: capacity, walltime and partitions --------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUNN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS (6 probe dirs x ~9 MB); mine pending=$PEND running=$RUNN, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over the 40 cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  TL=$(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)
+  R=$(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+  D=$(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 5b: $P timelimit ${TL:-?}   running ${R:-?}   pending ${D:-?}"
+done
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5c: PARTS and WALL disagree"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo
+  echo "!!! ONE OR MORE GUARDS FAILED.  This is a DRY RUN, so the composition below still"
+  echo "!!! runs, but --submit WOULD ABORT HERE.  Clear the failures first."
+  echo
+fi
+
+# ---- compose, guard each line under RULE 20, prove it against the scorer -------
+LINES=/tmp/cau1_lines.$$; : > "$LINES"
+N=0; REJ=0; BAD=0
+compose_sgd() {  # $1 lr $2 tag $3 seed
+  local RN="cau1-lr$2-s$3"
+  CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL \
+--export=ALL,AUGMENT=$AUG,COS_TOTAL=$COS_T,COS_WARMUP=$COS_W,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer SGD --dataset $DSET --NN-name $NET --batch-size $BATCH \
+--max-time 999:00:00 --num-epochs $EPOCHS --alpha0 $1 --seed $3 \
+--save-directory $SAVE --run-name $RN"
+  DESIGN=(optimizer=SGD dataset=$DSET NN-name=$NET batch-size=$BATCH num-epochs=$EPOCHS \
+          alpha0=$1 seed=$3 run-name=$RN)
+}
+compose_meta() {  # $1 arm $2 alpha0 $3 clip $4 seed
+  local RN="cau1-$1-s$4"
+  PDIR="$SAVE/probe_$RN"
+  CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$3,HIER=none,SCHED=none,PROBE=$PROBE_M,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base AdamW --normalizer-param-base 0.999 --momentum-param-base 0.9 \
+--weight-decay-base 0.1 --alg-meta Adam --normalizer-param-meta 0.999 --momentum-param-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET \
+--batch-size $BATCH --max-time 999:00:00 --gamma $GAMMA --meta-stepsize $MST --alpha0 $2 \
+--num-epochs $EPOCHS --stepsize-groups resnet18_blocks --seed $4 --save-directory $SAVE --run-name $RN"
+  DESIGN=(optimizer=HF alg-base=AdamW alg-meta=Adam meta-stepsize=$MST gamma=$GAMMA \
+          stepsize-groups=resnet18_blocks weight-decay-meta=0 dataset=$DSET NN-name=$NET \
+          batch-size=$BATCH num-epochs=$EPOCHS alpha0=$2 seed=$4 run-name=$RN)
+}
+emit() {
+  if ! guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then
+    echo "!!! RULE 20 PRE-CHECK FAILED:"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+  fi
+  printf '%s\n' "$CMD" >> "$LINES"
+  if [ "$SUBMIT" = 1 ]; then
+    [ -n "${PDIR:-}" ] && mkdir -p "$PDIR"
+    eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+  else
+    echo "$CMD"; echo; N=$((N+1))
+  fi
+  PDIR=""
+}
+for S in $SEEDS; do
+  for PAIR in $LRS; do compose_sgd "${PAIR%%:*}" "${PAIR##*:}" "$S"; PDIR=""; emit; done
+  compose_meta m6  "$M6_A0"  "$M6_CLIP"  "$S"; emit
+  compose_meta m6t "$M6T_A0" "$M6T_CLIP" "$S"; emit
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check (analysis/argsline_guard.py, unedited)"
+
+# ---- guard 6b: every composed line IS what the scorer will demand -------------
+python3 - "$SC" "$LINES" "$RUNNER" <<'PYEOF' || BAD=$((BAD+1))
+import sys, re, importlib.util
+sc, lines, runner = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location("cau1", sc)
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# the runner's OWN defaults for every echoed variable, read from its ENV line
+rsrc = open(runner).read()
+envln = [l for l in rsrc.splitlines() if l.strip().startswith('echo "ENV:')][0]
+defaults = dict(re.findall(r"\$\{(\w+):-([^}]*)\}", envln))
+seen, bad = set(), 0
+for ln in open(lines):
+    t = ln.split()
+    exp = [x for x in t if x.startswith("--export=")]
+    ri = t.index(runner)
+    ex = dict(kv.split("=", 1) for kv in exp[0][len("--export="):].split(",")[1:])
+    targs = "ARGS: " + " ".join(t[ri + 1:])
+    flags, dup = m.parse_args_line(targs)
+    rn = flags.get("--run-name")
+    mo = re.match(r"^cau1-(lr\d+|m6t|m6)-s(\d+)$", rn or "")
+    if not mo:
+        print("!!! guard 6b: unparseable run name %r" % rn); bad += 1; continue
+    arm, seed = mo.group(1), int(mo.group(2))
+    seen.add((arm, seed))
+    want = m.expected_args(arm, seed)
+    for k, w in want.items():
+        if not m._match(w, flags.get(k)):
+            print("!!! guard 6b: %s %s=%s want %s" % (rn, k, flags.get(k), w)); bad += 1
+    if set(flags) - set(want) or dup:
+        print("!!! guard 6b: %s undeclared %s / repeated %s" % (rn, sorted(set(flags) - set(want)), dup)); bad += 1
+    # simulate the runner's ENV echo: exported value, else the runner's default
+    echo = dict((k, ex.get(k, d)) for k, d in defaults.items())
+    for k, w in m.expected_env(arm, seed).items():
+        if not m._match(w, echo.get(k)):
+            print("!!! guard 6b: %s ENV %s would echo %s, the scorer wants %s" % (rn, k, echo.get(k), w)); bad += 1
+    if t[t.index(runner) - 1].startswith("--export=") is False and not exp:
+        bad += 1
+want_all = set((a, s) for a in m.ARMS for s in m.SEEDS)
+if seen != want_all:
+    print("!!! guard 6b: composed %d (arm,seed) pairs, the scorer expects %d" % (len(seen), len(want_all))); bad += 1
+if bad:
+    sys.exit(1)
+print("guard 6b: all %d composed lines match the scorer's expected_args() AND, through the"
+      " runner's own echo defaults, its expected_env() -- AUGMENT=0 on every one" % len(seen))
+PYEOF
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed -- NOTHING MORE SUBMITTED"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cau1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cau1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cau1- present in bin/PROTECTED.txt ----"
+  DESIGN=(dataset=$DSET NN-name=$NET batch-size=$BATCH num-epochs=$EPOCHS)
+  guard_postlaunch "$WS/runs" "cau1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cau1 job started inside the window" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cau1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+fi
+
+cat <<EOT
+
+---- AFTER LAUNCH, IN THIS ORDER, BEFORE ANY NUMBER IS QUOTED ----
+ 1. RULE 21 by wall clock:
+      git log -1 --format=%ct -- analysis/cAU1_unaug_denominator_score.py
+      sacct -u account_b -S 2026-09-10 --name=<a cau1 job> -o Submit,JobName --parsable2
+ 2. RULE 20, ARGS, at FULL 27/27 coverage, per family, with the declared axes:
+      export METAOPT_WS=$WS
+      python3 analysis/argsline_guard.py \$METAOPT_WS/runs --name cau1-lr --batch-consistency \\
+          --strict --vary seed --vary run-name --vary save-directory --vary alpha0
+      python3 analysis/argsline_guard.py \$METAOPT_WS/runs --name cau1-m6- --batch-consistency \\
+          --strict --vary seed --vary run-name --vary save-directory
+      python3 analysis/argsline_guard.py \$METAOPT_WS/runs --name cau1-m6t- --batch-consistency \\
+          --strict --vary seed --vary run-name --vary save-directory
+ 3. The SEPARATE ENV audit (AUGMENT / BETA_CLIP / PROBE / COS_* are environment variables):
+      bash bin/cAU1_unaug_denominator.sh --envaudit
+ 4. Ingest (aggregate.py writes to STDOUT -- 146.7), then args_repair.py --apply; verify
+    added == 27 AND changed == 0, keyed (run, job_id).
+ 5. Score with the DEFAULT invocation, ONE argument:
+      python3 analysis/cAU1_unaug_denominator_score.py \$METAOPT_WS/runs
+EOT
+if [ "$SUBMIT" = 0 ]; then
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cAU1_unaug_denominator.sh --submit"
+  rm -f "$LINES"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

@@ -1,0 +1,134 @@
+"""Correctness tests for the granularity implementations in HF.py.
+
+STRATEGY: the new granularities are validated against the AUTHORS' OWN already-working
+`blockwise` code path, which is untouched by our patch, via mathematical identities:
+
+  T1  layerwise  ==  blockwise with 62 singleton groups  "[1,1,...,1]"
+  T2  scalar     ==  blockwise with one group of all 62  "[62]"
+  T3  meta_stepsize=0 => every granularity trains IDENTICALLY (alpha frozen at alpha0)
+  T4  weightwise == nodewise on a net whose params are all 1-D (per-element == per-row)
+  T5  block_product math: z_b equals the explicit sum of h*g over each block
+
+Any failure means the implementation is wrong and every downstream result is void.
+"""
+import sys, copy, itertools
+sys.path.insert(0, "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10")
+import torch
+import torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+
+DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+FAILS = []
+
+
+class NullWriter:
+    """The shipped logging branches call writer.add_scalar unconditionally."""
+    def add_scalar(self, *a, **k):
+        pass
+
+
+def fresh_net(seed=0):
+    torch.manual_seed(seed)
+    return build_network("ResNet18", DEV)
+
+
+def run_steps(groups, k=6, seed=0, meta_stepsize=None, net_factory=fresh_net):
+    """Run k optimizer steps on a deterministic synthetic batch; return final weights."""
+    net = net_factory(seed)
+    meta = dict(META)
+    if meta_stepsize is not None:
+        meta["meta_stepsize"] = meta_stepsize
+    opt = HF(net, stepsize_groups=groups, alpha0=1e-6, args_base=dict(BASE),
+             args_meta=meta, gamma=1, writer=NullWriter())
+    crit = nn.CrossEntropyLoss()
+    g = torch.Generator().manual_seed(1234)
+    for _ in range(k):
+        x = torch.randn(8, 3, 32, 32, generator=g).to(DEV)
+        y = torch.randint(0, 10, (8,), generator=g).to(DEV)
+        loss = crit(net(x), y)
+        opt.step(net, loss)
+    return [p.detach().float().cpu().clone() for p in net.parameters()]
+
+
+def compare(name, a, b, tol=1e-6):
+    worst = max((x - y).abs().max().item() for x, y in zip(a, b))
+    ok = worst <= tol
+    print(f"  {'PASS' if ok else 'FAIL'}  {name:52s} max|diff| = {worst:.3e}")
+    if not ok:
+        FAILS.append(name)
+    return ok
+
+
+print(f"device={DEV}")
+n_tensors = len(list(fresh_net().parameters()))
+print(f"ResNet18 param tensors = {n_tensors}\n")
+
+# ---- T1: layerwise == blockwise with singleton groups -----------------------
+print("T1  layerwise  vs  blockwise[1,1,...,1]  (authors' own code path as reference)")
+singleton = "[" + ",".join(["1"] * n_tensors) + "]"
+compare("layerwise == blockwise singletons", run_steps("layerwise"), run_steps(singleton))
+
+# ---- T2: scalar == blockwise with one big group -----------------------------
+print("\nT2  scalar  vs  blockwise[62]")
+onegroup = f"[{n_tensors}]"
+compare("scalar == blockwise one-group", run_steps("scalar"), run_steps(onegroup))
+
+# ---- T3: meta_stepsize=0 -> all granularities identical ---------------------
+print("\nT3  meta_stepsize=0  =>  all granularities must be identical (alpha frozen)")
+ref = run_steps("scalar", meta_stepsize=0.0)
+for gname in ["resnet18_blocks", "layerwise", "nodewise", "weightwise"]:
+    compare(f"{gname} == scalar @ meta_stepsize=0", ref, run_steps(gname, meta_stepsize=0.0))
+
+# ---- T4: weightwise == nodewise on an all-1D net ----------------------------
+print("\nT4  weightwise vs nodewise on a params-are-all-1D network")
+
+
+class Flat(nn.Module):
+    """All parameters 1-D => per-row (nodewise) is per-element (weightwise)."""
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Parameter(torch.randn(16))
+        self.b = nn.Parameter(torch.randn(16))
+
+    def forward(self, x):
+        h = x.reshape(x.shape[0], -1)[:, :16] * self.a
+        return (h * self.b)[:, :10]
+
+
+def flat_factory(seed=0):
+    torch.manual_seed(seed)
+    return Flat().to(DEV)
+
+
+compare("weightwise == nodewise (all-1D net)",
+        run_steps("weightwise", net_factory=flat_factory),
+        run_steps("nodewise", net_factory=flat_factory))
+
+# ---- T5: block_product math -------------------------------------------------
+print("\nT5  block_product returns the correct per-group inner products")
+net = fresh_net()
+opt = HF(net, stepsize_groups="layerwise", alpha0=1e-6, args_base=dict(BASE),
+         args_meta=dict(META), gamma=1, writer=NullWriter())
+u = [torch.randn_like(p) for p in net.parameters()]
+v = [torch.randn_like(p) for p in net.parameters()]
+got = opt.block_product(u, v)[0]
+want = torch.stack([(ui * vi).sum() for ui, vi in zip(u, v)])
+compare("layerwise block_product == explicit per-tensor sums", [got.cpu()], [want.cpu()], tol=1e-3)
+
+optw = HF(net, stepsize_groups="weightwise", alpha0=1e-6, args_base=dict(BASE),
+          args_meta=dict(META), gamma=1, writer=NullWriter())
+gotw = optw.block_product(u, v)
+compare("weightwise block_product == elementwise u*v",
+        [x.cpu() for x in gotw], [(ui * vi).cpu() for ui, vi in zip(u, v)], tol=1e-6)
+
+print("\n" + "=" * 60)
+if FAILS:
+    print(f"RESULT: {len(FAILS)} TEST(S) FAILED -> implementation is WRONG")
+    for f in FAILS:
+        print("   - " + f)
+    sys.exit(1)
+print("RESULT: ALL TESTS PASSED")

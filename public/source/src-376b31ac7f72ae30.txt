@@ -1,0 +1,835 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cA2_g3_score.py -- THE REGISTERED SCORER FOR `a2g3`, THE ResNet-50 r-LADDER.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any a2g3 run exists.  Every
+# band edge, every threshold, every refusal below is frozen here, and selftest()
+# asserts each one against bin/cA2_g3_r50_ladder.sh's OWN TEXT so the
+# registration and the batch cannot drift apart.
+#
+# STANDING RULE 16 is respected in the strongest available form: this scorer does
+# not re-implement the campaign's reader or its statistics.  It IMPORTS
+# analysis/c87_hz3_score.py and calls that file's own series_from_out /
+# window_at / welch / t_two / betainc.  c87_hz3_score.py is NOT edited, NOT
+# copied and NOT monkey-patched; selftest() asserts its sha256 is unchanged from
+# the pin below.  The ONE statistic c87 does not carry -- the one-way F tail --
+# is built HERE on top of C87.betainc, and selftest() validates it against
+# published critical values.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS.  THE PREMISE, RE-DERIVED, NOT QUOTED
+# -----------------------------------------------------------------------------
+# ResNet-50 is the one architecture in this corpus where the hierarchical anomaly
+# reproduces at BOTH initialisations, and it received EXACTLY FOUR hierarchical
+# runs -- all at a single imported r = 0.06.  Read off the twelve archived
+# sc50-*.out files' own headers (RULE 20) and their own epoch series (plateau5 =
+# the mean of test accuracy over epochs 95..99, 0-indexed; the CSV `plateau`
+# column is mean-of-last-20 and is BANNED as primary):
+#
+#   alpha0   arm                       seed 0    seed 1     mean
+#   1e-6     scalar   (HIER unset)     89.1180   89.9020   89.5100
+#   1e-6     layerwise(HIER unset)     87.8940   88.4140   88.1540
+#   1e-6     additive r=0.06           91.1560   91.8660   91.5110
+#   1e-3     scalar   (HIER unset)     89.2040   89.2860   89.2450
+#   1e-3     layerwise(HIER unset)     90.0860   90.6640   90.3750
+#   1e-3     additive r=0.06           92.4960   92.8600   92.6780
+#
+# So the premise holds and is not marginal: the single interior r beats the
+# better of the two granularity endpoints by +2.0010 pp at alpha0=1e-6 (against
+# scalar) and by +2.3030 pp at alpha0=1e-3 (against layerwise), and beats the
+# worse endpoint by +3.3570 and +3.4330.  It is also, so far, ONE POINT.  No
+# ladder was ever run on ResNet-50, so nothing on disk distinguishes "there is an
+# interior optimum in r" from "additive-at-0.06 happens to be good".
+#
+# -----------------------------------------------------------------------------
+# WHY r=0 AND r=1 ARE THE ENDPOINTS, AND WHY THEY ARE *WITHIN* THE OPERATOR
+# -----------------------------------------------------------------------------
+# The additive operator, from the LIVE tree (Optimizers/HF.py, _apply_hier, the
+# layerwise branch; md5 pinned below), is
+#
+#     d      = beta_t_raw - beta_{t-1}          # the realised meta-update
+#     dm     = mean(d)                           # its shared component
+#     beta_t = beta_{t-1} + dm + r * (d - dm)
+#
+# r = 1 gives beta_t = beta_{t-1} + d EXACTLY: plain layerwise, no pooling.
+# r = 0 gives beta_t = beta_{t-1} + dm: every group moves by the SAME increment,
+# so with a common initialisation the m groups stay identical forever -- one
+# shared step size, driven by the mean of the per-group meta-gradients.
+# Both endpoints are therefore reachable by changing ETA_RATIO ALONE, with the
+# identical code path, the identical m, and the identical beta bookkeeping.  That
+# is why this batch needs NO CODE CHANGE and why its two endpoints are internal:
+# nothing in the contrast is a cross-batch or cross-operator comparison.
+#
+# NOTE the endpoints are NOT the archived `scalar` / `layerwise` arms.  r=1 IS
+# plain layerwise up to float associativity; r=0 is scalar-LIKE but not identical
+# to `--stepsize-groups scalar`, whose meta-gradient is the SUM over the network
+# rather than the per-group mean.  The archived arms are used ONLY as reporting
+# comparators (section RC below), never in a gated contrast.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN
+# -----------------------------------------------------------------------------
+# 36 jobs = 6 r-levels x 2 alpha0 x 3 seeds.
+#   r      in {0, 0.03, 0.06, 0.1, 0.2, 1}       (ETA_RATIO; HIER=additive on ALL)
+#   alpha0 in {1e-6, 1e-3}
+#   seed   in {0, 1, 2}
+# ResNet-50 / CIFAR-10 / layerwise (m=161, MEASURED on the live tree) / 100 ep /
+# batch 100 / SGDm+Lion / meta-stepsize 1e-3 / gamma 1 / AUGMENT=1 /
+# BETA_CLIP=-15:-2.3026.  Every one of those values is copied from the archived
+# sc50 runs' OWN ARGS and ENV lines, so the ladder is a strict extension of the
+# batch whose four points motivate it.
+#
+# -----------------------------------------------------------------------------
+# THE NOISE FLOOR, MEASURED BEFORE THE BARS ARE CHOSEN
+# -----------------------------------------------------------------------------
+# The bars below are NOT round numbers picked for rhetoric.  They are derived
+# from the only ResNet-50 seed-to-seed dispersion that exists: the 12 archived
+# sc50 runs, six cells of two seeds each.  For n=2 the within-cell sd is
+# |x0-x1|/sqrt(2), so the pooled variance over the six cells is
+# mean(diff^2)/2 with 6 degrees of freedom:
+#
+#   diffs  0.7840  0.5200  0.7100  0.0820  0.5780  0.3640
+#   pooled var = (0.614656+0.270400+0.504100+0.006724+0.334084+0.132496)/12
+#              = 1.862460/12 = 0.15520500
+#   SIGMA_REG  = 0.3939606...  -> 0.3940 pp   (df 6)
+#
+# With three seeds per cell the standard error of a difference of two cell means
+# is SIGMA_REG*sqrt(2/3) = 0.32172 pp.  Hence:
+#
+#   PEAK_BAR = 1.00 pp  = 3.108 x that SE.  An interior peak this size cannot be
+#                         seed noise, and is less than HALF the +2.00/+2.30 pp
+#                         the archived four runs already show -- so the bar is
+#                         demanding relative to noise and lenient relative to the
+#                         effect the batch exists to test.  Power at the archived
+#                         effect (+2.00 pp): t = 6.2, p ~ 1e-3.
+#   FLAT_BAR = 0.65 pp  = 2.020 x that SE.  A ladder whose whole span is inside
+#                         two standard errors is flat as measured.
+#
+# The bars are frozen HERE, before any a2g3 run exists.  score() RE-MEASURES the
+# in-batch noise floor and prints it beside SIGMA_REG, but it does NOT and MUST
+# NOT move the bars -- that would be editing a registered scorer after its data
+# exist (RULE 16).  If the in-batch sigma exceeds 3 x SIGMA_REG the verdict is
+# still issued and is accompanied by a mandatory UNDER-POWERED disclosure.
+#
+# -----------------------------------------------------------------------------
+# WHAT IS SCORED, AND IN WHAT ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# -----------------------------------------------------------------------------
+#   H0  THE PROVENANCE GATE, FIRST AND ABSOLUTELY GATING.  MEASURED, never
+#       declared: every a2g3 run's own ARGS line must carry no repeated flag and
+#       the registered design, its own ENV line must carry AUGMENT=1, the
+#       registered BETA_CLIP, HIER=additive and the ETA_RATIO its name claims,
+#       and its own epoch series must reach 100 completed epochs.  A run that
+#       fails is VOID.  A cell with fewer than MIN_SEEDS usable runs is
+#       INCOMPLETE and its alpha0's verdict is WITHHELD.
+#       RULE 13: the identical gate is applied to the ARCHIVED sc50 scalar and
+#       layerwise runs and MUST REFUSE ALL OF THEM (they carry HIER unset).  If
+#       it does not, the gate is decoration and this scorer refuses to issue any
+#       verdict at all.
+#   H1  THE NOISE FLOOR, SECOND.  In-batch pooled within-cell sd, printed against
+#       SIGMA_REG.  REPORTING plus the under-powered disclosure above.  Never a
+#       veto.
+#   H2  THE PRIMARY, per alpha0.  On cell means of plateau5:
+#         peak_gap = max over r in INTERIOR of  mean(r) - max(mean(0), mean(1))
+#         span     = max over all six r of mean(r)  -  min over all six
+#         p_welch  = two-sided Welch p for the best interior cell against the
+#                    BETTER endpoint cell (the harder of the two comparisons)
+#         p_F      = one-way F over the six levels, df (5, 12)
+#       CONFIRMED  iff peak_gap >= PEAK_BAR and p_welch < ALPHA_SIG
+#       REFUTED    iff span     <= FLAT_BAR and p_F     >= ALPHA_SIG
+#       UNRESOLVED otherwise -- and it is REPORTED as UNRESOLVED, not softened.
+#       The two conditions are provably mutually exclusive (span >= peak_gap, and
+#       FLAT_BAR < PEAK_BAR); selftest() asserts that.
+#   H3  THE COMBINATION.  Registered before the data: the batch is CONFIRMED only
+#       if BOTH alpha0 are CONFIRMED, REFUTED only if BOTH are REFUTED, and
+#       otherwise SPLIT -- reported per-alpha0 with no pooling.  There is no
+#       pooled-over-alpha0 test, because alpha0 changes the endpoint ORDER (at
+#       1e-6 the better endpoint is r=0, at 1e-3 it is r=1) and a pooled test
+#       would be answering a different question at each level.
+#   RC  THE REPORTING COMPARATORS, LAST AND NEVER GATING.  Cross-batch, so they
+#       cannot enter a verdict (BATCH is the unit of replication: F(62,85)=5.47).
+#         RC1  r=1 (a2g3) vs archived sc50 layerwise -- the operator identity
+#              check: these are the same algorithm and should agree.
+#         RC2  r=0 (a2g3) vs archived sc50 scalar -- the pooling endpoint against
+#              true scalar, which are NOT the same algorithm (see above).
+#         RC3  r=0.06 (a2g3) vs archived sc50 additive r=0.06 -- direct batch
+#              reproducibility of the four runs that motivated the ladder.
+#       Each is printed with the cross-batch disclosure and a flag when the
+#       discrepancy exceeds RC_DISCLOSE x SIGMA_REG.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS SCORER WILL NOT DO
+# -----------------------------------------------------------------------------
+#  * It will not read the CSV.  Every number comes from a run's own .out.
+#  * It will not use `plateau` (mean-of-last-20) or `best_test`.  plateau5 only.
+#  * It will not treat the three seeds as three batches (SEED is null: F 1.21,
+#    p 0.213).  The verdict is a within-batch contrast of cell means and says so.
+#  * It will not pool the two alpha0.
+#  * It will not move a bar after the fact.
+#
+# USAGE
+#   python3 analysis/cA2_g3_score.py --selftest
+#   python3 analysis/cA2_g3_score.py --runs /cluster/account_a/metaopt/runs
+# =============================================================================
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import math
+import os
+import re
+import statistics as st
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import c87_hz3_score as C87                                     # noqa: E402
+
+# The parent reader is IMPORTED, never edited.  If it changes, this scorer's
+# numbers change with it, so the pin is enforced.
+C87_SHA = "0be1f5201d43163b0afc9c9f81fa38a62c90e8eb811929caea8deb4b2be7561e"
+
+# ---------------------------------------------------------------------------
+# THE REGISTRATION.  selftest() checks every one of these against the batch
+# script's own text.
+# ---------------------------------------------------------------------------
+TAG = "a2g3"
+NET = "ResNet50"
+DSET = "CIFAR10"
+EPOCHS = 100
+BATCH = 100
+MST = "1e-3"
+GAMMA = "1"
+CLIP = "-15:-2.3026"
+GRAN = "layerwise"
+HIER = "additive"
+M_LAYER = 161                    # MEASURED on the live tree, not asserted
+NPARAM = 23520842
+WINDOW = C87.WINDOW              # 5 -- plateau5, the PRIMARY
+HF_MD5 = "d3202635c3fcef09387a316b73f2bb3f"
+
+# r level -> the tag that appears in the run name.  'p' is the decimal point;
+# r0p03 cannot be confused with r0p3 and r0 cannot be confused with r0p03,
+# because admission tests startswith(name + "-").
+R_LEVELS = [
+    ("r0",    0.0,  "0"),
+    ("r0p03", 0.03, "0.03"),
+    ("r0p06", 0.06, "0.06"),
+    ("r0p1",  0.1,  "0.1"),
+    ("r0p2",  0.2,  "0.2"),
+    ("r1",    1.0,  "1"),
+]
+ENDPOINTS = ("r0", "r1")
+INTERIOR = ("r0p03", "r0p06", "r0p1", "r0p2")
+ALPHAS = [("1e6", "1e-6"), ("1e3", "1e-3")]
+SEEDS = (0, 1, 2)
+NJOBS = len(R_LEVELS) * len(ALPHAS) * len(SEEDS)      # 36
+
+# ---------------------------------------------------------------------------
+# THE BARS.  Frozen.  Derivation in the header; SIGMA_REG is re-derived from the
+# archived runs by selftest() when they are reachable, and hard-coded otherwise.
+# ---------------------------------------------------------------------------
+SIGMA_REG = 0.3940               # pooled within-cell sd, 12 archived sc50 runs
+SE_DIFF_N3 = 0.32172             # SIGMA_REG * sqrt(2/3)
+PEAK_BAR = 1.00                  # pp; 3.108 x SE_DIFF_N3
+FLAT_BAR = 0.65                  # pp; 2.020 x SE_DIFF_N3
+ALPHA_SIG = 0.05
+MIN_SEEDS = 3                    # a cell below this is INCOMPLETE
+UNDERPOWER_MULT = 3.0            # in-batch sigma above this x SIGMA_REG -> disclose
+RC_DISCLOSE = 3.0                # cross-batch |diff| above this x SIGMA_REG -> flag
+
+# The archived comparators, re-derived from the sc50 .out files at registration
+# time and frozen so selftest() can run with no cluster access.  score() prefers
+# the live re-derivation and falls back to these only when the files are absent,
+# and says which it used.
+SC50_P5 = {
+    ("1e6", "scal"):  [89.1180, 89.9020],
+    ("1e6", "layer"): [87.8940, 88.4140],
+    ("1e6", "add"):   [91.1560, 91.8660],
+    ("1e3", "scal"):  [89.2040, 89.2860],
+    ("1e3", "layer"): [90.0860, 90.6640],
+    ("1e3", "add"):   [92.4960, 92.8600],
+}
+SC50_R = "0.06"                  # the single imported r of the archived arm
+
+
+# ---------------------------------------------------------------------------
+# The one statistic the parent does not carry: the one-way F tail.  Built on
+# C87.betainc so there is exactly ONE incomplete-beta in the campaign.
+# ---------------------------------------------------------------------------
+def f_sf(f, d1, d2):
+    """P(F > f) for F(d1, d2).  CDF(x) = I_{d1 x/(d1 x + d2)}(d1/2, d2/2)."""
+    if f <= 0 or d1 <= 0 or d2 <= 0:
+        return 1.0
+    return C87.betainc(d2 / 2.0, d1 / 2.0, d2 / (d2 + d1 * f))
+
+
+def oneway_f(groups):
+    """(F, df1, df2, p) for a one-way ANOVA over a list of equal-or-unequal lists."""
+    gs = [g for g in groups if len(g) >= 1]
+    k = len(gs)
+    n = sum(len(g) for g in gs)
+    if k < 2 or n - k < 1:
+        return float("nan"), 0, 0, float("nan")
+    grand = sum(sum(g) for g in gs) / n
+    ssb = sum(len(g) * (st.mean(g) - grand) ** 2 for g in gs)
+    ssw = sum(sum((x - st.mean(g)) ** 2 for x in g) for g in gs)
+    df1, df2 = k - 1, n - k
+    if ssw <= 0:
+        return float("inf"), df1, df2, 0.0
+    f = (ssb / df1) / (ssw / df2)
+    return f, df1, df2, f_sf(f, df1, df2)
+
+
+def pooled_sd(cells):
+    """Pooled within-cell sd over a list of lists (each len >= 2)."""
+    num = den = 0.0
+    for c in cells:
+        if len(c) >= 2:
+            num += sum((x - st.mean(c)) ** 2 for x in c)
+            den += len(c) - 1
+    return math.sqrt(num / den) if den > 0 else float("nan")
+
+
+# ---------------------------------------------------------------------------
+# READING A RUN.  The epoch series comes from C87.series_from_out; plateau5 from
+# C87.window_at.  Nothing here re-implements either.
+# ---------------------------------------------------------------------------
+ENV_RE = re.compile(r"(\b[A-Z_]+)=(\S+)")
+GPU_RE = re.compile(r"^\s*(NVIDIA[^,]*),")
+NODE_RE = re.compile(r"^NODE=(\S+)")
+
+
+def read_header(path):
+    """{args: str, env: {...}, gpu: str|None, node: str|None} from a run's .out."""
+    args = env = gpu = node = None
+    with open(path, errors="replace") as fh:
+        for i, line in enumerate(fh):
+            if i > 40:
+                break
+            m = NODE_RE.match(line)
+            if m:
+                node = m.group(1)
+            if line.startswith("ARGS:") and args is None:
+                args = line[len("ARGS:"):].strip()
+            if line.startswith("ENV:") and env is None:
+                env = dict(ENV_RE.findall(line[len("ENV:"):]))
+            m = GPU_RE.match(line)
+            if m and gpu is None:
+                gpu = m.group(1).strip()
+    return {"args": args, "env": env or {}, "gpu": gpu, "node": node}
+
+
+def effective_flags(argsline):
+    """{flag: value} exactly as argparse resolves it, plus the list of repeats."""
+    if not argsline:
+        return {}, ["<no ARGS line>"]
+    toks = argsline.split()
+    order, vals = [], {}
+    cur = None
+    for t in toks:
+        if t.startswith("--") and len(t) > 2:
+            cur = t[2:]
+            order.append(cur)
+            vals.setdefault(cur, []).append("")
+        elif cur is not None:
+            vals[cur][-1] = (vals[cur][-1] + " " + t).strip()
+    repeats = sorted({f for f, v in vals.items() if len(v) > 1})
+    return {f: v[-1] for f, v in vals.items()}, repeats
+
+
+def gate_run(path, want):
+    """H0 on ONE .out.  Returns (plateau5|None, [reasons]).  `want` carries the
+    per-run expectations: alpha0, eta_ratio, seed."""
+    bad = []
+    h = read_header(path)
+    flags, repeats = effective_flags(h["args"])
+    if repeats:
+        bad.append("REPEATED FLAG(S) %s -- argparse keeps the last (RULE 20)"
+                   % ", ".join(repeats))
+    design = {
+        "optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion",
+        "dataset": DSET, "NN-name": NET, "stepsize-groups": GRAN,
+        "num-epochs": str(EPOCHS), "batch-size": str(BATCH),
+        "meta-stepsize": MST, "gamma": GAMMA,
+        "alpha0": want["alpha0"], "seed": str(want["seed"]),
+    }
+    for f, v in sorted(design.items()):
+        got = flags.get(f)
+        if got != v:
+            bad.append("--%s is %r, registered %r" % (f, got, v))
+    env = h["env"]
+    for k, v in (("AUGMENT", "1"), ("BETA_CLIP", CLIP), ("HIER", HIER)):
+        if env.get(k) != v:
+            bad.append("ENV %s is %r, registered %r" % (k, env.get(k), v))
+    got_r = env.get("ETA_RATIO")
+    # A non-additive run carries ETA_RATIO=na (run_cifar.sh echoes ${ETA_RATIO:-na}
+    # over an unset variable), so this must FAIL rather than raise -- the RULE 13
+    # discrimination path feeds exactly such runs through this gate on purpose.
+    try:
+        r_ok = got_r is not None and abs(float(got_r) - want["r"]) <= 1e-12
+    except (TypeError, ValueError):
+        r_ok = False
+    if not r_ok:
+        bad.append("ENV ETA_RATIO is %r, registered %r" % (got_r, want["r"]))
+    ser = C87.series_from_out(path)
+    ndone = (max(ser) + 1) if ser else 0
+    if ndone < EPOCHS:
+        bad.append("only %d/%d epochs completed" % (ndone, EPOCHS))
+    p5 = C87.window_at(ser, EPOCHS, WINDOW) if ndone >= EPOCHS else None
+    if p5 is None and not bad:
+        bad.append("plateau5 window incomplete at epoch %d" % EPOCHS)
+    return (None if bad else p5), bad
+
+
+def newest_out(runs_dir, name):
+    """The highest-job-id .out whose basename is exactly `<name>-<jobid>.out`."""
+    best = None
+    for f in glob.glob(os.path.join(runs_dir, name + "-*.out")):
+        b = os.path.basename(f)[len(name) + 1:-4]
+        if not b.isdigit():
+            continue
+        if best is None or int(b) > best[0]:
+            best = (int(b), f)
+    return best[1] if best else None
+
+
+def run_name(atag, rtag, seed):
+    return "%s-%s-%s-s%d" % (TAG, atag, rtag, seed)
+
+
+# ---------------------------------------------------------------------------
+# SCORING
+# ---------------------------------------------------------------------------
+def _fmt_p(p):
+    if p != p:
+        return "  n/a"
+    return "<1e-4" if p < 1e-4 else "%.4f" % p
+
+
+def score(runs_dir, out=sys.stdout):
+    def P(s=""):
+        print(s, file=out)
+
+    P("=" * 78)
+    P("  %s -- THE ResNet-50 r-LADDER.  REGISTERED SCORER cA2_g3_score.py" % TAG)
+    P("  %s / %s / %d ep / %s (m=%d) / SGDm+Lion / ms=%s / AUGMENT=1 / box %s"
+      % (NET, DSET, EPOCHS, GRAN, M_LAYER, MST, CLIP))
+    P("  PRIMARY = plateau5 (mean test acc, epochs %d..%d, 0-indexed), re-derived"
+      % (EPOCHS - WINDOW, EPOCHS - 1))
+    P("  from each run's OWN .out.  The CSV is never read.")
+    P("=" * 78)
+
+    h = hashlib.sha256(open(C87.__file__.replace(".pyc", ".py"), "rb").read()).hexdigest()
+    if h != C87_SHA:
+        P("!! REFUSAL: the imported reader analysis/c87_hz3_score.py has sha256")
+        P("   %s, not the pinned %s." % (h, C87_SHA))
+        P("   A registered scorer was edited after its data existed (RULE 16).")
+        return 2
+    P("reader: analysis/c87_hz3_score.py sha256 %s (pin OK)" % h[:16])
+    P("")
+
+    # ---------------- H0 --------------------------------------------------
+    P("-- H0  PROVENANCE GATE (gating) ----------------------------------------")
+    cells, voids, missing = {}, [], []
+    for atag, a0 in ALPHAS:
+        for rtag, r, _rs in R_LEVELS:
+            acc = []
+            for s in SEEDS:
+                nm = run_name(atag, rtag, s)
+                f = newest_out(runs_dir, nm)
+                if f is None:
+                    missing.append(nm)
+                    continue
+                p5, bad = gate_run(f, {"alpha0": a0, "r": r, "seed": s})
+                if bad:
+                    voids.append((nm, os.path.basename(f), bad))
+                else:
+                    acc.append(p5)
+            cells[(atag, rtag)] = acc
+    P("runs found %d / %d ; VOID %d ; MISSING %d"
+      % (NJOBS - len(missing), NJOBS, len(voids), len(missing)))
+    for nm, base, bad in voids:
+        P("  VOID  %-24s (%s)" % (nm, base))
+        for b in bad:
+            P("          %s" % b)
+    if missing:
+        P("  MISSING: %s" % ", ".join(missing[:12])
+          + (" ... (+%d)" % (len(missing) - 12) if len(missing) > 12 else ""))
+
+    # RULE 13: the same gate must REFUSE the archived non-additive sc50 runs.
+    disc = {"tested": 0, "refused": 0, "detail": []}
+    for atag, a0 in ALPHAS:
+        for short in ("scal", "layer"):
+            for s in (0, 1):
+                nm = "sc50-%s-%s-s%d" % (atag, short, s)
+                f = newest_out(runs_dir, nm)
+                if f is None:
+                    continue
+                disc["tested"] += 1
+                _p5, bad = gate_run(f, {"alpha0": a0, "r": 0.06, "seed": s})
+                if bad:
+                    disc["refused"] += 1
+                else:
+                    disc["detail"].append(nm)
+    if disc["tested"] == 0:
+        P("  RULE 13: the archived sc50 controls are not on this host -- the gate")
+        P("           is UNVALIDATED here.  Re-run this scorer where runs/ lives.")
+    elif disc["refused"] != disc["tested"]:
+        P("!! REFUSAL (RULE 13): the H0 gate ADMITTED %d archived non-additive"
+          % len(disc["detail"]))
+        P("   sc50 run(s) %s, which carry HIER unset.  A gate that cannot tell an"
+          % ", ".join(disc["detail"]))
+        P("   additive run from a non-additive one is decoration.  NO VERDICT.")
+        return 2
+    else:
+        P("  RULE 13: the identical gate REFUSES all %d archived non-additive sc50"
+          % disc["tested"])
+        P("           runs (HIER unset).  The gate cuts in both directions.")
+
+    incomplete = sorted(k for k, v in cells.items() if len(v) < MIN_SEEDS)
+    P("")
+
+    # ---------------- the ladder table ------------------------------------
+    P("-- THE LADDER, plateau5 cell means -------------------------------------")
+    P("  %-6s %s" % ("r", "".join("  alpha0=%-24s" % a0 for _t, a0 in ALPHAS)))
+    for rtag, r, rs in R_LEVELS:
+        row = "  %-6s" % rs
+        for atag, _a0 in ALPHAS:
+            v = cells[(atag, rtag)]
+            if v:
+                row += "  %7.4f (n=%d, sd %s)   " % (
+                    st.mean(v), len(v),
+                    ("%.4f" % st.stdev(v)) if len(v) > 1 else "  -   ")
+            else:
+                row += "  %-28s" % "      -- no usable run --"
+        P(row)
+    P("")
+
+    # ---------------- H1 --------------------------------------------------
+    P("-- H1  NOISE FLOOR (reporting) -----------------------------------------")
+    sig = pooled_sd([v for v in cells.values() if len(v) >= 2])
+    ncell = sum(1 for v in cells.values() if len(v) >= 2)
+    underpowered = (sig == sig) and sig > UNDERPOWER_MULT * SIGMA_REG
+    P("  registered SIGMA_REG %.4f pp (12 archived sc50 runs, 6 cells x 2 seeds)"
+      % SIGMA_REG)
+    if sig == sig:
+        P("  in-batch pooled within-cell sd %.4f pp over %d cells" % (sig, ncell))
+        P("  ratio in-batch / registered = %.2f" % (sig / SIGMA_REG))
+    else:
+        P("  in-batch sd not computable (no cell with 2+ usable seeds)")
+    if underpowered:
+        P("  ** UNDER-POWERED DISCLOSURE: the in-batch floor exceeds %.1f x the"
+          % UNDERPOWER_MULT)
+        P("     registered one.  The bars are NOT moved (RULE 16); the verdict")
+        P("     below is issued and carries this disclosure with it.")
+    P("")
+
+    # ---------------- H2 --------------------------------------------------
+    P("-- H2  PRIMARY, per alpha0 ---------------------------------------------")
+    P("  CONFIRMED  iff peak_gap >= %.2f pp AND Welch p < %.2f" % (PEAK_BAR, ALPHA_SIG))
+    P("  REFUTED    iff span     <= %.2f pp AND one-way F p >= %.2f" % (FLAT_BAR, ALPHA_SIG))
+    P("  UNRESOLVED otherwise, and reported as such.")
+    P("")
+    verdicts = {}
+    for atag, a0 in ALPHAS:
+        P("  alpha0 = %s" % a0)
+        bad = [rt for rt, _r, _s in R_LEVELS if len(cells[(atag, rt)]) < MIN_SEEDS]
+        if bad:
+            verdicts[atag] = "WITHHELD"
+            P("    WITHHELD: %d of %d cells have fewer than %d usable seeds (%s)."
+              % (len(bad), len(R_LEVELS), MIN_SEEDS, ", ".join(bad)))
+            P("    A registered refusal, not a null.  Re-submit the missing cells.")
+            P("")
+            continue
+        means = {rt: st.mean(cells[(atag, rt)]) for rt, _r, _s in R_LEVELS}
+        ep_best = max(ENDPOINTS, key=lambda k: means[k])
+        int_best = max(INTERIOR, key=lambda k: means[k])
+        peak_gap = means[int_best] - means[ep_best]
+        span = max(means.values()) - min(means.values())
+        d, se, df = C87.welch(cells[(atag, int_best)], cells[(atag, ep_best)])
+        t = d / se if se and se == se and se > 0 else float("nan")
+        p_w = C87.t_two(t, df) if t == t and df == df else float("nan")
+        F, df1, df2, p_f = oneway_f([cells[(atag, rt)] for rt, _r, _s in R_LEVELS])
+        arg = max(means, key=lambda k: means[k])
+        P("    endpoints    r=0 %.4f   r=1 %.4f   (better: %s)"
+          % (means["r0"], means["r1"], ep_best))
+        P("    best interior %-6s %.4f      argmax over ALL six: %s"
+          % (int_best, means[int_best], arg))
+        P("    peak_gap %+.4f pp   vs bar %.2f" % (peak_gap, PEAK_BAR))
+        P("    Welch %s vs %s: diff %+.4f se %.4f t %+.3f df %.1f p %s"
+          % (int_best, ep_best, d, se, t, df, _fmt_p(p_w)))
+        P("    span     %.4f pp    vs bar %.2f" % (span, FLAT_BAR))
+        P("    one-way F(%d,%d) = %.3f  p %s" % (df1, df2, F, _fmt_p(p_f)))
+        if peak_gap >= PEAK_BAR and p_w == p_w and p_w < ALPHA_SIG:
+            v = "CONFIRMED"
+            why = ("an interior optimum in r survives on %s: the best interior "
+                   "level beats the BETTER endpoint by %+.3f pp" % (NET, peak_gap))
+        elif span <= FLAT_BAR and (p_f != p_f or p_f >= ALPHA_SIG):
+            v = "REFUTED"
+            why = ("the ladder is flat as measured: whole span %.3f pp inside the "
+                   "registered bar, F not significant" % span)
+        else:
+            v = "UNRESOLVED"
+            why = ("neither bar is met (peak_gap %+.3f, p %s, span %.3f, F p %s). "
+                   "Reported as unresolved, not softened."
+                   % (peak_gap, _fmt_p(p_w), span, _fmt_p(p_f)))
+        verdicts[atag] = v
+        P("    VERDICT alpha0=%s: %s -- %s" % (a0, v, why))
+        P("")
+
+    # ---------------- H3 --------------------------------------------------
+    P("-- H3  COMBINATION (registered before the data) ------------------------")
+    vs = [verdicts[a] for a, _ in ALPHAS]
+    if all(v == "CONFIRMED" for v in vs):
+        head = "CONFIRMED"
+    elif all(v == "REFUTED" for v in vs):
+        head = "REFUTED"
+    elif any(v == "WITHHELD" for v in vs):
+        head = "WITHHELD"
+    else:
+        head = "SPLIT"
+    P("  alpha0=1e-6 %s ; alpha0=1e-3 %s" % (verdicts.get("1e6"), verdicts.get("1e3")))
+    P("  HEADLINE: %s" % head)
+    if head == "SPLIT":
+        P("  The two initialisations disagree.  No pooling is performed; the")
+        P("  disagreement IS the result and must be written as one.")
+    if underpowered:
+        P("  (carries the H1 under-powered disclosure)")
+    P("")
+
+    # ---------------- RC --------------------------------------------------
+    P("-- RC  CROSS-BATCH REPORTING COMPARATORS (never gating) ----------------")
+    P("  BATCH is the unit of replication (F(62,85)=5.47, p 6.9e-13), so nothing")
+    P("  below can enter a verdict.  Flagged when |diff| > %.1f x SIGMA_REG = %.3f pp."
+      % (RC_DISCLOSE, RC_DISCLOSE * SIGMA_REG))
+    live = {}
+    for (atag, short), frozen in SC50_P5.items():
+        vals = []
+        for s in (0, 1):
+            f = newest_out(runs_dir, "sc50-%s-%s-s%d" % (atag, short, s))
+            if f is None:
+                continue
+            ser = C87.series_from_out(f)
+            v = C87.window_at(ser, EPOCHS, WINDOW)
+            if v is not None:
+                vals.append(v)
+        live[(atag, short)] = vals if len(vals) == len(frozen) else None
+    src = "re-derived from the archived .out files"
+    if any(v is None for v in live.values()):
+        live = {k: list(v) for k, v in SC50_P5.items()}
+        src = "the registration's frozen copy (archived .out not on this host)"
+    else:
+        for k, v in live.items():
+            if max(abs(a - b) for a, b in zip(sorted(v), sorted(SC50_P5[k]))) > 1e-6:
+                P("  !! the archived %s cell re-derives to %s, not the registered %s"
+                  % (str(k), v, SC50_P5[k]))
+    P("  comparator source: %s" % src)
+    for label, rtag, short in (("RC1  r=1  vs archived layerwise", "r1", "layer"),
+                               ("RC2  r=0  vs archived scalar   ", "r0", "scal"),
+                               ("RC3  r=%s vs archived additive" % SC50_R, "r0p06", "add")):
+        for atag, a0 in ALPHAS:
+            mine = cells.get((atag, rtag), [])
+            theirs = live.get((atag, short)) or []
+            if not mine or not theirs:
+                P("  %s  alpha0=%s: not computable" % (label, a0))
+                continue
+            dd = st.mean(mine) - st.mean(theirs)
+            flag = "  <-- DISCLOSE" if abs(dd) > RC_DISCLOSE * SIGMA_REG else ""
+            P("  %s  alpha0=%s: %7.4f (n=%d) vs %7.4f (n=%d)  diff %+.4f%s"
+              % (label, a0, st.mean(mine), len(mine), st.mean(theirs),
+                 len(theirs), dd, flag))
+    P("")
+    P("  RC1 is the operator identity check: r=1 additive is beta_prev + dm +")
+    P("  (d - dm) = beta_prev + d, i.e. plain layerwise up to float")
+    P("  associativity.  A large RC1 discrepancy is a BATCH effect, an")
+    P("  implementation defect, or both, and must be reported before any RC3")
+    P("  reproducibility claim is made.")
+    P("=" * 78)
+    return 0 if head in ("CONFIRMED", "REFUTED", "SPLIT") else 1
+
+
+# ---------------------------------------------------------------------------
+# SELFTEST.  Runs with no cluster access.  Every registered constant is checked
+# against bin/cA2_g3_r50_ladder.sh's OWN TEXT, and every statistic against a
+# published critical value.
+# ---------------------------------------------------------------------------
+def selftest(out=sys.stdout):
+    fails = []
+
+    def chk(cond, msg):
+        if not cond:
+            fails.append(msg)
+        print("  %s  %s" % ("ok  " if cond else "FAIL", msg), file=out)
+
+    print("cA2_g3_score.py selftest", file=out)
+
+    # -- 1. the imported reader is unedited ---------------------------------
+    src87 = os.path.join(_HERE, "c87_hz3_score.py")
+    h = hashlib.sha256(open(src87, "rb").read()).hexdigest()
+    chk(h == C87_SHA, "imported reader c87_hz3_score.py sha256 matches the pin")
+
+    # -- 2. statistics validated against published critical values ----------
+    chk(abs(C87.t_two(2.228, 10) - 0.05) < 5e-4,
+        "t_two(2.228, 10) = %.5f ~ 0.05 (published two-sided 5%% point)"
+        % C87.t_two(2.228, 10))
+    # F(5,12) upper 5% point is 3.106; upper 1% point is 5.064 (standard tables)
+    chk(abs(f_sf(3.106, 5, 12) - 0.05) < 5e-4,
+        "f_sf(3.106, 5, 12) = %.5f ~ 0.05" % f_sf(3.106, 5, 12))
+    chk(abs(f_sf(5.064, 5, 12) - 0.01) < 5e-4,
+        "f_sf(5.064, 5, 12) = %.5f ~ 0.01" % f_sf(5.064, 5, 12))
+    # [1,2,3] vs [4,5,6]: grand 3.5, SSB = 3*1.5^2 * 2 = 13.5 on 1 df,
+    # SSW = 2 + 2 = 4 on 4 df, so F = 13.5 / 1.0 = 13.5.
+    F, d1, d2, p = oneway_f([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    chk(d1 == 1 and d2 == 4 and abs(F - 13.5) < 1e-9,
+        "oneway_f on a hand-computable pair gives F(1,4)=13.500 (got %.3f)" % F)
+    chk(abs(p - f_sf(13.5, 1, 4)) < 1e-15 and 0.0 < p < 0.05,
+        "its p (%.5f) is the F(1,4) upper tail at 13.5" % p)
+    chk(abs(pooled_sd([[1.0, 3.0], [2.0, 4.0]]) - math.sqrt(2.0)) < 1e-12,
+        "pooled_sd on two n=2 cells of gap 2 gives sqrt(2)")
+
+    # -- 3. the bars are the stated multiples of the measured noise floor ----
+    diffs = [abs(v[0] - v[1]) for v in SC50_P5.values()]
+    sig = math.sqrt(sum(d * d for d in diffs) / (2.0 * len(diffs)))
+    chk(abs(sig - SIGMA_REG) < 5e-4,
+        "SIGMA_REG %.4f re-derives from the 12 archived sc50 plateau5 values "
+        "(%.6f)" % (SIGMA_REG, sig))
+    se = SIGMA_REG * math.sqrt(2.0 / 3.0)
+    chk(abs(se - SE_DIFF_N3) < 5e-5,
+        "SE_DIFF_N3 %.5f = SIGMA_REG*sqrt(2/3) (%.6f)" % (SE_DIFF_N3, se))
+    chk(abs(PEAK_BAR / se - 3.108) < 0.01,
+        "PEAK_BAR %.2f pp = %.3f x SE_DIFF_N3" % (PEAK_BAR, PEAK_BAR / se))
+    chk(abs(FLAT_BAR / se - 2.020) < 0.01,
+        "FLAT_BAR %.2f pp = %.3f x SE_DIFF_N3" % (FLAT_BAR, FLAT_BAR / se))
+    chk(FLAT_BAR < PEAK_BAR,
+        "FLAT_BAR < PEAK_BAR, so CONFIRMED and REFUTED are mutually exclusive "
+        "(span >= peak_gap always)")
+
+    # -- 4. the premise this batch rests on, re-derived from the frozen copy -
+    for atag, a0 in ALPHAS:
+        add = st.mean(SC50_P5[(atag, "add")])
+        best = max(st.mean(SC50_P5[(atag, "scal")]), st.mean(SC50_P5[(atag, "layer")]))
+        chk(add - best > 1.0,
+            "PREMISE alpha0=%s: archived additive r=%s beats the BETTER "
+            "granularity endpoint by %+.4f pp" % (a0, SC50_R, add - best))
+
+    # -- 5. power at the archived effect ------------------------------------
+    smallest = min(st.mean(SC50_P5[(a, "add")])
+                   - max(st.mean(SC50_P5[(a, "scal")]), st.mean(SC50_P5[(a, "layer")]))
+                   for a, _ in ALPHAS)
+    chk(smallest / se > 4.0,
+        "power: the SMALLEST archived gap (%.4f pp) is %.1f x SE_DIFF_N3, so a "
+        "real effect of that size clears both bars comfortably"
+        % (smallest, smallest / se))
+    chk(smallest > PEAK_BAR,
+        "PEAK_BAR (%.2f) is BELOW the smallest archived effect (%.4f) -- the bar "
+        "is demanding against noise, not against the hypothesis"
+        % (PEAK_BAR, smallest))
+
+    # -- 6. the naming scheme cannot self-collide ---------------------------
+    names = [run_name(a, rt, s) for a, _ in ALPHAS for rt, _r, _s in R_LEVELS
+             for s in SEEDS]
+    chk(len(set(names)) == NJOBS == 36,
+        "the design emits exactly %d distinct run names" % NJOBS)
+    coll = [(a, b) for a in names for b in names
+            if a != b and ("%s-4999999.out" % b).startswith(a + "-")]
+    chk(not coll, "no run name is a '<name>-' prefix of another (%s)"
+        % ("none" if not coll else coll[:2]))
+    coll2 = [n for n in names if n.startswith("g3-") or n.startswith("sc50-")]
+    chk(not coll2, "no run name collides with the existing g3-* or sc50-* tags")
+    chk(set(ENDPOINTS) | set(INTERIOR) == {rt for rt, _r, _s in R_LEVELS},
+        "ENDPOINTS + INTERIOR partition the six registered r-levels")
+
+    # -- 7. THE BATCH SCRIPT'S OWN TEXT -------------------------------------
+    sh = os.path.join(_HERE, "..", "bin", "cA2_g3_r50_ladder.sh")
+    if not os.path.exists(sh):
+        chk(False, "bin/cA2_g3_r50_ladder.sh exists (RULE 21: the registration "
+                   "must be checkable against the batch)")
+    else:
+        txt = open(sh).read()
+
+        def has(pat, what):
+            chk(re.search(pat, txt, re.M) is not None,
+                "batch script declares %s" % what)
+
+        has(r'^TAG=%s\b' % TAG, "TAG=%s" % TAG)
+        has(r'^NET=%s\b' % NET, "NET=%s" % NET)
+        has(r'^DSET=%s\b' % DSET, "DSET=%s" % DSET)
+        has(r'^EPOCHS=%d\b' % EPOCHS, "EPOCHS=%d" % EPOCHS)
+        has(r'^BATCH=%d\b' % BATCH, "BATCH=%d" % BATCH)
+        has(r'^MST=%s\b' % re.escape(MST), "MST=%s" % MST)
+        has(r'^GAMMA=%s\b' % GAMMA, "GAMMA=%s" % GAMMA)
+        has(r'^CLIP=%s\b' % re.escape(CLIP), "CLIP=%s" % CLIP)
+        has(r'^GRAN=%s\b' % GRAN, "GRAN=%s" % GRAN)
+        has(r'^HIERMODE=%s\b' % HIER, "HIERMODE=%s" % HIER)
+        has(r'^M_LAYER=%d\b' % M_LAYER, "M_LAYER=%d" % M_LAYER)
+        has(r'^NPARAM=%d\b' % NPARAM, "NPARAM=%d" % NPARAM)
+        has(r'^HF_MD5=%s\b' % HF_MD5, "the pinned HF.py md5")
+        has(r'^NJOBS=%d\b' % NJOBS, "NJOBS=%d" % NJOBS)
+        has(r'^SEEDS="0 1 2"', "SEEDS=0 1 2")
+        m = re.search(r'^RLEVELS="([^"]*)"', txt, re.M)
+        chk(m is not None, "batch script declares RLEVELS")
+        if m:
+            got = [tuple(x.split(":")) for x in m.group(1).split()]
+            want = [(rt, rs) for rt, _r, rs in R_LEVELS]
+            chk(got == want,
+                "RLEVELS matches the registration exactly: %s" % (got,))
+        m = re.search(r'^ALPHAS="([^"]*)"', txt, re.M)
+        chk(m is not None, "batch script declares ALPHAS")
+        if m:
+            got = [tuple(x.split(":")) for x in m.group(1).split()]
+            chk(got == ALPHAS, "ALPHAS matches the registration exactly: %s" % (got,))
+        chk("--stepsize-groups $GRAN" in txt,
+            "the composed command line takes its granularity from GRAN")
+        chk("HIER=$HIERMODE" in txt and "ETA_RATIO=$" in txt,
+            "HIER and ETA_RATIO are exported from the registered variables")
+        # RULE 20 offline: the EMITTER's own text, not the header prose.  The
+        # composed line is BFLAGS + the CMD assignment; no flag may appear twice
+        # across the two, because argparse silently keeps the last occurrence.
+        def _blk(pat):
+            mm = re.search(pat, txt, re.S | re.M)
+            return mm.group(0) if mm else ""
+        bf = _blk(r'^BFLAGS="[^"]*"')
+        cm = _blk(r'^\s*CMD="sbatch[^"]*"')
+        comp = bf + " " + cm
+        chk(bf.strip() != "" and cm.strip() != "",
+            "the emitter's BFLAGS and CMD blocks are both locatable")
+        fl = re.findall(r'--([A-Za-z0-9][A-Za-z0-9-]*)', comp)
+        dup = sorted({f for f in fl if fl.count(f) > 1})
+        chk(not dup, "no flag is written twice across BFLAGS+CMD (RULE 20); "
+                     "%d distinct flags, repeats: %s"
+                     % (len(set(fl)), dup or "none"))
+        for f in ("alpha0", "stepsize-groups", "seed", "run-name", "meta-stepsize",
+                  "num-epochs", "NN-name"):
+            chk(f in fl, "the composed line carries --%s exactly once" % f)
+        chk("cA2_g3_score.py" in txt,
+            "the batch script names THIS scorer as its registered scorer")
+
+    print("", file=out)
+    if fails:
+        print("SELFTEST FAIL -- %d check(s):" % len(fails), file=out)
+        for f in fails:
+            print("   - %s" % f, file=out)
+        return 1
+    print("SELFTEST PASS -- all checks", file=out)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--runs", default="/cluster/account_a/metaopt/runs",
+                    help="directory holding the batch's .out files")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if not os.path.isdir(a.runs):
+        print("no such runs directory: %s" % a.runs, file=sys.stderr)
+        return 2
+    return score(a.runs)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

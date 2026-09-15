@@ -1,0 +1,1126 @@
+#!/bin/bash
+# =============================================================================
+# c82_field_wideclip.sh -- `fa1`, THE ms/BOX DECONFOUND.  Runs on cluster_a ONLY
+# (needs PATCH_CHUNKWISE and PATCH_NODEBN).  24 jobs in TWO WAVES OF 12:
+# {nodewise, chunk777, nodewise1d, chunk2325} x seeds 0-2 (wave a) and 3-5
+# (wave b), ms=3e-4, 100 ep, probe ON, **BETA_CLIP=-25:-2.3026**.  NO NEW PATCH.
+# **ONE FIELD CHANGES FROM `ar1`, AND WITHIN IT ONLY ONE GUARD MOVES: THE FLOOR.**
+#
+# -----------------------------------------------------------------------------
+# REVISION NOTE -- WHAT CHANGED FROM THE FIRST REGISTRATION (commit c72d3f7) AND
+# WHY.  Read this first; it is the reason the box is not what it was.
+# -----------------------------------------------------------------------------
+#   The first version of this script registered BETA_CLIP=-25:**+9.0** and argued
+#   that margin above a provably unreachable bound is FREE.  THAT ARGUMENT WAS
+#   WRONG ON THE HIGH SIDE AND IS WITHDRAWN BEFORE ANY fa1 RUN EXISTS.  Three
+#   things were re-derived from disk this tick and each one is a gate below:
+#
+#   (i)  **ITS HEADLINE HI EVIDENCE CAME FROM TWO RUNS THAT DIVERGED.**  The old
+#        header quoted "the true free maximum at HI=+6.0 was +3.436, rec_hi 0.0000
+#        on 6/6" as proof that a measured ceiling had been 1.44 too low.  Re-read
+#        from the CSV: `bd7-w-c6-s0` and `bd7-w-c6-s1` carry **collapsed=1,
+#        plateau5=10.000, best_test 88.82/88.94** -- they hit 10% test accuracy at
+#        epoch 39 and stayed there.  Re-read from `probes_bd7`: in those two probes
+#        beta_true_min AND beta_true_max are bit-identical for **4,042 and 3,303
+#        consecutive records** -- a frozen beta on BOTH sides, i.e. a dead network,
+#        not a free excursion.  +3.436 is the odometer reading of a crashed car.
+#        The largest HEALTHY free HI excursion in the corpus at a coarse
+#        granularity is **+2.096** (`probes_bd7/probe_node_c6_s1`, rec_hi 0.0000,
+#        collapsed=0, plateau5 92.176).  GUARD H4 now refuses to run if those two
+#        rows ever stop reading collapsed=1, and the corpus rule this produced is
+#        general: **JOIN EVERY BETA STATISTIC AGAINST `collapsed` BEFORE QUOTING IT.**
+#
+#   (ii) **THE CEILING IS A STABILITY DEVICE, NOT AN INSTRUMENT.**  bd7-w-c2 vs
+#        bd7-w-c6 differ in exactly one field (HI +2.0 -> +6.0).  At HI=+2.0 the
+#        guard was ACTIVELY CLAMPING (rec_hi up to 0.6209) and both arms SURVIVED
+#        (plateau5 90.882 / 90.472).  At HI=+6.0 the guard never bound and both
+#        arms DIED (10.000 / 10.000).  Corpus-wide, 14 of 1,867 rows are
+#        collapsed=1: **10 weightwise UNBOXED at ms=1e-3, 2 unattributed, and
+#        exactly 2 boxed -- the -30:+6.0 pair.**  Zero collapses at any coarse
+#        granularity under any box.  "Two boxes that never bind produce identical
+#        trajectories" is true and irrelevant: the choice on the table is between a
+#        box that binds and one that does not, and the only direct evidence the
+#        corpus owns about releasing a ceiling is 2/2 fatal.  HI=+9.0 would have let
+#        alpha reach e^9 = 8,103 against ar1's e^-2.3026 = 0.1 -- an 81,000x
+#        enlargement of the reachable step-size set, bought for nothing.
+#
+#   (iii) **ONLY THE FLOOR IS CONFOUNDED WITH THE STEPSIZE.**  Re-derived from
+#        `probes_ar1` (12 dirs, 10,000 records each): the LO guard binds on 12/12
+#        (rec_lo 0.4521-0.4597); the HI guard binds on **1/12** -- node s2 only,
+#        rec_hi 0.1196, and at most 3 of 14,420 coordinates = 0.02%.  The confound
+#        this batch exists to retire is a FLOOR confound end to end (39/39 box-free
+#        at ms=1e-4 vs 15/15 LO-bound at ms=3e-4).  Moving the ceiling as well would
+#        have made fa1 the only cell in the four-cell D series with a different HI,
+#        which is precisely the pooling F2 forbids.
+#
+#   **THE FIX: BETA_CLIP=-25:-2.3026.**  The floor is released and is PROVABLY
+#   non-binding (GUARD H2); the ceiling is byte-identical to ar1, mm1, pp1 and cc1.
+#   Directly validated: re-running `occupancy()` over ar1's own 12 probes with the
+#   floor at -25 gives **rec_lo = 0.0000 on 12/12** while rec_hi is unchanged
+#   (0.0000 on 11, 0.1196 on node s2).  One field, one guard, zero new risk.
+#
+#   TWO OTHER SUBSTANTIVE CHANGES, both from measurement rather than taste:
+#   * **n goes 3 -> 6 seeds per arm (12 -> 24 jobs, two waves).**  Re-derived from
+#     the CSV this tick over 356 same-config SAME-SEED replicate pairs (ResNet18 /
+#     CIFAR10 / 100 ep / not collapsed / plateau5 > 80): median |difference| =
+#     **0.1710 pp**, implying a per-run sd of **0.179 pp**.  The across-seed sd
+#     within a config (156 configs, n>2) has median **0.159 pp**.  THOSE ARE THE
+#     SAME NUMBER.  **Seed explains essentially none of the run-to-run variance in
+#     plateau5 on this cluster**, so the first version's claim that reusing ar1's
+#     seeds makes F3 a PAIRED test with se ~0.098 pp is FALSE and is withdrawn.
+#     Mechanism: PARTS spans five GPU classes and ar1 alone scattered over
+#     [HOST_8d6ba568b8]/860/883/884/885 with wallclocks 44-114 min.  At n=3 a contrast has
+#     se 0.146 pp and resolves 0.29 pp; at n=6, se 0.104 and 0.21 pp.
+#   * **F1, F2 and F3 are RE-RANKED.**  F1 (concordance) cannot change any
+#     conclusion under any branch -- every branch it enumerates ends in "direction C
+#     stays DROPPED" -- so it may not hold the headline.  **F3, the box effect, is
+#     the PRIMARY**: it is the test that retires the STANDING RULE 10 violation.
+#     F2 is SECONDARY.  F1 is DESCRIPTIVE replication logging.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS -- AND THE HONEST DEFLATION, STATED FIRST
+# -----------------------------------------------------------------------------
+#   Cycle 79 registered A3 -- "does the sign-agreement field predict accuracy?" --
+#   and `ar1` VOIDED it: 12/12 arms sat on the LOW guard.
+#
+#   **THE SCIENTIFIC QUESTION A3 ASKED IS ALREADY ANSWERED AND CLOSED.**  `cc1`
+#   ran the same test at ms=1e-4, 12/12 box-free (rec_lo == rec_hi == 0.0000
+#   EXACTLY, re-derived here), and C1 came back MIXED: chunk777-nodewise
+#   ANTI-CONCORDANT (d_acc +0.727 t +3.63 vs d_N_eff/m -0.0237 t -11.14) and
+#   chunk2325-nodewise1d DISSOCIATED (d_acc +0.011 t +0.08 vs d_N_eff/m -0.0529
+#   t -23.26).  **DIRECTION C IS DROPPED** (CORRECTIONS 110.2, 110.5(1)).
+#   **NOTHING fa1 RETURNS MAY REOPEN IT.**  F1 below is registered strictly as a
+#   DESCRIPTIVE replication of a CLOSED result at a second stepsize; a CONCORDANT
+#   reading here is logged as a discrepancy for the record and is NOT a re-opening.
+#   This is written down BEFORE the data exist precisely so it cannot be revised.
+#
+#   SO WHAT DOES fa1 ACTUALLY BUY?  ONE THING, AND IT IS A RULE-10 REPAIR.
+#   Census re-derived this tick over every 100-epoch ResNet18 probe dir on disk in
+#   the box (-15, -2.3026):
+#       ms=1e-4   mm1 6 + pp1 9 + bn1 9 + cc1 12 + at1(blk6) 3  = **39/39 BOX-FREE**
+#       ms=3e-4   ar1 12 + at1(node) 3                          = **15/15 LO-BOUND**
+#   **THE STEPSIZE AXIS AND THE FLOOR-BINDING AXIS ARE PERFECTLY CONFOUNDED IN THIS
+#   CORPUS.**  STANDING RULE 10 says a series across any axis must hold the arm
+#   fixed; the campaign's ms series does not hold the BOX fixed.  fa1 changes one
+#   field and retires that confound.  Buy it for that reason or do not buy it.
+#   **Do NOT buy it to rescue A3: A3 is already rescued by cc1.**
+#
+#   THE PREDICTED SIZE OF WHAT F3 IS LOOKING FOR, WRITTEN DOWN BEFORE THE DATA SO
+#   THE OPERATOR CAN PRICE THE BATCH (this is registered as an EXPECTATION, never
+#   as a gate).  Releasing the floor from -15 to -25 changes a pinned coordinate's
+#   step size from exp(-15) = 3.06e-7 to at worst exp(-21.908) = 3.06e-10; both are
+#   numerically inert against base weights of order 1e-1.  And a coordinate pinned
+#   at -15 by step 27,020 cannot climb back to even -8 in the 22,980 steps that
+#   remain (it needs 7/3e-4 = 23,333).  **So |Delta_arm| is EXPECTED to be small --
+#   below 0.10 pp, i.e. below what n=6 resolves (0.25 pp at |t|=2 unpaired 6v3).**
+#   Registered consequence: **an unresolved F3 is the EXPECTED outcome and is
+#   therefore nearly uninformative on its own.**  What makes the batch worth buying
+#   is not F3's t-statistic but F3's OCCUPANCY: a box-free ms=3e-4 cell that does
+#   not exist anywhere in the corpus today.  If the operator wants a batch whose
+#   PRIMARY can resolve at its own expected effect size, this is not that batch and
+#   should not be bought as though it were.
+#
+# -----------------------------------------------------------------------------
+# CAN fa1 RE-READ ar1's A1 / A2?  **NO.  THIS BATCH IS INSTRUMENT-ONLY.**
+# -----------------------------------------------------------------------------
+#   Stated here, before the data, because the temptation to pool will exist after.
+#   (a) THE GUARD BOUND DIFFERENTIALLY ACROSS EXACTLY THE ARMS A1 COMPARES.  Both
+#       fractions below name their denominator (STANDING RULE 21) and both are
+#       re-derived from `probes_ar1` this tick.  AT THE FINAL RECORD, per COORDINATE:
+#       nodewise 11.25-11.74% of its 14,420 coordinates sit on the floor; chunk777
+#       0.159-0.173% of its 14,421.  **A 68-71x difference in clamped mass between
+#       the two arms of A1.**  Over ALL 10,000 records the same split reads 3.43% vs
+#       0.040% = 85x (guard 7b prints this one).  The clamp is not a shared
+#       background that cancels in the difference -- it is doing ARM-SPECIFIC work on
+#       the exact contrast.  For A2 the asymmetry is mild (nodewise1d 0.557% of 4,851
+#       vs chunk2325 0.39-0.43% of 4,851, ~1.3x), so A1 and A2 are NOT equally
+#       contaminated and cannot be rescued by one argument.
+#   (b) IT BOUND FOR THE HALF OF TRAINING THAT SETS THE PRIMARY.  First pin at
+#       27,020-27,395 of 50,000 steps; the clamp is live for 45.2-46.0% of
+#       training -- the whole second half, which is the half plateau5 is read from.
+#   (c) IT CLAMPED THE COORDINATES THE MECHANISM CLAIM IS ABOUT.  MEASURED, from the
+#       final record of every ar1 probe: in n1d, ch and c23, **15-17 of the 41
+#       one-dimensional (BatchNorm + linear.bias) tensors have their group at the
+#       floor** -- exact, because in those three arms every 1-D tensor is ONE group,
+#       so the probe's per-tensor beta IS that group's value.  The size-1 tail whose
+#       contribution A1-A2 exists to isolate is the tail the guard was holding up.
+#       **For nodewise itself the attribution is UNSURE and is left that way.**  Its
+#       probe carries 62 per-TENSOR values against 14,420 groups, and those means
+#       cannot resolve it: only 1 of 41 one-D tensor MEANS sits at the floor while
+#       1,622-1,693 coordinates do.  That gap is exactly the per-tensor-mean
+#       resolution error CORRECTIONS 50 was written about, so no nodewise split is
+#       quoted here in either direction.
+#   (d) THE SIGN OF THE CHANGE IS NOT PREDICTABLE.  **UNSURE, genuinely.**  Freeing
+#       the floor could help nodewise (its one-term singleton meta-gradient
+#       estimators stop injecting noise once alpha decays away) or hurt it (the BN
+#       scales freeze).  Its MAGNITUDE is expected to be small (see above); its SIGN
+#       is not predicted at all.  That is why F3 is mandatory, not optional.
+#   CONSEQUENCE, REGISTERED: **F2's D_w and G_w may NOT be appended to the
+#   mm1/pp1/ar1/cc1 D series as a fifth replication.**  fa1 is a different box and
+#   pooling across boxes is the exact error F3 exists to detect.  Every fa1 number
+#   is quoted WITH ITS BOX, always.
+#
+# -----------------------------------------------------------------------------
+# THE FLOOR, AND WHY IT IS ALGEBRAIC RATHER THAN EXTRAPOLATED
+# -----------------------------------------------------------------------------
+#   HF.py:675 (read read-only over ssh this tick, file untouched) implements Lion's
+#   meta update as
+#       beta[i] <- (1 - ms*wd_meta)*beta[i] - ms*sign(...)
+#   Every job in this family is submitted with `--weight-decay-meta 0`, so the decay
+#   term VANISHES IDENTICALLY and each update moves each coordinate by exactly 0 or
+#   +-ms.  Therefore, for T updates and ANY velocity profile whatsoever,
+#       beta_T in [ln(alpha0) - ms*T, ln(alpha0) + ms*T]     per coordinate.
+#   With alpha0=1e-3, ms=3e-4, T = 100 ep x 500 steps = 50,000:
+#       beta in [-21.907755, +8.092245]     ->  **A FLOOR AT -25 CANNOT BE REACHED.**
+#   A floor that cannot be reached cannot clamp; -25 leaves headroom to 120.6 epochs
+#   against a 100-epoch batch.  GUARD H computes all of this from this script's OWN
+#   CLIP=, MST=, ALPHA0= and EPOCHS= lines -- it is not a comment, it is a gate.
+#
+#   **THE BOUND IS USED FOR THE FLOOR ONLY, AND THAT ASYMMETRY IS DELIBERATE.**  On
+#   the LOW side the bound is TIGHT: ar1's own pre-pin slope runs at 0.99913 x ms
+#   from step 0 and the campaign's only genuinely unclipped, genuinely HEALTHY runs
+#   (`bf8-w-f60` / `bf8-w-f90`, collapsed=0, plateau5 90.58/90.61, floors -60 and
+#   -90 agreeing on beta_min = -46.738 / -46.744 to within 0.006) sit at 0.9959 of
+#   full Lion speed -- so nothing useful lives below -22 and the floor is pure
+#   headroom.  On the HIGH side the same bound is LOOSE (measured HI excursions run
+#   26-87% of full speed) and, worse, the ceiling is not just an instrument: see
+#   REVISION NOTE (ii).  **The ceiling is therefore NOT budgeted from the identity.
+#   It is HELD FIXED AT ar1's VALUE, -2.3026, and GUARD H2 asserts that it has not
+#   moved.**  It is reachable, it bound on 1/12 ar1 arms, and F0.4b treats a bind
+#   there as an empirical fact to be reported, not an impossibility.
+#
+#   WHY NOT A MEASURED FLOOR.  CORRECTIONS 72: a worst-seed extrapolated headroom
+#   was optimistic by 2.2x because the top coordinate's velocity is non-monotone and
+#   seed-dependent, which produced the rule *measure the headroom, or BUDGET the
+#   box; an extrapolation may earn a GATE, never a PRESUMPTION*.  The identity is
+#   the only object that satisfies that rule, because it holds for ANY velocity
+#   profile, monotone or not, seed-dependent or not.
+#
+#   EXPLICITLY REJECTED BOXES, with the reason:
+#     -15:-2.3026  ar1's box.  LO binds 12/12.  Provably impossible to keep at this
+#                  ms: the earliest step at which any coordinate can reach -15 is
+#                  (15-6.907755)/3e-4 = 26,974, and the measured first pin is 27,020.
+#     -25:+9.0     THE FIRST VERSION OF THIS SCRIPT.  Withdrawn: see REVISION NOTE.
+#                  Releasing a ceiling is unmeasured risk with no payoff for the
+#                  confound this batch exists to retire.
+#     -30:0.0      LO fine; HI 0.0 moves a guard this batch has no reason to move.
+#     -30:2.0      br6's box.  Same objection, and +2.0 is measured to bind at
+#                  ms=1e-3/80 ep (2 of 6 bd7 arms at HI, 10 of 12 at LO).
+#   **IF THE CEILING EVER NEEDS PROBING, IT IS A SEPARATE 2-JOB PILOT** (nodewise s0
+#   and nodewise1d s0 at -25:+9.0), read for `collapsed`, for best_test - plateau5,
+#   and for beta_true_max BEFORE anything larger is committed.  The corpus contains
+#   ZERO coarse-granularity runs at ms=3e-4/100 ep with a released ceiling, so that
+#   risk is currently UNMEASURED rather than small.  That pilot is NOT this batch
+#   and is NOT registered here.
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+# -----------------------------------------------------------------------------
+#
+#   F0    VALIDITY.  n_records == 10000; beta moved; epochs_done == requested == 100.
+#   F0.1  **HEALTH.  THE GATE THIS SCRIPT'S FIRST VERSION DID NOT HAVE.**  Three
+#         checks, ALL of which `bd7-w-c6-s0` would have failed and F0 would not:
+#           (a) the CSV `collapsed` column is 0 or empty;
+#           (b) best_test - plateau5 <= 2.0 pp  (healthy ar1 arms run 0.27-0.42;
+#               bd7-w-c6-s0 reads 78.8) -- the LATE-CRASH tripwire;
+#           (c) a BETA-FREEZE detector on probe.jsonl: VOID any arm where
+#               beta_true_min AND beta_true_max are both bit-identical **AND both
+#               strictly INSIDE the box** across >= 1,000 consecutive records.
+#               bd7-w-c6-s0/s1 read 4,042 and 3,303.
+#               **THE INTERIORITY CLAUSE WAS ADDED AFTER SMOKE-TESTING THE
+#               DETECTOR ON REAL PROBES, BEFORE ANY fa1 DATA EXISTED.**  Without
+#               it the detector is a CLAMP test, not a divergence test:
+#               ar1-node-s2 sat on BOTH guards at once (rec_lo 0.4521, rec_hi
+#               0.1196), so both extremes were constant by construction and the
+#               naive form reported a 1,194-record "freeze" on a healthy run.
+#               With interiority: ar1-node-s2 -> 0; bd7-w-c6-s0/s1 -> 4,042 /
+#               3,303; bd7-node-c6-s1 (healthy, free) -> 0.  Frozen ON the guards
+#               is clamped; frozen INSIDE the box is dead.
+#         A failing arm is VOIDED, never banded.  A diverged run that still
+#         completes its epochs is otherwise indistinguishable from a healthy one at
+#         F0, and would drag D_w by ~80 pp into the INVERTS band.
+#   F0.2  n_beta EXACT on EVERY record: node 14420, ch 14421, n1d 4851, c23 4851.
+#         Guard 4 MEASURES all four from the ALLOCATED beta on the real built
+#         network before anything is submitted.
+#   F0.3  THE INSTRUMENT FIRED.  neg_counts.json, n_tot == n_beta, npy shape read
+#         from its HEADER == (n_tot,).  (Header, never file size -- that inference
+#         produced c74's false VOID on 12/12 arms.)
+#   F0.4  **THE BOX-OCCUPANCY GATE, SCORED PER SEED (STANDING RULE 6/8), NOW SPLIT
+#         BY GUARD BECAUSE THE TWO GUARDS HAVE DIFFERENT LOGICAL STATUS.**
+#     F0.4a  **LO -- ALGEBRAIC.**  rec_lo == 0.0000 EXACTLY on every arm.  The Lion
+#            identity forces beta >= -21.907755, so a single record at -25 is
+#            IMPOSSIBLE and means THE CONFIG IS NOT WHAT THE HEADER SAYS (wd_meta
+#            != 0, wrong ms, wrong step count, a resumed run).  If F0.4a fires the
+#            batch is **VOID -- do not rescore, debug the config.**
+#     F0.4b  **HI -- EMPIRICAL.**  The ceiling is DELIBERATELY UNCHANGED from ar1
+#            and IS reachable.  ar1 bound there on 1/12 (node s2, rec_hi 0.1196),
+#            so a bind here is EXPECTED on the nodewise arm and is NOT a defect of
+#            this batch.  Registered in advance: an arm with rec_hi >= 5% is
+#            UNINTERPRETABLE on the FIELD (rule 5) and its PAIR is dropped from F1;
+#            if both pairs drop, F1 is VOID.  F2 and F3 are accuracy-only, stand,
+#            and report the occupancy beside every number.  **Because ar1 carried
+#            the SAME ceiling, an HI bind is a condition SHARED by both halves of
+#            F3 rather than a difference between them.**  Occupancy is printed for
+#            all 24 arms whatever the outcome.
+#   F0.5  **THE IDENTITY GATE.**  On EVERY record, |beta - ln(alpha0)| <= ms*T plus
+#         the one documented clamp-then-probe ms step.  This is a PREDICTION WITH AN
+#         ALGEBRAIC PROOF BEHIND IT.  A violation VOIDS the batch.
+#
+#   F3    **THE PRIMARY.  THE BOX EFFECT, PER ARM -- THE STANDING-RULE-10 REPAIR.**
+#         Delta_arm = mean plateau5(fa1 arm, n=6) - mean plateau5(ar1 arm, n=3),
+#         **UNPAIRED, Welch t, RESOLVED at |t| >= 2.0.**
+#         **THE PAIRING CLAIM OF THE FIRST VERSION IS WITHDRAWN.**  Measured this
+#         tick over 356 same-config SAME-SEED replicate pairs: median |difference|
+#         0.1710 pp (per-run sd 0.179), against an across-seed sd of 0.159 pp over
+#         156 configs.  Seed carries no reproducibility on this cluster (five GPU
+#         classes in PARTS; ar1 alone spread over five nodes), so a same-seed
+#         difference is not a paired statistic and must not be sold as one.
+#         Unpaired 6-vs-3 has se 0.127 pp and resolves **0.25 pp** at |t|=2.
+#           |Delta| resolved on ANY arm -> **THE BOX CHANGED THE OPTIMISER, NOT
+#              MERELY THE INSTRUMENT.**  D_w may not be pooled with ar1's D under
+#              any circumstances, and every prose sentence about D must thereafter
+#              carry its box.
+#           no arm resolved -> **UNRESOLVED at 0.25 pp.  THE EXPECTED OUTCOME.**
+#              **This may NOT be written as "the box is accuracy-neutral."**
+#              Declared now, because the campaign has previously written exactly
+#              that sentence off an underpowered null.
+#         **WHAT F3 DELIVERS REGARDLESS OF ITS t: a box-free ms=3e-4 cell.**  That
+#         is the deliverable; the t-statistic is the bonus.
+#
+#   F2    SECONDARY.  THE ACCURACY CONTRASTS **IN THIS BOX, AND ONLY IN THIS BOX.**
+#           D_w = plateau5(chunk777)  - plateau5(nodewise)     m 14,421 vs 14,420
+#           G_w = plateau5(chunk2325) - plateau5(nodewise1d)   m 4,851 EXACT
+#         FOUR BANDS, FIXED NOW, IDENTICAL FOR D_w AND G_w, calibrated against the
+#         three BOX-FREE readings of D the campaign owns (mm1 +0.485, pp1 +0.581,
+#         cc1 +0.727 -- all re-derived from the CSV this tick) so that SURVIVES
+#         means "indistinguishable from the box-free evidence":
+#           >= +0.45           -> **SURVIVES**.  Not a guard artefact; the ms=3e-4
+#                                 cell joins the series without a box qualifier.
+#           [+0.15, +0.45)     -> **ATTENUATED**.  Box-dependent; every quotation of
+#                                 ar1's +0.697 acquires "at BETA_CLIP=-15:-2.3026",
+#                                 permanently.
+#           (-0.15, +0.15)     -> **COLLAPSES**.  The ms=3e-4 cell is a guard
+#                                 artefact and is dropped from the D series, leaving
+#                                 three box-free cells.
+#           <= -0.15           -> **INVERTS**.  The strongest available refutation;
+#                                 reported as such, never softened to "collapses".
+#         The negative side is deliberately NOT subdivided.
+#         **THE SECOND CLAUSE, ADDED IN THIS REVISION AND FIXED HERE.**  The band
+#         is a threshold on a point estimate, and the ATTENUATED verdict carries a
+#         PERMANENT registered cost (every future quotation of +0.697 acquires a
+#         box qualifier).  Inverse-variance pooling the three box-free anchors gives
+#         **+0.5805 +- 0.0939** (Q = 0.88 on 2 df -- homogeneous), and the SURVIVES
+#         line at +0.45 sits only 0.13 pp below that pool while se(D_w - pool) at
+#         n=6 is 0.140.  A point estimate alone would therefore mis-band a truly
+#         box-free batch at a rate of order 10-25%.  **REGISTERED: ATTENUATED,
+#         COLLAPSES or INVERTS may be DECLARED only if D_w is ALSO below the pooled
+#         box-free anchor with |t| >= 2 against it (se_diff = sqrt(se(D_w)^2 +
+#         0.0939^2)).  Otherwise the reported verdict is CONSISTENT-WITH-BOX-FREE
+#         (UNDERPOWERED), and the band label is printed as an unconfirmed point
+#         reading beside it.**  The SURVIVES branch needs no second clause: it is
+#         the branch that asserts nothing new.
+#         PRIOR EXPECTATION ON G_w, stated so it cannot be claimed afterwards:
+#         ar1 read -0.139 and cc1 read +0.011, so G_w is expected to COLLAPSE.  A
+#         G_w outside that band with |t| >= 2 is the informative outcome -- it would
+#         say the guard was doing arm-specific work on the tail-FREE contrast too,
+#         which UNDERCUTS the tail interpretation of A1-A2 rather than supporting it.
+#
+#   F1    **DESCRIPTIVE.  THE CONCORDANCE READING, AT ms=3e-4 UNDER A FLOOR THAT
+#         CANNOT BIND.  DEMOTED FROM PRIMARY IN THIS REVISION** -- every branch it
+#         enumerates ends in "direction C stays DROPPED", so it cannot change a
+#         conclusion and may not hold the headline slot.  Convention and bands are
+#         nonetheless FIXED HERE, BEFORE ANY fa1 RUN EXISTS.
+#         For each matched-count pair (ch - node, c23 - n1d):
+#           d_acc = dplateau5, d_fld = dN_eff/m, each with a Welch t at n=6.
+#           A channel is RESOLVED at |t| >= 2.0.
+#         **CONVENTION, TRANSCRIBED UNCHANGED FROM `analysis/c81_cc1_score.py`'s C1
+#         (itself unchanged from A3): higher N_eff/m -> higher plateau5 =
+#         CONCORDANT.**  That is the direction the noise-averaging literature
+#         implies (more effective independence = more information per meta-step).
+#         Registered readings over the two pairs:
+#           both pairs resolved on BOTH channels, both ANTI-CONCORDANT
+#              -> **REPLICATES cc1's ANTI-CONCORDANT LEG AT A SECOND STEPSIZE AND A
+#                 NON-BINDING FLOOR.**  Direction C stays DROPPED.
+#           MIXED (any combination of CONCORDANT / ANTI-CONCORDANT / DISSOCIATION)
+#              -> **REPLICATES cc1's OWN MIXED VERDICT.**  Direction C stays DROPPED.
+#           both pairs resolved on BOTH channels, both CONCORDANT
+#              -> **DISCREPANCY WITH cc1, LOGGED FOR THE RECORD.**  This does NOT
+#                 reopen direction C.  It says the field's sign is stepsize- or
+#                 box-dependent, which makes it LESS of a design variable, not more.
+#           a pair RESOLVED on field, UNRESOLVED on accuracy -> DISSOCIATION.
+#           a pair UNRESOLVED on FIELD -> UNINFORMATIVE, reported, NOT folded in.
+#         **A PAIR IS DROPPED FROM F1 IF EITHER OF ITS ARMS BINDS (F0.4a/F0.4b)** --
+#         a box-bound arm's N_eff/m is not interpretable (rule 5).  If both pairs
+#         drop, F1 is VOID.  A void here is NOT another owed re-run: the question is
+#         closed, and a second void would only say this box binds too.
+#
+#   F4    THE CLIP METER.  **DESCRIPTIVE.**  rec_lo / rec_hi / coord_lo / coord_hi
+#         and beta_true_min/max per arm, printed AFTER F1-F3.  Its only job is to
+#         document how much headroom the floor bound actually left and how hard the
+#         unchanged ceiling was pressed.  It cannot gate F1, F2 or F3 beyond the
+#         F0.4 void it already feeds.
+#
+# THE STOPPING RULE, REGISTERED SO THE TWO-WAVE SUBMISSION CANNOT BECOME A PEEK
+#   The batch is 24 jobs.  It is submitted in TWO WAVES OF 12 only because the
+#   FairShare rule budgets a batch at ~20 jobs of ~40 min (CORRECTIONS: "< ~0.5% of
+#   RawUsage"), and 24 x ~60 min exceeds that in one shot.  **THE REGISTERED n IS 6.
+#   F2's band verdict and F3's resolution verdict MAY BE READ ONCE, AT n=6.**  Wave
+#   a alone is reported as INTERIM-UNDERPOWERED with occupancy and cell means only,
+#   and NO band label.  Stopping after wave a because wave a "looks clear" is a
+#   stopping-rule violation and is forbidden here in advance.
+#
+# WHAT THIS BATCH EXPLICITLY DOES NOT CLAIM
+#   * It does NOT reopen direction C.  That question was decided by cc1's own
+#     five-way pre-registered test and is CLOSED.
+#   * It does NOT re-read ar1's A1 or A2, and its D_w is NOT a fifth replication.
+#   * It does NOT measure any arm's argmax.  Two stepsizes are two points.
+#   * It does NOT say anything about a RELEASED CEILING.  The ceiling is held fixed
+#     on purpose and the corpus's only evidence about releasing one is 2/2 fatal.
+#   * It does NOT separate "the group-size distribution" from "the parameter role"
+#     on the 1-D tensors -- on ResNet18 those coincide EXACTLY (FINDINGS 78.1).
+#   * Every arm is a WITHIN-TENSOR partition.  Layer boundaries stay untested.
+#   * F1 is two pairs on one architecture and one dataset.  It registers a
+#     replication; it does not establish a law.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 tests/test_nodebn.py           (CPU, N0 asserts determinism first)
+#   2. python3 tests/test_chunkwise.py        (CPU)
+#   3. python3 analysis/c55_neff_noise.py --selftest
+#   4. python3 analysis/c82_fa1_score.py --selftest   (registered BEFORE the data)
+#   5. `fa1` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   6. plateau5 is PRIMARY.  best_test inflates ~0.27-0.42 pp.
+#
+# USAGE
+#   bash c82_field_wideclip.sh                    # dry run, wave a
+#   bash c82_field_wideclip.sh --wave b           # dry run, wave b
+#   bash c82_field_wideclip.sh --submit           # submits wave a if EVERY guard passes
+#   bash c82_field_wideclip.sh --wave b --submit  # submits wave b
+#
+# DRY RUN OFF THE CLUSTER.  Every guard below is MANDATORY for --submit: the first
+# failure aborts and nothing is submitted.  In DRY RUN a guard failure is counted,
+# printed loudly, and execution continues so the EMITTER itself can be validated on
+# a machine that has no /data1 -- the script then exits NON-ZERO with a banner.  A
+# dry run that reports failed guards is NOT a green light; it means exactly that the
+# emitter is syntactically sound and the guards have not been satisfied yet.
+# =============================================================================
+set -u
+
+SUBMIT=0
+WAVE=a
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit) SUBMIT=1 ;;
+    --wave)   shift; WAVE="${1:-a}" ;;
+    *) echo "unknown argument $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+case "$WAVE" in a|b) ;; *) echo "--wave must be a or b" >&2; exit 64 ;; esac
+
+GUARD_FAILS=0
+guard_fail() {
+  GUARD_FAILS=$((GUARD_FAILS + 1))
+  echo "!!! GUARD FAIL: $1"
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! SUBMIT ABORTED -- nothing was submitted."
+    exit 1
+  fi
+  echo "    (dry run: continuing so the emitter can be validated off-cluster."
+  echo "     THIS BATCH MUST NOT BE SUBMITTED UNTIL THIS GUARD PASSES ON cluster_a.)"
+}
+
+USER_NAME="${USER:-$(whoami)}"
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/fa1
+WALL=04:00:00
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+NJOBS=12                       # PER WAVE.  NJOBS_TOTAL is the registered n.
+NJOBS_TOTAL=24                 # 4 arms x 6 seeds.  THE REGISTERED n IS 6.
+CLIP=-25:-2.3026               # **THE ONE FIELD THAT CHANGES FROM ar1, AND WITHIN
+                               # IT ONLY THE FLOOR MOVES.**  -25 is provably
+                               # unreachable (GUARD H2 derives it); -2.3026 is
+                               # ar1's OWN ceiling, held fixed on purpose.
+CLIP_REF=-15:-2.3026           # ar1's box -- LO-bound on 12/12, HI on 1/12
+CLIP_HI_MUST_MATCH_REF=1       # GUARD H2 asserts the ceiling did NOT move
+MST=3e-4                       # ar1's stepsize, UNCHANGED, so the box is the only axis
+ALPHA0=1e-3                    # beta_0 = ln(alpha0) = -6.907755
+EPOCHS=100
+BATCH=100
+STEPS_PER_EPOCH=500            # 50,000 CIFAR-10 train images / batch 100; GUARD 4 MEASURES it
+WRITE_EVERY=500
+CHUNK_K=777                    # m(777)  = 14,421 = m(nodewise) + 1
+CHUNK_K2=2325                  # m(2325) =  4,851 = m(nodewise1d) EXACTLY
+M_NODE=14420
+M_CHUNK=14421
+M_N1D=4851
+M_CHUNK2=4851
+SEEDS_A="0 1 2"                # wave a -- ar1's own seed labels (NOT a pairing:
+SEEDS_B="3 4 5"                # wave b -- seed reproducibility is measured at
+                               # median |diff| 0.1710 pp, i.e. NONE.  See F3.)
+if [ "$WAVE" = "a" ]; then SEEDS="$SEEDS_A"; else SEEDS="$SEEDS_B"; fi
+REF_FAM=ar1                    # the NARROW-BOX half of F3's UNPAIRED contrast
+NET=ResNet18                   # GUARD H1d parses these two OFF THE EMITTER LINE
+DSET=CIFAR10                   # and feeds them to guards 2 and 4 (see H1d).
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  fa1 -- THE ms/BOX DECONFOUND.  WAVE $WAVE of 2."
+echo "    BETA_CLIP=$CLIP   (ar1's was $CLIP_REF)"
+echo "    ONE FIELD, TWO GUARDS -- AND ONLY THE FLOOR MOVES."
+echo "      LO -15 -> -25 : released, PROVABLY unreachable (guard H2)"
+echo "      HI -2.3026    : UNCHANGED from ar1/mm1/pp1/cc1.  It IS reachable and"
+echo "                      it bound on 1/12 ar1 arms (node s2, rec_hi 0.1196)."
+echo "    ms=$MST, alpha0=$ALPHA0, ${EPOCHS}ep, batch $BATCH, seeds $SEEDS = $NJOBS jobs this wave"
+echo "    REGISTERED n = 6 ($NJOBS_TOTAL jobs over both waves).  A BAND VERDICT MAY BE"
+echo "    READ ONCE, AT n=6.  Wave a alone is INTERIM-UNDERPOWERED, no band label."
+echo "    node(m=$M_NODE)/ch${CHUNK_K}(m=$M_CHUNK) and n1d(m=$M_N1D)/c${CHUNK_K2}(m=$M_CHUNK2)"
+echo "    F3 (PRIMARY): the box effect vs $REF_FAM, **UNPAIRED** Welch 6v3,"
+echo "       se 0.127 pp, resolves 0.25 pp.  Expected |Delta| < 0.10 pp, so an"
+echo "       UNRESOLVED F3 is the EXPECTED outcome; the deliverable is the"
+echo "       box-free ms=3e-4 cell itself, not the t."
+echo "    F2 (secondary): D_w / G_w IN THIS BOX ONLY -- NOT a fifth replication."
+echo "       ATTENUATED/COLLAPSES/INVERTS need |t| >= 2 vs the pooled box-free"
+echo "       anchor +0.5805 +-0.0939, else CONSISTENT-WITH-BOX-FREE (UNDERPOWERED)."
+echo "    F1 (DESCRIPTIVE): concordance, convention FIXED HERE --"
+echo "       higher N_eff/m -> higher plateau5 = CONCORDANT"
+echo "       REPLICATION ONLY.  Direction C is CLOSED (cc1 C1 MIXED); no outcome reopens it."
+echo "    **INSTRUMENT-ONLY: this batch CANNOT re-read ar1's A1/A2.**"
+echo "=============================================================="
+
+# --- GUARD 0 ---------------------------------------------------------------
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$RUNNER" ] || guard_fail "guard 0: no runner at $RUNNER"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || guard_fail "guard 1a-c: probe wiring"
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script exports for")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in mine[0]:
+        sys.exit("GUARD FAIL: export line missing %r -- that is bf8's bug" % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+# tw0's line is the CONFIRMED-FIRING reference: every key it carries must still be
+# here (losing one is bf8's bug).  Extra keys are allowed ONLY if they are on the
+# registered pin list -- HIER and SCHED, which guard H1e requires because
+# --export=ALL would otherwise inherit them from the submitting shell and
+# _apply_hier('additive') can move beta by more than ms, breaking H2's identity.
+PINNED_EXTRAS = {"HIER", "SCHED"}
+missing = set(keys(ref[0])) - set(keys(mine[0]))
+if missing:
+    sys.exit("GUARD FAIL: export line has LOST key(s) %s from tw0's "
+             "CONFIRMED-FIRING line -- that is bf8's bug" % sorted(missing))
+extra = set(keys(mine[0])) - set(keys(ref[0]))
+if extra - PINNED_EXTRAS:
+    sys.exit("GUARD FAIL: export line carries unregistered extra key(s) %s"
+             % sorted(extra - PINNED_EXTRAS))
+print("guard 1c: export keys are tw0's CONFIRMED-FIRING set plus the registered "
+      "pins %s" % sorted(extra))
+PYEOF
+
+# --- GUARD 1d -- THE TWO PATCHES THIS BATCH NEEDS, AND nodewise1d ISOLATION -
+python3 - "$WS" <<'PYEOF' || guard_fail "guard 1d: PATCH_CHUNKWISE / PATCH_NODEBN"
+import os, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks",
+                  "MetaOptimize", "cifar10", "Optimizers", "HF.py")
+src = open(hf).read()
+for marker, needs in (("PATCH_CHUNKWISE", ("chunkwise", "chunk_size")),
+                      ("PATCH_NODEBN", ("nodewise1d", "n1d_groups", "n1d_gsize",
+                                        "n1d_shape", "n1d_numel"))):
+    if marker not in src:
+        sys.exit("GUARD FAIL: %s is NOT applied to %s" % (marker, hf))
+    for need in needs:
+        if need not in src:
+            sys.exit("GUARD FAIL: %s present but %r missing -- partial patch"
+                     % (marker, need))
+if src.count("self.stepsize_type == 'nodewise1d'") != 3:
+    sys.exit("GUARD FAIL: expected 3 nodewise1d branches, found %d"
+             % src.count("self.stepsize_type == 'nodewise1d'"))
+if "'weightwise', 'nodewise1d'" not in src:
+    sys.exit("GUARD FAIL: nodewise1d is not in the exact-match dispatch list")
+# A SUBSTRING dispatch on 'nodewise' would silently route nodewise1d into nodewise.
+if "'nodewise' in self.stepsize_type" in src or '"nodewise" in self.stepsize_type' in src:
+    sys.exit("GUARD FAIL: a SUBSTRING dispatch on nodewise exists -- nodewise1d would leak")
+# The REVERSED form `self.stepsize_type in '<literal>'` is also a substring test
+# and HF.py really contains two of them (`in 'scalar'`, `in 'blockwise'`).  Neither
+# can capture an fa1 arm -- none of our four granularity strings is a substring of
+# 'scalar' or 'blockwise' -- but the guard's message claims to cover substring
+# dispatch, so make the coverage match the claim.
+import re as _re
+_rev = _re.findall(r"self\.stepsize_type\s+in\s+'([^']*)'", src)
+_leaky = [lit for lit in _rev
+          if any(g in lit for g in ("nodewise", "nodewise1d",
+                                    "chunk777", "chunk2325"))]
+if _leaky:
+    sys.exit("GUARD FAIL: reversed substring dispatch `self.stepsize_type in %r` "
+             "could capture an fa1 granularity" % _leaky[0])
+print("guard 1d-rev: %d reversed-substring dispatches exist in HF.py (%s); none "
+      "can capture nodewise / nodewise1d / chunk777 / chunk2325"
+      % (len(_rev), ", ".join(repr(x) for x in _rev)))
+if src.count("self.stepsize_type == 'nodewise'") != 3:
+    sys.exit("GUARD FAIL: the plain nodewise branches were disturbed")
+print("guard 1d: PATCH_CHUNKWISE and PATCH_NODEBN present, nodewise1d reachable, "
+      "plain nodewise undisturbed")
+PYEOF
+
+# --- GUARD 1e -- THE EQUIVALENCE SUITES PASS ON THIS TREE, ON CPU ----------
+# STANDING RULE 20: an equivalence suite must run on a deterministic device and its
+# FIRST assertion must be that a configuration equals ITSELF.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$REPO" || exit 1
+  for T in tests/test_nodebn.py tests/test_chunkwise.py; do
+    NODEBN_TEST_DEVICE=cpu python3 "$T" > /tmp/fa1_t.$$ 2>&1
+    if [ $? -ne 0 ]; then
+      echo "  $T did NOT pass on this tree:"; tail -25 /tmp/fa1_t.$$
+      rm -f /tmp/fa1_t.$$; exit 1
+    fi
+    echo "guard 1e: $T $(grep -c PASS /tmp/fa1_t.$$) PASS, 0 FAIL, on CPU, LIVE tree"
+    rm -f /tmp/fa1_t.$$
+  done
+) || guard_fail "guard 1e: equivalence suites on the live tree"
+
+# --- GUARD H -- **THE CEILING.  DERIVED HERE, NOT ASSERTED.** ---------------
+# Three parts: (H1) the Lion update is still the identity this box is budgeted
+# from; (H2) the box lies strictly outside [beta0 - ms*T, beta0 + ms*T], computed
+# from THIS SCRIPT'S OWN constants; (H3) the identity is VALIDATED against every
+# ar1 probe record on disk, with the clamp-then-probe one-update offset.
+python3 - "$WS" "$0" "$CLIP" "$MST" "$ALPHA0" "$EPOCHS" "$STEPS_PER_EPOCH" \
+              "$CLIP_REF" "$CSVP" "$NET" "$DSET" \
+  <<'PYEOF' || guard_fail "guard H: the floor derivation and the ceiling freeze"
+import csv, glob, json, math, os, re, sys
+ws, me, clip, mst, alpha0, epochs, spe, clip_ref, csvp, net, dset = sys.argv[1:12]
+ms, a0, ep, spe = float(mst), float(alpha0), int(epochs), int(spe)
+lo, hi = (float(x) for x in clip.split(":"))
+lo_ref, hi_ref = (float(x) for x in clip_ref.split(":"))
+
+# --- H1: the Lion meta update is still the form the bound is derived from ---
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent -- the ceiling cannot be validated" % hf)
+src = open(hf).read()
+DECAY = ("(1-self.args_meta['meta_stepsize']*self.args_meta['weight_decay'])"
+         "*self.beta[i]")
+STEP = "- self.args_meta['meta_stepsize'] * torch.sign("
+if src.count("def Lion_meta_update") != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 Lion_meta_update, found %d"
+             % src.count("def Lion_meta_update"))
+body = src.split("def Lion_meta_update", 1)[1].split("\n    def ", 1)[0]
+if DECAY not in body or STEP not in body:
+    sys.exit("GUARD FAIL: HF.py's Lion_meta_update is no longer "
+             "beta <- (1-ms*wd)*beta - ms*sign(.).  THE BOUND IS VOID; "
+             "re-derive the ceiling from scratch before submitting.")
+print("guard H1: HF.py Lion_meta_update is beta <- (1-ms*wd)*beta - ms*sign(.)")
+# the clamp must still run BEFORE the probe, or H3's one-update offset is wrong
+i_clamp = src.find("clamp(self._beta_lo, self._beta_hi)")
+i_probe = src.find("self._probe(HtT_gradft)")
+if i_clamp < 0 or i_probe < 0 or i_clamp > i_probe:
+    sys.exit("GUARD FAIL: PATCH_CLIP no longer clamps BEFORE PATCH_PROBE probes")
+print("guard H1b: PATCH_CLIP clamps before PATCH_PROBE probes (the one-update offset)")
+
+# --- H1c: wd_meta == 0 on THIS script's own submit line ---------------------
+mine = open(me).read()
+for need in ("--weight-decay-meta 0",
+             "--meta-stepsize \"$MST\"", "--alpha0 \"$ALPHA0\"",
+             "--num-epochs \"$EPOCHS\"", "--batch-size \"$BATCH\""):
+    if need not in mine:
+        sys.exit("GUARD FAIL: this script's submit line does not carry %r -- the "
+                 "bound's precondition is unverified" % need)
+print("guard H1c: the submit line carries --weight-decay-meta 0 and passes ms, "
+      "alpha0, epochs and batch size from the constants the bound uses")
+
+# --- H1d: THE NETWORK AND DATASET COME OFF THE EMITTER, NOT OFF A COMMENT ---
+# This campaign has already paid 6 jobs for a CIFAR-100 run built with a 10-class
+# head, because build_network dispatches on the NAME ALONE ('ResNet18' is a
+# separate entry from 'ResNet18_c100') and every guard downstream had the network
+# hard-coded.  Parse what will REALLY be submitted and hand it to guards 2 and 4.
+m_net = re.search(r'--NN-name "\$(\w+)"', mine)
+m_dst = re.search(r'--dataset "\$(\w+)"', mine)
+if not m_net or not m_dst:
+    sys.exit("GUARD FAIL: the emitter does not pass --NN-name / --dataset from a "
+             "shell variable; guards 2 and 4 cannot be tied to what is submitted")
+if m_net.group(1) != "NET" or m_dst.group(1) != "DSET":
+    sys.exit("GUARD FAIL: the emitter passes --NN-name $%s / --dataset $%s but the "
+             "guards read $NET / $DSET" % (m_net.group(1), m_dst.group(1)))
+print("guard H1d: the emitter submits --NN-name %s --dataset %s, and guards 2 and "
+      "4 are wired to those same two strings" % (net, dset))
+
+# --- H1e: THE HIERARCHY IS OFF.  The bound holds ONLY if nothing else writes -
+# beta.  HF.py's _apply_hier 'additive' branch computes
+# beta = beta_prev + dm + ratio*(ds - dm), which with ETA_RATIO > 1 can move a
+# coordinate by MORE than ms in one step and BREAKS THE IDENTITY.  --export=ALL
+# propagates the submitting shell's HIER/ETA_RATIO, so pin them explicitly.
+# NOTE: `mine` was rebound at H1c to the WHOLE FILE.  H1e must inspect the
+# --export LINE ONLY -- checking the whole file matches this guard's own
+# literals below and can never pass (fixed cycle 82c; see CORRECTIONS 112).
+_exp = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(_exp) != 1:
+    sys.exit("GUARD FAIL: H1e expected exactly 1 --export line, found %d" % len(_exp))
+_exp = _exp[0]
+if "HIER=none" not in _exp or "SCHED=none" not in _exp:
+    sys.exit("GUARD FAIL: the --export line does not pin HIER=none and SCHED=none. "
+             "--export=ALL would inherit them from the submitting shell and the "
+             "bound's precondition would be unverified.")
+for bad in ("HIER=shrink", "HIER=additive"):
+    if bad in _exp:
+        sys.exit("GUARD FAIL: %s is on the --export line -- the identity is VOID" % bad)
+print("guard H1e: HIER=none and SCHED=none are pinned on the --export line, so "
+      "_apply_hier cannot amplify a Lion step beyond +-ms")
+
+# --- H2: THE FLOOR IS PROVABLY UNREACHABLE; THE CEILING IS FROZEN AT ar1's --
+# The identity is applied to ONE guard on purpose.  On the LOW side it is tight
+# (ar1's pre-pin slope is 0.99913 x ms; the only HEALTHY unclipped runs the corpus
+# owns, bf8-w-f60/f90, sit at 0.9959) so -25 is pure headroom.  On the HIGH side
+# the SAME identity is loose AND the ceiling is not merely an instrument -- the
+# only two boxed collapses in 1,867 rows are the pair whose ceiling was released
+# from +2.0 to +6.0.  So the ceiling is NOT budgeted here.  It is HELD FIXED.
+T = ep * spe
+beta0 = math.log(a0)
+span = ms * T
+b_lo, b_hi = beta0 - span, beta0 + span
+print("guard H2: beta_0 = ln(%g) = %.6f;  T = %d ep x %d = %d updates;  ms*T = %.4f"
+      % (a0, beta0, ep, spe, T, span))
+print("guard H2: HARD BOUND  beta in [%.6f, %+.6f]   BOX (%.4f, %+.4f)"
+      % (b_lo, b_hi, lo, hi))
+if lo > b_lo:
+    sys.exit("GUARD FAIL: floor %.4f is ABOVE the reachable minimum %.6f -- it WILL "
+             "bind, exactly as -15 did at this ms" % (lo, b_lo))
+ep_lo = (beta0 - lo) / (ms * spe)
+print("guard H2a: the FLOOR is unreachable -- headroom %.1f ep against a %d-ep "
+      "batch, so rec_lo == 0.0000 is FORCED (F0.4a)" % (ep_lo, ep))
+if ep_lo < ep * 1.05:
+    sys.exit("GUARD FAIL: less than 5%% floor slack -- widen it; margin below an "
+             "unreachable bound is free on the LOW side")
+if lo >= lo_ref:
+    sys.exit("GUARD FAIL: the floor %.4f is not BELOW ar1's %.4f -- this batch "
+             "would change nothing" % (lo, lo_ref))
+# THE CEILING MUST NOT HAVE MOVED.  This is the gate that encodes the withdrawal
+# of the -25:+9.0 registration.
+if abs(hi - hi_ref) > 1e-9:
+    sys.exit("GUARD FAIL: the CEILING moved %+.4f -> %+.4f.  It must not.  The "
+             "ms/box confound this batch retires is a FLOOR confound (LO binds "
+             "12/12, HI 1/12); releasing the ceiling makes fa1 the only cell in "
+             "the D series with a different HI, and the corpus's only direct "
+             "evidence about releasing a ceiling is bd7-w-c6, 2/2 COLLAPSED."
+             % (hi_ref, hi))
+print("guard H2b: the CEILING is UNCHANGED at %+.4f -- identical to ar1, mm1, pp1 "
+      "and cc1.  It IS reachable (%+.6f) and it bound on 1/12 ar1 arms; F0.4b "
+      "treats a bind there as an EMPIRICAL fact, not an impossibility."
+      % (hi, b_hi))
+
+# --- H3: VALIDATE the identity against every ar1 record on disk ------------
+# The bound is an identity, but an identity about code that must still be running.
+# ar1 is the same optimiser, the same ms, the same alpha0 and the same horizon.
+ar1 = sorted(glob.glob(os.path.join(ws, "runs", "ar1", "probe_*")))
+if not ar1:
+    ar1 = sorted(glob.glob(os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(me))), "..", "probes_ar1", "probe_*")))
+if len(ar1) < 12:
+    sys.exit("GUARD FAIL: found %d ar1 probe dirs, expected 12 -- the identity "
+             "cannot be validated against real records" % len(ar1))
+worst, nrec, nviol = 0.0, 0, 0
+for d in ar1:
+    with open(os.path.join(d, "probe.jsonl")) as fh:
+        for line in fh:
+            r = json.loads(line)
+            st = int(r.get("step", 0))
+            nrec += 1
+            s = min(r["beta_true_min"] - (beta0 - ms * st),
+                    (beta0 + ms * st) - r["beta_true_max"])
+            worst = min(worst, s)
+            if s < -1.5 * ms:            # more than the ONE documented ms step
+                nviol += 1
+if nviol:
+    sys.exit("GUARD FAIL: %d of %d ar1 records violate the Lion bound by more than "
+             "one ms step -- the identity does NOT describe the live code and the "
+             "ceiling is VOID" % (nviol, nrec))
+print("guard H3: identity validated on %d ar1 records across %d arms; worst slack "
+      "%+.6f = %.2f ms steps (the documented clamp-then-probe offset), 0 violations"
+      % (nrec, len(ar1), worst, abs(worst) / ms))
+
+# --- H4: THE COLLAPSE AUDIT.  The gate the first registration did not have. -
+# The withdrawn -25:+9.0 ceiling was argued from "the true free maximum at HI=+6.0
+# was +3.436, free on 6/6".  Those two runs DIVERGED.  Assert that from the CSV
+# rather than remember it, so the number can never be re-quoted as evidence, and
+# assert the corpus-wide claim that motivates holding the ceiling fixed.
+rows = list(csv.DictReader(open(csvp)))
+dead = {r["run"]: r for r in rows if r.get("collapsed") == "1"}
+for run in ("bd7-w-c6-s0", "bd7-w-c6-s1"):
+    r = dead.get(run)
+    if r is None:
+        sys.exit("GUARD FAIL: %s does not read collapsed=1 in the CSV.  The whole "
+                 "reason this batch holds its ceiling fixed is that the corpus's "
+                 "only released-ceiling runs DIED; if that is no longer true the "
+                 "box must be re-argued from scratch before submitting." % run)
+    if float(r["plateau5"]) > 80.0:
+        sys.exit("GUARD FAIL: %s reads collapsed=1 but plateau5 %.3f -- the CSV is "
+                 "inconsistent; do not submit on it" % (run, float(r["plateau5"])))
+print("guard H4: bd7-w-c6-s0/s1 (BETA_CLIP=-30:6.0) are collapsed=1 at plateau5 "
+      "%.3f/%.3f -- their beta_true_max of +3.44 is a DEAD-NETWORK reading and is "
+      "NOT evidence about a free ceiling.  JOIN EVERY BETA STATISTIC AGAINST "
+      "`collapsed` BEFORE QUOTING IT."
+      % (float(dead["bd7-w-c6-s0"]["plateau5"]),
+         float(dead["bd7-w-c6-s1"]["plateau5"])))
+boxed_dead = [r for r in dead.values()
+              if r.get("beta_clip") and r["beta_clip"] not in ("none", "")]
+coarse_dead = [r for r in boxed_dead if r.get("granularity") != "weightwise"]
+print("guard H4b: %d of %d CSV rows are collapsed=1; %d of those carry a box, and "
+      "%d of THOSE are at a coarse granularity.  Every fa1 arm is coarse."
+      % (len(dead), len(rows), len(boxed_dead), len(coarse_dead)))
+for r in coarse_dead:
+    print("    coarse collapse on record: %s  gran=%s  box=%s  ms=%s"
+          % (r["run"], r.get("granularity"), r.get("beta_clip"),
+             r.get("meta_stepsize")))
+PYEOF
+
+# --- GUARD 2 -- the axis signature, re-derived FROM THE CSV -----------------
+# **beta_clip is the ONE axis that deliberately differs.**  Guard 2 asserts every
+# OTHER axis matches the ladder reference AND that beta_clip really has moved --
+# a fa1 that accidentally reran ar1's box would be 12 wasted jobs.
+python3 - "$CSVP" "$CLIP" "$CLIP_REF" "$EPOCHS" "$MST" "$ALPHA0" "$BATCH" "$REF_FAM" \
+              "$NET" "$DSET" \
+  <<'PYEOF' || guard_fail "guard 2: axis signature / CSV premises"
+import csv, sys, math, statistics
+(csvp, clip, clip_ref, epochs, mst, alpha0, batch, ref_fam,
+ net, dset) = sys.argv[1:11]
+rd = list(csv.DictReader(open(csvp)))
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row")
+sig = ref[0]
+# network / dataset come from $NET / $DSET, which guard H1d proved are the SAME
+# two strings the emitter passes to --NN-name / --dataset.  Never hard-coded here.
+mine = {'network': net, 'dataset': dset, 'batch_size': batch,
+        'base': 'SGDm', 'meta': 'Lion', 'alpha0': alpha0, 'gamma': '1',
+        'augment': '1', 'epochs_done': epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a, m, s in bad:
+        print("  axis %s: this batch %r vs reference %r" % (a, m, s))
+    sys.exit("GUARD FAIL: fa1 does not match the ladder's axis signature")
+print("guard 2: every axis EXCEPT beta_clip matches the rs-lay-1e4 signature "
+      "read FROM THE CSV")
+if clip == clip_ref:
+    sys.exit("GUARD FAIL: CLIP equals ar1's box -- this batch changes NOTHING")
+if sig['beta_clip'] != clip_ref:
+    sys.exit("GUARD FAIL: the reference row's box is %r, not ar1's %r -- the one "
+             "axis this batch moves is not the axis it thinks it is"
+             % (sig['beta_clip'], clip_ref))
+print("guard 2b: beta_clip moves %s -> %s, and it is the ONLY axis that moves"
+      % (clip_ref, clip))
+
+# guard 2c: F3's REFERENCE HALF must exist, at the same ms, in the OLD box.
+# NOT a pairing: seed carries no reproducibility on this cluster (356 same-
+# config same-seed replicate pairs, median |diff| 0.1710 pp, against an
+# across-seed sd of 0.159 pp), so F3 is an UNPAIRED Welch contrast, 6 v 3.
+def cell(prefix):
+    return sorted(float(r['plateau5']) for r in rd
+                  if r['run'].startswith(prefix) and r.get('plateau5', '').strip()
+                  and r['epochs_done'] == epochs)
+seeds_seen = sorted(r['seed'] for r in rd if r['run'].startswith(ref_fam + '-node-s'))
+for arm in ('node', 'ch', 'n1d', 'c23'):
+    v = cell('%s-%s-s' % (ref_fam, arm))
+    if len(v) != 3:
+        sys.exit("GUARD FAIL: %s-%s has %d scored runs, not the 3 F3 compares against"
+                 % (ref_fam, arm, len(v)))
+rows = [r for r in rd if r['run'].startswith(ref_fam + '-')]
+if any(r['beta_clip'] != clip_ref for r in rows):
+    sys.exit("GUARD FAIL: some %s rows are not in the %s box -- F3's reference half "
+             "is not a clean box contrast" % (ref_fam, clip_ref))
+if any(r['meta_stepsize'] != mst for r in rows):
+    sys.exit("GUARD FAIL: some %s rows are not at ms=%s -- F3 would not be a box "
+             "contrast, it would be a box+stepsize contrast" % (ref_fam, mst))
+print("guard 2c: %s has 4 arms x 3 seeds at ms=%s in box %s -- F3 has its reference "
+      "half and the contrast moves ONE field (UNPAIRED, 6 v 3)" % (ref_fam, mst, clip_ref))
+
+# guard 2d: the three BOX-FREE readings of D that F2's bands are calibrated on,
+# re-derived from the CSV rather than quoted.
+for fam, want in (("mm1", 0.485), ("pp1", 0.581), ("cc1", 0.727)):
+    a, b = cell('%s-ch-s' % fam), cell('%s-node-s' % fam)
+    if len(a) < 3 or len(b) < 3:
+        sys.exit("GUARD FAIL: %s's D cell is thin (%d vs %d)" % (fam, len(a), len(b)))
+    d = statistics.mean(a) - statistics.mean(b)
+    if abs(d - want) > 0.01:
+        sys.exit("GUARD FAIL: %s's D re-reads %+.3f, not the %+.3f F2's bands were "
+                 "calibrated on.  The CSV moved; re-derive the bands." % (fam, d, want))
+    print("guard 2d: %s D = %+.3f (box-free anchor for F2's +0.45 SURVIVES line)"
+          % (fam, d))
+
+# guard 2e: no name collision.
+clash = [r['run'] for r in rd if r['run'].startswith('fa1-')]
+if clash:
+    sys.exit("GUARD FAIL: %d fa1-* runs already in the CSV: %s"
+             % (len(clash), clash[:5]))
+print("guard 2e: no fa1-* run name already exists in the CSV")
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs -------------------
+python3 - "$REPO" "$CLIP" "$CLIP_REF" <<'PYEOF' || guard_fail "guard 3: box registration"
+import sys, os
+repo, clip, clip_ref = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if "fa1" not in c55.BOXES:
+    sys.exit("GUARD FAIL: `fa1` is not registered in c55_neff_noise.BOXES.  Register "
+             "it from THIS script's CLIP= line BEFORE submitting or the root is skipped.")
+lo, hi, prov = c55.BOXES["fa1"]
+want = tuple(float(x) for x in clip.split(":"))
+if (lo, hi) != want:
+    sys.exit("GUARD FAIL: c55 registers fa1 as %s but CLIP= is %s" % ((lo, hi), want))
+ref = c55.BOXES.get("ar1", (None, None, None))[:2]
+if (lo, hi) == ref:
+    sys.exit("GUARD FAIL: fa1's box equals ar1's -- F3 would be a null contrast")
+if ref != tuple(float(x) for x in clip_ref.split(":")):
+    sys.exit("GUARD FAIL: c55 registers ar1 as %s, not the %s this script pairs "
+             "against" % (ref, clip_ref))
+print("guard 3: fa1 registered as (%.1f, %+.1f) from %s; ar1 is (%.1f, %.4f) -- "
+      "F3's two boxes are DIFFERENT and both are registered" % (lo, hi, prov,
+                                                                ref[0], ref[1]))
+PYEOF
+
+# --- GUARD 4 -- ALL FOUR m FROM THE ALLOCATED BETA, AND len(trainloader) ---
+# The m block is lifted VERBATIM from bin/c79_argmax_robustness.sh (gate names
+# A1/A2 -> F2's D_w/G_w); it is the proven block and is not re-derived.  The
+# trainloader assertion is NEW and is load-bearing: T = EPOCHS * len(trainloader)
+# is the T the ceiling was budgeted from, so it is MEASURED, never assumed.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10" || exit 1
+  python - "$CHUNK_K" "$CHUNK_K2" "$M_NODE" "$M_CHUNK" "$M_N1D" "$M_CHUNK2" "$MST" \
+           "$BATCH" "$STEPS_PER_EPOCH" "$NET" "$DSET" <<'PYEOF' || exit 1
+import sys, torch
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+K, K2, want_node, want_chunk, want_n1d, want_chunk2 = (int(x) for x in sys.argv[1:7])
+MST = float(sys.argv[7])
+BATCH, SPE = int(sys.argv[8]), int(sys.argv[9])
+# NET and DSET are the emitter's own --NN-name / --dataset strings (guard H1d).
+# build_network dispatches on the NAME ALONE -- 'ResNet18' and 'ResNet18_c100' are
+# separate entries -- so measuring m on a hard-coded 'ResNet18' while submitting
+# something else is exactly the head mismatch this campaign has already paid for.
+NET, DSET = sys.argv[10], sys.argv[11]
+print("guard 4: measuring on the EMITTER's own network/dataset: %s / %s"
+      % (NET, DSET))
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": MST, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def build(gran):
+    torch.manual_seed(0)
+    net = build_network(NET, "cpu")
+    return HF(net, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+net = build_network(NET, "cpu")
+shapes = [tuple(p.shape) for p in net.parameters()]
+
+got = {}
+for name, gran, want in (("nodewise", "nodewise", want_node),
+                         ("chunk%d" % K, "chunk%d" % K, want_chunk),
+                         ("nodewise1d", "nodewise1d", want_n1d),
+                         ("chunk%d" % K2, "chunk%d" % K2, want_chunk2)):
+    m = m_of(build(gran))
+    got[name] = m
+    print("guard 4: %-12s ALLOCATED beta m=%-8d (registered %d)" % (name, m, want))
+    if m != want:
+        sys.exit("GUARD FAIL: m(%s) is %d, not the %d registered" % (name, m, want))
+
+d1 = abs(got["chunk%d" % K] - got["nodewise"])
+d2 = abs(got["chunk%d" % K2] - got["nodewise1d"])
+if d1 > 1:
+    sys.exit("GUARD FAIL: D_w's arms are %d groups apart, not <= 1" % d1)
+if d2 != 0:
+    sys.exit("GUARD FAIL: G_w's arms are %d groups apart, not 0" % d2)
+print("guard 4b: D_w's pair is %d group apart (m=%d vs %d); G_w's pair is EXACT at m=%d"
+      % (d1, got["chunk%d" % K], got["nodewise"], got["nodewise1d"]))
+
+o_n1d = build("nodewise1d")
+want_groups = [1 if len(s) == 1 else s[0] for s in shapes]
+if list(o_n1d.n1d_groups) != want_groups:
+    sys.exit("GUARD FAIL: nodewise1d group counts are not (1 per 1-D tensor, shape[0] else)")
+n_deg = sum(s[0] for s in shapes if len(s) == 1)
+if n_deg != 9610:
+    sys.exit("GUARD FAIL: nodewise has %d size-1 groups, not the 9,610 FINDINGS 77.6 "
+             "measured -- the network changed under the finding" % n_deg)
+print("guard 4c: nodewise1d isolates exactly the 1-D tensors; the size-1 tail is "
+      "still %d groups, as FINDINGS 77.6 measured" % n_deg)
+
+# --- guard 4c2: THE HEAD MATCHES THE DATASET.  build_network dispatches on the
+# NAME ALONE, so `--dataset CIFAR100 --NN-name ResNet18` silently builds a
+# 10-class head and every other guard still passes.  Assert the join.
+n_classes = int(shapes[-1][0])
+want_classes = {"CIFAR10": 10, "CIFAR100": 100}.get(DSET)
+if want_classes is None:
+    sys.exit("GUARD FAIL: unknown dataset %r -- add its class count before "
+             "submitting" % DSET)
+if n_classes != want_classes:
+    sys.exit("GUARD FAIL: %s builds a %d-class head but --dataset %s needs %d.  "
+             "THIS IS THE CIFAR-100 HEAD MISMATCH THAT HAS ALREADY COST THIS "
+             "CAMPAIGN 6 JOBS." % (NET, n_classes, DSET, want_classes))
+print("guard 4c2: %s's classifier head is %d-way and --dataset %s wants %d -- "
+      "the network and the dataset agree" % (NET, n_classes, DSET, want_classes))
+
+# --- guard 4d: T, MEASURED.  The ceiling is budgeted from ms*T. -------------
+from load_data import load_data
+trainloader, _ = load_data(DSET, BATCH, 0)
+n_steps = len(trainloader)
+print("guard 4d: len(trainloader) = %d at batch %d on %s (registered %d)"
+      % (n_steps, BATCH, DSET, SPE))
+# NOTE, registered: len(trainloader) == 500 at batch 100 for BOTH CIFAR-10 and
+# CIFAR-100 (both are 50,000 train images), so 4d ALONE cannot catch a dataset
+# mismatch.  What catches it is guard 4's build_network(NET) head size below and
+# guard 2's `dataset` axis, both of which are now wired to the emitter (H1d).
+if n_steps != SPE:
+    sys.exit("GUARD FAIL: len(trainloader) is %d, not the %d the ceiling was "
+             "budgeted from.  ms*T is wrong and BETA_CLIP MUST BE RE-DERIVED."
+             % (n_steps, SPE))
+PYEOF
+) || guard_fail "guard 4: allocated beta / len(trainloader)"
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" "$NJOBS" <<'PYEOF' || guard_fail "guard 5: disk"
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+# 0.100 GB/job, MEASURED: probes_ar1 is 1.1 GB over 12 dirs (probe.jsonl alone is
+# 113,735,692 bytes for probe_node_ar1_s0), i.e. ~88 MB each.  The old 0.060 was
+# an underestimate; the 20x factor absorbed it, but the printed number was wrong.
+need_gb = int(sys.argv[2]) * 0.100
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)" % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# --- GUARD 6 -- queue depth ------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS (wave $WAVE of 2; $NJOBS_TOTAL total)"
+if [ "$PEND" -gt 40 ]; then
+  guard_fail "guard 6: $PEND already pending, over the 40 cap"
+fi
+if [ "$((PEND + NJOBS))" -gt 40 ]; then
+  guard_fail "guard 6: $PEND pending + $NJOBS this wave would exceed the 40 cap"
+fi
+if [ "$NJOBS" -gt 20 ]; then
+  guard_fail "guard 6: a single submission of $NJOBS exceeds the ~20-job / ~0.5%-RawUsage budget rule -- that is WHY this batch is two waves"
+fi
+
+# --- GUARD 7 -- **THE PREMISE: ar1 REALLY DID BIND, RE-DERIVED FROM DISK** --
+# The batch exists because the old box bound.  Assert that from the probes rather
+# than quote it, and assert the differential that makes fa1 INSTRUMENT-ONLY.
+python3 - "$WS" "$REPO" "$CLIP_REF" <<'PYEOF' || guard_fail "guard 7: ar1's bind"
+import glob, os, sys
+ws, repo, clip_ref = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+from c52_boxfree import occupancy
+lo, hi = (float(x) for x in clip_ref.split(":"))
+dirs = sorted(glob.glob(os.path.join(ws, "runs", "ar1", "probe_*")))
+if not dirs:
+    dirs = sorted(glob.glob(os.path.join(repo, "..", "probes_ar1", "probe_*")))
+if len(dirs) != 12:
+    sys.exit("GUARD FAIL: %d ar1 probe dirs, expected 12" % len(dirs))
+bound = 0
+cl = {}
+for d in dirs:
+    o = occupancy(d, lo, hi)
+    b = not (o["rec_lo"] < 0.05 and o["rec_hi"] < 0.05)
+    bound += b
+    arm = os.path.basename(d).split("_")[1]
+    if o["coord_lo"] is not None:
+        cl.setdefault(arm, []).append(o["coord_lo"])
+if bound != 12:
+    sys.exit("GUARD FAIL: only %d/12 ar1 arms are box-bound in %s -- the premise "
+             "of this batch is weaker than stated; re-read before submitting"
+             % (bound, clip_ref))
+print("guard 7: ar1 is box-bound on 12/12 arms in %s -- the premise holds" % clip_ref)
+if "node" in cl and "ch" in cl:
+    n, c = max(cl["node"]), max(cl["ch"])
+    print("guard 7b: clamped coordinate mass over ALL (record, coordinate) cells "
+          "[denominator 10,000 records x m]: nodewise %.4f vs chunk777 %.4f = %.0fx "
+          "-- the guard bound DIFFERENTIALLY across D's own two arms, which is why "
+          "fa1 is INSTRUMENT-ONLY and may not re-read A1"
+          % (n, c, n / c if c else float("inf")))
+PYEOF
+
+# ---------------------------------------------------------------------------
+if [ "$SUBMIT" = "1" ]; then
+  mkdir -p "$SAVE" || { echo "GUARD FAIL: cannot create $SAVE"; exit 1; }
+else
+  mkdir -p "$SAVE" 2>/dev/null || true
+fi
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for S in $SEEDS; do
+  for ARM in "nodewise:node" "chunk${CHUNK_K}:ch" "nodewise1d:n1d" "chunk${CHUNK_K2}:c23"; do
+    GRAN="${ARM%%:*}"; SHORT="${ARM##*:}"
+    RN="fa1-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},HIER=none,SCHED=none,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_fa1_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset "$DSET" --NN-name "$NET" --batch-size "$BATCH"
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 "$ALPHA0"
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- wave $WAVE: $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+echo "---- REGISTERED n = 6 ($NJOBS_TOTAL jobs over waves a AND b).  A BAND VERDICT"
+echo "---- MAY BE READ ONCE, AT n=6.  Wave a alone is INTERIM-UNDERPOWERED: report"
+echo "---- occupancy and cell means, NO band label.  Stopping after wave a because"
+echo "---- it 'looks clear' is a stopping-rule violation, forbidden in advance. ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+if [ "$GUARD_FAILS" -gt 0 ]; then
+  echo "=============================================================="
+  echo "!!! $GUARD_FAILS GUARD(S) FAILED.  The emitter above is VALIDATED; the batch is NOT."
+  echo "!!! Nothing was submitted and nothing may be submitted until every guard"
+  echo "!!! passes ON cluster_a.  A dry run with failed guards is not a green light."
+  echo "=============================================================="
+  exit 2
+fi
+exit 0

@@ -1,0 +1,206 @@
+#!/bin/bash
+# =============================================================================
+# !!! NOT SUBMITTED -- SUPERSEDED BEFORE IT RAN BY bin/c49_ms_ladder_p5.sh !!!
+#
+# Written cycle 49 and retired the same tick.  A CONCURRENT SESSION on the same repo
+# submitted `bin/c49_ms_ladder_p5.sh` to cluster_b (36 jobs, 4702083-4702118) roughly one
+# minute before this script was ready, and that batch is a strict superset of this one:
+#     this script    eta_meta {1e-4, 1e-2} x {lay, node, w} x 2-3 seeds  = 14 jobs
+#     c49_ms_ladder  eta_meta {1e-4, 1e-3, 1e-2} x {blk6, lay, node, w} x 3 seeds = 36
+# It also re-runs the 1e-3 rung rather than reusing fr5, which is the better choice: it
+# makes the whole ladder one instrument in one batch and removes the cross-batch drift
+# that CORRECTIONS 51 found in `s`.  Submitting this as well would have been 14 duplicate
+# jobs, and 27 + 14 would in any case have breached the 40-pending cap.
+#
+# KEPT, NOT DELETED, because the two pre-registrations were written independently and
+# AGREE on the two things that could have wrecked the batch -- the monotone-b prediction
+# and the BETA_CLIP saturation confound at eta_meta = 1e-2 (D0.2 here, "KNOWN RISK" there,
+# both with a >50%-of-steps threshold).  That agreement is evidence about the design, and
+# deleting the file would destroy it.  Score the ladder against c49_ms_ladder_p5.sh's
+# L0-L3; D0-D3 below are a second opinion, not a competing verdict.
+#
+# Cycle 49 -- the META-STEPSIZE LADDER.  Runs on cluster_b.  14 jobs.
+#
+# OPEN QUESTION IT ANSWERS.
+#   CORRECTIONS 49(2) and 52(2) state the campaign's mechanism claim:
+#
+#       "A step-size adapter is a HIGH-PASS FILTER on meta-gradient correlation."
+#
+#   It rests on a TWO-point contrast -- beta frozen (`--alg-meta fixed`) versus beta free
+#   at one meta-stepsize (1e-3) -- plus, as of this cycle, a four-quarter time ladder on
+#   those same runs (`analysis/probe5_time_ladder.py`, FINDINGS 49.1) which measured the
+#   gain as a function of TIME:
+#
+#       frozen rho_w / free rho_w, R18/CIFAR-10, steady state
+#         quarter        k=1      k=775   k=180,225
+#         Q1 0-.25      1.26x     0.80x      0.70x     <- before beta moves: no filter
+#         Q2 .25-.5    24.83x     7.67x      2.17x
+#         Q3 .5-.75    28.26x     6.38x      0.84x
+#         Q4 .75-1     23.67x     4.57x      0.61x
+#
+#   That is a filter that SWITCHES ON inside one quarter and then holds -- not the gradual
+#   approach the "distance from the meta-optimum" wording implies.  The time axis cannot
+#   separate the two readings, because it confounds distance-from-equilibrium with
+#   training progress AND because everything after Q1 is saturated.
+#
+#   The meta-stepsize is the orthogonal knob: it changes how far beta gets from its
+#   initialisation WITHOUT changing the training epoch, the base optimizer, or anything
+#   else.  This batch adds eta_meta = 1e-4 and 1e-2 to the 1e-3 already on disk (fr5) and
+#   the frozen arm (p5, eta_meta inoperative), giving a FOUR-point gain curve at fixed
+#   training time.  It is the experiment CORRECTIONS 52(4) named, resized so that every
+#   rung on it resolves.
+#
+# PRE-REGISTERED PREDICTIONS -- score against these, not against what lands.
+#
+#   (D0) VALIDITY GATE.  Two parts, and the second is the one that can silently ruin the
+#        batch.
+#        1. MONOTONE X-AXIS.  Per-quarter beta net displacement (mean_j |beta_j(end) -
+#           beta_j(start)|, `probe5_time_ladder.beta_displacement`) must order
+#           net(1e-4) < net(1e-3) < net(1e-2) on the steady half.  The R18 1e-3 arm reads
+#           0.538-0.712 per quarter; frozen reads exactly 0.000.  If the order fails,
+#           eta_meta is not controlling distance-from-equilibrium and the x-axis is void.
+#        2. CLIP SATURATION, and this is why 1e-2 is the top rung rather than 1e-1.
+#           BETA_CLIP is -15:-2.3026.  Under Lion every per-step beta increment has
+#           magnitude EXACTLY the meta-stepsize (CORRECTIONS 21), so over 10,000 steps the
+#           reachable excursion is 1.0 log unit at 1e-4, 10 at 1e-3 and 100 at 1e-2
+#           against a clip window of 12.7.  At 1e-2 beta can therefore PIN against the
+#           clip -- and a pinned beta is a FROZEN beta, which would mimic the frozen arm
+#           and manufacture a gain of ~1 that looks like the filter switching off.
+#           Report, per run, the fraction of records with beta_true_max >= -2.31 or
+#           beta_true_min <= -14.99.  If that fraction exceeds 0.5 on the steady half, the
+#           1e-2 rung is reported as CLIPPED and its gain is NOT evidence about the filter.
+#           This is stated before submission precisely so that a low gain at 1e-2 cannot
+#           later be read as a discovery.
+#
+#   (D1) THE GAIN IS MONOTONE IN eta_meta -- this batch's core test.  Steady-half gain at k=1
+#        (frozen rho_w / free rho_w, frozen from the byte-matched p5 arm):
+#             gain(1e-4) < gain(1e-3) = 22.9x < gain(1e-2)
+#        with gain(1e-4) predicted in [1.5x, 12x] and gain(1e-2) >= 22.9x.
+#        REFUTATION: gain(1e-4) >= gain(1e-3) -> the gain is NOT set by how far beta has
+#        travelled, and the filter reading loses the only continuous knob it has.
+#        CORRECTIONS 49(2) would then have to be restated as a bare frozen-vs-free
+#        contrast with no mechanism attached -- weaker, still true, and it must be written
+#        that way rather than as a null.
+#
+#   (D2) THE HIGH-PASS SHAPE SURVIVES AT EVERY RUNG.  gain(k=1) > gain(k=775) >
+#        gain(k=180,225) at BOTH new eta_meta, as at 1e-3 (23.7 / 4.57 / 0.61).
+#        REFUTATION: shape inverted or flat at either rung -> the scale-selectivity is a
+#        property of eta_meta = 1e-3 and not of adaptation.
+#
+#   (D3) b1 CROSSES ZERO ON THE LADDER.  The weight->channel leg reads +0.156 frozen and
+#        -0.059 at eta_meta = 1e-3 (FINDINGS 48.18, 49.1).  Predict b1(1e-4) strictly
+#        between them, i.e. in (-0.059, +0.156), and b1(1e-2) <= -0.059.
+#        This is the sharpest form of "adaptation erases the channel-scale structure",
+#        and unlike D1 it is a statement about SHAPE rather than level.
+#
+#   RESOLUTION -- computed BEFORE submission (CORRECTIONS 33).  The R18 free arm at
+#   eta_meta = 1e-3, steady half, n=3: weightwise rho_s = 8.888e-08 against rho_min
+#   2.90e-08 (3.07x), nodewise 1.017e-04 vs 7.03e-06 (14.5x), layerwise 6.840e-03 vs
+#   1.61e-03 (4.25x).  At n=2 every rho_min rises by sqrt(3/2) = 1.22.
+#     rung    eta=1e-4 predicted            eta=1e-2 predicted
+#     w       rho_s HIGHER than at 1e-3     rho_s LOWER  -- the rung at risk
+#             (less suppression) -> >=3.7x  -> as little as ~1.25x at n=2
+#     node    ~10x                          ~6x
+#     lay     ~3.5x                         ~3.5x        (gain ~1 at layer scale)
+#   WEIGHTWISE AT eta=1e-2 IS THE ONE THIN RUNG, and it is the rung D1 is scored on at the
+#   top of the ladder.  It therefore gets a THIRD seed at both eta (n=3, matching fr5)
+#   while nodewise and layerwise take 2.  That is 14 jobs instead of 12, and the extra 2
+#   are spent exactly where the pre-registration says the batch can fail.
+#   If weightwise at 1e-2 still does not resolve, its gain is a LOWER BOUND -- "at least
+#   Nx" -- and D1 is scored as CONFIRMED-WITH-A-BOUND, never as a measured value.
+#
+# DESIGN.  Byte-for-byte `bin/c48_free_profile_p5.sh` (the fr5 recipe) with ONE field
+# changed, `--meta-stepsize`.  Same account, same partitions, same patch, same 20 epochs,
+# same PROBE=5 -> T=2000.  fr5 IS the eta_meta = 1e-3 rung of this ladder; it is not
+# re-run.  p5 is the frozen anchor; it is not re-run either.  Six of the ladder's twenty
+# cells are already paid for.
+#
+#   NOT INCLUDED: `resnet18_blocks`.  It resolved in NEITHER arm on the steady half at
+#   R18 (rho_s negative in frozen and free alike) and would be 4 jobs for a rung that has
+#   never cleared its own floor on the window this batch quotes.
+#
+# WHY cluster_b.  Account assignment is BY COMPARATOR (CORRECTIONS 46(6)).  Both arms this
+# batch is differenced against -- p5 (frozen) and fr5 (eta_meta = 1e-3) -- are on cluster_b.
+# The cycle-49 free-beta FAMILY ladder goes to cluster_a for the mirror-image reason: its
+# comparator, fz3, is there.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. beta_true_max != beta_true_min on the last record, 14/14 (beta really is free)
+#   2. the D0.2 clip-saturation fraction, printed per run, BEFORE any gain is quoted
+#   3. n_records == 2000 and n_tot matching the arm on every run
+#   4. python3 analysis/probe5_window.py --selftest && analysis/probe5_time_ladder.py --selftest
+#
+# USAGE
+#   bash c49_meta_stepsize_ladder.sh            # dry run: prints every sbatch line
+#   bash c49_meta_stepsize_ladder.sh --submit   # submits, ONLY if the guards below pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_b/metaopt                          # cluster_b
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+SAVE=$WS/runs/ms5
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_b
+PEND_CAP=40
+NJOBS=14
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c49 META-STEPSIZE ladder + PROBE5 (cluster_b) ==="
+
+if ! grep -q PATCH_PROBE5 "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5 not present in $HF"; exit 1
+fi
+if ! grep -q PATCH_PROBE5_FIX "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5_FIX not present -- unfixed patch crashes at record 500"; exit 1
+fi
+echo "guard 1: PATCH_PROBE5 + PATCH_PROBE5_FIX present  OK"
+
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 2: FairShare=${FS:-unknown} (informational only), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+mkdir -p "$SAVE"
+N=0
+sub () {   # sub <eta-token> <meta-stepsize> <gran-token> <stepsize-groups> <seed>
+  local etok=$1 eta=$2 gtok=$3 groups=$4 s=$5
+  local RN="ms5-${etok}-${gtok}-s${s}"
+  local PD="$SAVE/probe_${etok}_${gtok}_s${s}"
+  N=$((N+1))
+  local CMD=(sbatch --job-name="$RN" --partition="$PARTS" --time=03:50:00
+    --export="ALL,AUGMENT=1,BETA_CLIP=-15:-2.3026,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PD"
+    "$RUNNER"
+    --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+    --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+    --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+    --max-time 999:00:00 --gamma 1 --meta-stepsize "$eta" --alpha0 1e-3
+    --num-epochs 20 --stepsize-groups "$groups" --seed "$s"
+    --save-directory "$SAVE" --run-name "$RN")
+  if [ "$SUBMIT" = "1" ]; then "${CMD[@]}"; else printf '%s\n' "${CMD[*]}"; fi
+}
+
+# The token e4 / e2 becomes the "family" key in probe5_window.py's dirname parser, so each
+# eta_meta reduces as its own profile with its own weightwise n_tot.  Do NOT rename these
+# to anything containing a RUNG_TOKEN (w, node, lay, blk6, scal) or the parser will
+# mis-assign the rung.
+for s in 0 1; do
+  sub e4 1e-4 lay  layerwise  "$s"
+  sub e4 1e-4 node nodewise   "$s"
+  sub e4 1e-4 w    weightwise "$s"
+  sub e2 1e-2 lay  layerwise  "$s"
+  sub e2 1e-2 node nodewise   "$s"
+  sub e2 1e-2 w    weightwise "$s"
+done
+# The third seed, spent only where the resolution table says the batch can fail.
+sub e4 1e-4 w weightwise 2
+sub e2 1e-2 w weightwise 2
+
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with:  python3 analysis/probe5_window.py ../probes_ms5                    (D3)"
+echo "         and: python3 analysis/probe5_time_ladder.py ../probes_ms5 ../probes_p5  (D0.1, D1, D2)"
+echo "NOTE: score D0.2 (clip saturation) BEFORE quoting any gain from the e2 rung."

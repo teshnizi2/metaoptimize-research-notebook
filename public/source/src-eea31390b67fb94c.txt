@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cM1_cts2_score.py -- THE REGISTERED SCORER FOR BATCH `cts2`.
+#
+# COMMITTED BEFORE ANY cts2 RUN EXISTS (STANDING RULE 21).  Run it UNEDITED
+# (RULE 16).  Documented command-line arguments are not edits; nothing below
+# this line may be changed once a cts2 run exists on disk.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS
+# -----------------------------------------------------------------------------
+# cts1 (18 jobs, CORRECTIONS 147) cut the m = 2 partition of ResNet18_c100 at
+# single-tensor resolution and measured, IN BATCH, on plateau5:
+#
+#     k49 = [49,13]   55.1687 pp        k50 = [50,12]   30.3347 pp
+#     k49 - k50 = 24.8340 pp            (34.1 SE at the noise floor below)
+#
+# and the whole of that step is the departure of ONE tensor,
+# layer4.0.bn2.weight (512 parameters), from the second group.
+#
+# THE CONFOUND THIS BATCH IS BUILT TO RETIRE.  cts1's own TensorBoard traces --
+# which cts1's registered scorer never opens -- say the following, and this
+# scorer's --selftest re-derives all of it from those event files:
+#
+#   * beta is initialised at log(alpha0) = log(1e-6) = -13.815511.
+#   * BETA_CLIP=-15:-2.3026 puts the FLOOR only 1.184511 nats below the init.
+#   * In 12/12 cts1 cut runs the SECOND group (beta_block1) reaches -15.000000
+#     at meta-step 17700-18400 of 50000 and stays there for 63-65 % of the
+#     logged trajectory.
+#   * The FIRST group separates the arms: at k = 49 it also reaches the floor
+#     (-15.0000, -15.0000, -14.2897 over the three seeds), while at k = 50 it
+#     never comes within 1.18 nats of it and ends at -9.83, -9.88, -9.70.
+#
+# So the arm that wins is the arm whose BOTH groups end pinned against the
+# clamp, and the arm that loses is the arm whose first group never touches it.
+# The 24.834 pp cliff and the clamp's turnover are perfectly confounded in
+# cts1.  docs/FINDINGS.md 36.3 records the confound; nobody has measured it.
+#
+# cts2 releases the clamp and keeps everything else identical.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  2 x 2 x 3 seeds = 12 jobs, ONE submission.
+#
+#   factor A  cut     k49 = [49,13]   |  k50 = [50,12]
+#   factor B  clamp   C = CLAMPED  BETA_CLIP=-15:-2.3026   (the campaign standard)
+#                     R = RELEASED BETA_CLIP=-80:-2.3026   (floor non-binding)
+#
+#   Both CLAMPED cells are run IN BATCH.  cts1's arms are NOT spliced in:
+#   batch is the unit of replication in this corpus (F(62,85) = 5.47,
+#   p 6.9e-13 for batch; F(11,1976) = 0.152 for seed), and the estimand is a
+#   WITHIN-BATCH interaction.  cts1's k49/k50 means appear here only as a
+#   descriptive comparator, never inside a gate.
+#
+#   NO ANCHORS, AND CAPTURE IS NOT COMPUTED.  The primary contrast is a
+#   difference of two arm means in PERCENTAGE POINTS, which needs no anchors.
+#   Anchors would be worse than useless here, for two measured reasons:
+#     (i) cts1's scalar anchor sits ON the -15 floor for 62.8-63.0 % of its
+#         trajectory, so a RELEASED scalar anchor moves too; CAPTURE's
+#         denominator would then be as clamp-sensitive as its numerator and
+#         the ratio would confound exactly the factor under test.
+#     (ii) HF.py's TensorBoard block emits beta scalars only for
+#         stepsize_type in {scalar, blockwise}; `layerwise` emits NONE.  A
+#         RELEASED layerwise anchor could not be audited for R1 below, so the
+#         manipulation check could not be evaluated on it.
+#   Consequently NO number in this file is a CAPTURE, and any statement of the
+#   form "cts2 measured X % of the scalar-to-layerwise benefit" is out of
+#   scope for this batch by registration.
+#
+# -----------------------------------------------------------------------------
+# WHY THE RELEASED FLOOR IS -80, CHOSEN BY MEASUREMENT
+# -----------------------------------------------------------------------------
+# The meta-optimiser is Lion with --weight-decay-meta 0.  HF.Lion_meta_update:
+#
+#     beta <- (1 - ms*wd)*beta - ms*sign( b2*mom + (1-b2)*HtT_gradft )
+#
+# with wd = 0 this is beta <- beta - ms*sign(.), and sign(.) is in {-1, 0, +1}.
+# So |dbeta| per meta-step is at most ms = 1e-3, EXACTLY, in float32.
+# One meta-step per training iteration; 100 epochs x 500 iterations of
+# CIFAR-100 at batch 100 = 50000 meta-steps, which is exactly the range of
+# cts1's TensorBoard `step` axis (0 .. 49900 in strides of 100, 500 points).
+#
+# MEASURED, not assumed:
+#   * over all 13473 consecutive logging intervals in cts1's 27 traces, the
+#     largest |dbeta| in one 100-meta-step interval is 0.10004044 -- and
+#     float32 reproduces it exactly (subtracting float32(1e-3) one hundred
+#     times from float32(-8.0831937789917) gives float32(-8.183234214782715),
+#     the logged value, to the bit).  The 4.04e-5 excess over 0.1 is float32
+#     rounding, not a larger step.
+#   * simulating the WORST CASE -- 50000 consecutive downward steps in float32
+#     from the init -13.815511 -- lands at -63.790127.  That is the lowest
+#     beta this configuration can reach, by arithmetic, in any run.
+#
+# -80.0 is therefore 16.209873 nats -- 16209 meta-steps that do not exist --
+# below anything the dynamics can produce.  It is non-binding by construction,
+# not merely by observation, and R1 below still checks it empirically.
+# alpha = exp(-63.79) = 2.2e-28 stays a normal float32 (min normal 1.18e-38),
+# so releasing the floor introduces no underflow.
+#
+# The CEILING is left at -2.3026, unchanged, so the manipulation is
+# ONE-FACTOR.  It costs nothing: the largest beta anywhere in cts1 is -4.8234,
+# 2.52 nats clear of the ceiling, which is never touched.
+#
+# PROBE STAYS 0, and this is a considered refusal, not an omission:
+#   (a) it does not do what the cycle brief hoped.  HF.block_product already
+#       reduces <h,g> to ONE scalar PER GROUP before _probe() sees it, so for
+#       a blockwise arm z is a single length-2 tensor.  There is no per-tensor
+#       <h,g> to log at m = 2; the per-tensor path exists only for
+#       stepsize_type `layerwise`/`weightwise`/`nodewise`, which cts2 has none
+#       of.  PROBE=1 would log the two group sums this batch already infers.
+#   (b) PROBE is an INTERVAL, not a flag: _probe_every = int(PROBE), so
+#       PROBE=1 writes a JSONL record on EVERY meta-step -- 50000 records per
+#       run -- and each record calls .cpu()/float() on all 62 h_condenced
+#       tensors for h_absmax, i.e. ~62 device-to-host syncs per meta-step.
+#       That changes wall-clock and violates the byte-for-byte match with
+#       cts1 that makes the CLAMPED cells comparable.
+#   (c) with PROBE_DIR unset, _probe writes probe.jsonl into the CWD, which is
+#       the SHARED source tree, from 12 concurrent jobs.
+#   (d) the only field this batch actually needs -- clip occupancy -- is fully
+#       observable at m = 2 from the two TensorBoard beta_block scalars, at
+#       zero cost and zero deviation, which is what R1 reads.
+#
+# -----------------------------------------------------------------------------
+# PRE-REGISTERED QUANTITIES
+# -----------------------------------------------------------------------------
+#   M(arm, clamp) = mean over 3 seeds of plateau5 = mean of the LAST 5 test
+#                   epochs.  The CSV `plateau` column is BANNED as primary and
+#                   is never read; `best_test` is never read.
+#   T(arm, clamp) = the same on TRAIN accuracy (train5), REPORTED at every arm.
+#   D_C = M(k49,C) - M(k50,C)        the cliff under the standard clamp
+#   D_R = M(k49,R) - M(k50,R)        the cliff with the floor released
+#   INT = D_C - D_R                  the clamp x cut INTERACTION -- the estimand
+#
+# NOISE FLOOR, re-derived from results/all_runs.csv by --selftest and NOT
+# quoted from anywhere: pooled WITHIN (batch x granularity) SD of plateau5
+# over the cts1 cell (ResNet18_c100 / CIFAR100 / SGDm+Lion / ms 1e-3 /
+# alpha0 1e-6 / gamma 1 / AUGMENT 1 / BETA_CLIP -15:-2.3026 / no HIER /
+# batch 100 / 100 epochs done / not collapsed / not superseded) RESTRICTED to
+# the m = 2 "[k,62-k]" granularities, which is what the primary compares:
+#
+#     sigma_w = 0.8919 pp, df = 46, over 23 cells
+#     SE(any single arm difference, 3 seeds each)     = sigma_w*sqrt(2/3) = 0.7282 pp
+#     SE(the interaction, four arms, 3 seeds each)    = sigma_w*sqrt(4/3) = 1.0299 pp
+#
+# (The unrestricted cell gives 0.7765 pp over df 83; the m = 2 restriction is
+#  the CONSERVATIVE choice and is the one registered.)
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTRATION.  Gates are checked IN THIS ORDER and the first one
+# that fires DECIDES; no later branch may be reported if an earlier one fails.
+# -----------------------------------------------------------------------------
+#  G0 PROVENANCE.  12 runs, 4 cells x 3 seeds, 12 distinct job ids, every run
+#     100/100 epochs.  Each run's arm is read from its OWN `ARGS:` line and its
+#     clamp from its OWN `ENV:` line; the run NAME must agree with both.  Any
+#     repeated flag, any cross-batch splice, any disagreement -> VOID.
+#
+#  R1 MANIPULATION CHECK -- the batch is evidence only if the manipulation
+#     happened.  From each run's own TensorBoard trace:
+#       * every CLAMPED run must have BETA_CLIP=-15:-2.3026 in its ENV line;
+#       * every RELEASED run must have BETA_CLIP=-80:-2.3026 in its ENV line;
+#       * in every RELEASED run, min over both blocks and all logged steps of
+#         beta must be STRICTLY ABOVE -80.0 + 0.1004.  0.1004 is the measured
+#         ceiling on |dbeta| across one 100-meta-step logging interval, so a
+#         trace that never comes within 0.1004 of the floor cannot have
+#         touched it between two logged points either.
+#     If a RELEASED trace reaches the released floor, THE MANIPULATION FAILED:
+#     the batch is UNRESOLVED-MANIPULATION, not evidence, and no survive /
+#     collapse verdict may be reported.  If the traces cannot be read at all,
+#     the scorer FAILS CLOSED to UNRESOLVED-MANIPULATION-UNCHECKED.
+#
+#  R2 TRAINING FAILURE -- registered in advance because removing a floor can
+#     plausibly stop a run training, and that MUST NOT be scored as "the cliff
+#     collapsed".  A run is DEAD if epochs_done < 100, or plateau5/train5 is
+#     non-finite, or plateau5 <= 5.00 pp (CIFAR-100 chance is 1.00 pp; the
+#     lowest arm ever observed in this cell is cts1's scalar at 22.67 pp).
+#     Any DEAD run -> UNRESOLVED-DIVERGED.
+#
+#  R3 NOISE BLOW-UP -- the registered noise floor is measured in the CLAMPED
+#     regime and may not transfer.  If any of the four cells has a within-cell
+#     SD above 3*sigma_w = 2.6757 pp, the bars below do not apply:
+#     UNRESOLVED-NOISY.
+#
+#  R4 PREMISE -- cts2 exists only to test a cliff that cts1 measured.  If the
+#     in-batch CLAMPED cliff does not reproduce, D_C < 12.4170 pp (HALF of
+#     cts1's own 24.8340 pp; 17.05 SE), there is nothing to release the clamp
+#     on: UNRESOLVED-PREMISE.  cts1's arms may NOT be spliced in to rescue it.
+#
+#  THE VERDICT, only if G0 and R1-R4 all pass:
+#     SURVIVED   D_R >= 12.4170 pp   (half the clamped cliff; 17.05 SE)
+#                -> the 24.8 pp cliff is NOT an artefact of the clamp, and
+#                   CORRECTIONS 147's single-tensor finding is a statement
+#                   about STEPSIZE ALLOCATION.
+#     COLLAPSED  D_R <= 1.4564 pp    (2 SE of an arm difference; i.e. the
+#                   released cliff is not distinguishable from zero)
+#                -> the cliff was CLAMP-TURNOVER TIMING, and CORRECTIONS 147's
+#                   surviving claim must be RESTATED as a statement about the
+#                   CLAMPED REGIME ONLY: "at BETA_CLIP=-15:-2.3026, one tensor
+#                   carries the step", with the scope named in the sentence.
+#     PARTIAL    1.4564 < D_R < 12.4170 -> ATTENUATED; neither branch is
+#                claimed, the attenuation is reported as a magnitude, and
+#                CORRECTIONS 147 is scoped to the clamped regime as a
+#                precaution.
+#
+#  REPORTED ALONGSIDE, never instead of, the verdict:
+#     MODERATION  |INT| > 2*SE_INT = 2.0598 pp -> the clamp demonstrably
+#                 moderates the cut effect, whichever branch fired.
+#     FROZEN      a RELEASED run whose LAST logged beta is <= -20.0 in BOTH
+#                 blocks.  -20 is 5 nats (a factor e^5 = 148 in alpha) below
+#                 the standard floor and is unreachable under CLAMPED, so it
+#                 is a released-only signature.  If BOTH released cells are
+#                 FROZEN and the verdict is COLLAPSED, the verdict is reported
+#                 as COLLAPSED-BY-FREEZING: the cliff is gone because removing
+#                 the floor drove both arms' stepsizes to zero, which is a
+#                 statement about the floor as a FLOOR, not about turnover
+#                 timing, and it must be written that way.
+#
+#  MAY NOT BE CLAIMED FROM THIS BATCH: anything about group count m (every arm
+#  is m = 2); about any cut other than 49 and 50; about CAPTURE, scalar or
+#  layerwise (no anchors were run); about any other dataset, architecture,
+#  alpha0, meta-stepsize or optimiser pair; about which TENSOR carries the
+#  step (cts1 owns that, and cts2 re-scopes rather than re-derives it); or
+#  about any clamp setting other than the two run here.
+# =============================================================================
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cM1_clamp_release.sh")
+
+# ---- FROZEN REGISTRATION ----------------------------------------------------
+PREFIX = "cts2-"
+NET, DSET = "ResNet18_c100", "CIFAR100"
+MS, ALPHA0, AUG = "1e-3", "1e-6", "1"
+EPOCHS, BATCH, GAMMA = 100, 100, "1"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+SEEDS = (0, 1, 2)
+N_TENSORS = 62
+
+CLIP_C = "-15:-2.3026"          # the campaign standard
+CLIP_R = "-80:-2.3026"          # the released floor, same ceiling
+CLAMPS = ("C", "R")
+KGRID = (49, 50)
+ARMS = ("k49", "k50")
+CELLS = tuple((a, c) for c in CLAMPS for a in ARMS)
+N_RUNS = len(CELLS) * len(SEEDS)          # 12
+
+# ---- the arithmetic of the released floor, re-derived by --selftest ----------
+BETA_INIT = -13.815511          # float32 log(1e-6)
+FLOOR_C = -15.0
+FLOOR_R = -80.0
+CEIL = -2.3026
+META_STEPS = 50000              # 100 epochs x 500 iterations
+LOG_STRIDE = 100                # TensorBoard writes beta every 100 meta-steps
+STEP_BOUND = 0.1004             # measured max |dbeta| over one logging interval
+REACHABLE_MIN = -63.790127      # exact float32, 50000 monotone -1e-3 steps
+FLOOR_MARGIN = 16.209873        # REACHABLE_MIN - FLOOR_R
+FROZEN_BETA = -20.0
+
+# ---- the noise floor, re-derived from the corpus by --selftest ---------------
+SIGMA_W = 0.8919
+SIGMA_DF = 46
+SIGMA_CELLS = 23
+
+# ---- cts1's own in-batch cliff, re-derived from the corpus.  DESCRIPTIVE:
+# it enters only through PREMISE_BAR and SURVIVE_BAR, never as a comparator.
+CTS1_PREFIX = "cts1-"
+CTS1_K49 = 55.168667
+CTS1_K50 = 30.334667
+CTS1_CLIFF = 24.834000
+
+# ---- BARS.  --selftest quotes every one in SE units. ------------------------
+PREMISE_BAR = 12.4170     # R4: half of cts1's own in-batch cliff
+SURVIVE_BAR = 12.4170     # verdict: the released cliff keeps half the cliff
+COLLAPSE_BAR = 1.4564     # verdict: 2 * SE_ARM_DIFF
+INTERACTION_BAR = 2.0598  # 2 * SE_INT
+NOISY_BAR = 2.6757        # R3: 3 * SIGMA_W
+DEAD_BAR = 5.00           # R2: plateau5 at or below this = did not train
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+NAME_RE = re.compile(r"^cts2-(k49|k50)-([CR])-s([012])-(\d+)\.out$")
+
+
+# =============================================================================
+# the registered grid, spelled out so nothing is reconstructed at score time
+# =============================================================================
+def kspec(k):
+    return "[%d,%d]" % (k, N_TENSORS - k)
+
+
+def arm_spec(arm):
+    return kspec(int(arm[1:]))
+
+
+def clip_of(clamp):
+    return CLIP_C if clamp == "C" else CLIP_R
+
+
+def floor_of(clamp):
+    return FLOOR_C if clamp == "C" else FLOOR_R
+
+
+# =============================================================================
+# the corpus
+# =============================================================================
+def _csv_rows(path=CSV):
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if (r.get("superseded") or "0") != "1"]
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r):
+    """The cts1 cell, EXACTLY: the clamped regime this corpus was built in."""
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["meta_stepsize"] == MS and r["alpha0"] == ALPHA0
+            and r["gamma"] == GAMMA and r["augment"] == AUG
+            and r["beta_clip"] == CLIP_C and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH) and r["epochs_done"] == str(EPOCHS)
+            and r["collapsed"] == "0")
+
+
+M2_RE = re.compile(r"^\[\d+,\d+\]$")
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN (batch x granularity) SD of plateau5, m = 2 arms only."""
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not _in_cell(r) or not M2_RE.match(str(r["granularity"] or "")):
+            continue
+        try:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc
+
+
+def cts1_cliff_from_csv(path=CSV):
+    """cts1's own in-batch k49 - k50 on plateau5.  DESCRIPTIVE."""
+    g = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not str(r.get("run") or "").startswith(CTS1_PREFIX):
+            continue
+        try:
+            g[r["granularity"]].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    a, b = kspec(49), kspec(50)
+    if a not in g or b not in g:
+        return None
+    return (statistics.mean(g[a]), statistics.mean(g[b]),
+            statistics.mean(g[a]) - statistics.mean(g[b]), len(g[a]), len(g[b]))
+
+
+def premise_no_cts2_rows(path=CSV):
+    return sum(1 for r in _csv_rows(path)
+               if str(r.get("run") or "").startswith(PREFIX))
+
+
+# =============================================================================
+# the SE arithmetic.  Each contrast gets the SE of ITS OWN linear combination.
+# =============================================================================
+def se_of_combo(coefs, sigma=SIGMA_W, n=3):
+    """SE, in PERCENTAGE POINTS, of sum_i coefs[i]*mean(cell_i), n seeds each."""
+    return sigma * math.sqrt(sum(c * c for c in coefs) / float(n))
+
+
+SE_ARM_DIFF = se_of_combo((1, -1))        # D_C, D_R
+SE_INT = se_of_combo((1, -1, -1, 1))      # INT = D_C - D_R
+
+
+# =============================================================================
+# reading the runs.  Nothing is taken from the launcher's header.
+# =============================================================================
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    eff, seen = {}, collections.Counter()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("--"):
+            key = t[2:]
+            val = "1"
+            if i + 1 < len(toks) and not toks[i + 1].startswith("--"):
+                val = toks[i + 1]
+                i += 1
+            seen[key] += 1
+            eff[key] = val
+        i += 1
+    return eff, sorted(k for k, c in seen.items() if c > 1)
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    test, train = {}, {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    test[int(m.group(1))] = float(m.group(2))
+                m = EPTR_RE.search(line)
+                if m:
+                    train[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "envline": env or "",
+            "test": test, "train": train, "path": path}
+
+
+def tail5(series, budget=EPOCHS, w=5):
+    """PRIMARY window.  Mean of the LAST 5 epochs; train.py prints 0-indexed."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect(runsdir):
+    """Every cts2 .out file, with its cell MEASURED from its own ARGS and ENV."""
+    recs = []
+    for p in sorted(glob.glob(os.path.join(runsdir, PREFIX + "*.out"))):
+        base = os.path.basename(p)
+        m = NAME_RE.match(base)
+        r = read_out(p)
+        if r is None:
+            recs.append({"path": p, "base": base, "bad": "no ARGS line"})
+            continue
+        r["base"] = base
+        r["job_id"] = m.group(4) if m else None
+        r["name_arm"] = m.group(1) if m else None
+        r["name_clamp"] = m.group(2) if m else None
+        r["name_seed"] = int(m.group(3)) if m else None
+        # arm and clamp MEASURED, not read off the filename
+        spec = r["args"].get("stepsize-groups")
+        r["meas_arm"] = None
+        for a in ARMS:
+            if spec == arm_spec(a):
+                r["meas_arm"] = a
+        clip = r["env"].get("BETA_CLIP")
+        r["meas_clamp"] = {CLIP_C: "C", CLIP_R: "R"}.get(clip)
+        r["clip"] = clip
+        try:
+            r["seed"] = int(r["args"].get("seed"))
+        except (TypeError, ValueError):
+            r["seed"] = None
+        r["p5"] = tail5(r["test"])
+        r["t5"] = tail5(r["train"])
+        r["n_ep"] = len(r["test"])
+        recs.append(r)
+    return recs
+
+
+# =============================================================================
+# the manipulation check.  beta comes from the runs' OWN TensorBoard traces.
+# =============================================================================
+def beta_from_tb(tbroot):
+    """{run_name: {tag: [(step, value), ...]}} or None if unreadable."""
+    try:
+        from tensorboard.backend.event_processing.event_accumulator \
+            import EventAccumulator
+    except Exception:
+        return None
+    if not os.path.isdir(tbroot):
+        return None
+    out = {}
+    for d in sorted(os.listdir(tbroot)):
+        if not d.startswith(PREFIX):
+            continue
+        p = os.path.join(tbroot, d)
+        if not os.path.isdir(p):
+            continue
+        try:
+            ea = EventAccumulator(p, size_guidance={"scalars": 0})
+            ea.Reload()
+            rec = {}
+            for t in ea.Tags()["scalars"]:
+                if "beta" not in t.lower():
+                    continue
+                rec[t] = [(int(e.step), float(e.value)) for e in ea.Scalars(t)]
+            if rec:
+                out[d] = rec
+        except Exception:
+            continue
+    return out or None
+
+
+def beta_from_json(path):
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except Exception:
+        return None
+    out = {}
+    for run, tags in raw.items():
+        if not str(run).startswith(PREFIX):
+            continue
+        out[run] = dict((t, [(int(s), float(v)) for s, v in pts])
+                        for t, pts in tags.items() if "beta" in t.lower())
+    return out or None
+
+
+def beta_summary(trace):
+    """(min, max, last_min_over_blocks, npts, nblocks) over every beta tag."""
+    vals, lasts, npts = [], [], 0
+    for _t, pts in trace.items():
+        if not pts:
+            continue
+        vals.extend(v for _s, v in pts)
+        lasts.append(pts[-1][1])
+        npts = max(npts, len(pts))
+    if not vals:
+        return None
+    return (min(vals), max(vals), max(lasts), npts, len(lasts))
+
+
+# =============================================================================
+# reporting helpers
+# =============================================================================
+class Report(object):
+    def __init__(self):
+        self.fail = 0
+        self.lines = []
+
+    def ok(self, label, cond, extra=""):
+        tag = "PASS" if cond else "FAIL"
+        if not cond:
+            self.fail += 1
+        print("  [%s] %-62s %s" % (tag, label, extra))
+        return bool(cond)
+
+    def note(self, s):
+        print("       %s" % s)
+
+
+def fmt(x, w=9, p=4):
+    return ("%*.*f" % (w, p, x)) if x is not None and x == x else " " * (w - 2) + "--"
+
+
+# =============================================================================
+# SELFTEST -- must pass BEFORE any cts2 run exists
+# =============================================================================
+def selftest():
+    import numpy as _np
+    R = Report()
+    print("=" * 78)
+    print("cM1_cts2_score.py --selftest")
+    print("=" * 78)
+
+    print("\n-- RULE 21 premise ---------------------------------------------")
+    n = premise_no_cts2_rows()
+    R.ok("no cts2- row exists in the corpus yet", n == 0, "%d found" % n)
+
+    print("\n-- the released floor, re-derived by arithmetic -----------------")
+    b0 = float(_np.float32(_np.log(_np.float32(1e-6))))
+    R.ok("beta init = float32 log(1e-6)", abs(b0 - BETA_INIT) < 5e-6, "%.6f" % b0)
+    R.ok("the standard floor is only %.6f nats below init"
+         % (b0 - FLOOR_C), abs((b0 - FLOOR_C) - 1.184489) < 1e-4,
+         "%.6f" % (b0 - FLOOR_C))
+    b = _np.float32(b0)
+    ms = _np.float32(1e-3)
+    for _ in range(META_STEPS):
+        b = _np.float32(b - ms)
+    R.ok("float32 worst case after %d monotone -1e-3 steps" % META_STEPS,
+         abs(float(b) - REACHABLE_MIN) < 5e-5, "%.6f" % float(b))
+    R.ok("the released floor is strictly unreachable",
+         FLOOR_R < REACHABLE_MIN, "%.1f < %.6f" % (FLOOR_R, REACHABLE_MIN))
+    R.ok("margin REACHABLE_MIN - FLOOR_R",
+         abs((REACHABLE_MIN - FLOOR_R) - FLOOR_MARGIN) < 1e-5,
+         "%.6f nats = %d meta-steps that do not exist"
+         % (REACHABLE_MIN - FLOOR_R, int((REACHABLE_MIN - FLOOR_R) / 1e-3)))
+    R.ok("one logging interval cannot move beta by more than STEP_BOUND",
+         STEP_BOUND > LOG_STRIDE * 1e-3, "%.4f > %.4f" % (STEP_BOUND, LOG_STRIDE * 1e-3))
+    R.ok("alpha at the reachable minimum is a normal float32",
+         math.exp(REACHABLE_MIN) > 1.18e-38, "exp(%.3f) = %.3e"
+         % (REACHABLE_MIN, math.exp(REACHABLE_MIN)))
+    R.ok("FROZEN_BETA is unreachable under the CLAMPED floor",
+         FROZEN_BETA < FLOOR_C, "%.1f < %.1f (alpha ratio e^%.0f = %.0fx)"
+         % (FROZEN_BETA, FLOOR_C, FLOOR_C - FROZEN_BETA,
+            math.exp(FLOOR_C - FROZEN_BETA)))
+
+    print("\n-- the noise floor, re-derived from the corpus ------------------")
+    sd, df, nc = noise_floor_from_csv()
+    R.ok("SIGMA_W matches the CSV", abs(sd - SIGMA_W) < 0.005,
+         "%.4f pp over df %d, %d cells" % (sd, df, nc))
+    R.ok("SIGMA_DF matches the CSV", df == SIGMA_DF, "%d" % df)
+    R.ok("SIGMA_CELLS matches the CSV", nc == SIGMA_CELLS, "%d" % nc)
+    R.note("SE(arm difference, 3 seeds) = sigma*sqrt(2/3) = %.4f pp" % SE_ARM_DIFF)
+    R.note("SE(interaction, 4 cells)    = sigma*sqrt(4/3) = %.4f pp" % SE_INT)
+
+    print("\n-- cts1's own cliff, re-derived from the corpus -----------------")
+    c = cts1_cliff_from_csv()
+    R.ok("cts1's k49/k50 rows are present", c is not None and c[3] == 3 and c[4] == 3,
+         "n=%s/%s" % ((c[3], c[4]) if c else ("-", "-")))
+    if c:
+        R.ok("CTS1_K49 matches the CSV", abs(c[0] - CTS1_K49) < 0.005, "%.4f pp" % c[0])
+        R.ok("CTS1_K50 matches the CSV", abs(c[1] - CTS1_K50) < 0.005, "%.4f pp" % c[1])
+        R.ok("CTS1_CLIFF matches the CSV", abs(c[2] - CTS1_CLIFF) < 0.005,
+             "%.4f pp = %.2f SE" % (c[2], c[2] / SE_ARM_DIFF))
+
+    print("\n-- every bar, quoted in SE units --------------------------------")
+    R.ok("PREMISE_BAR is half of cts1's own cliff",
+         abs(PREMISE_BAR - CTS1_CLIFF / 2.0) < 0.005,
+         "%.4f pp = %.2f SE" % (PREMISE_BAR, PREMISE_BAR / SE_ARM_DIFF))
+    R.ok("SURVIVE_BAR equals PREMISE_BAR", SURVIVE_BAR == PREMISE_BAR,
+         "%.4f pp = %.2f SE" % (SURVIVE_BAR, SURVIVE_BAR / SE_ARM_DIFF))
+    R.ok("COLLAPSE_BAR is 2 SE of an arm difference",
+         abs(COLLAPSE_BAR - 2 * SE_ARM_DIFF) < 0.005,
+         "%.4f pp = %.2f SE" % (COLLAPSE_BAR, COLLAPSE_BAR / SE_ARM_DIFF))
+    R.ok("INTERACTION_BAR is 2 SE of the interaction",
+         abs(INTERACTION_BAR - 2 * SE_INT) < 0.005,
+         "%.4f pp = %.2f SE_INT" % (INTERACTION_BAR, INTERACTION_BAR / SE_INT))
+    R.ok("NOISY_BAR is 3 sigma_w", abs(NOISY_BAR - 3 * SIGMA_W) < 0.005,
+         "%.4f pp" % NOISY_BAR)
+    R.ok("COLLAPSE_BAR < SURVIVE_BAR leaves a PARTIAL band",
+         COLLAPSE_BAR < SURVIVE_BAR,
+         "PARTIAL = (%.4f, %.4f) pp" % (COLLAPSE_BAR, SURVIVE_BAR))
+    R.ok("DEAD_BAR is far below anything observed in this cell",
+         DEAD_BAR < 20.0, "%.2f pp vs cts1's lowest arm 22.67 pp" % DEAD_BAR)
+
+    print("\n-- the design, and the launcher's own text ----------------------")
+    R.ok("2 cuts x 2 clamps x 3 seeds", N_RUNS == 12, "%d runs" % N_RUNS)
+    R.ok("the two specs are the registered ones",
+         arm_spec("k49") == "[49,13]" and arm_spec("k50") == "[50,12]",
+         "%s %s" % (arm_spec("k49"), arm_spec("k50")))
+    R.ok("the two clamps share a ceiling and differ only in the floor",
+         CLIP_C.split(":")[1] == CLIP_R.split(":")[1]
+         and CLIP_C.split(":")[0] != CLIP_R.split(":")[0],
+         "%s vs %s" % (CLIP_C, CLIP_R))
+    try:
+        sh = open(BATCH_SH).read()
+    except IOError:
+        sh = ""
+    R.ok("the launcher script is on disk", bool(sh), BATCH_SH)
+    if sh:
+        for lit in ('CLIP_C="%s"' % CLIP_C, 'CLIP_R="%s"' % CLIP_R,
+                    "G_K49='[49,13]'", "G_K50='[50,12]'",
+                    'SEEDS="0 1 2"', "PROBE=0", "MST=%s" % MS,
+                    "ALPHA0=%s" % ALPHA0, "EPOCHS=%d" % EPOCHS,
+                    "BATCH=%d" % BATCH, "GAMMA=%s" % GAMMA, "AUG=%s" % AUG,
+                    "DSET=%s" % DSET, "NET=%s" % NET, "NTENS=%d" % N_TENSORS):
+            R.ok("launcher contains  %s" % lit, lit in sh)
+        R.ok("the launcher names THIS scorer",
+             os.path.basename(__file__) in sh)
+        R.ok("the launcher names ONLY this account's workspace",
+             "/data1" not in sh and "/cluster/account_b/metaopt" in sh)
+        R.ok("every guard and scancel line is filtered on the cts2- prefix",
+             "cts2-" in sh and "^cts1-" not in sh and "cpk1-" not in sh)
+        R.ok("the launcher declares the two clamp levels and nothing else",
+             sh.count("BETA_CLIP=$CLIP") == 1 and 'CLAMPS="C R"' in sh)
+
+    print("\n-- argparse last-wins, on a synthetic line ----------------------")
+    eff, dup = parse_args_line("--alg-meta RMSProp --seed 0 --alg-meta Lion")
+    R.ok("last occurrence wins", eff["alg-meta"] == "Lion", eff["alg-meta"])
+    R.ok("the repeat is reported", dup == ["alg-meta"], str(dup))
+
+    print("\n-- the verdict machine, on synthetic cells ----------------------")
+    def _v(dc, dr):
+        return verdict(dc, dr)[0]
+    R.ok("a reproduced-and-surviving cliff scores SURVIVED",
+         _v(24.8, 24.0) == "SURVIVED")
+    R.ok("a reproduced-and-vanished cliff scores COLLAPSED",
+         _v(24.8, 0.5) == "COLLAPSED")
+    R.ok("a half-attenuated cliff scores PARTIAL",
+         _v(24.8, 6.0) == "PARTIAL")
+    R.ok("a cliff that did not reproduce scores UNRESOLVED-PREMISE",
+         _v(9.0, 0.2) == "UNRESOLVED-PREMISE")
+    R.ok("the premise gate fires BEFORE the collapse branch",
+         _v(9.0, 0.0) != "COLLAPSED")
+
+    print("\n" + "=" * 78)
+    print("SELFTEST %s   (%d failures)" % ("PASSED" if R.fail == 0 else "FAILED", R.fail))
+    print("=" * 78)
+    return 0 if R.fail == 0 else 1
+
+
+def verdict(dc, dr):
+    """The FROZEN decision rule.  Premise first, then the three branches."""
+    if dc is None or dr is None:
+        return "UNRESOLVED-INCOMPLETE", "a cell mean is missing"
+    if dc < PREMISE_BAR:
+        return ("UNRESOLVED-PREMISE",
+                "the in-batch CLAMPED cliff D_C = %.4f pp is below the premise "
+                "bar %.4f pp; there is nothing to release the clamp on, and "
+                "cts1's arms may not be spliced in" % (dc, PREMISE_BAR))
+    if dr >= SURVIVE_BAR:
+        return ("SURVIVED",
+                "D_R = %.4f pp >= %.4f pp: the cliff is NOT an artefact of the "
+                "clamp, and CORRECTIONS 147 is a statement about stepsize "
+                "allocation" % (dr, SURVIVE_BAR))
+    if dr <= COLLAPSE_BAR:
+        return ("COLLAPSED",
+                "D_R = %.4f pp <= %.4f pp (2 SE): the cliff was clamp-turnover "
+                "timing, and CORRECTIONS 147's surviving claim must be "
+                "restated as holding in the CLAMPED regime only"
+                % (dr, COLLAPSE_BAR))
+    return ("PARTIAL",
+            "D_R = %.4f pp lies in the registered PARTIAL band (%.4f, %.4f) pp: "
+            "attenuated, neither branch claimed, and CORRECTIONS 147 is scoped "
+            "to the clamped regime as a precaution"
+            % (dr, COLLAPSE_BAR, SURVIVE_BAR))
+
+
+# =============================================================================
+# SCORE
+# =============================================================================
+def score(runsdir, tbroot, betajson):
+    R = Report()
+    print("=" * 78)
+    print("cts2 -- RELEASE THE CLAMP.  registered scorer, run unedited.")
+    print("  runs   %s" % runsdir)
+    print("  TB     %s" % tbroot)
+    print("=" * 78)
+
+    recs = collect(runsdir)
+    print("\n-- G0 PROVENANCE ------------------------------------------------")
+    R.ok("%d cts2 .out files" % N_RUNS, len(recs) == N_RUNS, "%d found" % len(recs))
+    bad = [r for r in recs if r.get("bad")]
+    R.ok("every .out has an ARGS line", not bad,
+         ", ".join(r["base"] for r in bad) if bad else "")
+    good = [r for r in recs if not r.get("bad")]
+    dups = [r["base"] for r in good if r["dup"]]
+    R.ok("no repeated flag on any ARGS line (RULE 20)", not dups, ", ".join(dups))
+    jids = set(r["job_id"] for r in good if r["job_id"])
+    R.ok("%d distinct job ids" % N_RUNS, len(jids) == N_RUNS, "%d" % len(jids))
+    mism = [r["base"] for r in good
+            if r["meas_arm"] != r["name_arm"] or r["meas_clamp"] != r["name_clamp"]
+            or r["seed"] != r["name_seed"]]
+    R.ok("run NAME agrees with its own ARGS and ENV", not mism, ", ".join(mism))
+    wrongcfg = []
+    for r in good:
+        a = r["args"]
+        for k, want in (("dataset", DSET), ("NN-name", NET), ("alg-base", BASE_ALG),
+                        ("alg-meta", META_ALG), ("gamma", GAMMA)):
+            if a.get(k) != want:
+                wrongcfg.append("%s %s=%s" % (r["base"], k, a.get(k)))
+        for k, want in (("meta-stepsize", MS), ("alpha0", ALPHA0),
+                        ("num-epochs", str(EPOCHS)), ("batch-size", str(BATCH))):
+            if norm_num(a.get(k)) != norm_num(want):
+                wrongcfg.append("%s %s=%s" % (r["base"], k, a.get(k)))
+        if r["env"].get("AUGMENT") != AUG:
+            wrongcfg.append("%s AUGMENT=%s" % (r["base"], r["env"].get("AUGMENT")))
+        if r["env"].get("PROBE", "0") not in ("0", "none"):
+            wrongcfg.append("%s PROBE=%s" % (r["base"], r["env"].get("PROBE")))
+        if (r["env"].get("HIER") or "none") != "none":
+            wrongcfg.append("%s HIER=%s" % (r["base"], r["env"].get("HIER")))
+    R.ok("every run's own ARGS/ENV matches the registered cell", not wrongcfg,
+         "; ".join(wrongcfg[:4]))
+    got = collections.Counter((r["meas_arm"], r["meas_clamp"]) for r in good)
+    R.ok("all four cells have 3 seeds",
+         all(got.get(c) == 3 for c in CELLS), str(dict(got)))
+    if R.fail:
+        print("\nVOID -- G0 failed.  No number below may be reported.")
+        return 2
+
+    print("\n-- R1 MANIPULATION CHECK ----------------------------------------")
+    tb = beta_from_json(betajson) if betajson else beta_from_tb(tbroot)
+    if tb is None:
+        print("  [FAIL] beta traces could not be read (need tensorboard, or "
+              "--beta-json)")
+        print("\nUNRESOLVED-MANIPULATION-UNCHECKED -- the scorer fails closed.")
+        return 3
+    R.ok("a beta trace for every run", len(tb) == N_RUNS, "%d traces" % len(tb))
+    manip_fail, frozen = [], []
+    print("       %-16s %-2s %9s %9s %9s %6s %6s" %
+          ("run", "cl", "min beta", "max beta", "last min", "npts", "blocks"))
+    for r in sorted(good, key=lambda x: x["base"]):
+        run = r["base"].rsplit("-", 1)[0]
+        tr = tb.get(run)
+        if not tr:
+            manip_fail.append("%s: no trace" % run)
+            continue
+        s = beta_summary(tr)
+        if s is None:
+            manip_fail.append("%s: empty trace" % run)
+            continue
+        mn, mx, lastmin, npts, nb = s
+        print("       %-16s %-2s %9.4f %9.4f %9.4f %6d %6d"
+              % (run, r["meas_clamp"], mn, mx, lastmin, npts, nb))
+        fl = floor_of(r["meas_clamp"])
+        if nb != 2:
+            manip_fail.append("%s: %d beta blocks, expected 2" % (run, nb))
+        if r["meas_clamp"] == "R":
+            if mn <= fl + STEP_BOUND:
+                manip_fail.append("%s: beta reached %.4f, within %.4f of the "
+                                  "released floor %.1f" % (run, mn, STEP_BOUND, fl))
+            if lastmin <= FROZEN_BETA:
+                frozen.append(run)
+        else:
+            if mn > fl + STEP_BOUND:
+                manip_fail.append("%s: CLAMPED run never approaches its floor "
+                                  "(min %.4f)" % (run, mn))
+        if mx >= CEIL - STEP_BOUND:
+            manip_fail.append("%s: beta reached the CEILING (%.4f)" % (run, mx))
+    R.ok("every RELEASED run's floor was non-binding, and every CLAMPED run's "
+         "was not", not manip_fail, "; ".join(manip_fail[:3]))
+    if manip_fail:
+        print("\nUNRESOLVED-MANIPULATION -- the manipulation did not happen as "
+              "registered.  This batch is NOT evidence about the cliff, and no "
+              "survive/collapse verdict may be reported.")
+        return 3
+    if frozen:
+        print("       FROZEN (last beta <= %.1f in both blocks): %s"
+              % (FROZEN_BETA, ", ".join(sorted(frozen))))
+
+    print("\n-- R2 TRAINING FAILURE ------------------------------------------")
+    dead = []
+    for r in good:
+        if r["n_ep"] < EPOCHS:
+            dead.append("%s: %d/%d epochs" % (r["base"], r["n_ep"], EPOCHS))
+        elif r["p5"] is None or r["p5"] != r["p5"]:
+            dead.append("%s: no plateau5" % r["base"])
+        elif r["p5"] <= DEAD_BAR:
+            dead.append("%s: plateau5 %.4f <= %.2f" % (r["base"], r["p5"], DEAD_BAR))
+    R.ok("no run failed to train", not dead, "; ".join(dead[:3]))
+    if dead:
+        print("\nUNRESOLVED-DIVERGED -- at least one run did not train.  This is "
+              "a REGISTERED outcome and is NOT scored as 'the cliff collapsed'.")
+        return 4
+
+    cell = collections.defaultdict(list)
+    tcell = collections.defaultdict(list)
+    for r in good:
+        cell[(r["meas_arm"], r["meas_clamp"])].append(r["p5"])
+        if r["t5"] is not None:
+            tcell[(r["meas_arm"], r["meas_clamp"])].append(r["t5"])
+
+    print("\n-- THE ARMS (plateau5 PRIMARY; train5 reported alongside) --------")
+    print("       %-5s %-9s %-9s %10s %8s %10s %8s"
+          % ("cut", "spec", "clamp", "plateau5", "sd", "train5", "sd"))
+    for c in CELLS:
+        v, t = cell[c], tcell[c]
+        print("       %-5s %-9s %-9s %10.4f %8.4f %10s %8s"
+              % (c[0], arm_spec(c[0]), "CLAMPED" if c[1] == "C" else "RELEASED",
+                 statistics.mean(v), statistics.stdev(v) if len(v) > 1 else 0.0,
+                 "%10.4f" % statistics.mean(t) if t else "        --",
+                 "%8.4f" % (statistics.stdev(t) if len(t) > 1 else 0.0) if t else "      --"))
+
+    print("\n-- R3 NOISE BLOW-UP ---------------------------------------------")
+    noisy = ["%s-%s sd %.4f" % (c[0], c[1], statistics.stdev(cell[c]))
+             for c in CELLS if statistics.stdev(cell[c]) > NOISY_BAR]
+    R.ok("no cell's SD exceeds 3 sigma_w = %.4f pp" % NOISY_BAR, not noisy,
+         "; ".join(noisy))
+    if noisy:
+        print("\nUNRESOLVED-NOISY -- the registered noise floor does not transfer "
+              "to this batch, so the bars do not apply.")
+        return 5
+
+    dc = statistics.mean(cell[("k49", "C")]) - statistics.mean(cell[("k50", "C")])
+    dr = statistics.mean(cell[("k49", "R")]) - statistics.mean(cell[("k50", "R")])
+    tdc = (statistics.mean(tcell[("k49", "C")]) - statistics.mean(tcell[("k50", "C")])
+           if tcell[("k49", "C")] and tcell[("k50", "C")] else None)
+    tdr = (statistics.mean(tcell[("k49", "R")]) - statistics.mean(tcell[("k50", "R")])
+           if tcell[("k49", "R")] and tcell[("k50", "R")] else None)
+    it = dc - dr
+
+    print("\n-- THE CONTRASTS ------------------------------------------------")
+    print("       D_C  (k49 - k50, CLAMPED )  %9.4f pp  %7.2f SE   train %s"
+          % (dc, dc / SE_ARM_DIFF, fmt(tdc)))
+    print("       D_R  (k49 - k50, RELEASED)  %9.4f pp  %7.2f SE   train %s"
+          % (dr, dr / SE_ARM_DIFF, fmt(tdr)))
+    print("       INT  (D_C - D_R)            %9.4f pp  %7.2f SE_INT"
+          % (it, it / SE_INT))
+    print("       cts1's own in-batch cliff   %9.4f pp  (DESCRIPTIVE, a "
+          "different batch)" % CTS1_CLIFF)
+
+    print("\n-- R4 PREMISE, THEN THE VERDICT ---------------------------------")
+    v, why = verdict(dc, dr)
+    if v == "COLLAPSED" and len(frozen) >= len(SEEDS) * 2:
+        v = "COLLAPSED-BY-FREEZING"
+        why += ("; and BOTH released cells are FROZEN, so the cliff is gone "
+                "because releasing the floor drove both arms' stepsizes to "
+                "zero -- a statement about the floor AS A FLOOR, not about "
+                "turnover timing, and it must be written that way")
+    print("       VERDICT  %s" % v)
+    print("       %s" % why)
+    if abs(it) > INTERACTION_BAR:
+        print("       MODERATION: |INT| = %.4f pp > %.4f pp -- the clamp "
+              "demonstrably moderates the cut effect." % (abs(it), INTERACTION_BAR))
+    else:
+        print("       NO MODERATION at 2 SE_INT: |INT| = %.4f pp <= %.4f pp."
+              % (abs(it), INTERACTION_BAR))
+    if frozen:
+        print("       FROZEN released runs: %d of %d." % (len(frozen), len(SEEDS) * 2))
+    print("\n       OUT OF SCOPE by registration: CAPTURE, scalar, layerwise, "
+          "any m != 2,\n       any cut but 49/50, any other clamp setting, and "
+          "which tensor carries\n       the step (cts1 owns that; cts2 re-scopes "
+          "it, it does not re-derive it).")
+    print("=" * 78)
+    return 0
+
+
+def dump_beta(tbroot, out):
+    tb = beta_from_tb(tbroot)
+    if tb is None:
+        print("could not read %s" % tbroot)
+        return 1
+    with open(out, "w") as fh:
+        json.dump(tb, fh)
+    print("wrote %d traces to %s" % (len(tb), out))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--tb", default="/cluster/account_b/metaopt/runs/cts2/Tensorboard_outputs")
+    ap.add_argument("--beta-json", default=None,
+                    help="read beta traces from a JSON written by --dump-beta")
+    ap.add_argument("--dump-beta", default=None,
+                    help="write the TensorBoard beta traces to this JSON and exit")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if a.dump_beta:
+        return dump_beta(a.tb, a.dump_beta)
+    return score(a.runs, a.tb, a.beta_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

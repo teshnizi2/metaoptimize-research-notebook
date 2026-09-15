@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cTD1_tensor_dominate_score.py -- H-DOMINATE AT THE TENSOR LEVEL, PRE-REGISTERED
+# AGAINST A BATCH THAT DOES NOT YET EXIST (`ctd1`: scalar x3 + layerwise x3 at
+# the standard CIFAR-100 cell, PROBE=100, PROBE_TENSOR=1).
+#
+# RULE 21, THE NORMAL CLAIM: this file is git-committed BEFORE any `ctd1` run
+# exists; the CORRECTIONS entry states the commit time, the earliest sacct
+# Submit and the margin.  RULE 16: run UNEDITED; if it is broken it is FROZEN
+# and a successor is registered.
+#
+# THE DOCUMENTED INVOCATION (no second argument to forget):
+#     python3 analysis/cTD1_tensor_dominate_score.py <runsdir>
+#     python3 analysis/cTD1_tensor_dominate_score.py --selftest
+#
+# =============================================================================
+# THE HYPOTHESIS, STATED BEFORE ANY NUMBER IT PRODUCES IS READ
+# =============================================================================
+#   H-DOMINATE (tensor level).  In the scalar arm the sign the single beta
+#   follows is carried by a MINORITY of large-magnitude per-tensor terms whose
+#   sign is opposite to the tensor-count majority's, that minority votes DOWN
+#   persistently, and its members are the layer4 convolutions and the
+#   classifier weight.  That is offered as WHY beta descends to the -15 floor
+#   and pins there.
+#
+# =============================================================================
+# THREE PLACES THE CYCLE BRIEF IS WRONG, READ OFF THE LIVE SOURCE (sha256
+# 9abd4318... at registration).  REGISTERED HERE SO NO CHOICE IS MADE AFTER
+# THE NUMBERS.
+# =============================================================================
+#   (1) THE BRIEF SAYS BETA MOVES BY -ms*sign(sum_i <h_i,g_i>).  IT DOES NOT.
+#       Lion_meta_update, verbatim:
+#           self.beta[i] = (1-ms*wd)*self.beta[i]
+#                          - ms * torch.sign(b2*self.momentum_meta[i] + (1-b2)*HtT_gradft[i])
+#           self.momentum_meta[i] = mp*self.momentum_meta[i] + (1-mp)*HtT_gradft[i]
+#       with b2 = 0.9 and mp = 0.99 on every command line of this cell.  The
+#       sign the harness consumes is that of L = 0.9*m + 0.1*z, with m a
+#       zero-initialised EMA of z (time constant ~100 meta-steps).  Both m and
+#       z are LINEAR in the 62 per-tensor terms, so L decomposes EXACTLY:
+#           z = sum_i z_i;  m = sum_i m_i  (m_i the same EMA applied to z_i);
+#           L = sum_i L_i;  L_i = 0.9*m_i + 0.1*z_i.
+#       CONSEQUENCE, REGISTERED: the PRIMARY per-tensor "vote" is L_i, the
+#       term that actually enters the sign the harness takes.  The brief's
+#       instantaneous z_i is the SECONDARY, printed in full on the same ladder.
+#       If they disagree, the PRIMARY decides: a z-level domination that the
+#       momentum averages away cannot be what pins beta.
+#   (2) THE BRIEF SAYS 62 PER-TENSOR TERMS "AT EACH PROBE RECORD" SUFFICE.
+#       They suffice for z_i but not for m_i: an EMA cannot be reconstructed
+#       from every-100th-step samples.  patches/patch_probe_tensor.py therefore
+#       keeps the per-tensor EMA at EVERY meta-step (float32, the harness's own
+#       coefficients) and logs, at each record, z_tensor, m_tensor AND the
+#       harness's own pre-update z, momentum_meta and beta, so that
+#       sum_i z_i == z and sum_i m_i == momentum_meta are CHECKED, not assumed,
+#       at every record (section A), and the applied step -(beta-beta_pre)/ms
+#       is checked against sign(L) (section A).
+#   (3) THE BRIEF CALLS frac_neg AN ELEMENT-LEVEL MAJORITY STATISTIC.  For the
+#       scalar arm it is not: _probe computes it on zall = z[0].reshape(-1),
+#       and for scalar z[0] is the already-reduced sum, so n_tot = 1, t_n = [1]
+#       and frac_neg is 1.0 iff z < 0 (confirmed on cru1's own records).
+#       Track A's problem, recorded here because this scorer USES it: on the
+#       scalar arm frac_neg == 1 must agree with sign(z_agg) < 0 at every
+#       record, a free cross-check of the capture (section A).
+#
+# =============================================================================
+# DISCLOSURE -- WHAT WAS VISIBLE WHILE THIS WAS DESIGNED.  THIS IS AN AUDIT
+# WITH A REGISTERED BAR, NOT A BLIND TEST.
+# =============================================================================
+#   * results/crn1_reduction_probe/REPORT.txt (CORRECTIONS 169.3): per-step
+#     per-tensor <h_i,g_i> along the TRUE scalar trajectory for 6,000 steps
+#     (seed 0, 12 epochs, the first 12 % of the horizon).  It reports, for
+#     the scalar group: a pure sign-vote (one vote per tensor) differs from
+#     the unnormalised sum on 0.0008 of steps (last half 0.0017); sign(z)
+#     equals the sign of the largest |term| on 0.9968 of steps; that largest
+#     term is linear.weight 95 % / layer4.1.conv2 4 % / layer4.0.conv2 1 %
+#     and is 0.38 of sum|t| on average; the terms are unanimous on 0.0002 of
+#     steps.  That is an instantaneous-z, tensor-count statistic on the early
+#     phase -- close to this file's SECONDARY R_T on 12 % of the horizon --
+#     and it is SMALL.  So prediction (1) is already disfavoured for the early
+#     phase and the author knew it.  What it does NOT cover: the PRIMARY (L)
+#     statistic, the remaining 88 % of the horizon, and in particular the
+#     PINNED phase where H-DOMINATE's "votes DOWN persistently" lives.  The
+#     raw crn1_stage/*.terms.npy files were NOT opened and no statistic in
+#     this file was computed on them before it was committed.
+#   * CORRECTIONS 177.5: under LAYERWISE dynamics at the frozen rungs the
+#     layer4 convs and linear.weight ascend while the bn2 scales descend, and
+#     the scalar beta descends.  179.8 (descriptive, on layerwise windows at
+#     the standard cell): linear.weight carries 49 % of sum|W_i|, three
+#     layer3 BN scales 7/6/3.5 %, no conv above 1.4 %.
+#   * The scalar arm's beta trajectory at this cell (cru1 s15-17): descends
+#     from -13.815 and pins at -15 (cY2/174).  Its accuracy (22.8 pp) and the
+#     n = 29 corpus cell (section H re-derives it).
+#   * NOT seen: any per-tensor term under scalar dynamics beyond step 6,000;
+#     any per-tensor EMA; anything at seeds 18-20, which have never been run
+#     on ResNet18_c100.
+#
+# =============================================================================
+# THE BATCH (bin/cTD1_tensor_dominate.sh) -- 6 jobs, ONE submission, ~5 GPU-h
+# =============================================================================
+#   PRIMARY  `scalar`    x seeds {18,19,20}   the arm the hypothesis is about
+#   COMPANION `layerwise` x seeds {18,19,20}  same cell, same logging.  WHY:
+#     177 showed per-tensor signs under layerwise dynamics are NOT those under
+#     scalar dynamics, so prediction (4) needs both in ONE batch at matched
+#     seed and step, and the companion validates the capture where the
+#     harness's own z IS per-tensor (z_tensor == z[0], m_tensor ==
+#     momentum_meta[0], elementwise).  2.5 GPU-h buys a within-batch
+#     measurement in place of a cross-batch inference.
+#   Cell: CIFAR-100 / ResNet18_c100 / SGDm(0.99, wd 0.1) + Lion(0.99, 0.9,
+#   wd 0) / gamma 1 / AUGMENT=1 / BETA_CLIP=-15:-2.3026 / batch 100 / 100 ep /
+#   ms 1e-3 / alpha0 1e-6 / PROBE=100 / PROBE_TENSOR=1.  50,000 meta-steps,
+#   500 records per run at steps 0,100,...,49900.
+#
+# =============================================================================
+# THE QUANTITIES, PER RECORD (scalar arm), FOR X in {L (PRIMARY), z (SECONDARY)}
+# =============================================================================
+#   X_i           the 62 per-tensor terms (L_i = b2*m_i + (1-b2)*z_i from the
+#                 record's own m_tensor, z_tensor and coefficients)
+#   s_agg         sign of the HARNESS's own aggregate: sign(b2*mom_pre +
+#                 (1-b2)*z_agg) for L, sign(z_agg) for z.  sign(sum_i X_i) is
+#                 checked against it (section A) and a record where they
+#                 differ is INDETERMINATE and excluded, with its count printed.
+#   s_maj         sign(#{X_i > 0} - #{X_i < 0}); a tie is INDETERMINATE.
+#   DISAGREE      s_agg != s_maj, both non-zero.
+#   R_T           #DISAGREE / #determinate, POOLED over the three scalar seeds
+#                 (and printed per seed).
+#   CARRYING SET  tensors ranked by |X_i| descending; the shortest prefix
+#                 whose partial sum has sign s_agg AND whose |partial sum|
+#                 exceeds the sum of |X_i| over the remaining tensors -- the
+#                 smallest set that fixes the sign whatever the rest do.
+#   DOWN          among DISAGREE records, the fraction with s_agg < 0.
+#   NAMED-CARRIED among DISAGREE records, the fraction whose carrying set is a
+#                 subset of NAMED = {layer4.0.conv2.weight,
+#                 layer4.1.conv2.weight, linear.weight}.
+#   PINNED phase  records with n_at_lo == 1 (beta at the -15 floor); R_T and
+#                 the fraction of pinned records with s_agg < 0 are printed for
+#                 the pinned and unpinned phases separately (H-DOMINATE's
+#                 "persistently DOWN" claim lives there).
+#   PATH (companion)  for each seed and each record step present in BOTH arms,
+#                 and each tensor j: sign(L_j) under scalar dynamics (from the
+#                 capture) vs sign(L_j) under layerwise dynamics (from the
+#                 harness's own per-tensor mom_pre and z_agg).  agree_j = the
+#                 agreement rate; opp_j = P(scalar < 0 and layerwise > 0).
+#
+# =============================================================================
+# THE PREDICTIONS AND THE BARS, FROZEN
+# =============================================================================
+#   (1) R_T >= R_BAR = 0.10 on the PRIMARY statistic, pooled.  Rationale: for
+#       a minority to be "why beta pins" it must set the sign against the
+#       majority on a non-trivial share of steps; one record in ten is the
+#       lowest share that could plausibly be called substantial, and it is
+#       125x the visible early-phase sign-vote rate, so the bar is not set
+#       where the prior already sits.
+#   (2) DOWN >= 0.75 among DISAGREE records.
+#   (3) NAMED-CARRIED >= 0.75 among DISAGREE records.
+#   (4) COMPANION: opp_j >= 0.50 for at least two of the three NAMED tensors
+#       -> PATH-DEPENDENT-OPPOSITE.  agree_j >= 0.75 for all three NAMED ->
+#       PATH-INDEPENDENT.  Otherwise PATH-DEPENDENT-MIXED.  Reported as a
+#       STAMP; it is a refutation branch only when domination exists.
+#   FLOOR CHECK (provenance, not a result): each scalar run's plateau5 must lie
+#       inside the corpus cell's mean +/- 4 SD (re-derived at score time from
+#       rows NOT prefixed `ctd1-`, section H; at registration n = 29, mean
+#       22.8361, SD 0.5568, band [20.61, 25.06]); each layerwise run likewise
+#       against its cell (n = 23, 69.5345, SD 0.4916).  The batch is about the
+#       SIGN TRAJECTORY; accuracy only proves the runs are the phenomenon.
+#
+# =============================================================================
+# THE BRANCH MAP, FIRST MATCH WINS
+# =============================================================================
+#   UNRESOLVED-PATCH-NOT-INERT   no ALL PASS inertness log, or the HF.py it
+#                                passed on is not the HF.py that ran
+#   UNRESOLVED-PROVENANCE        an ARGS / ENV / PROBE_TENSOR line, the
+#                                PROVENANCE file, probe_tensor.json, the
+#                                numels or the record layout is not the
+#                                registered one; fewer than 3 scalar runs
+#   UNRESOLVED-DIVERGED          a run without RUN_DONE / 500 records, or a
+#                                scalar (layerwise) plateau5 outside its band
+#   UNRESOLVED-DECOMPOSITION     sum_i z_i != z, sum_i m_i != momentum_meta,
+#                                or -(beta-beta_pre)/ms != sign(L) on more than
+#                                1 % of the checkable records
+#   NO-TENSOR-DOMINATION         R_T(PRIMARY) < 0.10: the aggregate agrees
+#                                with the tensor-count majority; the scalar
+#                                failure is not sign domination
+#   DOMINATION-BUT-NOT-DOWN      R_T >= 0.10 but DOWN < 0.75
+#   DOMINATION-BY-OTHER-TENSORS  R_T >= 0.10, DOWN >= 0.75, NAMED-CARRIED <
+#                                0.75 -- informative, not a null; the carriers
+#                                are printed by frequency
+#   TENSOR-DOMINATION-SUPPORTED  all three bars met
+#   STAMPS alongside, never as the branch: SECONDARY-z:<same ladder on z>,
+#   PATH-<...>|NO-COMPANION, PINNED-R_T=<...>, PINNED-FRAC=<...>,
+#   FLOOR-OK|FLOOR-NOT-INGESTED.
+#
+# DESCRIPTIVE, printed, gating nothing: on ALL records, the identity of the
+# argmax-|X_i| tensor and how often sign(X_argmax) == s_agg; carrying-set size
+# distribution; per-tensor sign census under both dynamics.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+# ---- the design ---------------------------------------------------------------
+BATCH = "ctd1"
+ARMS = {"sc": "scalar", "lay": "layerwise"}
+SEEDS = (18, 19, 20)
+EPOCHS, BATCH_SIZE = 100, 100
+META_STEPS = EPOCHS * (50000 // BATCH_SIZE)     # 50,000
+PROBE_EVERY = 100
+N_RECORDS = META_STEPS // PROBE_EVERY           # 500
+CLIP_C = "-15:-2.3026"
+BETA_LO, BETA_HI = -15.0, -2.3026
+MS, A0 = 1e-3, 1e-6
+MP, B2 = 0.99, 0.9
+N_TENSORS, N_PARAMS = 62, 11220132
+NAMED = ("layer4.0.conv2.weight", "layer4.1.conv2.weight", "linear.weight")
+
+# ---- the bars, frozen ---------------------------------------------------------
+R_BAR = 0.10
+DOWN_BAR = 0.75
+NAMED_BAR = 0.75
+PATH_OPP_BAR = 0.50
+PATH_AGREE_BAR = 0.75
+FLOOR_K = 4.0
+TOL_Z = 1e-5          # relative to sum_i |z_i|
+TOL_M = 1e-4          # relative to sum_i |m_i|
+DECOMP_FAIL_MAX = 0.01
+SIGN_FAIL_MAX = 0.01
+PIN_EPS = 1e-6
+
+# ---- the registered ARGS / ENV lines (PROBE_DIR stripped) -----------------------
+ARGS_RE = re.compile(
+    r"^ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0\.99 --weight-decay-base 0\.1 "
+    r"--alg-meta Lion --momentum-param-meta 0\.99 --Lion-beta2-meta 0\.9 --weight-decay-meta 0 "
+    r"--dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100 --max-time 999:00:00 --gamma 1 "
+    r"--meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups (scalar|layerwise) "
+    r"--seed (\d+) --save-directory \S+/runs/ctd1 --run-name ctd1-(sc|lay)-s(\d+)$")
+ENV_FIXED = ("AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+             "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+             "PROBE=100 EB_RHO=na EB_LOG=0")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=100 type=(scalar|layerwise) tensors=62 meta_alg=Lion "
+                   r"momentum_param=0\.99 Lion_beta2=0\.9 dir=\S+$")
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,\s*Test Accuracy:\s*([0-9.]+)")
+RUN_RE = re.compile(r"^probe_ctd1-(sc|lay)-s(\d+)$")
+OUT_RE = re.compile(r"^ctd1-(sc|lay)-s(\d+)-(\d+)\.out$")
+
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# named_parameters() of the live ResNet18_c100 (registered in cL1/cW1/cX1/cY3);
+# G0 checks these numels against every run's own probe_tensor.json.
+TENSOR_NAMES = (
+    "conv1.weight", "bn1.weight", "bn1.bias", "layer1.0.conv1.weight",
+    "layer1.0.bn1.weight", "layer1.0.bn1.bias", "layer1.0.conv2.weight",
+    "layer1.0.bn2.weight", "layer1.0.bn2.bias", "layer1.1.conv1.weight",
+    "layer1.1.bn1.weight", "layer1.1.bn1.bias", "layer1.1.conv2.weight",
+    "layer1.1.bn2.weight", "layer1.1.bn2.bias", "layer2.0.conv1.weight",
+    "layer2.0.bn1.weight", "layer2.0.bn1.bias", "layer2.0.conv2.weight",
+    "layer2.0.bn2.weight", "layer2.0.bn2.bias",
+    "layer2.0.shortcut.0.weight", "layer2.0.shortcut.1.weight",
+    "layer2.0.shortcut.1.bias", "layer2.1.conv1.weight",
+    "layer2.1.bn1.weight", "layer2.1.bn1.bias", "layer2.1.conv2.weight",
+    "layer2.1.bn2.weight", "layer2.1.bn2.bias", "layer3.0.conv1.weight",
+    "layer3.0.bn1.weight", "layer3.0.bn1.bias", "layer3.0.conv2.weight",
+    "layer3.0.bn2.weight", "layer3.0.bn2.bias",
+    "layer3.0.shortcut.0.weight", "layer3.0.shortcut.1.weight",
+    "layer3.0.shortcut.1.bias", "layer3.1.conv1.weight",
+    "layer3.1.bn1.weight", "layer3.1.bn1.bias", "layer3.1.conv2.weight",
+    "layer3.1.bn2.weight", "layer3.1.bn2.bias", "layer4.0.conv1.weight",
+    "layer4.0.bn1.weight", "layer4.0.bn1.bias", "layer4.0.conv2.weight",
+    "layer4.0.bn2.weight", "layer4.0.bn2.bias",
+    "layer4.0.shortcut.0.weight", "layer4.0.shortcut.1.weight",
+    "layer4.0.shortcut.1.bias", "layer4.1.conv1.weight",
+    "layer4.1.bn1.weight", "layer4.1.bn1.bias", "layer4.1.conv2.weight",
+    "layer4.1.bn2.weight", "layer4.1.bn2.bias", "linear.weight",
+    "linear.bias")
+TENSOR_NUMEL = (
+    1728, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64,
+    73728, 128, 128, 147456, 128, 128, 8192, 128, 128, 147456, 128, 128,
+    147456, 128, 128, 294912, 256, 256, 589824, 256, 256, 32768, 256, 256,
+    589824, 256, 256, 589824, 256, 256, 1179648, 512, 512, 2359296, 512, 512,
+    131072, 512, 512, 2359296, 512, 512, 2359296, 512, 512, 51200, 100)
+NAMED_IDX = tuple(TENSOR_NAMES.index(n) for n in NAMED)
+
+GATE_FAIL = []
+CHECKS = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    CHECKS.append((bool(cond), label))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+# ---- resolvers ------------------------------------------------------------------
+def resolve_probe_root(runsdir):
+    p = os.path.join(runsdir, BATCH)
+    return p if os.path.isdir(p) else None
+
+
+# ---- readers --------------------------------------------------------------------
+def read_probe_dirs(root):
+    runs = {}
+    uncl = []
+    for d in sorted(glob.glob(os.path.join(root, "probe_*"))):
+        pj = os.path.join(d, "probe.jsonl")
+        if not os.path.isfile(pj):
+            continue
+        m = RUN_RE.match(os.path.basename(d))
+        if not m:
+            uncl.append((os.path.basename(d), sum(1 for _ in open(pj))))
+            continue
+        arm, seed = m.group(1), int(m.group(2))
+        recs = []
+        bad = 0
+        for ln in open(pj):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                recs.append(json.loads(ln))
+            except Exception:
+                bad += 1
+        hdr = None
+        hp = os.path.join(d, "probe_tensor.json")
+        if os.path.isfile(hp):
+            try:
+                hdr = json.load(open(hp))
+            except Exception:
+                hdr = None
+        runs[(arm, seed)] = {"dir": d, "recs": recs, "bad": bad, "hdr": hdr}
+    return runs, uncl
+
+
+def read_outs(runsdir):
+    outs = {}
+    for f in sorted(glob.glob(os.path.join(runsdir, "ctd1-*.out"))):
+        m = OUT_RE.match(os.path.basename(f))
+        if not m:
+            continue
+        arm, seed, job = m.group(1), int(m.group(2)), int(m.group(3))
+        txt = open(f, errors="replace").read()
+        lines = txt.splitlines()
+        args = [l for l in lines if l.startswith("ARGS:")]
+        env = [l for l in lines if l.startswith("ENV:")]
+        pt = [l for l in lines if l.startswith("PROBE_TENSOR:")]
+        ep = [(int(a), float(b), float(c)) for a, b, c in EPTR_RE.findall(txt)]
+        outs.setdefault((arm, seed), []).append(
+            {"file": f, "job": job, "args": args, "env": env, "pt": pt, "epochs": ep,
+             "done": "RUN_DONE" in txt, "traceback": "Traceback" in txt})
+    return outs
+
+
+def read_csv_cell(path, gran, exclude_prefix="ctd1-"):
+    rows = []
+    if not os.path.isfile(path):
+        return rows
+    for r in csv.DictReader(open(path)):
+        try:
+            if (r["network"] == "ResNet18_c100" and r["granularity"] == gran
+                    and r["base"] == "SGDm" and r["meta"] == "Lion"
+                    and float(r["meta_stepsize"]) == MS and float(r["alpha0"]) == A0
+                    and r["epochs_requested"] == "100" and r["epochs_done"] == "100"
+                    and r["beta_clip"] == CLIP_C and r["hier"] == "" and r["augment"] == "1"
+                    and r["gamma"] == "1" and r["batch_size"] == "100"
+                    and r["dataset"] == "CIFAR100" and r["superseded"] == "0"
+                    and not r["run"].startswith(exclude_prefix)):
+                rows.append(r)
+        except (KeyError, ValueError):
+            continue
+    return rows
+
+
+def read_csv_batch(path):
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    for r in csv.DictReader(open(path)):
+        if r.get("run", "").startswith("ctd1-"):
+            out[r["run"]] = r
+    return out
+
+
+def floor_band(rows):
+    v = [float(r["plateau5"]) for r in rows]
+    if len(v) < 2:
+        return None
+    mu, sd = statistics.mean(v), statistics.stdev(v)
+    return {"n": len(v), "mean": mu, "sd": sd, "lo": mu - FLOOR_K * sd, "hi": mu + FLOOR_K * sd,
+            "train": statistics.mean(float(r["final_train"]) for r in rows)}
+
+
+# ---- the per-record statistics ---------------------------------------------------
+def carrying_set(X, s_agg):
+    order = sorted(range(len(X)), key=lambda i: -abs(X[i]))
+    tot_abs = sum(abs(x) for x in X)
+    part = 0.0
+    rem = tot_abs
+    for k, i in enumerate(order, 1):
+        part += X[i]
+        rem -= abs(X[i])
+        if sgn(part) == s_agg and abs(part) > rem:
+            return order[:k]
+    return order  # degenerate: only the full set fixes the sign
+
+
+def record_terms(r):
+    z = r["z_tensor"]
+    m = r["m_tensor"]
+    b2 = float(r.get("pt_b2", B2))
+    L = [b2 * mi + (1.0 - b2) * zi for mi, zi in zip(m, z)]
+    zh = float(r["z_agg"][0][0])
+    mh = float(r["mom_pre"][0][0])
+    Lh = b2 * mh + (1.0 - b2) * zh
+    return z, m, L, zh, mh, Lh
+
+
+class Tally:
+    def __init__(self, name):
+        self.name = name
+        self.n_det = 0
+        self.n_dis = 0
+        self.n_ind_agg = 0
+        self.n_ind_maj = 0
+        self.dis_down = 0
+        self.dis_named = 0
+        self.dis_carriers = collections.Counter()
+        self.dis_sizes = collections.Counter()
+        self.all_argmax = collections.Counter()
+        self.all_argmax_agree = 0
+        self.all_sizes = collections.Counter()
+        self.n_all = 0
+        self.per_seed = collections.defaultdict(lambda: [0, 0])
+        self.pinned = [0, 0, 0]     # det, dis, down(agg<0)
+        self.unpinned = [0, 0, 0]
+        self.agg_neg = 0
+        self.dis_records = []
+
+    def add(self, seed, step, X, s_agg_h, pinned):
+        s_sum = sgn(sum(X))
+        if s_agg_h == 0 or s_sum != s_agg_h:
+            self.n_ind_agg += 1
+            return
+        pos = sum(1 for x in X if x > 0)
+        neg = sum(1 for x in X if x < 0)
+        s_maj = sgn(pos - neg)
+        if s_maj == 0:
+            self.n_ind_maj += 1
+            return
+        self.n_all += 1
+        self.n_det += 1
+        self.agg_neg += s_agg_h < 0
+        cs = carrying_set(X, s_agg_h)
+        self.all_sizes[len(cs)] += 1
+        am = max(range(len(X)), key=lambda i: abs(X[i]))
+        self.all_argmax[TENSOR_NAMES[am]] += 1
+        self.all_argmax_agree += sgn(X[am]) == s_agg_h
+        ph = self.pinned if pinned else self.unpinned
+        ph[0] += 1
+        ph[2] += s_agg_h < 0
+        self.per_seed[seed][0] += 1
+        dis = s_agg_h != s_maj
+        if dis:
+            self.n_dis += 1
+            ph[1] += 1
+            self.per_seed[seed][1] += 1
+            self.dis_down += s_agg_h < 0
+            named = all(i in NAMED_IDX for i in cs)
+            self.dis_named += named
+            self.dis_sizes[len(cs)] += 1
+            for i in cs:
+                self.dis_carriers[TENSOR_NAMES[i]] += 1
+            self.dis_records.append((seed, step, s_agg_h, pos, neg, [TENSOR_NAMES[i] for i in cs]))
+
+    def R(self):
+        return None if self.n_det == 0 else self.n_dis / self.n_det
+
+    def down(self):
+        return None if self.n_dis == 0 else self.dis_down / self.n_dis
+
+    def named(self):
+        return None if self.n_dis == 0 else self.dis_named / self.n_dis
+
+    def ladder(self):
+        R = self.R()
+        if R is None:
+            return "UNRESOLVED-NO-RECORDS"
+        if R < R_BAR:
+            return "NO-TENSOR-DOMINATION"
+        if self.down() < DOWN_BAR:
+            return "DOMINATION-BUT-NOT-DOWN"
+        if self.named() < NAMED_BAR:
+            return "DOMINATION-BY-OTHER-TENSORS"
+        return "TENSOR-DOMINATION-SUPPORTED"
+
+    def report(self):
+        print("\n  [%s]  determinate records %d (indeterminate: aggregate %d, majority tie %d)"
+              % (self.name, self.n_det, self.n_ind_agg, self.n_ind_maj))
+        print("    R_T = %s  (%d DISAGREE of %d)   bar %.2f -> %s"
+              % (fmt(self.R()), self.n_dis, self.n_det, R_BAR,
+                 "SUBSTANTIAL" if (self.R() or 0) >= R_BAR else "below bar"))
+        for s in sorted(self.per_seed):
+            d, n = self.per_seed[s][1], self.per_seed[s][0]
+            print("      seed %d: R_T = %s (%d / %d)" % (s, fmt(d / n if n else None), d, n))
+        print("    aggregate NEGATIVE on %s of determinate records" % fmt(self.agg_neg / max(self.n_det, 1)))
+        for lab, ph in (("PINNED (n_at_lo==1)", self.pinned), ("UNPINNED", self.unpinned)):
+            print("    %-20s det %5d  R_T %s  agg<0 %s"
+                  % (lab, ph[0], fmt(ph[1] / ph[0] if ph[0] else None), fmt(ph[2] / ph[0] if ph[0] else None)))
+        print("    DOWN among DISAGREE   = %s (bar %.2f)" % (fmt(self.down()), DOWN_BAR))
+        print("    NAMED-CARRIED among DISAGREE = %s (bar %.2f; NAMED = %s)"
+              % (fmt(self.named()), NAMED_BAR, ", ".join(NAMED)))
+        if self.n_dis:
+            print("    carrying-set sizes on DISAGREE records: %s"
+                  % dict(sorted(self.dis_sizes.items())))
+            print("    carriers on DISAGREE records, by frequency (share of DISAGREE records):")
+            for nm, c in self.dis_carriers.most_common(12):
+                print("      %-32s %5d  %.3f" % (nm, c, c / self.n_dis))
+            print("    first 8 DISAGREE records (seed, step, s_agg, #pos, #neg, carriers):")
+            for rr in self.dis_records[:8]:
+                print("      %s" % (rr,))
+        print("    DESCRIPTIVE, all determinate records: argmax-|X| tensor")
+        for nm, c in self.all_argmax.most_common(6):
+            print("      %-32s %.3f" % (nm, c / max(self.n_all, 1)))
+        print("    DESCRIPTIVE: sign(X_argmax) == s_agg on %s of records; carrying-set size 1 on %s, <=3 on %s"
+              % (fmt(self.all_argmax_agree / max(self.n_all, 1)),
+                 fmt(self.all_sizes[1] / max(self.n_all, 1)),
+                 fmt(sum(v for k, v in self.all_sizes.items() if k <= 3) / max(self.n_all, 1))))
+        print("    LADDER -> %s" % self.ladder())
+
+
+# ---- main scoring ----------------------------------------------------------------
+def score(runsdir, csv_path):
+    root = resolve_probe_root(runsdir)
+    print("=" * 78)
+    print("cTD1 -- H-DOMINATE, TENSOR LEVEL.  runsdir %s   probe root %s" % (runsdir, root))
+    print("=" * 78)
+    stamps = []
+    unresolved = []
+
+    # ---- G: gates ------------------------------------------------------------
+    print("\n[G] GATES")
+    if root is None:
+        chk(False, "probe root %s/ctd1 exists" % runsdir)
+        return finish("UNRESOLVED-PROVENANCE", stamps)
+    runs, uncl = read_probe_dirs(root)
+    outs = read_outs(runsdir)
+    prov = {}
+    pp = os.path.join(root, "PROVENANCE.txt")
+    if os.path.isfile(pp):
+        for ln in open(pp):
+            p = ln.split()
+            if len(p) >= 2:
+                prov[p[0]] = p[1]
+    ilog = os.path.join(root, "inertness_test.log")
+    itxt = open(ilog, errors="replace").read() if os.path.isfile(ilog) else ""
+    post_sha = None
+    for ln in itxt.splitlines():
+        if ln.startswith("POST_SHA256 "):
+            post_sha = ln.split()[1]
+    ok_inert = chk("\nALL PASS" in itxt, "inertness_test.log records ALL PASS (R0-R5 on the cluster)")
+    ok_inert &= chk(post_sha is not None and prov.get("HF_SHA256") == post_sha,
+                    "the HF.py the inertness test passed on IS the HF.py that ran (PROVENANCE HF_SHA256)",
+                    "test %s  ran %s" % (str(post_sha)[:12], str(prov.get("HF_SHA256"))[:12]))
+    if not ok_inert:
+        unresolved.append("UNRESOLVED-PATCH-NOT-INERT")
+    chk(prov.get("PATCH_PROBE_TENSOR_MARKERS") == "3", "PROVENANCE: 3 PATCH_PROBE_TENSOR markers at submit")
+    for u in uncl:
+        print("  NOTE unclassified probe dir %s (%d records) -- not used" % u)
+    n_sc = sum(1 for k in runs if k[0] == "sc")
+    n_lay = sum(1 for k in runs if k[0] == "lay")
+    chk(n_sc >= 3, "at least 3 scalar probe runs present", "%d scalar, %d layerwise" % (n_sc, n_lay))
+    for (arm, seed), R in sorted(runs.items()):
+        h = R["hdr"]
+        tag = "%s-s%d" % (arm, seed)
+        chk(h is not None and h.get("PROBE_TENSOR") == 1 and h.get("every") == PROBE_EVERY
+            and h.get("stepsize_type") == ARMS[arm] and h.get("n_tensors") == N_TENSORS
+            and abs(float(h.get("momentum_param", -1)) - MP) < 1e-12
+            and abs(float(h.get("Lion_beta2", -1)) - B2) < 1e-12 and h.get("meta_alg") == "Lion",
+            "%s: probe_tensor.json is the registered header" % tag)
+        chk(h is not None and tuple(h.get("param_numels", ())) == TENSOR_NUMEL,
+            "%s: param_numels == the registered 62 numels (G0 naming alignment)" % tag)
+        recs = R["recs"]
+        steps = [r.get("step") for r in recs]
+        chk(len(recs) == N_RECORDS and steps == list(range(0, META_STEPS, PROBE_EVERY)) and R["bad"] == 0,
+            "%s: %d records at steps 0..49900 (%d unparsable)" % (tag, len(recs), R["bad"]))
+        chk(all(all(k in r for k in ("z_tensor", "m_tensor", "z_agg", "mom_pre", "beta_pre")) for r in recs)
+            and all(len(r["z_tensor"]) == N_TENSORS and len(r["m_tensor"]) == N_TENSORS for r in recs),
+            "%s: every record carries the five appended fields with 62 terms" % tag)
+        chk(not any("pt_step_mismatch" in r for r in recs), "%s: no pt_step_mismatch" % tag)
+        oo = outs.get((arm, seed), [])
+        chk(len(oo) >= 1, "%s: .out present" % tag, "%d" % len(oo))
+        if oo:
+            o = oo[-1]
+            am = ARGS_RE.match(o["args"][-1]) if o["args"] else None
+            chk(am is not None and am.group(1) == ARMS[arm] and int(am.group(2)) == seed
+                and am.group(3) == arm and int(am.group(4)) == seed,
+                "%s: ARGS line is the registered line" % tag)
+            env = re.sub(r" PROBE_DIR=\S+", "", o["env"][-1]).replace("ENV: ", "") if o["env"] else ""
+            chk(env == ENV_FIXED, "%s: ENV line (modulo PROBE_DIR) is the registered line" % tag)
+            pm = PT_RE.match(o["pt"][-1]) if o["pt"] else None
+            chk(pm is not None and pm.group(1) == ARMS[arm], "%s: PROBE_TENSOR line present and registered" % tag)
+            if not (o["done"] and not o["traceback"]):
+                unresolved.append("UNRESOLVED-DIVERGED")
+            chk(o["done"] and not o["traceback"], "%s: RUN_DONE and no traceback" % tag)
+        if len(recs) != N_RECORDS:
+            unresolved.append("UNRESOLVED-DIVERGED")
+    if GATE_FAIL and "UNRESOLVED-PATCH-NOT-INERT" not in unresolved:
+        unresolved.append("UNRESOLVED-PROVENANCE")
+
+    # ---- A: decomposition and applied sign ----------------------------------------
+    print("\n[A] DECOMPOSITION AND THE APPLIED SIGN, EVERY RECORD, BOTH ARMS")
+    n_rec = n_bad_z = n_bad_m = n_bad_agg = n_bad_fn = 0
+    n_sign = n_sign_bad = n_clamped = 0
+    worst_z = worst_m = 0.0
+    for (arm, seed), R in sorted(runs.items()):
+        for r in R["recs"]:
+            try:
+                z, m = r["z_tensor"], r["m_tensor"]
+                za, ma = r["z_agg"][0], r["mom_pre"][0]
+                b2 = float(r.get("pt_b2", B2))
+            except (KeyError, IndexError, TypeError):
+                continue
+            n_rec += 1
+            if arm == "sc":
+                gz, wz, gm, wm = [sum(z)], za, [sum(m)], ma
+            else:
+                gz, wz, gm, wm = z, za, m, ma
+            sz = sum(abs(v) for v in z) + 1e-30
+            sm = sum(abs(v) for v in m) + 1e-30
+            dz = max(abs(p - q) for p, q in zip(gz, wz)) / sz
+            dm = max(abs(p - q) for p, q in zip(gm, wm)) / sm
+            worst_z, worst_m = max(worst_z, dz), max(worst_m, dm)
+            n_bad_z += dz > TOL_Z
+            n_bad_m += dm > TOL_M
+            if arm == "sc":
+                L = [b2 * mi + (1 - b2) * zi for mi, zi in zip(m, z)]
+                n_bad_agg += sgn(sum(L)) != sgn(b2 * ma[0] + (1 - b2) * za[0])
+                fn = r.get("frac_neg")
+                if fn is not None:
+                    n_bad_fn += (fn == 1.0) != (za[0] < 0)
+            bpre, bpost = r["beta_pre"][0], r["beta"]
+            for i in range(len(bpre)):
+                Lh = b2 * ma[i] + (1 - b2) * za[i]
+                if not (bpost[i] > BETA_LO + 1e-9 and bpost[i] < BETA_HI - 1e-9):
+                    n_clamped += 1
+                    continue
+                n_sign += 1
+                n_sign_bad += abs(-(bpost[i] - bpre[i]) / MS - sgn(Lh)) > 1e-3
+    ok_a = chk(n_rec > 0 and n_bad_z / max(n_rec, 1) <= DECOMP_FAIL_MAX,
+               "sum/elementwise z_tensor == harness z within %.0e on >= 99%% of records" % TOL_Z,
+               "%d/%d fail, worst rel %.2e" % (n_bad_z, n_rec, worst_z))
+    ok_a &= chk(n_rec > 0 and n_bad_m / max(n_rec, 1) <= DECOMP_FAIL_MAX,
+                "sum/elementwise m_tensor == harness momentum_meta within %.0e on >= 99%% of records" % TOL_M,
+                "%d/%d fail, worst rel %.2e" % (n_bad_m, n_rec, worst_m))
+    ok_a &= chk(n_bad_agg == 0, "scalar: sign(sum_i L_i) == sign(harness L) on every record", "%d differ" % n_bad_agg)
+    ok_a &= chk(n_bad_fn == 0, "scalar: frac_neg == 1 iff harness z < 0 (brief correction (3), cross-check)",
+                "%d differ" % n_bad_fn)
+    ok_a &= chk(n_sign > 0 and n_sign_bad / max(n_sign, 1) <= SIGN_FAIL_MAX,
+                "-(beta - beta_pre)/ms == sign(b2*mom_pre + (1-b2)*z_agg) on >= 99%% of unclamped coordinates",
+                "%d/%d fail, %d clamped" % (n_sign_bad, n_sign, n_clamped))
+    if not ok_a:
+        unresolved.append("UNRESOLVED-DECOMPOSITION")
+
+    # ---- B / C: the domination statistics on the scalar arm -----------------------
+    print("\n[B] PRIMARY -- X = L_i = b2*m_i + (1-b2)*z_i, the term the Lion sign consumes")
+    TL = Tally("PRIMARY L")
+    TZ = Tally("SECONDARY z")
+    for (arm, seed), R in sorted(runs.items()):
+        if arm != "sc":
+            continue
+        for r in R["recs"]:
+            try:
+                z, m, L, zh, mh, Lh = record_terms(r)
+            except (KeyError, IndexError, TypeError):
+                continue
+            pinned = int(r.get("n_at_lo", 0) or 0) >= 1 or (r["beta"][0] <= BETA_LO + PIN_EPS)
+            TL.add(seed, r["step"], L, sgn(Lh), pinned)
+            TZ.add(seed, r["step"], z, sgn(zh), pinned)
+    TL.report()
+    print("\n[C] SECONDARY -- X = z_i, the brief's instantaneous term")
+    TZ.report()
+    stamps.append("SECONDARY-z:%s" % TZ.ladder())
+    stamps.append("PINNED-R_T=%s" % fmt(TL.pinned[1] / TL.pinned[0] if TL.pinned[0] else None))
+    stamps.append("PINNED-FRAC=%s" % fmt(TL.pinned[0] / TL.n_det if TL.n_det else None))
+    stamps.append("PINNED-AGG-NEG=%s" % fmt(TL.pinned[2] / TL.pinned[0] if TL.pinned[0] else None))
+
+    # ---- P: path dependence against the companion ---------------------------------
+    print("\n[P] PATH DEPENDENCE -- sign(L_j) under scalar vs layerwise dynamics, same seed and step")
+    agree = collections.Counter()
+    opp = collections.Counter()
+    n_pair = 0
+    neg_sc = collections.Counter()
+    neg_lay = collections.Counter()
+    n_sc_rec = n_lay_rec = 0
+    for seed in SEEDS:
+        S = runs.get(("sc", seed))
+        Y = runs.get(("lay", seed))
+        if S is None or Y is None:
+            continue
+        by_step = {r["step"]: r for r in Y["recs"] if "z_agg" in r}
+        for r in S["recs"]:
+            try:
+                z, m, L, zh, mh, Lh = record_terms(r)
+            except (KeyError, IndexError, TypeError):
+                continue
+            n_sc_rec += 1
+            for j in range(N_TENSORS):
+                neg_sc[j] += L[j] < 0
+            y = by_step.get(r["step"])
+            if y is None:
+                continue
+            b2 = float(y.get("pt_b2", B2))
+            zy, my = y["z_agg"][0], y["mom_pre"][0]
+            if len(zy) != N_TENSORS:
+                continue
+            n_pair += 1
+            for j in range(N_TENSORS):
+                Ly = b2 * my[j] + (1 - b2) * zy[j]
+                agree[j] += sgn(L[j]) == sgn(Ly)
+                opp[j] += (L[j] < 0) and (Ly > 0)
+    for seed in SEEDS:
+        Y = runs.get(("lay", seed))
+        if Y is None:
+            continue
+        for y in Y["recs"]:
+            try:
+                b2 = float(y.get("pt_b2", B2))
+                zy, my = y["z_agg"][0], y["mom_pre"][0]
+            except (KeyError, IndexError, TypeError):
+                continue
+            n_lay_rec += 1
+            for j in range(N_TENSORS):
+                neg_lay[j] += (b2 * my[j] + (1 - b2) * zy[j]) < 0
+    if n_pair == 0:
+        print("  no companion pairs -> NO-COMPANION")
+        stamps.append("NO-COMPANION")
+    else:
+        print("  %d (seed, step) pairs.  %-32s agree  opp(sc<0,lay>0)  P(L<0|sc)  P(L<0|lay)"
+              % (n_pair, "tensor"))
+        for j in range(N_TENSORS):
+            mark = "*" if j in NAMED_IDX else " "
+            print("  %s %-32s %.3f  %.3f            %.3f      %.3f"
+                  % (mark, TENSOR_NAMES[j], agree[j] / n_pair, opp[j] / n_pair,
+                     neg_sc[j] / max(n_sc_rec, 1), neg_lay[j] / max(n_lay_rec, 1)))
+        n_opp = sum(1 for j in NAMED_IDX if opp[j] / n_pair >= PATH_OPP_BAR)
+        all_agree = all(agree[j] / n_pair >= PATH_AGREE_BAR for j in NAMED_IDX)
+        if n_opp >= 2:
+            path = "PATH-DEPENDENT-OPPOSITE"
+        elif all_agree:
+            path = "PATH-INDEPENDENT"
+        else:
+            path = "PATH-DEPENDENT-MIXED"
+        print("  NAMED: opp >= %.2f on %d of 3; all agree >= %.2f: %s  -> %s"
+              % (PATH_OPP_BAR, n_opp, PATH_AGREE_BAR, all_agree, path))
+        # the measured carriers, if any, get the same treatment
+        if TL.n_dis:
+            top = [nm for nm, _ in TL.dis_carriers.most_common(3)]
+            print("  measured top-3 carriers under scalar dynamics: %s" % top)
+            for nm in top:
+                j = TENSOR_NAMES.index(nm)
+                print("    %-32s agree %.3f  opp %.3f" % (nm, agree[j] / n_pair, opp[j] / n_pair))
+        stamps.append(path)
+
+    # ---- H: the floor check (provenance) ------------------------------------------
+    print("\n[H] FLOOR CHECK -- provenance only; the batch is about the sign trajectory")
+    batch_rows = read_csv_batch(csv_path)
+    bands = {arm: floor_band(read_csv_cell(csv_path, ARMS[arm])) for arm in ARMS}
+    for arm in ARMS:
+        b = bands[arm]
+        print("  corpus cell %-9s n %2d  plateau5 %.4f +/- %.4f  band [%.3f, %.3f]  final_train %.3f"
+              % (ARMS[arm], b["n"], b["mean"], b["sd"], b["lo"], b["hi"], b["train"]) if b else
+              "  corpus cell %-9s MISSING" % ARMS[arm])
+    floor_ok = True
+    any_ingested = False
+    for (arm, seed), R in sorted(runs.items()):
+        rn = "ctd1-%s-s%d" % (arm, seed)
+        row = batch_rows.get(rn)
+        b = bands[arm]
+        oo = outs.get((arm, seed), [])
+        tail = None
+        if oo and oo[-1]["epochs"]:
+            ep = oo[-1]["epochs"]
+            tail = (statistics.mean(e[2] for e in ep[-5:]), statistics.mean(e[1] for e in ep[-5:]), len(ep))
+        if row is not None and b is not None:
+            any_ingested = True
+            p5 = float(row["plateau5"])
+            inside = b["lo"] <= p5 <= b["hi"]
+            floor_ok &= inside
+            print("  %-12s plateau5 %.3f final_train %s  %s" % (rn, p5, row.get("final_train"),
+                                                                "inside band" if inside else "OUTSIDE BAND"))
+        elif tail is not None:
+            print("  %-12s NOT INGESTED; .out tail-5 test %.3f train %.3f over %d epochs%s"
+                  % (rn, tail[0], tail[1], tail[2],
+                     "" if b is None else ("  [%s band]" % ("inside" if b["lo"] <= tail[0] <= b["hi"] else "OUTSIDE"))))
+            if b is not None and tail[2] >= EPOCHS and not (b["lo"] <= tail[0] <= b["hi"]):
+                floor_ok = False
+        else:
+            print("  %-12s no CSV row and no epoch lines" % rn)
+    stamps.append("FLOOR-OK" if floor_ok else "FLOOR-OUTSIDE")
+    if not any_ingested:
+        stamps.append("FLOOR-NOT-INGESTED")
+    if not floor_ok:
+        unresolved.append("UNRESOLVED-DIVERGED")
+
+    # ---- FINAL -------------------------------------------------------------------
+    order = ["UNRESOLVED-PATCH-NOT-INERT", "UNRESOLVED-PROVENANCE", "UNRESOLVED-DIVERGED",
+             "UNRESOLVED-DECOMPOSITION"]
+    for u in order:
+        if u in unresolved:
+            return finish(u, stamps)
+    return finish(TL.ladder(), stamps)
+
+
+def finish(branch, stamps):
+    print("\n" + "=" * 78)
+    print("FINAL: PRIMARY %s | %s" % (branch, " | ".join(stamps) if stamps else "no stamps"))
+    print("=" * 78)
+    print("The PRIMARY branch is on X = L_i (the term the Lion sign consumes), pooled over the")
+    print("three scalar seeds.  The SECONDARY-z stamp is the brief's instantaneous statistic.")
+    print("Accuracy is a provenance check only; no accuracy number from this batch is a result.")
+    return branch
+
+
+# ---- selftest ---------------------------------------------------------------------
+def selftest(csv_path):
+    print("=" * 78)
+    print("cTD1 --selftest: arithmetic, the registered constants and the corpus floor band")
+    print("=" * 78)
+    chk(len(TENSOR_NAMES) == N_TENSORS and len(TENSOR_NUMEL) == N_TENSORS, "62 names, 62 numels")
+    chk(sum(TENSOR_NUMEL) == N_PARAMS, "numels sum to 11,220,132", "%d" % sum(TENSOR_NUMEL))
+    chk(all(n in TENSOR_NAMES for n in NAMED), "NAMED are live parameter names")
+    chk(NAMED_IDX == (48, 57, 60), "NAMED indices are (48, 57, 60)", "%s" % (NAMED_IDX,))
+    chk(META_STEPS == 50000 and N_RECORDS == 500, "50,000 meta-steps, 500 records")
+    chk(abs(math.log(A0) - (-13.815510557964274)) < 1e-9, "beta0 = ln(1e-6) = -13.8155")
+    # carrying set: strict definition
+    cs = carrying_set([5.0, -1.0, -1.0, -1.0, 0.5], 1)
+    chk(cs == [0], "carrying set: one dominant term fixes the sign alone", "%s" % cs)
+    cs = carrying_set([2.0, -1.5, -1.0, 1.2, 0.1], 1)
+    chk(cs == [0, 1, 3] or cs == [0, 1, 3, 2], "carrying set grows until the remainder cannot flip it", "%s" % cs)
+    X = [1.0, -0.9, 0.8, -0.7, 0.6, -0.5]
+    chk(carrying_set(X, sgn(sum(X))) == list(range(6)) or abs(sum(X)) > 0, "degenerate set is the full set")
+    # tally logic on synthetic records
+    T = Tally("synthetic")
+    T.add(18, 0, [-100.0] + [1.0] * 61, -1, False)       # disagree, down, carried by tensor 0
+    T.add(18, 100, [1.0] * 62, 1, False)                 # agree
+    T.add(18, 200, [3.0] + [-0.01] * 61, 1, True)        # disagree, up
+    chk(T.n_det == 3 and T.n_dis == 2 and abs(T.R() - 2 / 3) < 1e-12, "tally: R_T on synthetic records")
+    chk(abs(T.down() - 0.5) < 1e-12, "tally: DOWN fraction")
+    chk(T.named() == 0.0, "tally: NAMED-CARRIED (conv1.weight is not NAMED)")
+    chk(T.pinned == [1, 1, 0] and T.unpinned == [2, 1, 1], "tally: pinned / unpinned split")
+    chk(T.ladder() == "DOMINATION-BUT-NOT-DOWN", "ladder on synthetic tally", T.ladder())
+    T2 = Tally("s2")
+    for k in range(100):
+        T2.add(18, k, [1.0] * 62, 1, False)
+    chk(T2.ladder() == "NO-TENSOR-DOMINATION", "ladder: no disagreement -> NO-TENSOR-DOMINATION")
+    # regexes on the registered lines
+    a = ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+         "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 "
+         "--dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100 --max-time 999:00:00 --gamma 1 "
+         "--meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups scalar --seed 18 "
+         "--save-directory /cluster/account_b/metaopt/runs/ctd1 --run-name ctd1-sc-s18")
+    chk(ARGS_RE.match(a) is not None, "ARGS regex matches the registered scalar line")
+    chk(ARGS_RE.match(a.replace("scalar", "layerwise").replace("-sc-", "-lay-")) is not None,
+        "ARGS regex matches the registered layerwise line")
+    chk(ARGS_RE.match(a.replace("1e-3", "1e-4")) is None, "ARGS regex rejects a wrong ms")
+    e = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+         "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 "
+         "PROBE_DIR=/cluster/account_b/metaopt/runs/ctd1/probe_ctd1-sc-s18 EB_RHO=na EB_LOG=0")
+    chk(re.sub(r" PROBE_DIR=\S+", "", e).replace("ENV: ", "") == ENV_FIXED, "ENV line modulo PROBE_DIR is the registered one")
+    p = ("PROBE_TENSOR: on every=100 type=scalar tensors=62 meta_alg=Lion momentum_param=0.99 "
+         "Lion_beta2=0.9 dir=/cluster/account_b/metaopt/runs/ctd1/probe_ctd1-sc-s18")
+    chk(PT_RE.match(p) is not None, "PROBE_TENSOR regex matches the patch's ON line")
+    chk(EPTR_RE.search("Epoch 99, Train Accuracy: 23.65 %, Test Accuracy: 23.68 %") is not None,
+        "epoch-line regex matches the runner's format")
+    # the corpus floor band, re-derived with ctd1- rows excluded
+    for arm in ARMS:
+        rows = read_csv_cell(csv_path, ARMS[arm])
+        b = floor_band(rows)
+        chk(b is not None and b["n"] >= 20, "corpus cell %s has >= 20 rows with ctd1- excluded" % ARMS[arm],
+            "n %s" % (b["n"] if b else 0))
+        if b:
+            print("       %-9s n %d  plateau5 mean %.4f  sd %.4f  band [%.3f, %.3f]  final_train %.3f"
+                  % (ARMS[arm], b["n"], b["mean"], b["sd"], b["lo"], b["hi"], b["train"]))
+            chk(not any(r["run"].startswith("ctd1-") for r in rows), "%s: no ctd1- row in the reference cell" % ARMS[arm])
+    chk(abs(B2 * 0.5 + (1 - B2) * (-0.5) - 0.4) < 1e-12, "L = b2*m + (1-b2)*z arithmetic")
+    print("\n%s" % ("SELFTEST ALL PASS" if not GATE_FAIL else "SELFTEST FAILURES: %r" % GATE_FAIL))
+    return 0 if not GATE_FAIL else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default=None)
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv))
+    if a.runsdir is None:
+        ap.error("runsdir is required (or --selftest)")
+    score(a.runsdir, a.csv)
+
+
+if __name__ == "__main__":
+    main()

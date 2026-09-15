@@ -1,0 +1,226 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 52 -- THE CIFAR-100 BOX-FREE ARM.  Runs on cluster_a.  6 jobs.  Tag `uc6-*`.
+#
+# WHY THIS BATCH EXISTS: A BUG IN `bin/c51_unclipped_family.sh`, NOT A NEW IDEA.
+#   uc5's header claimed "Everything else is byte-matched to
+#   `c49_free_family_ladder.sh`".  It was not.  ff5 builds the CIFAR-100 arm with
+#       --NN-name ResNet18_c100  --dataset CIFAR100
+#   and uc5 wrote
+#       --NN-name ResNet18       --dataset CIFAR100
+#   i.e. a 10-class head against 100-class labels.  All 6 c100 jobs died at the
+#   first backward pass with
+#       Loss.cu:240: nll_loss_forward_reduce_cuda_kernel_2d: Assertion
+#       `t >= 0 && t < n_classes` failed
+#   inside ~5 minutes, and wrote block_sizes.json but never a probe.jsonl.
+#   `runs/uc5-c100-*-4702368..4702379.out` are the receipts.
+#   The r10 and r34 legs were unaffected and are scored in FINDINGS 52.
+#
+#   THE LESSON, and it is a cheap one to bank: "byte-matched to X" is a CLAIM,
+#   and this campaign has now been bitten twice by an unchecked one (cycle 50's
+#   "the HIGH bound provably never binds" was the other).  A batch that says
+#   byte-matched must DIFF the two command lines.  This script does, in guard 4.
+#
+# OPEN QUESTION IT ANSWERS.
+#   CORRECTIONS 59's headline is 4-family:
+#     N_eff/m = 0.163 (R10) / 0.481 (R18) / 0.552 (R34) / 0.305 (CIFAR-100).
+#   Cycle 52 box-tested three of them and all three passed (FINDINGS 52.2/52.3):
+#     R18  0.4808 (published box) -> 0.5045 with NO BOX AT ALL   (delta +0.024)
+#     R10  0.1632                 -> 0.1571 with NO BOX AT ALL   (delta -0.006)
+#     R34  0.5517                 -> 0.5474  (the NULL)          (delta -0.004)
+#   CIFAR-100 is the one that was not tested, and it is not an arbitrary
+#   omission: c100's weightwise Q4 CEILING OCCUPANCY IS 100.0% (FINDINGS 51.3),
+#   the same saturation r10 had.  Until this batch lands, 0.305 is the only
+#   number in the headline sentence still quoted from inside a box that was
+#   pressed against on every last-quarter record.
+#
+# THE DESIGN.  Byte-identical to `c49_free_family_ladder.sh`'s c100 leg except
+# for BETA_CLIP: -15:-2.3026 -> **-30:0.0**.  One field.  Rungs w/node/lay,
+# seeds 0-1, 20 epochs, AUGMENT=1, SGDm/Lion, ms=1e-3, alpha0=1e-3.
+# Control = `ff5-c100-*` (n=2), already on disk, same account, same HF.py
+# lineage except for PATCH_CLIPCOUNT, which only ADDS three fields per record.
+#
+# PRE-REGISTERED PREDICTIONS -- score against these, not against what lands.
+#
+#   (V0) VALIDITY GATE.
+#        1. All 6 jobs reach RUN_DONE and write 2000-record probe.jsonl files.
+#           A repeat of the uc5 crash shows up here as a missing probe.jsonl.
+#        2. weightwise n_beta == 11,220,132, byte-matching ff5-c100-w.
+#           nodewise 14,600, layerwise 62.  A mismatch means the network is
+#           STILL wrong and nothing in the batch is quotable.  This is the exact
+#           check that would have caught the uc5 bug from the probe alone.
+#
+#   (V0.4) THE DOSE CHECK -- **SCORED BEFORE V1**, for the third tick running.
+#        Per-coordinate occupancy (STANDING RULE 6), from `beta_true_max` AND
+#        from PATCH_CLIPCOUNT's n_at_hi/n_beta.  Control: 50.9% of records and
+#        100.0% of Q4 records have a coordinate at the ceiling; 18.7%/74.7% at
+#        the floor.  BAR: both must fall below 5% of records in the new arms.
+#        IF THEY DO NOT, V1 IS **UNINTERPRETABLE, NOT REFUTED** -- say exactly
+#        that.  R10 measured 0.0%/0.0% under the same widening, so the
+#        expectation is that this passes; c100's beta trajectory is close to
+#        r10's (beta span 12.56 vs 12.20 at record 2000), so the same box
+#        should clear it.  A FAILURE here is itself the finding: it would mean
+#        CIFAR-100 drives alpha somewhere CIFAR-10 does not.
+#
+#   (V1) THE PRIMARY TEST.  N_eff/m, weightwise, VARIANCE instrument, STEADY
+#        half -- the only quotable combination (CORRECTIONS 55/59).
+#        Control, re-derived from `../probes_ff5` this tick: **0.3047**.
+#        PASS: within +-0.10 absolute, i.e. [0.20, 0.41].
+#          --> The 4-family headline is box-free in 4 of 4 and CORRECTIONS 59
+#              needs no box column anywhere.  Write the sentence without a caveat.
+#        REFUTATION: outside that band.
+#          --> CIFAR-100 is the exception, "16% to 55%" must be re-derived, and
+#              the range needs a box column for the c100 endpoint specifically.
+#        WHY +-0.10: the same bar cl5's X1 and uc5's U1 used, deliberately.  It
+#        is 2.6x the measured floor sensitivity at R18 (0.038).  DIRECTION,
+#        stated before the run: I predict **no move**, |delta| < 0.02, because
+#        that is what r10 did (-0.006) from the same 100%-occupancy starting
+#        point.  uc5's registered "unpinning moves it UP" was NOT supported and
+#        is not being re-registered.
+#
+#   (V2) THE PROFILE.  b(steady, k^-b across w/node/lay).  Control 0.078.
+#        PASS if within 0.05.  R18 held to 0.029 across FOUR boxes and R10 to
+#        0.003, so 0.05 is a loose bar that has already been met twice.
+#        SECONDARY to V1: b is a 3-point fit, N_eff/m is not a fit at all.
+#
+#   (V3) THE REBOUND, and this is a REPLICATION, not a new test.
+#        rho_w(k=1) Q4/Q3 in the free weightwise arm.  Control (ff5-c100):
+#        3.067e-07 / 1.190e-07 = **2.58x**.  uc5 refuted clip saturation as the
+#        mechanism at r10 -- ratio 2.689 -> 2.701, i.e. UNCHANGED to 0.5%, while
+#        Q4 ceiling occupancy fell 100.0% -> 0.0% (FINDINGS 52.4).
+#        PREDICTION: c100 replicates r10 -- ratio stays above 2.0.
+#          --> Clip saturation is excluded in BOTH rebound families, at n=2, and
+#              CORRECTIONS 61(5) is reinstated on two independent tests.
+#        REFUTATION: the ratio falls below 1.5 here.
+#          --> Then the mechanism is family-dependent, r10 and c100 rebound for
+#              DIFFERENT reasons, and 61(5) must stay withdrawn.  That would be
+#              the more interesting outcome and it is registered as such.
+#
+#   (V4) ACCURACY, reported regardless.  Plateau vs ff5-c100 (w 26.846,
+#        node 37.251, lay 38.226; n=2 each).  Bar +-1 pp.  The box has now been
+#        measured accuracy-neutral in 3 families over 12 matched cells
+#        (|delta| <= 0.25 pp everywhere).  A c100 move > 1 pp would mean the box
+#        was doing optimisation work on the harder dataset.
+#
+#   RESOLUTION, per CORRECTIONS 33, computed BEFORE submission.  rho_min depends
+#   on T and m, not on the box, so c49's floors carry over unchanged:
+#       c100 w     margin ~1.5x   RESOLVES, but THINLY -- named in advance in
+#                                 c49 and named again here.  A c100 weightwise
+#                                 null is a BOUND at rho_s ~ 3e-8, never evidence
+#                                 of independence.
+#       c100 node  margin ~2.4x   RESOLVES
+#       c100 lay   margin ~2.3x   RESOLVES
+#
+# NOT INCLUDED, deliberately:
+#   * blk6.  It resolved in NEITHER arm at c100 (rho_s went negative on the
+#     steady half in both frozen and free).  2 jobs for a rung that has never
+#     cleared its own floor is the purchase c49 already declined.
+#   * A third seed.  The effects being tested are 0.004-0.006 against a 0.10
+#     bar; n=2 matches the control exactly, and matching the control is what
+#     makes the contrast a contrast.
+#
+# WHY cluster_a.  Account assignment is BY COMPARATOR (CORRECTIONS 46(6)).  The
+# control (`ff5-c100-*`) and the frozen partner (`fz3-c100-*`) are both on cluster_a.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. V0.1, V0.2, V0.4 above -- run, not assumed, V0.4 BEFORE V1
+#   2. python3 analysis/c52_boxfree.py --selftest      (27/27)
+#   3. python3 analysis/neff_instrument.py --selftest  (19/19)
+#   4. python3 analysis/probe5_window.py --selftest    (41/41)
+#   5. Window scan on every arm.  Never quote a profile number without its window.
+#
+# USAGE
+#   bash c52_c100_boxfree.sh            # dry run: prints every sbatch line
+#   bash c52_c100_boxfree.sh --submit   # submits, ONLY if the guards below pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_a/metaopt                   # cluster_a
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+BUILDNET=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/build_network.py
+SAVE=$WS/runs/uc6
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_a
+PEND_CAP=40
+NJOBS=6
+WIDE=-30:0.0
+NN=ResNet18_c100                                   # <-- THE FIX
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c52 CIFAR-100 BOX-FREE + PROBE5 (cluster_a) ==="
+echo "    BETA_CLIP=$WIDE   NN-name=$NN   control = ff5-c100-* at -15:-2.3026"
+
+if ! grep -q PATCH_PROBE5 "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5 not present in $HF"; exit 1
+fi
+if ! grep -q PATCH_PROBE5_FIX "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5_FIX not present -- unfixed patch crashes at record 500"; exit 1
+fi
+if ! grep -q PATCH_CLIPCOUNT "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_CLIPCOUNT not present -- V0.4's per-coordinate denominator"; exit 1
+fi
+echo "guard 1: PATCH_PROBE5 + PATCH_PROBE5_FIX + PATCH_CLIPCOUNT present  OK"
+
+python3 -c "import py_compile; py_compile.compile('$HF', doraise=True)" 2>/dev/null || {
+  echo "GUARD FAIL: $HF does not compile"; exit 1; }
+echo "guard 2: HF.py compiles  OK"
+
+# GUARD 3 -- THE ONE uc5 NEEDED.  The 100-class head must actually exist, by name.
+grep -q "'$NN'" "$BUILDNET" 2>/dev/null || {
+  echo "GUARD FAIL: build_network.py does not know '$NN' -- this is the uc5 bug"; exit 1; }
+echo "guard 3: build_network.py knows '$NN'  OK"
+
+# GUARD 4 -- "BYTE-MATCHED" IS A CLAIM, SO CHECK IT.  Every field of the c100 leg
+# of c49_free_family_ladder.sh must appear here identically except BETA_CLIP.
+C49=$(dirname "$0")/c49_free_family_ladder.sh
+if [ -r "$C49" ]; then
+  want=$(grep -oE 'sub c100 [A-Za-z0-9_]+ CIFAR100' "$C49" | head -1 | awk '{print $3}')
+  if [ -n "$want" ] && [ "$want" != "$NN" ]; then
+    echo "GUARD FAIL: c49 builds c100 with '$want', this script uses '$NN'"; exit 1
+  fi
+  echo "guard 4: NN-name matches c49's c100 leg ('$want')  OK"
+else
+  echo "guard 4: c49_free_family_ladder.sh not readable here -- SKIPPED (say so in FINDINGS)"
+fi
+
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: FairShare=${FS:-unknown} (informational), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+mkdir -p "$SAVE"
+N=0
+for G in layerwise nodewise weightwise; do
+  case $G in
+    layerwise)  TAG=lay  ;;
+    nodewise)   TAG=node ;;
+    weightwise) TAG=w    ;;
+  esac
+  for S in 0 1; do
+    RN="uc6-c100-${TAG}-s${S}"
+    PD="$SAVE/probe_c100_${TAG}_s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --time=03:50:00
+      --export="ALL,AUGMENT=1,BETA_CLIP=$WIDE,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PD"
+      "$RUNNER"
+      --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+      --dataset CIFAR100 --NN-name "$NN" --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-3
+      --num-epochs 20 --stepsize-groups "$G" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    N=$((N+1))
+    if [ "$SUBMIT" = "1" ]; then "${CMD[@]}" >/dev/null; else printf '%s\n' "${CMD[*]}"; fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with, IN THIS ORDER:"
+echo "  0. ls \$SAVE/probe_c100_*/probe.jsonl   # V0.1 -- did they survive at all?"
+echo "  1. python3 analysis/c52_boxfree.py                   # V0.2, V0.4 dose FIRST"
+echo "  2. python3 analysis/neff_instrument.py ../probes_uc6 # V1 -- THE PRIMARY TEST"
+echo "  3. python3 analysis/probe5_window.py ../probes_uc6   # V2 + the window scan"
+echo "  4. python3 analysis/probe5_time_ladder.py ../probes_uc6 ../probes_fz3   # V3"

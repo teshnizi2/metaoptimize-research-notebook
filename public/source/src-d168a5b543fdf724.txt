@@ -1,0 +1,125 @@
+set -u
+cd /cluster/account_a/metaopt
+R=/cluster/account_a/metaopt/runs
+P="gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g"
+C="BETA_CLIP=-15:-2.3026"
+SGDM="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0"
+
+# ===========================================================================
+# CYCLE 32.  Four batches, each attached to a named open question.
+#
+# What cycle 32 found in ALREADY-ON-DISK data (nothing below is speculative):
+#  * sc50-* (ResNet50, n=1) and cs-r10/cs-r34-* (CIFAR-100 x model scale, n=3)
+#    completed cycles ago and were NEVER tabulated.  Reducing them gives a
+#    FOUR-point model-scale ladder on CIFAR-10 and a THREE-point one on C100.
+#  * At matched r=0.06, a0=1e-6, the M1 pooling gain RISES with model size:
+#        R10 +0.166 (t=0.8, null) / R18 +2.446 / R34 +2.594 / R50 +3.237 (n=1)
+#    while the plain granularity gain (layerwise - scalar) FALLS:
+#        R10 +19.877 / R18 +3.043 / R34 +0.835 / R50 -1.394 (n=1)
+#    R50 is the FIRST architecture where the parent paper's premise reproduces
+#    (layerwise LOSES to scalar) -- and it rests on a single seed.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# B1  `p10-*` -- CIFAR-100 x {ResNet10, ResNet34} agreement/drift ladder.
+# OPEN QUESTION (31.7, last bullet).  The sqrt(N) refutation is the paper's
+# core.  It now has 8 fits (2 windows x 4 families) at n=10 for R18/C10 and
+# R18/C100 but the CIFAR-100 side is ONE model size.  The model-scale x dataset
+# grid for the DRIFT statistic is one row deep.  These 30 probes make it three.
+# PRE-REGISTERED: every slope stays above -0.500 in both windows.  If a C100
+# R10 or R34 ladder reaches -0.5, the headline refutation is dataset-specific.
+# Cheapest decisive jobs on the board: 20 epochs, ~15 min each.
+# ---------------------------------------------------------------------------
+mkdir -p $R/p7free
+prb(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=01:30:00 \
+  --nice=0 \
+  --export="ALL,AUGMENT=1,$C,PROBE=100,PROBE_DIR=$R/p7free/$1" jobs/run_cifar.sh $SGDM \
+  --dataset $4 --NN-name $3 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize 1e-3 --alpha0 1e-3 --num-epochs 20 --stepsize-groups $2 --seed $5 \
+  --save-directory $R/p7free --run-name $1 >/dev/null; }
+for s in 0 1 2 3 4; do
+  prb p7-c100r10-lay-s$s  layerwise  ResNet10_c100 CIFAR100 $s
+  prb p7-c100r10-node-s$s nodewise   ResNet10_c100 CIFAR100 $s
+  prb p7-c100r10-w-s$s    weightwise ResNet10_c100 CIFAR100 $s
+  prb p7-c100r34-lay-s$s  layerwise  ResNet34_c100 CIFAR100 $s
+  prb p7-c100r34-node-s$s nodewise   ResNet34_c100 CIFAR100 $s
+  prb p7-c100r34-w-s$s    weightwise ResNet34_c100 CIFAR100 $s
+done
+echo "B1_P10=$(squeue -h -u account_a -o '%j' | grep -c '^p7-c100r')"
+
+# ---------------------------------------------------------------------------
+# B2  `sc50-*` seeds -- the ResNet50 rung to n=5.
+# OPEN QUESTION.  R50 is the 4th and largest rung of the model-scale ladder and
+# EVERY cell of it is n=1.  Two claims rest on it:
+#   (a) the M1 pooling gain keeps rising to 23.5M params (+3.237)
+#   (b) at a0=1e-6, layerwise finally LOSES to scalar (-1.394) -- the only
+#       architecture in the whole campaign where the parent paper's premise
+#       reproduces.  A single seed cannot carry it (R18 seed sd is ~0.16pp but
+#       R10's is 0.27-0.83pp, so -1.394 at n=1 is not safe).
+# s1 is already queued (promoted below); this adds s2,s3,s4 -> n=5.
+# R50 100ep measured at 138 min mean / 141 max, so 03:50 keeps gpu-short.
+# ---------------------------------------------------------------------------
+mkdir -p $R/sc50
+s5(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --nice=50 --export="ALL,AUGMENT=1,$C$3" jobs/run_cifar.sh $SGDM \
+  --dataset CIFAR10 --NN-name ResNet50 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize 1e-3 --alpha0 $4 --num-epochs 100 --stepsize-groups $2 --seed $5 \
+  --save-directory $R/sc50 --run-name $1 >/dev/null; }
+for s in 2 3 4; do
+  s5 sc50-1e6-scal-s$s  scalar    ""                              1e-6 $s
+  s5 sc50-1e6-layer-s$s layerwise ""                              1e-6 $s
+  s5 sc50-1e6-add-s$s   layerwise ",HIER=additive,ETA_RATIO=0.06" 1e-6 $s
+  s5 sc50-1e3-scal-s$s  scalar    ""                              1e-3 $s
+  s5 sc50-1e3-layer-s$s layerwise ""                              1e-3 $s
+  s5 sc50-1e3-add-s$s   layerwise ",HIER=additive,ETA_RATIO=0.06" 1e-3 $s
+done
+echo "B2_SC50=$(squeue -h -u account_a -o '%j' | grep -c '^sc50-')"
+
+# ---------------------------------------------------------------------------
+# B3  `f5-*` -- the tuned non-meta baseline at ResNet34 and ResNet50.
+# OPEN QUESTION (axis 4, and the sharpest reviewer objection we have).  The
+# tuned AdamW+cosine baseline exists at ONE architecture: ResNet18, 94.093.
+# Our best MetaOptimize plateau is 93.884 (R34, r=0.02) -- compared against a
+# baseline measured on a DIFFERENT network.  That comparison is not admissible.
+# If the baseline is flat in model size while the M1 gain grows, MetaOptimize
+# overtakes at R34/R50; if the baseline grows too, it does not.  Either answer
+# is publishable; not knowing is not.
+# lrs 3e-4 and 1e-3 are the flat top of the R18 sweep (94.062 / 94.093).
+# ---------------------------------------------------------------------------
+mkdir -p $R/fx
+f5(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --nice=150 --export=ALL,AUGMENT=1,COS_TOTAL=50000,COS_WARMUP=2500 jobs/run_cifar.sh \
+  --optimizer AdamW --alpha0 $2 --seed $3 --num-epochs 100 --NN-name $4 \
+  --dataset CIFAR10 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --save-directory $R/fx --run-name $1 >/dev/null; }
+for s in 0 1 2; do
+  f5 f5cos-r34-3e-4-s$s 3e-4 $s ResNet34
+  f5 f5cos-r34-1e-3-s$s 1e-3 $s ResNet34
+  f5 f5cos-r50-3e-4-s$s 3e-4 $s ResNet50
+  f5 f5cos-r50-1e-3-s$s 1e-3 $s ResNet50
+done
+echo "B3_F5=$(squeue -h -u account_a -o '%j' | grep -c '^f5cos-')"
+
+# ---------------------------------------------------------------------------
+# B4  `r34x-*` -- the ResNet34 r-grid BELOW its current edge.
+# OPEN QUESTION.  The R34 r-curve peaks at r=0.02, the SMALLEST non-zero point
+# on its grid (r=0 gives 93.098, r=0.02 gives 93.884, r=0.03 gives 93.813).
+# The optimum is interior but its LOCATION is grid-limited, and the candidate
+# scaling law r* ~ 1/N rests on exactly that location:
+#     R10 r*=0.10 x 4.90M = 0.49M ; R18 0.06 x 11.17M = 0.67M ; R34 0.02 x 21.28M = 0.43M
+# PRE-REGISTERED: if r* ~ 1/N holds, r*(R34) = 0.023, so r=0.005/0.010/0.015
+# must all fall BELOW 93.884 while staying above r=0's 93.098.  A monotone rise
+# from 0.005 to 0.02 confirms; a peak at 0.01 or below refutes the 1/N form.
+# ---------------------------------------------------------------------------
+mkdir -p $R/r34r
+rx(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --nice=150 --export="ALL,AUGMENT=1,$C,HIER=additive,ETA_RATIO=$2" jobs/run_cifar.sh $SGDM \
+  --dataset CIFAR10 --NN-name ResNet34 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups layerwise --seed $3 \
+  --save-directory $R/r34r --run-name $1 >/dev/null; }
+for spec in 0.005:r0005 0.01:r001 0.015:r0015; do
+  RR=${spec%%:*}; TAG=${spec##*:}
+  for s in 0 1 2; do rx r34r-$TAG-s$s $RR $s; done
+done
+echo "B4_R34X=$(squeue -h -u account_a -o '%j' | grep -c '^r34r-r00')"
+echo "TOTAL_cluster_a=$(squeue -h -u account_a | wc -l)"

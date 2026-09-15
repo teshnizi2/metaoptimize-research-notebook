@@ -1,0 +1,252 @@
+"""CORRECTIONS 175 -- the launcher partition defect, closed in the SHARED helper.
+
+Four of this week's launchers (bin/cV1_*, bin/cW1_*, bin/cX1_*, bin/cY1_*) hard-code
+PARTS=gpu-l4-24g,gpu-mig-40g,gpu-a100-80g -- the three 7-day partitions -- while
+requesting --time=03:00:00, which fits gpu-short's 4:00:00 MaxTime.  On cluster_a every
+partition carries its OWN QOS with its OWN per-user GPU cap (sacctmgr, 2026-09-08:
+qos-gpu-l4 8, qos-gpu-mig 8, qos-gpu-a100 2, qos-short-gpu 12), so leaving gpu-short
+out forfeits an independent 12-GPU pool whose node set is a SUPERSET of the three
+partitions' nodes.  crn1 (cX1) sat 0/18 started for 3h31m behind cru1 on exactly that
+list before it was cancelled and resubmitted.
+
+This file was written and COMMITTED BEFORE bin/_lib_guards.sh gained any of the
+functions it exercises (commit-before-first-execution only; there are no runs and no
+RULE 21 label is claimed).  Every expected partition list below was fixed here first.
+Premise visible while designing: `sinfo -o '%P %l'` on cluster_b (gpu-short 4:00:00, the
+other four GPU partitions 7-00:00:00) and the brief's rule "include gpu-short whenever
+the requested walltime is <= 04:00:00".  No result number was visible: there are none.
+
+Exercised, RULE 13 style, in BOTH directions (a real configuration must PASS and an
+injected violation must FAIL):
+
+  slurm_time_secs        -- Slurm's six --time grammars, parsed as sbatch parses them
+  slurm_parts_for_wall   -- the composer: 01:00, 03:00, 04:00, 04:01, 11:00 (as HH:MM:SS,
+                            the form every launcher uses) plus the literal two-field forms,
+                            which Slurm reads as MINUTES:SECONDS -- a trap this file records
+  guard_parts_for_wall   -- the checker, both directions, with the reason-required opt-out
+  the source-time hook   -- the launcher pattern in use since cH1 (PARTS/WALL set BEFORE
+                            `. _lib_guards.sh`) is aborted with exit 2 on the defective pair
+  the four launchers     -- their own PARTS/WALL lines, read from the files UNEDITED, FAIL
+                            the guard; the 11:00:00 launchers and cdn1 PASS
+
+NOTHING here invokes sbatch, scontrol or sinfo for real: a fake `sinfo` on PATH is used
+once, to prove that the live re-read of gpu-short's MaxTime overrides the frozen 04:00:00.
+
+Run:  python3 tests/test_partition_composer.py     (exit 0 iff every check passes)
+"""
+import os, re, stat, subprocess, sys, tempfile
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIB = os.path.join(REPO, "bin", "_lib_guards.sh")
+PASS = FAIL = 0
+
+LONG3 = "gpu-l4-24g,gpu-mig-40g,gpu-a100-80g"
+WITH_SHORT = "gpu-short," + LONG3
+
+
+def report(name, ok, detail=""):
+    global PASS, FAIL
+    if ok:
+        PASS += 1
+        print("  PASS  %s" % name)
+    else:
+        FAIL += 1
+        print("  FAIL  %s%s" % (name, ("   [%s]" % detail) if detail else ""))
+
+
+def sh(script, env=None, path_prepend=None):
+    """Run `script` under bash with the library available; return (rc, stdout, stderr)."""
+    e = dict(os.environ)
+    e["METAOPT_WS"] = "/nonexistent"          # keep the venv preamble inert
+    e.pop("PARTS", None); e.pop("WALL", None)  # never inherit a caller's pair
+    e.pop("PARTS_NO_SHORT_REASON", None); e.pop("ARGSGUARD_PARTS_CHECK", None)
+    if path_prepend:
+        e["PATH"] = path_prepend + os.pathsep + e.get("PATH", "")
+    if env:
+        e.update(env)
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=e)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def compose(wall, base=None, env=None, path_prepend=None):
+    args = "'%s'" % wall + ((" '%s'" % base) if base is not None else "")
+    return sh(". '%s'; slurm_parts_for_wall %s" % (LIB, args), env=env, path_prepend=path_prepend)
+
+
+def guard(parts, wall, env=None):
+    return sh(". '%s'; guard_parts_for_wall '%s' '%s'" % (LIB, parts, wall), env=env)
+
+
+def secs(t):
+    return sh(". '%s'; slurm_time_secs '%s'" % (LIB, t))
+
+
+print("=" * 76)
+print("CORRECTIONS 175 -- partition composition in bin/_lib_guards.sh, BOTH DIRECTIONS")
+print("=" * 76)
+
+# ---------------- 0. the library still sources cleanly with no PARTS/WALL --------
+print("\n-- 0  the library sources cleanly when no PARTS/WALL pair is set")
+rc, out, err = sh(". '%s'; echo SOURCED" % LIB)
+report("`. _lib_guards.sh` with PARTS/WALL unset -> exit 0, control returns", rc == 0 and out.endswith("SOURCED"), err[-200:])
+rc, out, err = sh(". '%s'; type slurm_time_secs slurm_parts_for_wall guard_parts_for_wall >/dev/null && echo DEFINED" % LIB)
+report("the three functions are defined", out.endswith("DEFINED"), err[-200:])
+
+# ---------------- 1. slurm_time_secs: the six sbatch grammars -------------------
+print("\n-- 1  slurm_time_secs parses --time exactly as sbatch does")
+for t, want in [("240", 14400), ("241", 14460), ("04:01", 241), ("01:00", 60), ("11:00", 660),
+                ("4:00:00", 14400), ("04:00:00", 14400), ("04:01:00", 14460), ("11:00:00", 39600),
+                ("0-04:00", 14400), ("0-04:00:01", 14401), ("1-00:00:00", 86400), ("7-00:00:00", 604800),
+                ("03:50:00", 13800), ("08:00:00", 28800)]:
+    rc, out, err = secs(t)
+    report("%-12s -> %d s" % (t, want), rc == 0 and out.split("\n")[-1] == str(want), "got rc=%s out=%r" % (rc, out[-40:]))
+for bad in ("", "abc", "4h", "04:00:00:00", "-1", "1-2-3"):
+    rc, out, err = secs(bad)
+    report("%-12r -> REJECTED (rc!=0)" % bad, rc != 0, "got rc=0 out=%r" % out[-40:])
+
+# ---------------- 2. slurm_parts_for_wall: the composer -------------------------
+print("\n-- 2  slurm_parts_for_wall composes the list (default base = the three 7-day partitions)")
+CASES = [  # the brief's five walltimes, in the HH:MM:SS form every launcher writes
+    ("01:00:00", WITH_SHORT), ("03:00:00", WITH_SHORT), ("04:00:00", WITH_SHORT),
+    ("04:01:00", LONG3), ("11:00:00", LONG3),
+]
+for wall, want in CASES:
+    rc, out, err = compose(wall)
+    got = out.split("\n")[-1] if out else ""
+    report("--time=%s -> %s" % (wall, want), rc == 0 and got == want, "got rc=%s %r" % (rc, got))
+    report("    ... and prints a 'chosen because' line naming the walltime", ("chosen because" in err) and (wall in err), err[-160:])
+
+print("\n-- 2b the literal two-field forms are MINUTES:SECONDS to Slurm, so they all fit gpu-short")
+for wall in ("01:00", "04:01", "11:00"):
+    rc, out, err = compose(wall)
+    got = out.split("\n")[-1] if out else ""
+    report("--time=%-6s (= %s s) -> %s" % (wall, secs(wall)[1].split("\n")[-1], WITH_SHORT), rc == 0 and got == WITH_SHORT, "got %r" % got)
+
+print("\n-- 2c the other grammars and the cap boundary")
+for wall, want in [("240", WITH_SHORT), ("241", LONG3), ("4:00:00", WITH_SHORT), ("0-04:00", WITH_SHORT),
+                   ("0-04:00:01", LONG3), ("1-00:00:00", LONG3), ("03:50:00", WITH_SHORT)]:
+    rc, out, err = compose(wall)
+    got = out.split("\n")[-1] if out else ""
+    report("--time=%-10s -> %s" % (wall, want), rc == 0 and got == want, "got %r" % got)
+
+print("\n-- 2d an explicit base list is respected; gpu-short is never duplicated and is dropped above the cap")
+rc, out, err = compose("11:00:00", WITH_SHORT)
+report("base WITH gpu-short at 11:00:00 -> gpu-short DROPPED (sbatch would reject the whole request)",
+       rc == 0 and out.split("\n")[-1] == LONG3, "got %r" % out[-80:])
+rc, out, err = compose("03:00:00", WITH_SHORT)
+report("base WITH gpu-short at 03:00:00 -> kept once, first", rc == 0 and out.split("\n")[-1] == WITH_SHORT, "got %r" % out[-80:])
+rc, out, err = compose("03:00:00", "gpu-2080ti-11g")
+report("base gpu-2080ti-11g at 03:00:00 -> gpu-short,gpu-2080ti-11g", rc == 0 and out.split("\n")[-1] == "gpu-short,gpu-2080ti-11g", "got %r" % out[-80:])
+rc, out, err = compose("03:00:00", "gpu-l4-24g, gpu-mig-40g")
+report("a base with a stray space is normalised", rc == 0 and out.split("\n")[-1] == "gpu-short,gpu-l4-24g,gpu-mig-40g", "got %r" % out[-80:])
+rc, out, err = compose("4h")
+report("INJECTED: unparsable --time -> composer FAILS (rc!=0), prints nothing usable", rc != 0, "got rc=0 out=%r" % out[-60:])
+
+# ---------------- 3. the cap is re-read LIVE from sinfo when one is on PATH ------
+print("\n-- 3  the 04:00:00 cap is a FROZEN premise, overridden by a live sinfo when present")
+rc, out, err = compose("03:00:00")
+report("no sinfo on PATH here -> the rationale says the cap is the frozen one", "frozen" in err, err[-160:])
+tmp = tempfile.mkdtemp(prefix="fake_sinfo_")
+fake = os.path.join(tmp, "sinfo")
+with open(fake, "w") as fh:
+    fh.write("#!/bin/bash\n# fake sinfo: gpu-short capped at 2:00:00\necho '2:00:00'\n")
+os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
+rc, out, err = compose("03:00:00", path_prepend=tmp)
+report("fake sinfo says gpu-short MaxTime=2:00:00 -> 03:00:00 now EXCLUDES gpu-short",
+       rc == 0 and out.split("\n")[-1] == LONG3, "got %r" % out[-80:])
+report("    ... and the rationale says the cap came from sinfo, not the frozen value", "sinfo" in err and "frozen" not in err, err[-160:])
+rc, out, err = compose("01:30:00", path_prepend=tmp)
+report("fake sinfo, 01:30:00 -> still INCLUDES gpu-short", rc == 0 and out.split("\n")[-1] == WITH_SHORT, "got %r" % out[-80:])
+with open(fake, "w") as fh:
+    fh.write("#!/bin/bash\necho ''\n")
+rc, out, err = compose("03:00:00", path_prepend=tmp)
+report("sinfo present but silent -> falls back to the frozen cap and SAYS so",
+       rc == 0 and out.split("\n")[-1] == WITH_SHORT and "frozen" in err, "got %r / %s" % (out[-60:], err[-120:]))
+
+# ---------------- 4. guard_parts_for_wall, both directions ----------------------
+print("\n-- 4  guard_parts_for_wall, BOTH DIRECTIONS")
+rc, out, err = guard(LONG3, "03:00:00")
+report("INJECTED (the real crn1/cru1 pair): 3-list at 03:00:00 -> GUARD FAIL", rc != 0 and "GUARD FAIL" in out, out[-160:])
+report("    ... and the failure names the corrected list", WITH_SHORT in out, out[-160:])
+rc, out, err = guard(WITH_SHORT, "03:00:00")
+report("gpu-short present at 03:00:00 -> PASS", rc == 0 and "PASS" in out, out[-120:])
+rc, out, err = guard(WITH_SHORT, "11:00:00")
+report("INJECTED: gpu-short present at 11:00:00 -> GUARD FAIL (sbatch would reject the whole batch)", rc != 0 and "GUARD FAIL" in out, out[-160:])
+rc, out, err = guard(LONG3, "11:00:00")
+report("3-list at 11:00:00 (cO1/cR1/cS2's pair) -> PASS", rc == 0 and "PASS" in out, out[-120:])
+rc, out, err = guard(LONG3, "04:00:00")
+report("INJECTED: 3-list at exactly 04:00:00 -> GUARD FAIL (the cap is inclusive)", rc != 0, out[-120:])
+rc, out, err = guard(LONG3, "04:00:01")
+report("3-list at 04:00:01 -> PASS (one second over the cap)", rc == 0, out[-120:])
+rc, out, err = guard(LONG3, "4h")
+report("INJECTED: unparsable --time -> GUARD FAIL", rc != 0 and "GUARD FAIL" in out, out[-120:])
+rc, out, err = guard(LONG3, "03:00:00", env={"PARTS_NO_SHORT_REASON": "node-set consistency with cpk3 (162.10)"})
+report("opt-out WITH a reason: 3-list at 03:00:00 -> PASS, and the reason is PRINTED",
+       rc == 0 and "162.10" in out and "DELIBERATE" in out.upper(), out[-160:])
+rc, out, err = guard(LONG3, "03:00:00", env={"PARTS_NO_SHORT_REASON": ""})
+report("INJECTED: an EMPTY reason is no opt-out -> GUARD FAIL", rc != 0, out[-120:])
+rc, out, err = guard(WITH_SHORT, "11:00:00", env={"PARTS_NO_SHORT_REASON": "irrelevant"})
+report("INJECTED: the opt-out cannot rescue gpu-short ABOVE the cap -> GUARD FAIL", rc != 0, out[-120:])
+
+# ---------------- 5. the source-time hook: the launcher pattern since cH1 --------
+print("\n-- 5  the source-time hook (PARTS/WALL set BEFORE `. _lib_guards.sh`, as every launcher since cH1 does)")
+def launcher(parts, wall, extra=""):
+    return sh("set -u; %s PARTS='%s'; WALL='%s'; . '%s'; echo REACHED-SBATCH-LOOP" % (extra, parts, wall, LIB))
+rc, out, err = launcher(LONG3, "03:00:00")
+report("INJECTED (cX1's own pair): the launcher is ABORTED with exit 2 before its sbatch loop",
+       rc == 2 and "REACHED-SBATCH-LOOP" not in out and "GUARD FAIL" in out, "rc=%s %s" % (rc, out[-160:]))
+rc, out, err = launcher(WITH_SHORT, "03:00:00")
+report("corrected pair: control reaches the sbatch loop", rc == 0 and out.endswith("REACHED-SBATCH-LOOP"), "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = launcher(LONG3, "11:00:00")
+report("cO1's pair (3-list, 11:00:00): control reaches the sbatch loop", rc == 0 and out.endswith("REACHED-SBATCH-LOOP"), "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = launcher(WITH_SHORT, "11:00:00")
+report("INJECTED: gpu-short at 11:00:00 -> ABORTED with exit 2", rc == 2 and "REACHED-SBATCH-LOOP" not in out, "rc=%s %s" % (rc, out[-160:]))
+rc, out, err = launcher(LONG3, "03:00:00", extra="export ARGSGUARD_PARTS_CHECK=0;")
+report("ARGSGUARD_PARTS_CHECK=0 bypasses the hook (and says so)", rc == 0 and out.endswith("REACHED-SBATCH-LOOP"), "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = launcher(LONG3, "03:00:00", extra="export PARTS_NO_SHORT_REASON='node-set consistency, 162.10';")
+report("a reason-bearing opt-out passes the hook and the reason is printed", rc == 0 and out.endswith("REACHED-SBATCH-LOOP") and "162.10" in out, "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = sh("set -u; WALL='03:00:00'; . '%s'; echo REACHED" % LIB)
+report("WALL set but PARTS unset -> hook is inert (a launcher that composes later)", rc == 0 and out.endswith("REACHED"), "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = sh("set -u; PARTS='%s'; . '%s'; echo REACHED" % (LONG3, LIB))
+report("PARTS set but WALL unset -> hook is inert", rc == 0 and out.endswith("REACHED"), "rc=%s %s" % (rc, (out + err)[-160:]))
+rc, out, err = sh("set -u; PARTS='%s'; WALL='03:00:00'; . '%s'; echo REACHED; PARTS=$(slurm_parts_for_wall \"$WALL\" \"$PARTS\"); echo \"PARTS=$PARTS\"" % (WITH_SHORT, LIB))
+report("the documented pattern PARTS=$(slurm_parts_for_wall \"$WALL\" \"$PARTS\") round-trips",
+       rc == 0 and out.endswith("PARTS=" + WITH_SHORT), "rc=%s %s" % (rc, (out + err)[-160:]))
+
+# ---------------- 6. the launchers themselves, read UNEDITED --------------------
+print("\n-- 6  the registered launchers' own PARTS/WALL lines (files read, never edited)")
+def pair(name):
+    src = open(os.path.join(REPO, "bin", name)).read()
+    p = re.search(r"^PARTS=(\S+)", src, re.M); w = re.search(r"^WALL=(\S+)", src, re.M)
+    return (p.group(1) if p else None), (w.group(1) if w else None)
+DEFECTIVE = ["cV1_namelist_permutation.sh", "cW1_cogroup_contiguity.sh",
+             "cX1_reduction_intervention.sh", "cY1_rule11_ms_alpha0.sh"]
+for name in DEFECTIVE:
+    p, w = pair(name)
+    rc, out, err = guard(p, w)
+    report("%-32s PARTS=%s WALL=%s -> GUARD FAIL" % (name, p, w), p == LONG3 and w == "03:00:00" and rc != 0, "rc=%s" % rc)
+for name, wantw in [("cO1_cliff_horizon.sh", "11:00:00"), ("cR1_cut_position_horizon.sh", "11:00:00"),
+                    ("cS2_cut_position_infill.sh", "11:00:00")]:
+    p, w = pair(name)
+    rc, out, err = guard(p, w)
+    report("%-32s PARTS=%s WALL=%s -> PASS" % (name, p, w), p == LONG3 and w == wantw and rc == 0, "rc=%s" % rc)
+p, w = pair("cdn1_c100_denominator.sh")
+rc, out, err = guard(p, w)
+report("%-32s PARTS=%s WALL=%s -> PASS" % ("cdn1_c100_denominator.sh", p, w), p and p.startswith("gpu-short,") and w == "03:50:00" and rc == 0, "rc=%s" % rc)
+for name in DEFECTIVE:
+    p, w = pair(name)
+    rc, out, err = compose(w, p)
+    report("%-32s composer would have written %s" % (name, WITH_SHORT), rc == 0 and out.split("\n")[-1] == WITH_SHORT, out[-80:])
+
+# ---------------- 7. the library diff is additions-only (RULE 16 spirit) ---------
+print("\n-- 7  the change to bin/_lib_guards.sh is a pure tail append (guard_scorer_registered is untouched)")
+src = open(LIB).read()
+report("guard_presubmit / guard_postlaunch / guard_scorer_registered still defined, in that order",
+       src.index("guard_presubmit() {") < src.index("guard_postlaunch() {") < src.index("guard_scorer_registered() {"))
+report("the new block sits AFTER guard_scorer_registered",
+       ("slurm_parts_for_wall() {" in src) and src.index("slurm_parts_for_wall() {") > src.index("guard_scorer_registered() {"))
+
+print("\n" + "=" * 76)
+print("CORRECTIONS 175 SUMMARY: %d PASS, %d FAIL" % (PASS, FAIL))
+print("=" * 76)
+sys.exit(1 if FAIL else 0)

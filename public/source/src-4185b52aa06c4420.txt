@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Three-arm alpha0/LR robustness reducer  (cycle 47).
+
+Cycle 45/46 compared MetaOptimize (arm B) against a GENUINELY FIXED learning rate
+(arm A) and asked which is flatter in alpha0.  That contrast is the parent paper's
+own framing, but it is not the one a practitioner faces: nobody ships a constant LR.
+The honest competitor is the tuned schedule, and the campaign ALREADY HAS IT --
+`SW_*` (cycle 43) is a horizon-matched AdamW+cosine peak-LR sweep at the identical
+network / dataset / batch size / augmentation / budget / account, 7 points x n=2.
+
+This reducer adds it as ARM C and reports all three on the SHARED sub-grid only, so
+no arm is ever credited with a width measured on grid points the others lack.
+
+    arm A  i3a-*  AdamW, genuinely fixed lr  (COS_WARMUP=0, COS_TOTAL=1e8)
+    arm B  i3b-*  AdamW base + Adam meta, resnet18_blocks (m=6), alpha0 varied
+    arm C  SW_*   AdamW + horizon-matched cosine (COS_TOTAL=50000), peak lr varied
+           i3c-*  the SAME recipe, extending arm C onto the i3 grid extremes
+
+STRUCTURAL FACTS VERIFIED BEFORE USE (cycle 47, against the live source):
+  * `COS_TOTAL`/`COS_WARMUP` are read ONLY by `AdamW_optimizer` and `SGD_optimizer`
+    in build_optimizer.py.  Arm B is `--optimizer HF --alg-base AdamW`, which routes
+    to `HF.AdamW_base_update` -- a hand-written update with NO scheduler attached.
+    So arm B carries no hidden cosine and the `COS_TOTAL=default` its .out echoes is
+    an unread variable.
+  * arm C's ENV is `COS_TOTAL=50000 COS_WARMUP=default`, i.e. a 10,000-step (20-epoch)
+    linear warmup then cosine to ~0 over the exact 50,000-step horizon.
+  * arms A and C both ran on the `account_a` account; arm B is split across both
+    accounts by seed, which is what cycle 45's design intended.
+
+WIDTH CONVENTION is inherited from analysis/idea3_robustness.py and is the same
+judgement call: the longest CONTIGUOUS in-band run, measured in decades between the
+end points, so a lone in-band cell is 0 decades.  Gapped in-band sets are flagged.
+
+WHY TWO WIDTH FAMILIES ARE REPORTED, and this is the cycle's main methodological point:
+  "within X pp of its OWN best" is scale-free and is what a robustness claim means,
+  but it PENALISES a sharp high peak.  "above an ABSOLUTE floor" is what a practitioner
+  actually cares about (will this run be usable at all?).  The two disagree in sign on
+  this data, so reporting only one is a selection.  Both are printed.
+
+Run `--selftest` before trusting any number this prints.
+"""
+import csv
+import math
+import sys
+
+# the c45 grid, in order
+GRID = ["1e-6", "1e-5", "1e-4", "3e-4", "1e-3", "1e-2", "1e-1"]
+GRIDV = {g: float(g) for g in GRID}
+
+
+def _fnum(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def load(path):
+    with open(path) as fh:
+        return list(csv.DictReader(fh))
+
+
+def _a0key(raw):
+    """Map a CSV alpha0 string onto a grid label, tolerating 1e-06 / 1E-6 / 0.0001."""
+    v = _fnum(raw)
+    if v is None:
+        return None
+    for g, gv in GRIDV.items():
+        if gv != 0 and abs(v / gv - 1.0) < 1e-6:
+            return g
+    return None
+
+
+def collect(rows, prefixes, min_epochs):
+    """{alpha0_label: [plateau, ...]} over rows whose run name starts with any prefix."""
+    out = {}
+    for r in rows:
+        name = r.get("run", "")
+        if not any(name.startswith(p) for p in prefixes):
+            continue
+        if r.get("superseded", "0") != "0":
+            continue
+        ep = _fnum(r.get("epochs_done"))
+        if ep is None or ep < min_epochs:
+            continue
+        pl = _fnum(r.get("plateau"))
+        if pl is None:
+            continue
+        k = _a0key(r.get("alpha0"))
+        if k is None:
+            continue
+        out.setdefault(k, []).append(pl)
+    return out
+
+
+DIVERGED = 50.0   # plateau at or below this is a collapse, not a slow run
+
+
+def cellstats(vals):
+    """Mean/sd over SURVIVING seeds, plus the divergence count.
+
+    A collapsed run (plateau <= DIVERGED; the campaign has seeds at exactly 10.000 =
+    chance) is not a low score, it is a different outcome, and averaging it in produces a
+    number that describes neither.  `i3b-1e1` reads 48.429 +-54.3 from {10.000, 86.858} --
+    a "mean" no seed is anywhere near, and it is what made analysis/idea3_robustness.py
+    report the clip control with the wrong SIGN (CORRECTIONS 39).
+
+    The `collapsed` column in all_runs.csv is 0 on every row and flags nothing, so this
+    filter must be applied here.
+
+    Returns (mean_of_survivors, sd_of_survivors, n_survivors, n_diverged).
+    """
+    div = [v for v in vals if v <= DIVERGED]
+    ok = [v for v in vals if v > DIVERGED]
+    n = len(ok)
+    if n == 0:
+        return float("nan"), float("nan"), 0, len(div)
+    m = sum(ok) / n
+    if n < 2:
+        return m, float("nan"), n, len(div)
+    var = sum((v - m) ** 2 for v in ok) / (n - 1)
+    return m, math.sqrt(var), n, len(div)
+
+
+def width(means, subgrid, lo, divs=None):
+    """Longest CONTIGUOUS run of subgrid points with mean >= lo AND no diverged seed.
+
+    Returns (decades, first_label, last_label, gapped) where `gapped` is True when
+    some in-band point lies outside the returned run -- i.e. the band is not an
+    interval and the single number under-reports it.
+
+    A cell with any diverged seed is never in band, at any tolerance.  Robustness to a
+    step size means it works at that step size, not that it works on the seeds where it
+    did not collapse.
+    """
+    divs = divs or {}
+    inband = [g for g in subgrid
+              if g in means and means[g] >= lo and not divs.get(g)]
+    if not inband:
+        return 0.0, None, None, False
+    best = (0.0, None, None)
+    i = 0
+    idx = {g: k for k, g in enumerate(subgrid)}
+    present = [g for g in subgrid if g in means]
+    while i < len(present):
+        if present[i] not in inband:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(present) and present[j + 1] in inband:
+            j += 1
+        dec = abs(math.log10(GRIDV[present[j]]) - math.log10(GRIDV[present[i]]))
+        if dec > best[0] or best[1] is None:
+            best = (dec, present[i], present[j])
+        i = j + 1
+    run = present[idx[best[1]]: idx[best[2]] + 1] if best[1] else []
+    gapped = len(inband) > len([g for g in run if g in inband])
+    return best[0], best[1], best[2], gapped
+
+
+def report_arm(label, cells, subgrid, out=sys.stdout):
+    """Returns (means_over_survivors, diverged_counts). A cell with ANY divergence is
+    reported but is NOT eligible for a width band -- see `width_ok` in summarise()."""
+    means, divs = {}, {}
+    print(f"\n=== {label} ===", file=out)
+    print(f"{'alpha0':>8} {'n':>3} {'plateau':>9} {'sd':>7}  {'diverged':>8}", file=out)
+    for g in subgrid:
+        if g not in cells:
+            print(f"{g:>8} {'-':>3} {'-':>9} {'-':>7}  {'-':>8}", file=out)
+            continue
+        m, sd, n, nd = cellstats(cells[g])
+        divs[g] = nd
+        if n:
+            means[g] = m
+        sds = "  n/a " if math.isnan(sd) else f"{sd:7.3f}"
+        ms = "      -  " if math.isnan(m) else f"{m:9.3f}"
+        flag = f"{nd:>8}" if nd else f"{'.':>8}"
+        print(f"{g:>8} {n:>3} {ms} {sds}  {flag}", file=out)
+    missing = [g for g in subgrid if g not in means]
+    if missing:
+        print(f"  INCOMPLETE on this sub-grid -- missing {', '.join(missing)}", file=out)
+    bad = [g for g in subgrid if divs.get(g)]
+    if bad:
+        print(f"  DIVERGED seeds at {', '.join(bad)} -- these cells are excluded from every",
+              file=out)
+        print("  width band below: a step size that collapses on some seeds is not robust at",
+              file=out)
+        print("  that step size, whatever the surviving seeds averaged to.", file=out)
+    return means, divs
+
+
+def summarise(arm, subgrid, out=sys.stdout, floors=(90.0, 85.0)):
+    means, divs = arm
+    if not means:
+        return None
+    peak_g = max(means, key=lambda g: means[g])
+    peak = means[peak_g]
+    worst = min(means[g] for g in subgrid if g in means)
+    ndiv = sum(1 for g in subgrid if divs.get(g))
+    print(f"  peak  {peak:8.3f} at alpha0={peak_g}    worst {worst:8.3f}"
+          f"    span {peak - worst:7.3f} pp    cells with a divergence: {ndiv}", file=out)
+    res = {"peak": peak, "peak_at": peak_g, "worst": worst, "ndiv": ndiv}
+    for tol in (1.0, 2.0, 3.0):
+        d, a, b, gap = width(means, subgrid, peak - tol, divs)
+        span = f"[{a} .. {b}]" if a else "[none]"
+        flag = "  (GAPPED -- band is not an interval)" if gap else ""
+        print(f"  width within {tol:.0f}pp of own best : {d:4.1f} decades  {span}{flag}", file=out)
+        res[f"w{int(tol)}"] = d
+    for fl in floors:
+        d, a, b, gap = width(means, subgrid, fl, divs)
+        span = f"[{a} .. {b}]" if a else "[none]"
+        flag = "  (GAPPED)" if gap else ""
+        print(f"  width above absolute {fl:.0f}   : {d:4.1f} decades  {span}{flag}", file=out)
+        res[f"f{int(fl)}"] = d
+    return res
+
+
+def threshold_free(raw, subgrid, survivable):
+    """The two robustness statistics with NO tolerance and NO floor to choose.
+
+    WHY.  CORRECTIONS 41(c) made it a standing rule that a threshold result must carry its
+    sensitivity scan.  The B-vs-C absolute-floor ranking does not survive that scan (B>C at
+    floors <=91, C>B at 92), and the scale-free family has its own free parameter, the
+    tolerance.  Every number in the head-to-head table therefore has a dial on it.  These
+    two do not, and they are what a practitioner actually faces:
+
+      GRID MEAN (survivors)  -- mean of the per-cell survivor means over the sub-grid where
+        every arm has at least one surviving seed.  This is the campaign's standing
+        `plateau > 50` convention (CORRECTIONS 39) applied unchanged, so it is comparable
+        to every cell mean printed above.
+      GRID MEAN (face value) -- mean over ALL seeds at the number they actually scored,
+        collapses included, over the whole shared sub-grid.  This is the expected accuracy
+        of drawing alpha0 blind from the grid.  A method that collapses on some seeds
+        SHOULD be punished here; that is the point of reporting it.
+
+    The two answer different questions and can disagree, so both are returned and both are
+    printed.  Returns None if any arm is missing a cell on the requested sub-grid.
+    """
+    surv, face = [], []
+    for g in survivable:
+        vals = raw.get(g)
+        if not vals:
+            return None
+        ok = [v for v in vals if v > DIVERGED]
+        if not ok:
+            return None
+        surv.append(sum(ok) / len(ok))
+    for g in subgrid:
+        vals = raw.get(g)
+        if not vals:
+            return None
+        face.append(sum(vals) / len(vals))
+    if not surv or not face:
+        return None
+    return dict(surv_mean=sum(surv) / len(surv), surv_min=min(surv), surv_n=len(surv),
+                face_mean=sum(face) / len(face), face_min=min(face), face_n=len(face))
+
+
+def main(path):
+    rows = load(path)
+    A = collect(rows, ("i3a-",), 100)
+    B = collect(rows, ("i3b-",), 100)
+    C = collect(rows, ("SW_", "SW-", "i3c-"), 100)
+
+    shared = [g for g in GRID if g in A and g in B and g in C]
+    full = [g for g in GRID if g in A or g in B or g in C]
+
+    print("THREE-ARM alpha0 / LR ROBUSTNESS  --  ResNet18 / CIFAR-10 / bs100 / AUGMENT=1 / 100 ep")
+    print("  A = AdamW at a genuinely fixed lr        (i3a-*)")
+    print("  B = MetaOptimize, AdamW base, m=6        (i3b-*)")
+    print("  C = AdamW + horizon-matched cosine       (SW_* / i3c-*)")
+    print(f"\nfull union grid : {' '.join(full)}")
+    print(f"SHARED sub-grid : {' '.join(shared) if shared else '(none)'}"
+          "   <- every cross-arm width below is measured HERE and nowhere else")
+
+    armA = report_arm("A  fixed-lr AdamW", A, full) if A else ({}, {})
+    armB = report_arm("B  MetaOptimize m=6", B, full) if B else ({}, {})
+    armC = report_arm("C  AdamW + cosine", C, full) if C else ({}, {})
+    arms = (armA, armB, armC)
+    resA = summarise(armA, shared) if A else None
+    resB = summarise(armB, shared) if B else None
+    resC = summarise(armC, shared) if C else None
+    # divergence is a first-class robustness outcome, so it appears in the head-to-head
+
+    print("\n=== HEAD TO HEAD, shared sub-grid only ===")
+    if not (resA and resB and resC):
+        print("  NOT DECIDABLE -- at least one arm has no cell on the shared sub-grid.")
+        return
+    if len(shared) < 4:
+        print(f"  WARNING: shared sub-grid has only {len(shared)} points; widths are coarse.")
+    hdr = f"{'':26}{'A fixed':>10}{'B meta':>10}{'C cosine':>10}"
+    print(hdr)
+    for key, lab in (("peak", "peak plateau"), ("worst", "worst plateau"),
+                     ("w1", "width <=1pp of own best"), ("w2", "width <=2pp of own best"),
+                     ("w3", "width <=3pp of own best"),
+                     ("f90", "width above 90"), ("f85", "width above 85"),
+                     ("ndiv", "cells with a divergence")):
+        print(f"{lab:26}{resA[key]:10.3f}{resB[key]:10.3f}{resC[key]:10.3f}")
+
+    # ---- threshold sensitivity.  An absolute-floor width is only meaningful if it does
+    # not hinge on where the floor sits relative to a single cell.  Cycle 47: arm B's
+    # 1e-2 cell landed at 89.987, i.e. 0.013pp under the 90 line -- far inside the ~0.1pp
+    # seed noise -- and that alone moved its >=90 width by a whole decade.  So the scan is
+    # printed, not just one row, and the caller is told when the ranking is unstable.
+    print("\n  threshold sensitivity of the ABSOLUTE-floor width (decades):")
+    print(f"{'    floor':26}{'A fixed':>10}{'B meta':>10}{'C cosine':>10}   ranking")
+    flips = []
+    for fl in (84.0, 86.0, 88.0, 89.0, 89.5, 90.0, 91.0, 92.0):
+        wa = width(arms[0][0], shared, fl, arms[0][1])[0]
+        wb = width(arms[1][0], shared, fl, arms[1][1])[0]
+        wc = width(arms[2][0], shared, fl, arms[2][1])[0]
+        rank = ("B>C" if wb > wc + 1e-9 else "C>B" if wc > wb + 1e-9 else "B=C")
+        flips.append(rank)
+        print(f"{'    >= ' + format(fl, '.1f'):26}{wa:10.3f}{wb:10.3f}{wc:10.3f}   {rank}")
+    distinct = sorted(set(flips))
+    if len(distinct) > 1:
+        print(f"  -> the B-vs-C ranking is NOT threshold-stable ({', '.join(distinct)} all occur).")
+        print("     Any 'MetaOptimize is flatter on an absolute floor' sentence MUST name its")
+        print("     threshold and show this scan.  Quoting one row of it is a selection.")
+    else:
+        print(f"  -> the B-vs-C ranking is threshold-stable at {distinct[0]} over 84..92.")
+
+    # ---- threshold-FREE statistics.  The scan above shows the absolute-floor ranking is
+    # not threshold-stable and the own-best family has a tolerance dial.  These have no
+    # dial at all, so they cannot be selected -- report them next to any width claim.
+    survivable = [g for g in shared
+                  if all(any(v > DIVERGED for v in raw.get(g, [])) for raw in (A, B, C))]
+    tfA = threshold_free(A, shared, survivable)
+    tfB = threshold_free(B, shared, survivable)
+    tfC = threshold_free(C, shared, survivable)
+    print("\n=== THRESHOLD-FREE (no tolerance, no floor -- nothing here can be selected) ===")
+    if not (tfA and tfB and tfC):
+        print("  NOT DECIDABLE -- an arm is missing a cell on the shared sub-grid.")
+    else:
+        dropped = [g for g in shared if g not in survivable]
+        print(f"  survivor sub-grid ({tfA['surv_n']} pts): "
+              f"{' '.join(survivable) if survivable else '(none)'}"
+              + (f"   DROPPED (an arm has no survivor): {' '.join(dropped)}" if dropped else ""))
+        print(f"  face-value sub-grid ({tfA['face_n']} pts): {' '.join(shared)}")
+        hdr2 = f"{'':26}{'A fixed':>10}{'B meta':>10}{'C cosine':>10}"
+        print(hdr2)
+        for key, lab in (("surv_mean", "grid mean, survivors"),
+                         ("surv_min", "grid worst, survivors"),
+                         ("face_mean", "grid mean, face value"),
+                         ("face_min", "grid worst, face value")):
+            print(f"{lab:26}{tfA[key]:10.3f}{tfB[key]:10.3f}{tfC[key]:10.3f}")
+        for key, lab in (("surv_mean", "survivors"), ("face_mean", "face value")):
+            d = tfB[key] - tfC[key]
+            print(f"  B - C on grid mean ({lab}): {d:+.3f} pp "
+                  f"-- {'MetaOptimize' if d > 0 else 'the tuned cosine'} is ahead "
+                  f"averaged over the grid.")
+        print("  This is the one robustness comparison in this file with no free parameter.")
+
+    print("\n=== VERDICT ===")
+    # B vs C is the claim that matters: does meta-learning the step size buy
+    # robustness that a tuned schedule does not already have?
+    own = [(t, resB[f"w{t}"], resC[f"w{t}"]) for t in (1, 2, 3)]
+    b_wins_own = [t for t, b, c in own if b > c + 1e-9]
+    c_wins_own = [t for t, b, c in own if c > b + 1e-9]
+    tied_own = [t for t, b, c in own if abs(b - c) <= 1e-9]
+    abs_b = resB["f90"] > resC["f90"] + 1e-9
+    print(f"  B peak is {resC['peak'] - resB['peak']:+.3f} pp vs C "
+          f"(negative = MetaOptimize is AHEAD).")
+    print(f"  B worst is {resB['worst'] - resC['worst']:+.3f} pp vs C "
+          f"(positive = MetaOptimize degrades less at the grid extremes).")
+    print(f"  own-best width, B vs C:  B wider at {b_wins_own or '[none]'} pp,"
+          f"  C wider at {c_wins_own or '[none]'} pp,  TIED at {tied_own or '[none]'} pp.")
+    if b_wins_own and not c_wins_own:
+        print("  -> B is flatter than C at every tolerance where they differ: the parent "
+              "paper's robustness claim SURVIVES against a tuned schedule.")
+    elif c_wins_own and not b_wins_own:
+        print("  -> C is flatter than B at every tolerance where they differ, and ties "
+              "elsewhere.  MetaOptimize does NOT buy scale-free robustness that a tuned "
+              "cosine lacks, and it costs peak accuracy on top.  Note this is a WIN-OR-TIE "
+              "for C, not a sweep -- do not write it as 'C is flatter at every tolerance'.")
+    else:
+        print("  -> SPLIT: the two curves have different shapes and the verdict depends on "
+              "the tolerance chosen.  A split is NOT a tie.  Report the whole row.")
+    print(f"  On the ABSOLUTE floor (>=90): B {resB['f90']:.1f} dec vs C {resC['f90']:.1f} dec"
+          f" -> {'B' if abs_b else 'C'} is usable over a wider range.")
+    print("\n  Peak reference OFF this grid: the tuned cosine's true argmax is 3e-3, giving")
+    print("  94.417 +-0.113 (n=5, CORRECTIONS 30).  Arm C's on-grid peak therefore UNDER-states")
+    print("  the baseline, and every deficit quoted against arm C is a LOWER bound.")
+
+
+# ------------------------------------------------------------------ selftest
+def _selftest():
+    ok = fail = 0
+
+    def chk(name, got, want):
+        nonlocal ok, fail
+        good = (got == want) or (isinstance(want, float) and isinstance(got, float)
+                                 and abs(got - want) < 1e-9)
+        if good:
+            ok += 1
+        else:
+            fail += 1
+            print(f"  FAIL {name}: got {got!r} want {want!r}")
+
+    # --- width convention
+    m = {"1e-4": 91.0, "3e-4": 91.5, "1e-3": 90.9}
+    chk("w contiguous 3pt", width(m, GRID, 89.0)[0], 1.0)
+    chk("w lone cell is 0 dec", width(m, GRID, 91.2)[0], 0.0)
+    chk("w empty band", width(m, GRID, 99.0)[0], 0.0)
+    chk("w endpoints", width(m, GRID, 89.0)[1:3], ("1e-4", "1e-3"))
+    # gap detection: two separated in-band cells
+    mg = {"1e-6": 91.0, "1e-5": 10.0, "1e-4": 91.0}
+    d, a, b, gap = width(mg, GRID, 90.0)
+    chk("w gapped flagged", gap, True)
+    chk("w gapped returns 0 dec run", d, 0.0)
+    # a gap that is NOT a gap once the low cell is in band
+    d2, _, _, gap2 = width(mg, GRID, 5.0)
+    chk("w no false gap", gap2, False)
+    chk("w full span 2 dec", d2, 2.0)
+
+    # --- alpha0 label mapping
+    chk("a0 1e-06", _a0key("1e-06"), "1e-6")
+    chk("a0 0.0001", _a0key("0.0001"), "1e-4")
+    chk("a0 3e-04", _a0key("3e-04"), "3e-4")
+    chk("a0 off grid", _a0key("3e-3"), None)
+    chk("a0 junk", _a0key("na"), None)
+
+    # --- collect: filters
+    rows = [
+        {"run": "i3a-1e3-s0", "superseded": "0", "epochs_done": "100", "plateau": "90.0", "alpha0": "1e-3"},
+        {"run": "i3a-1e3-s1", "superseded": "0", "epochs_done": "99", "plateau": "50.0", "alpha0": "1e-3"},   # short
+        {"run": "i3a-1e3-s2", "superseded": "1", "epochs_done": "100", "plateau": "50.0", "alpha0": "1e-3"},  # superseded
+        {"run": "i3a300-1e3-s0", "superseded": "0", "epochs_done": "300", "plateau": "95.0", "alpha0": "1e-3"},
+        {"run": "SW_1e-3_s0", "superseded": "0", "epochs_done": "100", "plateau": "94.0", "alpha0": "1e-3"},
+    ]
+    a = collect(rows, ("i3a-",), 100)
+    chk("collect drops short run", len(a["1e-3"]), 1)
+    chk("collect drops superseded", a["1e-3"][0], 90.0)
+    chk("collect prefix excludes i3a300", "i3a300-1e3-s0" not in str(a), True)
+    c = collect(rows, ("SW_", "SW-", "i3c-"), 100)
+    chk("collect arm C prefix", c["1e-3"], [94.0])
+
+    # --- cellstats
+    m_, sd_, _n, nd_ = cellstats([91.0, 93.0])
+    chk("cellstats mean", m_, 92.0)
+    chk("cellstats sd (n-1)", round(sd_, 9), round(math.sqrt(2.0), 9))
+    chk("cellstats no divergence", nd_, 0)
+    chk("cellstats n=1 sd nan", math.isnan(cellstats([95.0])[1]), True)
+
+    # --- divergence handling.  This is CORRECTIONS 39: the campaign's own
+    # `i3b-1e1` = {10.000, 86.858} was averaged to 48.429 +-54.3 and that number
+    # flipped the SIGN of a published verdict.
+    m2, sd2, n2, nd2 = cellstats([10.0, 86.858])
+    chk("diverged seed excluded from mean", round(m2, 3), 86.858)
+    chk("diverged seed counted", nd2, 1)
+    chk("survivor count excludes it", n2, 1)
+    chk("all-diverged cell -> nan mean", math.isnan(cellstats([10.0, 10.0])[0]), True)
+    chk("all-diverged cell counts both", cellstats([10.0, 10.0])[3], 2)
+    chk("boundary: exactly 50 is diverged", cellstats([50.0, 91.0])[3], 1)
+    chk("boundary: 50.001 survives", cellstats([50.001, 91.0])[3], 0)
+
+    # a cell whose SURVIVORS are in band must still be excluded from the width
+    md = {"1e-6": 91.0, "1e-5": 91.0, "1e-4": 91.0}
+    chk("width without divergence", width(md, GRID, 90.0)[0], 2.0)
+    chk("width excludes a diverged cell",
+        width(md, GRID, 90.0, {"1e-5": 1})[0], 0.0)
+    chk("width splits the run at a diverged cell",
+        width(md, GRID, 90.0, {"1e-5": 1})[1:3], ("1e-6", "1e-6"))
+    chk("divs=None behaves as no divergence", width(md, GRID, 90.0, None)[0], 2.0)
+
+    # --- absolute-floor width is independent of the peak
+    mh = {"1e-6": 91.0, "1e-5": 91.0, "1e-4": 99.0}
+    chk("floor width ignores peak", width(mh, GRID, 90.0)[0], 2.0)
+    chk("own-best width punishes peak", width(mh, GRID, 99.0 - 1.0)[0], 0.0)
+
+    # ---- threshold-free statistics (cycle 48).  These exist because the absolute-floor
+    # ranking is not threshold-stable; if THEY could be gamed by a dial the fix would be
+    # worthless, so the cases below are the ones where a careless implementation differs.
+    A_ = {"1e-6": [90.0, 90.0], "1e-5": [92.0, 92.0], "1e-1": [10.0, 10.0]}
+    B_ = {"1e-6": [80.0, 80.0], "1e-5": [82.0, 82.0], "1e-1": [70.0, 90.0]}
+    sub = ["1e-6", "1e-5", "1e-1"]
+    survivable = [g for g in sub
+                  if all(any(v > DIVERGED for v in raw.get(g, [])) for raw in (A_, B_))]
+    chk("TF survivable drops the all-collapsed cell", survivable, ["1e-6", "1e-5"])
+    tfa = threshold_free(A_, sub, survivable)
+    tfb = threshold_free(B_, sub, survivable)
+    # A: survivors over {1e-6,1e-5} = mean(90, 92) = 91.  Face value over all three
+    # includes the 10.000 collapses: mean(90, 92, 10) = 64.
+    chk("TF A survivor mean", round(tfa["surv_mean"], 6), 91.0)
+    chk("TF A face mean", round(tfa["face_mean"], 6), 64.0)
+    chk("TF A survivor grid uses 2 pts", tfa["surv_n"], 2)
+    chk("TF A face grid uses 3 pts", tfa["face_n"], 3)
+    # B has ONE surviving seed at 1e-1 (90.0), so that cell is survivable-for-B but the
+    # sub-grid is shared, so it is still dropped -- the comparison must be like for like.
+    chk("TF B survivor mean on the SHARED survivor grid", round(tfb["surv_mean"], 6), 81.0)
+    # ...and B's face value keeps the 70/90 pair at face value: (80+82+80)/3 = 80.667
+    chk("TF B face mean", round(tfb["face_mean"], 6), round((80 + 82 + 80) / 3, 6))
+    chk("TF worst is over the same sub-grid as the mean", round(tfa["surv_min"], 6), 90.0)
+    chk("TF face worst includes collapses", round(tfa["face_min"], 6), 10.0)
+    # a cell missing from an arm makes the statistic undefined rather than silently
+    # averaging over a different grid than the other arm
+    chk("TF missing cell -> None", threshold_free({"1e-6": [90.0]}, sub, survivable), None)
+    chk("TF all-collapsed survivable cell -> None",
+        threshold_free({"1e-6": [10.0], "1e-5": [92.0], "1e-1": [10.0]}, sub, survivable), None)
+
+    print(f"selftest: {ok}/{ok + fail} PASS")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(_selftest())
+    main(sys.argv[1] if len(sys.argv) > 1 else "results/all_runs.csv")

@@ -1,0 +1,214 @@
+#!/bin/bash
+# =============================================================================
+# cT1_tin_granularity.sh -- `tn1`, THE TINY-IMAGENET GRANULARITY LADDER.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches /cluster/account_a and nothing is submitted to cluster_a.
+#
+# REGISTERED SCORER: analysis/cT1_tin_score.py, git-committed BEFORE this batch
+# is submitted (STANDING RULE 21).  Every bar quoted here is frozen there, and
+# that file's --selftest asserts each one against THIS FILE'S own text and
+# re-derives every archived number from results/all_runs.csv.
+#
+# CODE CHANGE: patches/patch_tinyimagenet.py.  Purely additive and guarded:
+# one `elif dataset_name == "TinyImageNet"` in load_data.py, one
+# `if network_name == 'ResNet18_tin'` in build_network.py, one new class, and
+# one new file tin_data.py that nothing imports unless the new dataset is asked
+# for.  tests/tin_equivalence.py proves bitwise identity for every pre-existing
+# network name and for CIFAR-10/CIFAR-100 with augmentation on and off; GUARD 4
+# below re-runs that proof against the LIVE tree at submission time.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# The parent paper's motivating anomaly is a SCALE anomaly: finer step-size
+# granularity beats a scalar on small vision tasks and stops beating it on
+# ImageNet.  All 2,174 archived runs in this campaign are at CIFAR resolution
+# with 10 or 100 classes, so the campaign has never observed that axis.
+# ImageNet-1k is blocked on DATA (489 of 1000 classes present in the PI tree, an
+# unlabelled 50,000-image val split, and invisible from this account anyway).
+# Tiny-ImageNet-200 moves BOTH separating axes -- 32px -> 64px and 10 -> 200
+# classes -- with no credentials and no terms-of-access acceptance.
+#
+# It is NOT ImageNet.  No number from this batch may be compared with a
+# published ImageNet-1k result.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  12 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85)=5.47, p 6.9e-13; SEED is null, F 1.21, p 0.213) -- is held constant
+# and both contrasts are WITHIN this batch.
+#
+#   scal    TinyImageNet / ResNet18_tin / scalar
+#   lay     TinyImageNet / ResNet18_tin / layerwise
+#   node    TinyImageNet / ResNet18_tin / nodewise
+#   c10lay  CIFAR10      / ResNet18     / layerwise      <- TREE GATE, not science
+#   x seed in {0,1,2}
+#
+#   GRAN = M(lay)  - M(scal)   PRIMARY.  plateau5 = mean of the LAST 5 test epochs.
+#   NODE = M(node) - M(lay)    SECONDARY.
+#
+# PRE-REGISTERED, and it can come out either way.  Re-derived from
+# results/all_runs.csv at the matching archived cell (ResNet18/CIFAR10/SGDm+Lion/
+# ms 1e-3/alpha0 1e-6/box -15:-2.3026/AUGMENT=1/100 ep/batch 100/gamma 1,
+# HIER unset): scalar 87.879 (n=12, 5 batches), layerwise 90.893 (n=17, 6),
+# nodewise 91.739 (n=8, 3); GRAN_CIFAR = +3.014 pp, NODE_CIFAR = +0.846 pp;
+# pooled within-cell SD of plateau5 = 0.1774 pp (df 23, 12 cells).
+#
+#   REPLICATES  GRAN >= +1.507 (half the archived lift) and t >= +2
+#   VANISHES    |GRAN| <= 0.50   -- the anomaly appears at Tiny-ImageNet scale.
+#                                  A POSITIVE finding, not a failure.
+#   REVERSES    GRAN <= -0.50 and t <= -2
+#   otherwise   UNRESOLVED
+#
+# WHY A CIFAR-10 ARM IS IN A TINY-IMAGENET BATCH.  PATCH_TINYIMAGENET edits two
+# files every run in this workspace imports, and 60 jobs of two other agents'
+# decisive batches (`tl1`, `eb1`) were queued when it was applied.  c10lay is the
+# live-tree, in-production proof that the CIFAR path still reproduces its
+# archived arm mean.  If it misses by more than 0.60 pp the scorer returns
+# VOID-PATCHBROKE and no Tiny-ImageNet number is reportable.
+#
+# MAY NOT CLAIM: anything about ImageNet-1k; any hierarchical or shrinkage
+# operator (HIER is unset in every arm); any alpha0 but 1e-6; any meta-stepsize
+# but 1e-3; any optimizer pair but SGDm+Lion; any architecture but ResNet-18;
+# any budget but 100 epochs.  Three rungs cannot locate an optimum.
+#
+# USAGE   bash bin/cT1_tin_granularity.sh            # dry run, submits nothing
+#         bash bin/cT1_tin_granularity.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/tn1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+CACHE=$CIF/data/tiny-imagenet-200-cache
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP="-15:-2.3026"; MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+# WALL, MEASURED not guessed.  Smoke tinsmoke3-lay-s0 (job 4887023, NVIDIA L4,
+# [HOST_e8d809bd94], shared with three other jobs) ran Tiny-ImageNet at ~44 s/epoch
+# including the test pass, so 100 epochs is ~74 min there; smoke tinsmoke2
+# (job 4886984, same node, less contended) was ~36 s/epoch, i.e. ~61 min.
+# Taking the slower measurement, allowing 1.5x for the slowest GPU in the
+# partition list, and then the house 1.5x margin gives ~167 min -> 03:00:00,
+# which is still inside gpu-short's 4 h ceiling so no partition is excluded.
+# CTRL_WALL is the CIFAR-10 arm's, at the same 2:30 the archived 100-epoch
+# CIFAR runs use (measured p99 93 min).
+WALL=03:00:00
+CTRL_WALL=02:30:00
+
+echo "=============================================================="
+echo " tn1 -- Tiny-ImageNet-200 granularity ladder + a CIFAR-10 tree gate"
+echo " box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  4 arms x 3 seeds = 12 jobs"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ------
+SC="$REPO/analysis/cT1_tin_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: scorer missing"
+if [ -d "$REPO/.git" ] || git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cT1_tin_score.py bin/cT1_tin_granularity.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires the scorer committed BEFORE any run exists: $DIRTY"
+else
+  guard_fail "guard 1b: no git repo here; cannot verify RULE 21"
+fi
+python3 "$SC" --selftest >/tmp/tn1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -20 /tmp/tn1_selftest.$$; }
+
+# ---- guard 2: RULE 21 premise -- no Tiny-ImageNet run may exist yet ----------
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2: premise"
+import csv, sys
+rows=[r for r in csv.DictReader(open(sys.argv[1])) if (r.get("superseded") or "0")!="1"]
+n=sum(1 for r in rows if "tiny" in (r.get("dataset") or "").lower()
+      or "_tin" in (r.get("network") or "").lower())
+print("guard 2: %d Tiny-ImageNet rows in the corpus (must be 0)" % n)
+assert n==0, "Tiny-ImageNet runs already exist; this registration is no longer prior"
+PYEOF
+grep -q '^tn1-' "$CSVP" && guard_fail "guard 2b: tn1-* already in the CSV" || echo "guard 2b: no tn1-* name collision"
+
+# ---- guard 3: the staged dataset, MEASURED ----------------------------------
+[ -f "$CACHE/MANIFEST.json" ] || guard_fail "guard 3a: no Tiny-ImageNet cache at $CACHE"
+python3 "$REPO/bin/tin_stage.py" --verify-only --out "$CACHE" >/tmp/tn1_verify.$$ 2>&1 \
+  && { echo "guard 3b: cache VERIFY PASS"; grep -E 'train_x|labels|per class' /tmp/tn1_verify.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 3b: cache verification FAILED"; tail -20 /tmp/tn1_verify.$$; }
+
+# ---- guard 4: the patch is a proven no-op on the LIVE tree ------------------
+python3 "$REPO/tests/tin_equivalence.py" --cifar10-dir "$CIF" >/tmp/tn1_equiv.$$ 2>&1 \
+  && { echo "guard 4: PATCH_TINYIMAGENET is a bitwise no-op on the live tree"
+       grep -E 'PROOF|m_params|scalar=|PASS --' /tmp/tn1_equiv.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4: equivalence proof FAILED -- do NOT submit"; tail -30 /tmp/tn1_equiv.$$; }
+
+# ---- guard 5: capacity ------------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 12"
+# The cap is 70, not the usual 40, because two other agents' decisive batches
+# (tl1, 42 jobs; eb1, 18 jobs) are deliberately in flight this cycle.
+[ "${PEND:-0}" -le 70 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA)
+
+mkdir -p "$SAVE"; N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in scal lay node c10lay; do
+    case $ARM in
+      scal)   DSET=TinyImageNet; NET=ResNet18_tin; G=scalar;    W=$WALL ;;
+      lay)    DSET=TinyImageNet; NET=ResNet18_tin; G=layerwise; W=$WALL ;;
+      node)   DSET=TinyImageNet; NET=ResNet18_tin; G=nodewise;  W=$WALL ;;
+      c10lay) DSET=CIFAR10;      NET=ResNet18;     G=layerwise; W=$CTRL_WALL ;;
+    esac
+    CMD="sbatch --job-name=tn1-$ARM-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=24G --time=$W --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name tn1-$ARM-s$S"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for tn1-$ARM-s$S"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; echo; N=$((N+1)); fi
+  done
+done
+echo "guard 6: $((N)) composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  echo "tn1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- tn1- added to bin/PROTECTED.txt ----"
+  # NOTE: jobs/run_cifar.sh hard-codes  #SBATCH --output=$WS/runs/%x-%j.out,
+  # so the .out files land in $WS/runs, NOT in --save-directory.  Point the
+  # RULE 20 post-launch guard at the directory that actually receives them.
+  guard_postlaunch "$WS/runs" "tn1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no tn1 job started inside the window (queued behind"
+       echo "         tl1/eb1).  This is NOT a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name tn1-" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel this batch:"
+       echo "    squeue -h -u $USER_NAME -n \$(squeue -h -u $USER_NAME -o %j | grep '^tn1-' | paste -sd,) -o %i | xargs -r scancel" ;;
+  esac
+fi

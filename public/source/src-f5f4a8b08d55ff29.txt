@@ -1,0 +1,39 @@
+set -e
+cd /cluster/account_b/metaopt
+R=/cluster/account_b/metaopt/runs
+# CYCLE 19 DECISIVE CONTROL.
+# The whole scale axis (sc-ResNet10/18/34) is at alpha0=1e-6. Its emerging headline --
+# granularity gain collapses with scale (+19.88pp @R10, +2.87pp @R18, ~+0.6pp @R34) --
+# is driven ENTIRELY by the SCALAR arm improving with scale (70.74 -> 87.82 -> ~89.5),
+# not by layerwise degrading (90.62 -> 90.69 -> ~90.4). Rule 5: alpha0=1e-6 costs
+# 14-25 epochs of escape that differs per arm, and sc-ResNet10-scal NEVER reaches 85%.
+# So "granularity stops helping at scale" may be "the escape penalty is worst for
+# scalar on small nets". This block re-runs the entire ladder at alpha0=1e-3.
+# If the trend survives -> the paper has its spine. If it vanishes -> a headline dies
+# before it is written, which is the point.
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+C="BETA_CLIP=-15:-2.3026"
+B="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset CIFAR10 --batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-3 --num-epochs 100"
+
+# $1=name $2=NN $3=stepsize-groups $4=seed $5=extra-env
+sub(){ sbatch --parsable --job-name=$1-s$4 --partition=$PARTS --gres=gpu:1 \
+  --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --export="ALL,AUGMENT=1,$C$5" \
+  jobs/run_cifar.sh $B --NN-name $2 --stepsize-groups $3 --seed $4 \
+  --save-directory $R/sca3 --run-name $1-s$4 >/dev/null; }
+
+for s in 0 1 2; do
+  for NN in ResNet10 ResNet18 ResNet34; do
+    # NOTE: HIER must be UNSET for the non-hierarchical arms. HF.py does
+    # self._hier = os.environ.get('HIER','') then `if self._hier:` -- so
+    # HIER=none is TRUTHY and would silently enable the hierarchy branch.
+    # The existing sc-* runs echo "HIER=none" only because run_cifar.sh
+    # echoes ${HIER:-none} over an unset variable.
+    sub sa3-$NN-scal  $NN scalar    $s ""
+    sub sa3-$NN-layer $NN layerwise $s ""
+    sub sa3-$NN-add   $NN layerwise $s ",HIER=additive,ETA_RATIO=0.06"
+  done
+done
+sleep 3
+echo "E1_SUBMITTED=$(squeue -h -u account_b -o '%j' | grep -c '^sa3-')"
+echo "TOTAL_QUEUE=$(squeue -h -u account_b | wc -l)"

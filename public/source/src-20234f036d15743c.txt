@@ -1,0 +1,135 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 48 -- the FREE-BETA scale profile.  Runs on cluster_b.  12 jobs.
+#
+# OPEN QUESTION IT ANSWERS -- and it is the one that can most damage the headline.
+#   Cycle 48's structural result is measured with beta FROZEN (`--alg-meta fixed`):
+#
+#       steady half, R18/CIFAR-10, alpha0=1e-3, T=2000
+#         k=1       rho_w^implied = 3.200e-06
+#         k=775                   = 1.133e-06
+#         k=180,225               = 4.620e-08        span 69.3x  -> outcome (b)
+#
+#   A frozen step size is OFF the meta-optimum.  FINDINGS 44.3 measured that adaptation
+#   changes this system qualitatively, not quantitatively: the channel split goes
+#   85% bias / 15% common mode / 0.7% independent (frozen) -> 4% / 46% / 52% (free), and
+#   the per-weight rho falls 22.8x (1.925e-6 -> 8.458e-8).  Every method the claim is
+#   aimed at -- Adam-mini, Adalayer, SGG -- ADAPTS.  So "the 1/sqrt(N) noise model is
+#   violated and the violation is scale-dependent" is, on present evidence, a statement
+#   about a system that has not adapted yet.  This batch decides whether it survives.
+#
+# PRE-REGISTERED PREDICTIONS -- write the verdict against these.
+#   (B0) REPRODUCTION CHECK, and it is this batch's own validity gate.  Steady-half
+#        rho_s at weightwise must land within 3x of FINDINGS 44.3's independently
+#        measured free-beta value **8.458e-08**.  The instrument is calibrated: its
+#        frozen counterpart reproduced 44.3's 1.925e-06 to 3-8% this cycle
+#        (p5-w-a3: 1.991e-06 / 2.085e-06 steady half).
+#        If B0 fails, nothing else in the batch may be quoted.
+#   (B1) THE PROFILE SURVIVES ADAPTATION -- tested on the k=1 -> k=775 leg, which is the
+#        only leg with assured resolution (see RESOLUTION).  Frozen, that leg falls
+#        3.200e-06 -> 1.133e-06 = **2.82x**.  Predict the free arm falls >= 2x on the
+#        same leg.
+#        REFUTATION: flat to within 1.3x -> the correlation length is an OFF-EQUILIBRIUM
+#        phenomenon only.  Every "the noise model is violated" sentence would then have
+#        to be qualified to "before the step size adapts" -- materially weaker, still
+#        publishable, and it changes the paper's framing.  Write it as that, not as a
+#        null result.
+#   (B2) THE LEVEL DROPS.  free rho_w(k=1) in [1e-8, 4e-7] against frozen 3.200e-06,
+#        i.e. a drop of roughly 8x-320x, centred on 44.3's measured 22.8x.
+#   (B3) Reported as a BOUND, not a test: the layerwise rung.
+#
+#   RESOLUTION -- computed BEFORE submission, per CORRECTIONS 33's standing rule that a
+#   null may not be reported until the minimum detectable effect is stated beside it.
+#   Taking the measured frozen steady-half rho_s and dividing by 44.3's 22.8x:
+#       rung        rho_min (measured, T=1000 steady)   predicted free rho_s   verdict
+#       weightwise  8.5e-09                             8.7e-08                ~10 sigma  RESOLVES
+#       nodewise    7.1e-06                             2.4e-05                ~3.4x      RESOLVES
+#       layerwise   1.3e-03                             2.3e-04                0.18x      WILL NOT
+#       blk6        >8.6e-02                            n/a                    did not resolve FROZEN
+#   So B1 is deliberately written on the w->node leg.  **A layerwise null in this batch
+#   means "no correlation above rho_s = 1.3e-3", NOT "no correlation"** -- and pooling the
+#   3 seeds improves that to ~7.4e-04, still 3x above the predicted value.  Do not write a
+#   layerwise absence.  The 3 seeds are for exactly this pooling; 2 would not do it.
+#
+# DESIGN.  Byte-for-byte the frozen `p5-*-a3` recipe with ONE field changed --
+# `--alg-meta fixed` -> the p7free meta-optimizer -- so the frozen/free contrast is not
+# confounded by anything else.  The meta fields are recovered verbatim from
+# `p7-r18-w-s0` (cluster_a), which is the run FINDINGS 44.3's free-beta column was measured on:
+#     --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+# 20 epochs, PROBE=5 -> T=2000 records, matching p5 and p7free exactly.  Changing the
+# horizon would break B0, which is the whole point of B0.
+#
+# WHY cluster_b.  Its comparator is the frozen `p5-*-a3` batch, which ran on cluster_b and whose
+# PROBE5 output this batch is differenced against.  Same account, same partition list, same
+# patch, same everything except --alg-meta.  (The c48 frozen LADDER goes to cluster_a for the
+# mirror-image reason: its comparators, p7free, are on cluster_a.)
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. beta_true_max != beta_true_min on at least one record -- beta really is FREE here.
+#      This is the inverse of the frozen batch's check and it must be run, not assumed.
+#   2. neg_counts.json exists with n_records == 2000 and n_tot matching the arm
+#   3. sum(neg_counts)/(n_records*n_tot) == time-mean of frac_neg to <1e-6
+#   4. python3 analysis/probe5_floor.py --selftest && analysis/probe5_window.py --selftest
+#
+# USAGE
+#   bash c48_free_profile_p5.sh            # dry run
+#   bash c48_free_profile_p5.sh --submit   # submits, ONLY if the guards below pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_b/metaopt                          # cluster_b
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+SAVE=$WS/runs/fr5
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_b
+PEND_CAP=40
+NJOBS=12
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c48 FREE-beta scale profile + PROBE5 (cluster_b) ==="
+
+if ! grep -q PATCH_PROBE5 "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5 not present in $HF"; exit 1
+fi
+if ! grep -q PATCH_PROBE5_FIX "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5_FIX not present -- unfixed patch crashes at record 500"; exit 1
+fi
+echo "guard 1: PATCH_PROBE5 + PATCH_PROBE5_FIX present  OK"
+
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 2: FairShare=${FS:-unknown} (informational only), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+mkdir -p "$SAVE"
+N=0
+for G in resnet18_blocks layerwise nodewise weightwise; do
+  case $G in
+    resnet18_blocks) TAG=blk6 ;;
+    layerwise)       TAG=lay  ;;
+    nodewise)        TAG=node ;;
+    weightwise)      TAG=w    ;;
+  esac
+  for S in 0 1 2; do
+    RN="fr5-${TAG}-a3-s${S}"
+    PD="$SAVE/probe_${TAG}_a3_s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --time=03:50:00
+      --export="ALL,AUGMENT=1,BETA_CLIP=-15:-2.3026,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PD"
+      "$RUNNER"
+      --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-3
+      --num-epochs 20 --stepsize-groups "$G" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    N=$((N+1))
+    if [ "$SUBMIT" = "1" ]; then "${CMD[@]}"; else printf '%s\n' "${CMD[*]}"; fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with:  python3 analysis/probe5_window.py <probe root>   (steady half)"

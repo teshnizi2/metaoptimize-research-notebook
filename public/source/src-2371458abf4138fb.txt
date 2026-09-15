@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cA1_g4_score.py -- THE REGISTERED SCORER FOR `g4m`, THE r x META-STEPSIZE
+#                    LADDER.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any g4m run exists.  Every
+# band edge, every threshold, every refusal below is frozen here.  selftest()
+# asserts each constant against bin/cA1_g4_ms_ladder.sh's OWN TEXT so the
+# registration and the batch cannot drift apart, and RE-DERIVES the noise floor
+# and every prior from results/all_runs.csv rather than quoting a number.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments is not editing it.  Once a g4m run exists this file is
+# frozen for good.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# The additive operator (HF.py, PATCH_HIER, `_apply_hier`, layerwise branch) is
+#
+#     d      = beta_t - beta_{t-1}        the realised meta-update
+#     dm     = mean(d)                    its shared component
+#     beta_t := beta_{t-1} + dm + r * (d - dm)
+#
+# so r scales the DEVIATION component of the meta-update and leaves the shared
+# component at full rate.  r = 1 is the arithmetic identity (plain layerwise);
+# r = 0 freezes every deviation and moves all groups together.
+#
+# THE OBJECTION THIS BATCH EXISTS TO SETTLE.  "r is not a hierarchy at all; it
+# is a meta-stepsize dial in disguise, and the r-curve is what you would get by
+# tuning `--meta-stepsize`."  MEASURED, not quoted: every one of the 637
+# hierarchical runs in results/all_runs.csv sits at meta_stepsize = 1e-3.  A
+# single value.  The confound has therefore never been swept, in either
+# direction, in the entire corpus.  premise_ms_is_single() re-derives that.
+#
+# -----------------------------------------------------------------------------
+# THE ms GRID IS **NOT** THE ONE THE BRIEF NAMED, AND THIS IS WHY
+# -----------------------------------------------------------------------------
+# The brief proposed ms in {1e-5, 3e-5, 1e-4, 3e-4, 1e-3} at alpha0 = 1e-6.
+# That grid was checked against the corpus BEFORE anything was submitted, and it
+# is defective.  results/all_runs.csv already carries the r = 1 (plain layerwise,
+# HIER=none) ms ladder at EXACTLY this cell -- ResNet18 / CIFAR-10 / layerwise /
+# alpha0 = 1e-6 / box -15:-2.3026 / AUGMENT=1 / 100 ep, run names `ms-lay-*`,
+# five seeds each -- and it reads (re-derived by dead_rungs_from_csv()):
+#
+#       ms      plateau5      state
+#     1e-5       19.570       DEAD -- beta cannot climb out of alpha0 in 100 ep
+#     3e-5       22.766       DEAD
+#     1e-4       46.362       crippled
+#     3e-4       90.228       live
+#     1e-3       90.893       live, and the LARGEST value on the ladder (n=17)
+#     > 1e-3     NO DATA AT THIS CELL
+#
+# The ladder is MONOTONE INCREASING to the top of the proposed grid.  At
+# alpha0 = 1e-6 log-beta must climb ~11.5 nats before the step size is useful,
+# the shared component does that climbing, and a smaller GLOBAL ms slows the
+# climb as well as the deviations.  So on the proposed grid the ms-argmax of
+# every arm would land on the grid's upper EDGE, "optimising ms within each r"
+# would be a no-op, the r-curve could not move, and the batch would return
+# REFUTED by construction while burning 36 of its 60 jobs at 19-46% accuracy.
+#
+# A test that can only return one answer is not a test.  The grid is therefore
+# ms in {1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2}: the two provably dead rungs are
+# dropped, the three live ones kept, and three rungs added ABOVE the observed
+# argmax so that the maximum over ms is BRACKETED rather than truncated.
+# Bracketing is enforced as a gate, not assumed -- see G2.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN
+# -----------------------------------------------------------------------------
+#   r  in {0, 0.06, 0.2, 1}                 4 rungs, endpoints r=0 and r=1
+#   ms in {1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2}   6 rungs
+#   seed in {0, 1, 2}                       3 seeds       ->  72 jobs
+#   ResNet18 / CIFAR-10 / layerwise / SGDm base / Lion meta / alpha0 1e-6 /
+#   100 epochs / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 / AUGMENT=1 /
+#   PROBE=5.  ONE submission, so BATCH -- the unit of replication
+#   (F(62,85)=5.47) -- is held constant across every cell.  Every contrast
+#   below is WITHIN this batch and carries no cross-batch floor.
+#
+# -----------------------------------------------------------------------------
+# THE PRIMARY STATISTIC, FROZEN
+# -----------------------------------------------------------------------------
+#   plateau5 = mean of the LAST 5 test epochs.  The CSV `plateau` column
+#   (mean-of-last-20) is BANNED as primary and is never read by this file;
+#   `best_test` is not a plateau and is never read either.
+#
+#   OPT(r)  = max over the 6 ms rungs of the 3-seed mean plateau5 at that (r, ms)
+#   PEAK    = max(OPT(0.06), OPT(0.2)) - max(OPT(0), OPT(1))     interior lift
+#   SPAN    = max_r OPT(r) - min_r OPT(r)                        curve span
+#
+# -----------------------------------------------------------------------------
+# THE BARS.  DERIVED FROM THE MEASURED NOISE FLOOR, FROZEN HERE
+# -----------------------------------------------------------------------------
+# noise_floor_from_csv() re-derives the pooled WITHIN-CELL standard deviation of
+# plateau5 over the 10 populated r-cells of the archived additive r-curve at this
+# exact configuration (ResNet18 / CIFAR-10 / layerwise / alpha0 1e-6 / SGDm+Lion /
+# box -15:-2.3026 / AUGMENT=1 / 100 ep / not collapsed / complete):
+#
+#     SIGMA_W = 0.1438 pp   (df = 47, n = 57 runs over 10 cells)
+#     SE of a 3-seed cell mean            = SIGMA_W / sqrt(3) = 0.0830 pp
+#     SE of a difference of two such      = SIGMA_W * sqrt(2/3) = 0.1174 pp
+#
+# CONFIRMED_BAR = 0.30 pp.  Under the null "the ms-optimised r-curve is flat",
+#   SPAN is the range of four 3-seed means at SIGMA_W.  The 95th percentile of
+#   that range is 3.63 * 0.0830 = 0.301 pp (200k-draw simulation, reproduced by
+#   selftest() with a fixed seed).  Declaring CONFIRMED at SPAN <= 0.30 therefore
+#   carries a <= 5% false-CONFIRMED rate at this n.  The rate is SMALLER still
+#   when the max-over-ms selection is included -- selection over 6 exchangeable
+#   rungs gives a 95th percentile of only 0.20 pp -- so 0.30 is the conservative
+#   of the two null models, which is the one that gets registered.
+#
+# REFUTED_BAR = 0.50 pp.  PEAK >= 0.50 is 4.26 SE-of-difference at this n, and
+#   it is HALF the interior lift the archived ms = 1e-3 data already shows
+#   (prior_curve_from_csv(): 93.285 at r = 0.06 against 92.288 at r = 0 and
+#   90.971 at r = 1, i.e. +0.997 over the better endpoint).  A dial-only account
+#   of r predicts this collapses to zero once ms is optimised within each r;
+#   surviving at half strength is the registered threshold for saying it did not.
+#
+# Anything strictly between the two bars is UNRESOLVED and is reported as
+# UNRESOLVED.  There is no third reading of the gap and none will be invented
+# afterwards.
+#
+# -----------------------------------------------------------------------------
+# THE GATES, IN ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# -----------------------------------------------------------------------------
+#   G0  PROVENANCE, ABSOLUTELY GATING.  MEASURED from each run's OWN `ARGS:` and
+#       `ENV:` lines, never from its filename and never from the batch script's
+#       header (STANDING RULE 20).  Every run must carry: no repeated flag;
+#       --NN-name ResNet18; --dataset CIFAR10; --stepsize-groups layerwise;
+#       --alpha0 1e-6; --num-epochs 100; --batch-size 100; --gamma 1;
+#       --alg-base SGDm; --alg-meta Lion; HIER=additive; AUGMENT=1;
+#       BETA_CLIP=-15:-2.3026; PROBE=5; SCHED=none; and an (ETA_RATIO,
+#       meta-stepsize, seed) triple that is one of the 72 registered cells.
+#       100 completed epochs.  If ANY run fails, that run is dropped and named;
+#       if any registered CELL ends with fewer than 2 usable seeds the batch is
+#       VOID and nothing else is read.
+#   G1  THE NO-OP CONTROL.  r = 1 additive is the arithmetic identity, so the
+#       g4m r = 1, ms = 1e-3 cell must reproduce the archived plain-layerwise
+#       HIER=none mean at the same cell.  The archived value is re-derived by
+#       plain_prior_from_csv() (90.906 pp, six batches).  BAND +-0.45 pp, which
+#       is 3.2 sigma on sqrt(between-batch 0.107^2 + 3-seed 0.083^2 +
+#       prior-mean 0.044^2) = 0.142.  A miss means the operator is not the
+#       identity on the live tree, or the tree moved: batch VOID.
+#   G2  THE BRACKET GATE.  For each r the ms-argmax must be INTERIOR to the grid.
+#       An argmax on an edge means OPT(r) is a TRUNCATED maximum and understates
+#       that r.  Registered consequence, and the direction matters:
+#         * truncation at an ENDPOINT r (0 or 1) understates the subtrahend,
+#           inflates PEAK, and therefore INVALIDATES a REFUTED verdict
+#           -> UNRESOLVED-TRUNCATED;
+#         * truncation at an INTERIOR r (0.06 or 0.2) understates PEAK and
+#           inflates nothing, so it INVALIDATES a CONFIRMED verdict but leaves a
+#           REFUTED standing (it can only have been conservative).
+#   G3  THE MANIFOLD GATE.  The ms = 1e-3 slice of THIS batch must reproduce the
+#       archived r-curve's interior lift: PEAK restricted to ms = 1e-3 must be
+#       >= REFUTED_BAR.  Without this a CONFIRMED cannot be told apart from "the
+#       effect was simply absent in this batch".  A miss is
+#       UNRESOLVED-NOMANIFOLD and NO verdict on the dial question is issued.
+#   G4  THE BOX METER.  DESCRIPTIVE, NEVER GATING.  Per-cell rail occupancy from
+#       each run's own probe.jsonl (n_at_lo / n_at_hi over n_beta).  The upper ms
+#       rungs are expected to press the ceiling at -2.3026; that is disclosed,
+#       not silently absorbed, and it CANNOT change G5.
+#   G5  THE PRIMARY.  PEAK and SPAN against the two registered bars.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS SCORER WILL NOT DO
+# -----------------------------------------------------------------------------
+#   * It will not report the CSV `plateau` (last-20) column, or `best_test`.
+#   * It will not name an argmax r as "the optimum": the r grid has four rungs
+#     and cannot locate one.
+#   * It will not pool g4m with any archived batch to raise n.  The archived
+#     curves enter only as G1's and G3's registered comparators.
+#   * It will not claim anything about ResNet50, CIFAR-100, alpha0 = 1e-3, any
+#     granularity other than layerwise, or any operator other than `additive`.
+#   * It will not soften either bar after the fact.  If the answer lands in the
+#     gap, the deliverable is the word UNRESOLVED.
+#   * It will not read a run whose own ARGS line disagrees with its filename.
+#
+# -----------------------------------------------------------------------------
+# USAGE
+#   python3 analysis/cA1_g4_score.py --selftest
+#   python3 analysis/cA1_g4_score.py --runs /cluster/account_a/metaopt/runs/g4m
+#   python3 analysis/cA1_g4_score.py --runs <dir> --probes <dir>
+# =============================================================================
+
+from __future__ import print_function
+
+import os
+import re
+import csv
+import sys
+import glob
+import json
+import math
+import random
+import argparse
+import statistics
+import collections
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+SCRIPT = os.path.join(REPO, "bin", "cA1_g4_ms_ladder.sh")
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+# --------------------------------------------------------------------------
+# THE REGISTERED DESIGN.  Asserted against the batch script's own text below.
+# --------------------------------------------------------------------------
+PREFIX = "g4m"
+NET = "ResNet18"
+DSET = "CIFAR10"
+GRAN = "layerwise"
+ALPHA0 = "1e-6"
+EPOCHS = 100
+BATCH = 100
+GAMMA = 1
+CLIP = "-15:-2.3026"
+AUG = "1"
+PROBE = "5"
+M_LAYERWISE = 62
+WALL = "02:00:00"
+
+RS = ["0", "0.06", "0.2", "1"]
+MSS = ["1e-4", "3e-4", "1e-3", "3e-3", "1e-2", "3e-2"]
+SEEDS = ["0", "1", "2"]
+NJOBS = len(RS) * len(MSS) * len(SEEDS)          # 72
+
+R_ENDPOINTS = ("0", "1")
+R_INTERIOR = ("0.06", "0.2")
+MS_REF = "1e-3"
+
+# --------------------------------------------------------------------------
+# THE REGISTERED BARS AND PRIORS.  Every one of these is RE-DERIVED from the
+# CSV at run time by the functions below; the literals are the registration and
+# selftest() fails if the re-derivation drifts away from them.
+# --------------------------------------------------------------------------
+SIGMA_W = 0.1438            # pooled within-cell SD of plateau5, df 47
+SIGMA_TOL = 0.005
+CONFIRMED_BAR = 0.30        # SPAN <= this  -> r IS a step-size dial
+REFUTED_BAR = 0.50          # PEAK >= this  -> r is MORE than a step-size dial
+G1_BAND = 0.45              # no-op control half-width, pp
+PLAIN_PRIOR = 90.906        # plain layerwise HIER=none, ms 1e-3, 6 batches
+PRIOR_CURVE = {"0": 92.288, "0.06": 93.285, "0.2": 91.519, "1": 90.971}
+DEAD_RUNGS = {"1e-5": 19.570, "3e-5": 22.766, "1e-4": 46.362, "3e-4": 90.228}
+DEAD_MAX = 30.0             # a rung below this is DEAD and was dropped
+MIN_SEEDS = 2               # per cell, below which the batch is VOID
+
+VOID = "VOID"
+UNRES = "UNRESOLVED"
+UNRES_TRUNC = "UNRESOLVED-TRUNCATED"
+UNRES_NOMAN = "UNRESOLVED-NOMANIFOLD"
+CONFIRMED = "CONFIRMED"
+REFUTED = "REFUTED"
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+
+
+# --------------------------------------------------------------------------
+# re-derivation from the corpus.  NOTHING here is quoted from prose.
+# --------------------------------------------------------------------------
+def _cell_rows(path):
+    """Archived additive r-curve rows at EXACTLY the g4m configuration."""
+    out = []
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r["hier"] != "additive":
+                continue
+            if (r["network"] != NET or r["dataset"] != DSET
+                    or r["granularity"] != GRAN or r["alpha0"] != ALPHA0
+                    or r["base"] != "SGDm" or r["meta"] != "Lion"
+                    or r["beta_clip"] != CLIP or r["augment"] != AUG):
+                continue
+            if (r["epochs_requested"] != str(EPOCHS) or r["collapsed"] != "0"
+                    or r["complete"] != "1" or not r["plateau5"]):
+                continue
+            out.append(r)
+    return out
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN-CELL SD of plateau5 over the archived r-cells.  Returns
+    (sigma, df, n_runs, n_cells)."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path):
+        by[float(r["eta_ratio"])].append(float(r["plateau5"]))
+    num = den = 0.0
+    n = 0
+    for v in by.values():
+        n += len(v)
+        if len(v) > 1:
+            s = statistics.stdev(v)
+            num += s * s * (len(v) - 1)
+            den += len(v) - 1
+    if den <= 0:
+        return None, 0, n, len(by)
+    return math.sqrt(num / den), int(den), n, len(by)
+
+
+def prior_curve_from_csv(path=CSV):
+    """The archived r-curve at ms = 1e-3.  {r_string: (mean, n)}."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path):
+        if r["meta_stepsize"] != MS_REF:
+            continue
+        by["%g" % float(r["eta_ratio"])].append(float(r["plateau5"]))
+    return dict((k, (statistics.mean(v), len(v))) for k, v in by.items())
+
+
+def plain_prior_from_csv(path=CSV):
+    """Plain layerwise HIER=none at the g4m cell, ms=1e-3, as a GRAND MEAN OVER
+    BATCHES -- batch, not seed, is the unit of replication.  Returns
+    (grand_mean, between_batch_sd, n_batches, n_runs)."""
+    by = collections.defaultdict(list)
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if (r["hier"] or "") != "":
+                continue
+            if (r["network"] != NET or r["dataset"] != DSET
+                    or r["granularity"] != GRAN or r["alpha0"] != ALPHA0
+                    or r["meta_stepsize"] != MS_REF or r["base"] != "SGDm"
+                    or r["meta"] != "Lion" or r["beta_clip"] != CLIP
+                    or r["augment"] != AUG or r["epochs_done"] != str(EPOCHS)
+                    or r["collapsed"] != "0" or not r["plateau5"]):
+                continue
+            by[r["run"].split("-")[0].split("_")[0]].append(float(r["plateau5"]))
+    if not by:
+        return None, None, 0, 0
+    means = [statistics.mean(v) for v in by.values()]
+    nrun = sum(len(v) for v in by.values())
+    sd = statistics.stdev(means) if len(means) > 1 else 0.0
+    return statistics.mean(means), sd, len(means), nrun
+
+
+def dead_rungs_from_csv(path=CSV):
+    """The archived r=1 (HIER=none) ms ladder at the g4m cell -- the `ms-lay-*`
+    runs.  {ms_string: (mean, n)}.  This is the measurement that condemned the
+    briefed ms grid."""
+    tag = {"1e5": "1e-5", "3e5": "3e-5", "1e4": "1e-4", "3e4": "3e-4"}
+    by = collections.defaultdict(list)
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            m = re.match(r"^ms-lay-(\w+)-s\d+$", r["run"])
+            if not m or m.group(1) not in tag or not r["plateau5"]:
+                continue
+            by[tag[m.group(1)]].append(float(r["plateau5"]))
+    return dict((k, (statistics.mean(v), len(v))) for k, v in by.items())
+
+
+def premise_ms_is_single(path=CSV):
+    """THE PREMISE: every hierarchical run in the corpus is at one meta-stepsize.
+    Returns the Counter so the caller can print it rather than trust it."""
+    c = collections.Counter()
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if (r["hier"] or "").strip():
+                c[r["meta_stepsize"]] += 1
+    return c
+
+
+# --------------------------------------------------------------------------
+# reading the runs.  The cell of a run is MEASURED from its own ARGS/ENV.
+# --------------------------------------------------------------------------
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ = []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals = []
+            j = i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff = collections.OrderedDict()
+    seen = collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    dup = dict((f, v) for f, v in seen.items() if len(v) > 1)
+    return eff, dup
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    """{'args':.., 'dup':.., 'env':.., 'series':{ep: acc}} or None."""
+    args = env = None
+    ser = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for k, line in enumerate(fh):
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    ser[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "series": ser, "path": path}
+
+
+def plateau5(series, budget=EPOCHS, w=5):
+    """Mean of the last 5 test epochs.  Epochs are 0-indexed in the .out."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def gate0(recs):
+    """PROVENANCE.  Returns (cells, dropped) where cells maps (r, ms, seed) to
+    plateau5.  Every check is against the run's OWN ARGS/ENV."""
+    want_args = {"NN-name": NET, "dataset": DSET, "stepsize-groups": GRAN,
+                 "alpha0": ALPHA0, "num-epochs": str(EPOCHS),
+                 "batch-size": str(BATCH), "gamma": str(GAMMA),
+                 "alg-base": "SGDm", "alg-meta": "Lion"}
+    want_env = {"HIER": "additive", "AUGMENT": AUG, "BETA_CLIP": CLIP,
+                "PROBE": PROBE, "SCHED": "none"}
+    cells, dropped = {}, []
+    for rec in recs:
+        why = []
+        if rec["dup"]:
+            why.append("REPEATED FLAG %s (RULE 20)" % ",".join(sorted(rec["dup"])))
+        for f, w in want_args.items():
+            got = rec["args"].get(f)
+            if got is None:
+                why.append("--%s absent" % f)
+            elif norm_num(w) is not None and norm_num(got) is not None:
+                if norm_num(got) != norm_num(w):
+                    why.append("--%s=%s want %s" % (f, got, w))
+            elif got != w:
+                why.append("--%s=%s want %s" % (f, got, w))
+        for k, w in want_env.items():
+            got = rec["env"].get(k)
+            if got != w:
+                why.append("ENV %s=%s want %s" % (k, got, w))
+        r = norm_num(rec["env"].get("ETA_RATIO"))
+        ms = rec["args"].get("meta-stepsize")
+        sd = rec["args"].get("seed")
+        if r is None or r not in [norm_num(x) for x in RS]:
+            why.append("ETA_RATIO=%s not a registered rung" % rec["env"].get("ETA_RATIO"))
+        if norm_num(ms) not in [norm_num(x) for x in MSS]:
+            why.append("--meta-stepsize=%s not a registered rung" % ms)
+        if sd not in SEEDS:
+            why.append("--seed=%s not a registered seed" % sd)
+        p5 = plateau5(rec["series"])
+        if p5 is None:
+            why.append("fewer than %d completed epochs (max ep %s)"
+                       % (EPOCHS, max(rec["series"]) if rec["series"] else "none"))
+        # the filename must not disagree with the run's own --run-name
+        rn = rec["args"].get("run-name", "")
+        if rn and not os.path.basename(rec["path"]).startswith(rn + "-"):
+            why.append("filename disagrees with --run-name %s" % rn)
+        if why:
+            dropped.append((os.path.basename(rec["path"]), why))
+            continue
+        key = (r, norm_num(ms), sd)
+        cells.setdefault(key, p5)
+    return cells, dropped
+
+
+def cell_means(cells):
+    """{(r, ms): (mean, n, [values])} keyed on NORMALISED rung strings."""
+    by = collections.defaultdict(list)
+    for (r, ms, _s), v in cells.items():
+        by[(r, ms)].append(v)
+    return dict((k, (statistics.mean(v), len(v), sorted(v)))
+                for k, v in by.items())
+
+
+# --------------------------------------------------------------------------
+# probe rails -- G4, descriptive only
+# --------------------------------------------------------------------------
+def rails(probe_dir, frac_tail=0.5):
+    """(rec_lo, rec_hi) over the last `frac_tail` of records, or None."""
+    p = os.path.join(probe_dir, "probe.jsonl")
+    if not os.path.exists(p):
+        return None
+    lo = hi = tot = 0
+    recs = []
+    try:
+        with open(p, "r", errors="replace") as fh:
+            for line in fh:
+                if '"n_at_lo"' not in line:
+                    continue
+                recs.append(line)
+    except IOError:
+        return None
+    if not recs:
+        return None
+    for line in recs[int(len(recs) * (1 - frac_tail)):]:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        nb = d.get("n_beta") or 0
+        if not nb:
+            continue
+        lo += d.get("n_at_lo") or 0
+        hi += d.get("n_at_hi") or 0
+        tot += nb
+    if not tot:
+        return None
+    return lo / float(tot), hi / float(tot)
+
+
+# --------------------------------------------------------------------------
+# THE VERDICT.  Registered, and there is no fourth branch.
+# --------------------------------------------------------------------------
+def verdict(peak, span, trunc_endpoint, trunc_interior, manifold_ok):
+    if not manifold_ok:
+        return UNRES_NOMAN
+    if peak >= REFUTED_BAR:
+        return UNRES_TRUNC if trunc_endpoint else REFUTED
+    if span <= CONFIRMED_BAR:
+        return UNRES_TRUNC if trunc_interior else CONFIRMED
+    return UNRES
+
+
+VERDICT_TEXT = {
+    REFUTED: ("r is MORE than a meta-stepsize dial.  After optimising ms WITHIN "
+              "each r the r-curve keeps an interior peak of at least "
+              "%.2f pp over both endpoints." % REFUTED_BAR),
+    CONFIRMED: ("r IS a meta-stepsize dial at this cell.  Once ms is optimised "
+                "within each r the r-curve is flat to within %.2f pp and the "
+                "hierarchical reading of the r-curve is not supported."
+                % CONFIRMED_BAR),
+    UNRES: ("The ms-optimised r-curve lands between the two registered bars.  "
+            "Neither branch is claimed.  Reported as UNRESOLVED."),
+    UNRES_TRUNC: ("An ms-argmax sits on a grid EDGE, so at least one OPT(r) is a "
+                  "truncated maximum in the direction that would change the "
+                  "answer.  Reported as UNRESOLVED; the fix is more ms rungs, "
+                  "not a softer bar."),
+    UNRES_NOMAN: ("The ms = %s slice of this batch does not reproduce the "
+                  "archived interior lift, so this batch is not on the manifold "
+                  "where the phenomenon exists and the dial question cannot be "
+                  "asked of it." % MS_REF),
+    VOID: "Provenance failed.  Nothing is read and no number is quoted.",
+}
+
+
+# --------------------------------------------------------------------------
+def selftest():
+    src = open(SCRIPT).read() if os.path.exists(SCRIPT) else ""
+    # This file's header block is the REGISTRATION.  It is a `#` comment block,
+    # not a docstring, so it is read from the source and cut at the first line
+    # of code -- otherwise a check would match its own assertion line and be
+    # tautological.
+    doc = open(os.path.abspath(__file__)).read().split("from __future__")[0]
+    p = n = 0
+
+    def ok(label, cond):
+        nonlocal p, n
+        n += 1
+        p += bool(cond)
+        print("    %-74s %s" % (label, "ok" if cond else "FAIL"))
+
+    print("cA1_g4_score selftest")
+
+    print("  -- the design, asserted against the BATCH SCRIPT's own text --")
+    ok("the batch script exists", os.path.exists(SCRIPT))
+    ok("PREFIX matches the script", 'PREFIX=%s' % PREFIX in src)
+    ok("NET matches the script", "NET=%s" % NET in src)
+    ok("DSET matches the script", "DSET=%s" % DSET in src)
+    ok("GRAN matches the script", "GRAN=%s" % GRAN in src)
+    ok("ALPHA0 matches the script", "ALPHA0=%s" % ALPHA0 in src)
+    ok("EPOCHS matches the script", "EPOCHS=%d" % EPOCHS in src)
+    ok("BATCH matches the script", "BATCH=%d" % BATCH in src)
+    ok("GAMMA matches the script", "GAMMA=%d" % GAMMA in src)
+    ok("the box matches the script", 'CLIP="%s"' % CLIP in src)
+    ok("AUGMENT matches the script", "AUG=%s" % AUG in src)
+    ok("PROBE matches the script", "PROBE=%s" % PROBE in src)
+    ok("the layerwise group count matches the script", "M_LAYERWISE=%d" % M_LAYERWISE in src)
+    ok("the walltime matches the script", "WALL=%s" % WALL in src)
+    ok("the r rungs match the script", 'RS="%s"' % " ".join(RS) in src)
+    ok("the ms rungs match the script", 'MSS="%s"' % " ".join(MSS) in src)
+    ok("the seeds match the script", 'SEEDS="%s"' % " ".join(SEEDS) in src)
+    ok("NJOBS matches the script", "NJOBS=%d" % NJOBS in src and NJOBS == 72)
+    ok("the script submits under the %s- run-name prefix" % PREFIX,
+       'RN="$PREFIX-r${RTAG}-m${MTAG}-s${S}"' in src and "PREFIX=%s" % PREFIX in src)
+    ok("the script's probe dir carries the %s tag" % PREFIX,
+       "probe_${RTAG}_${MTAG}_${PREFIX}_s${S}" in src)
+    ok("the script names THIS scorer as its registration",
+       "cA1_g4_score.py" in src)
+
+    print("  -- the bars, present and identically worded in both files --")
+    ok("CONFIRMED_BAR is in the script", "CONFIRMED_BAR=%.2f" % CONFIRMED_BAR in src)
+    ok("REFUTED_BAR is in the script", "REFUTED_BAR=%.2f" % REFUTED_BAR in src)
+    ok("G1_BAND is in the script", "G1_BAND=%.2f" % G1_BAND in src)
+    ok("SIGMA_W is in the script", "SIGMA_W=%.4f" % SIGMA_W in src)
+    ok("the bars are ordered REFUTED > CONFIRMED", REFUTED_BAR > CONFIRMED_BAR)
+    ok("the gap between the bars is registered as UNRESOLVED",
+       "UNRESOLVED" in doc and "no third reading of the gap" in " ".join(doc.split()))
+
+    print("  -- the gates, registered in BOTH files --")
+    for g in ("G0", "G1", "G2", "G3", "G4", "G5"):
+        ok("gate %s is registered in this scorer" % g, "#   %s " % g in doc)
+        ok("gate %s is registered in the batch script" % g, "#   %s " % g in src)
+
+    print("  -- the noise floor, RE-DERIVED from the corpus, not quoted --")
+    sig, df, nr, nc = noise_floor_from_csv()
+    ok("the CSV is present", os.path.exists(CSV))
+    ok("the pooled within-cell SD re-derives to %.4f (got %s)"
+       % (SIGMA_W, "%.4f" % sig if sig else "none"),
+       sig is not None and abs(sig - SIGMA_W) <= SIGMA_TOL)
+    ok("it rests on >= 40 df (got %d)" % df, df >= 40)
+    ok("it rests on >= 8 r-cells (got %d)" % nc, nc >= 8)
+
+    print("  -- CONFIRMED_BAR is the simulated 95th percentile of the null span --")
+    random.seed(20260903)
+    se = SIGMA_W / math.sqrt(len(SEEDS))
+    draws = []
+    for _ in range(60000):
+        v = [random.gauss(0, se) for _ in range(len(RS))]
+        draws.append(max(v) - min(v))
+    draws.sort()
+    q95 = draws[int(0.95 * len(draws))]
+    print("       simulated null span p95 = %.3f pp   (CONFIRMED_BAR %.2f)"
+          % (q95, CONFIRMED_BAR))
+    ok("CONFIRMED_BAR is within 0.04 pp of the simulated p95",
+       abs(q95 - CONFIRMED_BAR) <= 0.04)
+    ok("REFUTED_BAR is >= 4 SE-of-difference",
+       REFUTED_BAR / (SIGMA_W * math.sqrt(2.0 / len(SEEDS))) >= 4.0)
+
+    print("  -- the priors, RE-DERIVED --")
+    pc = prior_curve_from_csv()
+    for k, want in sorted(PRIOR_CURVE.items()):
+        got = pc.get(k)
+        ok("archived r=%-5s at ms=%s re-derives to %.3f (got %s)"
+           % (k, MS_REF, want, "%.3f" % got[0] if got else "absent"),
+           got is not None and abs(got[0] - want) <= 0.002)
+    lift = PRIOR_CURVE["0.06"] - max(PRIOR_CURVE["0"], PRIOR_CURVE["1"])
+    ok("the archived interior lift is >= 2 x REFUTED_BAR (%.3f)" % lift,
+       lift >= 2 * REFUTED_BAR - 0.01)
+    gm, bsd, nb, nrun = plain_prior_from_csv()
+    ok("the plain-layerwise prior re-derives to %.3f (got %s)"
+       % (PLAIN_PRIOR, "%.3f" % gm if gm else "none"),
+       gm is not None and abs(gm - PLAIN_PRIOR) <= 0.002)
+    ok("it rests on >= 5 distinct batches (got %d)" % nb, nb >= 5)
+    ok("G1_BAND is >= 3 sigma on the combined batch+seed noise",
+       gm is not None and G1_BAND >= 3.0 * math.sqrt(
+           bsd ** 2 + (SIGMA_W ** 2) / len(SEEDS) + (bsd ** 2) / max(nb, 1)))
+
+    print("  -- THE PREMISE: every hierarchical run sits at ONE meta-stepsize --")
+    c = premise_ms_is_single()
+    print("       hierarchical runs by meta_stepsize: %s" % dict(c))
+    ok("the corpus has hierarchical runs at all", sum(c.values()) > 0)
+    ok("they sit at exactly ONE meta-stepsize", len(c) == 1)
+    ok("that value is %s" % MS_REF, list(c) == [MS_REF])
+
+    print("  -- THE GRID CHANGE, justified by measurement not by assertion --")
+    dr = dead_rungs_from_csv()
+    for k, want in sorted(DEAD_RUNGS.items()):
+        got = dr.get(k)
+        ok("archived r=1 ms=%-5s re-derives to %.3f (got %s)"
+           % (k, want, "%.3f" % got[0] if got else "absent"),
+           got is not None and abs(got[0] - want) <= 0.002)
+    ok("ms=1e-5 is DEAD (< %.0f%%) and was dropped" % DEAD_MAX,
+       dr["1e-5"][0] < DEAD_MAX and "1e-5" not in MSS)
+    ok("ms=3e-5 is DEAD (< %.0f%%) and was dropped" % DEAD_MAX,
+       dr["3e-5"][0] < DEAD_MAX and "3e-5" not in MSS)
+    ok("the archived ladder is MONOTONE up to ms=1e-3",
+       dr["1e-5"][0] < dr["3e-5"][0] < dr["1e-4"][0] < dr["3e-4"][0] < PLAIN_PRIOR)
+    ok("the grid therefore extends ABOVE 1e-3",
+       max(float(x) for x in MSS) > 1e-3 and "3e-3" in MSS and "1e-2" in MSS)
+    ok("the grid keeps the three LIVE briefed rungs",
+       "1e-4" in MSS and "3e-4" in MSS and "1e-3" in MSS)
+    ok("the grid change is stated in the scorer's own header",
+       "IS **NOT** THE ONE THE BRIEF NAMED" in doc)
+    ok("the grid change is stated in the batch script",
+       "NOT THE ONE THE BRIEF NAMED" in src)
+
+    print("  -- the verdict table, every branch reachable and distinct --")
+    ok("clean interior peak -> REFUTED",
+       verdict(0.9, 1.2, False, False, True) == REFUTED)
+    ok("flat curve -> CONFIRMED",
+       verdict(0.05, 0.2, False, False, True) == CONFIRMED)
+    ok("between the bars -> UNRESOLVED",
+       verdict(0.2, 0.4, False, False, True) == UNRES)
+    ok("endpoint truncation KILLS a REFUTED",
+       verdict(0.9, 1.2, True, False, True) == UNRES_TRUNC)
+    ok("interior truncation LEAVES a REFUTED standing",
+       verdict(0.9, 1.2, False, True, True) == REFUTED)
+    ok("interior truncation KILLS a CONFIRMED",
+       verdict(0.05, 0.2, False, True, True) == UNRES_TRUNC)
+    ok("endpoint truncation LEAVES a CONFIRMED standing",
+       verdict(0.05, 0.2, True, False, True) == CONFIRMED)
+    ok("a failed manifold gate beats everything",
+       verdict(0.9, 1.2, False, False, False) == UNRES_NOMAN
+       and verdict(0.05, 0.2, False, False, False) == UNRES_NOMAN)
+    ok("every verdict has registered prose",
+       all(k in VERDICT_TEXT for k in
+           (REFUTED, CONFIRMED, UNRES, UNRES_TRUNC, UNRES_NOMAN, VOID)))
+
+    print("  -- the reader, exercised on synthetic input --")
+    demo_args = ("--optimizer HF --alg-base SGDm --alg-meta Lion --dataset CIFAR10 "
+                 "--NN-name ResNet18 --batch-size 100 --gamma 1 --meta-stepsize 1e-3 "
+                 "--alpha0 1e-6 --num-epochs 100 --stepsize-groups layerwise --seed 0")
+    eff, dup = parse_args_line(demo_args)
+    ok("the ARGS parser finds no repeat in a clean line", not dup)
+    ok("the ARGS parser reads meta-stepsize", eff["meta-stepsize"] == "1e-3")
+    eff2, dup2 = parse_args_line(demo_args + " --alg-meta Adam")
+    ok("the ARGS parser CATCHES a repeated --alg-meta", "alg-meta" in dup2)
+    ok("and reports argparse's effective value", eff2["alg-meta"] == "Adam")
+    env = parse_env_line("AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=additive ETA_RATIO=0.06 PROBE=5")
+    ok("the ENV parser reads ETA_RATIO", env["ETA_RATIO"] == "0.06")
+    ok("the ENV parser reads HIER", env["HIER"] == "additive")
+    ok("plateau5 is the mean of the LAST FIVE epochs",
+       abs(plateau5(dict((e, float(e)) for e in range(100))) - 97.0) < 1e-9)
+    ok("plateau5 REFUSES a short run",
+       plateau5(dict((e, 1.0) for e in range(97))) is None)
+
+    print("  -- the refusals, stated in this file --")
+    flat = " ".join(doc.split())
+    ok("the last-20 plateau column is banned", "will not report the CSV `plateau`" in flat)
+    ok("no argmax r will be named an optimum", "will not name an argmax r" in flat)
+    ok("no pooling with archived batches", "will not pool g4m with any archived batch" in flat)
+    ok("scope is fenced to this cell", "will not claim anything about ResNet50" in flat)
+    ok("the bars will not be softened", "will not soften either bar after the fact" in flat)
+    ok("a filename/ARGS disagreement is refused", "will not read a run whose own ARGS line" in flat)
+    ok("G4 is declared descriptive and non-gating", "DESCRIPTIVE, NEVER GATING" in doc)
+
+    print("selftest: %d/%d %s" % (p, n, "PASS" if p == n else "FAIL"))
+    return 0 if p == n else 1
+
+
+# --------------------------------------------------------------------------
+def score(runs_dir, probes_dir):
+    files = sorted(glob.glob(os.path.join(runs_dir, PREFIX + "*.out")))
+    print("=" * 78)
+    print("cA1 -- g4m: THE r x META-STEPSIZE LADDER.  %d .out files under %s"
+          % (len(files), runs_dir))
+    print("%s / %s / %s / alpha0 %s / %d ep / box %s / AUGMENT=%s / PROBE=%s"
+          % (NET, DSET, GRAN, ALPHA0, EPOCHS, CLIP, AUG, PROBE))
+    print("r %s   x   ms %s   x   seeds %s   =   %d cells"
+          % (",".join(RS), ",".join(MSS), ",".join(SEEDS), len(RS) * len(MSS)))
+    print("BARS (registered before any run existed): REFUTED if PEAK >= %.2f pp; "
+          "CONFIRMED if SPAN <= %.2f pp; otherwise UNRESOLVED."
+          % (REFUTED_BAR, CONFIRMED_BAR))
+    print("=" * 78)
+
+    recs = [r for r in (read_out(f) for f in files) if r]
+
+    print("\n--- G0  PROVENANCE, from each run's OWN ARGS/ENV line (RULE 20)")
+    cells, dropped = gate0(recs)
+    for name, why in dropped:
+        print("    DROPPED %-34s %s" % (name, "; ".join(why)))
+    means = cell_means(cells)
+    want_cells = [(norm_num(r), norm_num(m)) for r in RS for m in MSS]
+    thin = [k for k in want_cells if means.get(k, (0, 0, []))[1] < MIN_SEEDS]
+    print("    %d runs admitted, %d dropped, %d/%d cells populated"
+          % (len(cells), len(dropped), len(want_cells) - len(thin), len(want_cells)))
+    if thin:
+        print("    !!! cells with fewer than %d usable seeds: %s"
+              % (MIN_SEEDS, ", ".join("r=%s/ms=%s" % k for k in thin)))
+        print("\nVERDICT: %s -- %s" % (VOID, VERDICT_TEXT[VOID]))
+        return 2
+
+    print("\n--- the grid, plateau5 (mean of the last 5 test epochs)")
+    hdr = "    %-8s" % "r \\ ms" + "".join("%10s" % m for m in MSS)
+    print(hdr)
+    for r in RS:
+        row = "    %-8s" % r
+        for m in MSS:
+            mm = means.get((norm_num(r), norm_num(m)))
+            row += "%10s" % ("%.3f" % mm[0] if mm else "--")
+        print(row)
+    print("    (n per cell: " + ", ".join(
+        "%s" % means[(norm_num(r), norm_num(m))][1]
+        for r in RS for m in MSS) + ")")
+
+    # ---- G1 ---------------------------------------------------------------
+    print("\n--- G1  THE NO-OP CONTROL  (r=1 additive IS plain layerwise)")
+    gm, bsd, nb, nrun = plain_prior_from_csv()
+    got = means[(norm_num("1"), norm_num(MS_REF))][0]
+    d1 = got - gm
+    g1_ok = abs(d1) <= G1_BAND
+    print("    archived plain layerwise HIER=none, ms=%s: %.3f  (%d batches, %d runs, "
+          "between-batch sd %.3f)" % (MS_REF, gm, nb, nrun, bsd))
+    print("    g4m r=1, ms=%s: %.3f      difference %+.3f pp   band +-%.2f   %s"
+          % (MS_REF, got, d1, G1_BAND, "PASS" if g1_ok else "FAIL"))
+    if not g1_ok:
+        print("    The additive operator at r=1 is not the identity on this tree, or")
+        print("    the tree moved.  Nothing downstream is readable.")
+        print("\nVERDICT: %s -- %s" % (VOID, VERDICT_TEXT[VOID]))
+        return 2
+
+    # ---- OPT --------------------------------------------------------------
+    opt, argms = {}, {}
+    for r in RS:
+        best = max(MSS, key=lambda m: means[(norm_num(r), norm_num(m))][0])
+        argms[r] = best
+        opt[r] = means[(norm_num(r), norm_num(best))][0]
+
+    print("\n--- G2  THE BRACKET GATE  (an ms-argmax on a grid EDGE truncates OPT)")
+    trunc_e = trunc_i = False
+    for r in RS:
+        edge = argms[r] in (MSS[0], MSS[-1])
+        where = "ENDPOINT" if r in R_ENDPOINTS else "interior"
+        if edge:
+            if r in R_ENDPOINTS:
+                trunc_e = True
+            else:
+                trunc_i = True
+        print("    r=%-5s (%-8s) ms-argmax %-6s OPT %.3f   %s"
+              % (r, where, argms[r], opt[r],
+                 "EDGE -- TRUNCATED" if edge else "interior, bracketed"))
+    print("    truncation at an endpoint: %s   at an interior rung: %s"
+          % (trunc_e, trunc_i))
+
+    # ---- G3 ---------------------------------------------------------------
+    print("\n--- G3  THE MANIFOLD GATE  (the ms=%s slice must show the lift)" % MS_REF)
+    ref = dict((r, means[(norm_num(r), norm_num(MS_REF))][0]) for r in RS)
+    peak_ref = (max(ref[r] for r in R_INTERIOR)
+                - max(ref[r] for r in R_ENDPOINTS))
+    manifold = peak_ref >= REFUTED_BAR
+    for r in RS:
+        print("    r=%-5s  %.3f      (archived %s)"
+              % (r, ref[r], "%.3f" % PRIOR_CURVE[r] if r in PRIOR_CURVE else "--"))
+    print("    interior lift at ms=%s: %+.3f pp   bar %.2f   %s"
+          % (MS_REF, peak_ref, REFUTED_BAR, "PASS" if manifold else "FAIL"))
+
+    # ---- G4 ---------------------------------------------------------------
+    print("\n--- G4  THE BOX METER  (DESCRIPTIVE, cannot change the verdict)")
+    if probes_dir and os.path.isdir(probes_dir):
+        seen = 0
+        for d in sorted(glob.glob(os.path.join(probes_dir, "probe_*"))):
+            rr = rails(d)
+            if rr is None:
+                continue
+            seen += 1
+            print("    %-40s rec_lo %.4f  rec_hi %.4f"
+                  % (os.path.basename(d), rr[0], rr[1]))
+        if not seen:
+            print("    no readable probe.jsonl under %s" % probes_dir)
+    else:
+        print("    no probe directory given (--probes); the meter is skipped.")
+        print("    It is descriptive only, so skipping it changes nothing below.")
+
+    # ---- G5 ---------------------------------------------------------------
+    print("\n--- G5  THE PRIMARY  (the ms-OPTIMISED r-curve)")
+    for r in RS:
+        print("    OPT(r=%-5s) = %.3f  at ms=%s" % (r, opt[r], argms[r]))
+    peak = (max(opt[r] for r in R_INTERIOR) - max(opt[r] for r in R_ENDPOINTS))
+    span = max(opt.values()) - min(opt.values())
+    print("    PEAK (best interior - best endpoint) = %+.3f pp   [REFUTED at >= %.2f]"
+          % (peak, REFUTED_BAR))
+    print("    SPAN (max - min over r)              =  %.3f pp   [CONFIRMED at <= %.2f]"
+          % (span, CONFIRMED_BAR))
+    print("    for reference, the SAME statistic at ms=%s only: PEAK %+.3f"
+          % (MS_REF, peak_ref))
+
+    v = verdict(peak, span, trunc_e, trunc_i, manifold)
+    print("\n" + "=" * 78)
+    print("VERDICT: %s" % v)
+    print("  %s" % VERDICT_TEXT[v])
+    print("=" * 78)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default=".", help="directory of g4m*.out files")
+    ap.add_argument("--probes", default=None, help="directory of probe_* dirs")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    return score(a.runs, a.probes)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,575 @@
+#!/usr/bin/env python3
+r"""CYCLE 53 -- score the two cycle-52 pre-registrations against what landed.
+
+TWO BATCHES, BOTH COMPLETE, NEITHER SCORED BEFORE THIS FILE EXISTED.
+
+  `bl5-*`  (cluster_b, 9 jobs)  -- THE BOX-FREE BUDGET LADDER.  20 -> 40 epochs at
+      R18/ms=1e-3/BETA_CLIP=-30:0.0, rungs w/node/lay, seeds 0-2, against the
+      20-epoch `cl5-*-cU-*` control already on disk.  Registered B0, B0.3, B1,
+      B1.5, B2, B2.5, B3, B4 in `bin/c52_budget_ladder.sh`.
+      THE BUDGET IS THE LAST UNTESTED THREAT TO THE CAMPAIGN'S HEADLINE: every
+      N_eff/m ever quoted comes from a 20-epoch run, in a system CORRECTIONS 65
+      showed is still descending at 89-100% of max Lion speed in its last quarter.
+
+  `ns5-*`  (cluster_a, 12 jobs)  -- THE NODEWISE-MINIMUM ONSET LADDER.  ms in
+      {2e-4, 5e-4} at R18, box-free, rungs w/node/lay, seeds 0-1, filling the
+      interval between the two controls already on disk:
+          ms=1e-4  ml5 m4   argmin **w**     (0.700 / 0.170 / 0.129)   n=3
+          ms=1e-3  cl5 cU   argmin **node**  (0.726 / 0.402 / 0.504)   n=3
+      Registered N0, N0.3, N1, N2, N3 in `bin/c52_nodemin_onset.sh`.
+
+WHY THIS IS A NEW FILE AND NOT AN EDIT TO `c52_boxfree.py`.  That scorer's ARMS
+table is a hard-coded list of last tick's probe globs; it accepts a positional
+argument and IGNORES it, so pointing it at `../probes_bl5` silently reprints the
+cycle-52 table.  Editing it in place would also re-derive the numbers CORRECTIONS
+67-70 are written from.  Its *functions* are imported and reused unchanged --
+`occupancy`, `headroom`, `agg`, `plateau`, `neff_table`, `profile_b` -- because a
+second implementation of a number is a second chance to get it wrong.
+
+SCORING ORDER IS THE REGISTERED ORDER AND IS NOT NEGOTIABLE.  B0.3 before B1.5
+before B1; N0.3 before N1.  Cycle 51 established that reading a ladder in the
+wrong order produces a bigger, more interesting, wrong claim (CORRECTIONS 62),
+and cycle 52 kept that discipline deliberately.
+
+Run `--selftest` before trusting any number this prints.
+"""
+import glob
+import math
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from c52_boxfree import (  # noqa: E402
+    agg, headroom, mean, neff_table, occupancy, plateau, profile_b, records,
+)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+P = os.path.join(ROOT, "..")
+
+RUNGS = ("lay", "node", "w")
+
+# ---------------------------------------------------------------- the controls
+# Every one of these is a number ALREADY IN docs/CORRECTIONS.md, quoted here so a
+# drift between this file and the record is visible rather than silent.  They are
+# RE-DERIVED below from the probe dirs, never trusted as constants (rule 1).
+CTRL_NEFF_W_CU = 0.5045      # CORRECTIONS 68, R18 box-free weightwise, 20 epochs
+CTRL_B_CU = 0.071            # CORRECTIONS/FINDINGS 52, b(steady) cl5 cU
+CTRL_V_Q4 = 0.076            # FINDINGS 52.1, mean-trajectory v_Q4/vmax, cl5 w cU
+BAR_NEFF = 0.10              # the bar X1/U1/V1/B1 all used
+BAR_B = 0.05                 # the bar B2 registered
+BAR_BOXFREE = 0.05           # < 5% of records at either guard
+
+# plateau controls, 20 epochs, cl5-*-cU-* (batch header, re-derived below)
+CTRL_PLATEAU = {"w": 68.578, "node": 72.787, "lay": 74.426}
+
+# n_beta byte-match, registered in both batch headers as a VOIDING check
+NBETA = {"w": 11_173_962, "node": 14_420, "lay": 62}
+
+
+def fmt(v, nd=4):
+    if v is None:
+        return "--"
+    if isinstance(v, float) and not math.isfinite(v):
+        return "inf"
+    return f"{v:.{nd}f}"
+
+
+def pct(v):
+    return "--" if v is None else f"{100.0 * v:.4f}"
+
+
+def rule(n=110):
+    print("=" * n)
+
+
+# ----------------------------------------------------------------- beta span
+def beta_span(pat):
+    """max - min of beta on the LAST record, averaged over seeds.
+
+    N2's registered mechanism variable.  The pre-registration calls it
+    "ADAPTATION EXTENT" and predicts the argmin flips to `node` at the stepsize
+    whose weightwise span first exceeds ~5 log units -- and that the flip tracks
+    span BETTER than it tracks ms.  Span grows sublinearly in ms (measured 4.9x
+    for 10x), so the two orderings are genuinely different orderings and the
+    four-point ladder can tell them apart.
+    """
+    import glob
+    ds = sorted(glob.glob(pat))
+    if not ds:
+        return None, None, 0
+    spans, travels = [], []
+    for d in ds:
+        R = records(d)
+        spans.append(R[-1]["beta_true_max"] - R[-1]["beta_true_min"])
+        travels.append(R[-1]["beta_true_max"] - R[0]["beta_true_max"])
+    return mean(spans), mean(travels), len(ds)
+
+
+# ------------------------------------------------------------------- selftest
+def selftest():
+    import json
+    import tempfile
+    checks = []
+
+    def ok(name, cond):
+        checks.append((name, bool(cond)))
+
+    with tempfile.TemporaryDirectory() as td:
+        # two seeds, known analytic answers, so span/travel are checkable by hand
+        for s, (b0, b1) in enumerate([(-7.0, -2.0), (-7.0, -3.0)]):
+            d = os.path.join(td, f"probe_w_x_s{s}")
+            os.makedirs(d)
+            with open(os.path.join(d, "probe.jsonl"), "w") as f:
+                for t in range(100):
+                    f.write(json.dumps(dict(
+                        step=t * 5,
+                        beta_true_min=-15.0 if t else -6.909,
+                        beta_true_max=b0 + (b1 - b0) * t / 99.0,
+                        n_at_lo=0, n_at_hi=0, n_beta=10)) + "\n")
+        sp, tr, n = beta_span(os.path.join(td, "probe_w_x_s*"))
+        ok("beta_span sees both seeds", n == 2)
+        # seed0 span = -2 - (-15) = 13; seed1 = -3 - (-15) = 12; mean 12.5
+        ok("span is max-min on the LAST record", abs(sp - 12.5) < 1e-9)
+        # travel seed0 = -2 - (-7) = 5; seed1 = -3 - (-7) = 4; mean 4.5
+        ok("travel is max_final - max_first", abs(tr - 4.5) < 1e-9)
+        ok("empty glob returns None", beta_span(os.path.join(td, "nope*"))[2] == 0)
+
+        # occupancy is imported, not reimplemented -- check the import is live and
+        # that the synthetic arm reads as PINNED at the low guard (t>=1) and never
+        # at the high one.  If this ever flips, the guard convention changed.
+        o = occupancy(os.path.join(td, "probe_w_x_s0"), -15.0, 0.0)
+        ok("imported occupancy pins the low guard", abs(o["rec_lo"] - 0.99) < 1e-9)
+        ok("imported occupancy sees no high guard", o["rec_hi"] == 0.0)
+        ok("coord denominator is live (PATCH_CLIPCOUNT)", o["coord_lo"] == 0.0)
+        ok("n_beta is read from the record", o["n_beta"] == 10)
+
+        # headroom must use the LAST-QUARTER velocity, never the whole run.
+        # The ramp is linear so both are equal by construction -- what is checked
+        # here is the SIGN and the vmax normalisation (STANDING RULE 7).
+        h = headroom(os.path.join(td, "probe_w_x_s0"), 0.0, meta_stepsize=1e-3)
+        ok("headroom head = hi - final max", abs(h["head"] - 2.0) < 1e-9)
+        ok("headroom velocity is positive on a rising arm", h["v_q4"] > 0)
+
+    # argmin logic: an UNRESOLVED rung must make the argmin UNDECIDABLE, never
+    # default to one of the resolved ones (N1's own words).
+    ok("argmin over 3 finite values", argmin_rung({"lay": 0.7, "node": 0.4, "w": 0.5})[0] == "node")
+    ok("argmin refuses a missing rung", argmin_rung({"lay": 0.7, "node": None})[0] is None)
+    ok("argmin UNDECIDED inside 0.02",
+       argmin_rung({"lay": 0.7, "node": 0.400, "w": 0.415})[1] is False)
+    ok("argmin decided outside 0.02",
+       argmin_rung({"lay": 0.7, "node": 0.400, "w": 0.500})[1] is True)
+
+    n_ok = sum(1 for _, c in checks if c)
+    for name, c in checks:
+        if not c:
+            print(f"  FAIL: {name}")
+    print(f"selftest: {n_ok}/{len(checks)} PASS")
+    return 0 if n_ok == len(checks) else 1
+
+
+def argmin_rung(vals, tol=0.02):
+    """-> (rung, decided).  `decided` is False when the two smallest are within
+    `tol`, which the ns5 header registers as the UNDECIDED branch ("if two rungs
+    come back within 0.02 of each other, say UNDECIDED and buy the third seed").
+    A missing/unresolved rung returns (None, False): an argmin over three rungs
+    with one absent is undecidable, not a default to one of the other two."""
+    if any(v is None or not math.isfinite(v) for v in vals.values()):
+        return None, False
+    if len(vals) < 3:
+        return None, False
+    order = sorted(vals.items(), key=lambda kv: kv[1])
+    return order[0][0], (order[1][1] - order[0][1]) > tol
+
+
+# =============================================================== bl5, in order
+def score_bl5():
+    rule()
+    print("BL5 -- THE BOX-FREE BUDGET LADDER.  20 -> 40 epochs, R18, ms=1e-3, BETA_CLIP=-30:0.0")
+    print("  Registered in bin/c52_budget_ladder.sh.  SCORING ORDER: B0, B0.3, B1.5, B1, B2, B2.5, B3, B4.")
+    rule()
+
+    arms = {g: f"{P}/probes_bl5/probe_{g}_e40_s*" for g in RUNGS}
+    ctrl = {g: f"{P}/probes_cl5/probe_{g}_cU_s*" for g in RUNGS}
+
+    # ---- B0 VALIDITY
+    print("\n(B0) VALIDITY GATE")
+    print(f"  {'rung':6}{'n_dirs':>8}{'T':>8}{'n_beta':>14}{'byte-match':>12}{'beta MOVED':>12}")
+    b0 = True
+    for g in RUNGS:
+        a, n = agg(arms[g], -30.0, 0.0)
+        moved = a["min_final"] != a["max_final"]
+        match = a["n_beta"] == NBETA[g]
+        b0 &= (n == 3) and (a["T"] == 4000) and moved and match
+        print(f"  {g:6}{n:>8}{a['T']:>8}{a['n_beta']:>14,}"
+              f"{('yes' if match else 'NO'):>12}{('yes' if moved else 'NO'):>12}")
+    print(f"  --> B0 {'PASS' if b0 else 'FAIL'}   (T must be 4000, not 2000: a 2000 means the "
+          f"probe stride changed\n      and the window slices no longer mean what they mean in cl5)")
+
+    # ---- B0.3 THE BOX-FREE GATE, SCORED FIRST
+    print("\n(B0.3) **THE BOX-FREE GATE, SCORED FIRST.**  bar: < 5% of records at either guard")
+    print("  The batch rests on a headroom EXTRAPOLATION, and an extrapolation is not a")
+    print("  measurement.  If an arm exceeds the bar its B1 is UNINTERPRETABLE, NOT REFUTED,")
+    print("  and its first_hi record IS the result -- the first direct measurement of the")
+    print("  budget at which a box becomes unavoidable.")
+    print(f"\n  {'rung':6}{'%rec LO':>10}{'%rec HI':>10}{'%Q4 LO':>10}{'%Q4 HI':>10}"
+          f"{'%coordLO':>11}{'%coordHI':>11}{'1stHI':>8}{'ep(1stHI)':>11}"
+          f"{'final min':>12}{'final max':>12}")
+    boxfree = {}
+    for g in RUNGS:
+        a, _ = agg(arms[g], -30.0, 0.0)
+        # 4000 records over 40 epochs => 100 records per epoch
+        ep = f"{a['first_hi'] / 100.0:.1f}" if a["first_hi"] is not None else "-"
+        boxfree[g] = max(a["rec_lo"], a["rec_hi"]) < BAR_BOXFREE
+        print(f"  {g:6}{pct(a['rec_lo']):>10}{pct(a['rec_hi']):>10}{pct(a['q4_lo']):>10}"
+              f"{pct(a['q4_hi']):>10}{pct(a['coord_lo']):>11}{pct(a['coord_hi']):>11}"
+              f"{(a['first_hi'] if a['first_hi'] is not None else '-'):>8}{ep:>11}"
+              f"{a['min_final']:>12.3f}{a['max_final']:>12.3f}")
+    for g in RUNGS:
+        print(f"  B0.3 {g:5} --> {'PASS (box-free at 40 epochs)' if boxfree[g] else 'FAIL -- B1 UNINTERPRETABLE for this rung'}")
+
+    # ---- N_eff tables.  Computed once, used by B1, B1.5, B2.5.
+    print("\n  ... computing N_eff (variance instrument) on bl5 and its control ...")
+    t40 = neff_table(f"{P}/probes_bl5")
+    t20 = neff_table(f"{P}/probes_cl5")
+    t15 = neff_table_window(f"{P}/probes_bl5", (0.25, 0.5))
+
+    def nm(tab, fam, g):
+        v = tab.get(fam, {}).get(g)
+        return v[2] if v else None
+
+    ctrl_w = nm(t20, "cU", "w")
+    print(f"  control re-derived from probes_cl5 (cU, w, steady half): {fmt(ctrl_w)}"
+          f"   [CORRECTIONS 68 records {CTRL_NEFF_W_CU}]")
+
+    # ---- B1.5 THE INTERNAL REPLICATION -- BEFORE B1
+    print("\n(B1.5) **THE INTERNAL REPLICATION, AND IT IS WHAT MAKES B1 INTERPRETABLE.**")
+    print("  N_eff/m on the 40-epoch runs restricted to records 1000-2000 -- the SAME")
+    print("  ABSOLUTE window of training as the whole steady half of the 20-epoch control.")
+    print("  If it does NOT land within +-0.10 of the control, the two budgets differ for")
+    print("  some reason OTHER than budget and B1 is uninterpretable.")
+    v15 = nm(t15, "e40", "w")
+    d15 = (v15 - ctrl_w) if (v15 is not None and ctrl_w is not None) else None
+    print(f"\n  40-epoch run, window 0.25-0.5 (= records 1000-2000), weightwise: {fmt(v15)}")
+    print(f"  20-epoch control, steady half (= records 1000-2000), weightwise: {fmt(ctrl_w)}")
+    print(f"  difference: {fmt(d15, 4) if d15 is None else f'{d15:+.4f}'}   bar |d| <= {BAR_NEFF}")
+    b15 = d15 is not None and abs(d15) <= BAR_NEFF
+    print(f"  --> B1.5 {'PASS -- the same wall clock gives the same number; B1 IS a budget contrast' if b15 else 'FAIL -- B1 is UNINTERPRETABLE (seed/node/dataloader, not budget)'}")
+
+    # ---- B1 THE PRIMARY TEST
+    print("\n(B1) THE PRIMARY TEST.  N_eff/m, weightwise, VARIANCE instrument, STEADY half")
+    print("  (records 2000-4000 at 40 epochs; 1000-2000 at 20).")
+    print("  REGISTERED DIRECTION: DOWN (more agreement, less effective information),")
+    print("  because beta keeps spreading and a wider spread concentrates the meta-gradient")
+    print("  onto the few fastest coordinates.  If it moves UP the prediction is WRONG.")
+    v40 = nm(t40, "e40", "w")
+    d1 = (v40 - ctrl_w) if (v40 is not None and ctrl_w is not None) else None
+    print(f"\n  {'arm':34}{'N_eff/m (w)':>14}{'delta':>10}{'bar':>16}{'verdict':>10}")
+    print(f"  {'cl5 cU  20 epochs (control)':34}{fmt(ctrl_w):>14}{'':>10}{'':>16}{'':>10}")
+    if v40 is not None and d1 is not None:
+        ok1 = abs(d1) <= BAR_NEFF
+        print(f"  {'bl5     40 epochs':34}{fmt(v40):>14}{d1:>+10.4f}"
+              f"{f'|d| <= {BAR_NEFF}':>16}{('PASS' if ok1 else 'REFUTED'):>10}")
+        if not boxfree["w"]:
+            print("  --> B1 IS UNINTERPRETABLE: B0.3 failed on the weightwise rung.")
+        elif not b15:
+            print("  --> B1 IS UNINTERPRETABLE: B1.5 failed, so this is not a budget contrast.")
+        elif ok1:
+            print("  --> B1 PASSES (STATIONARY).  N_eff/m is an OPERATING POINT, not a transient.")
+            print("      The headline is budget-robust as well as box-free.")
+        else:
+            print("  --> B1 REFUTED (DRIFTING).  Every N_eff/m must be quoted WITH ITS BUDGET.")
+        print(f"      registered direction was DOWN; measured {'DOWN' if d1 < 0 else 'UP'} "
+              f"({d1:+.4f}) --> direction {'CONFIRMED' if d1 < 0 else 'WRONG, and recorded as wrong'}")
+
+    # ---- B2 THE PROFILE
+    print("\n(B2) THE PROFILE.  b(steady, k^-b across w/node/lay).  SECONDARY to B1.")
+    b40 = profile_b(f"{P}/probes_bl5")
+    b20 = profile_b(f"{P}/probes_cl5")
+    bc, bn = b20.get("cU"), b40.get("e40")
+    print(f"  20-epoch control b(steady) = {fmt(bc, 3)}   [record: {CTRL_B_CU}]")
+    print(f"  40-epoch          b(steady) = {fmt(bn, 3)}")
+    if bc is not None and bn is not None:
+        db = bn - bc
+        print(f"  delta {db:+.3f}   bar {BAR_B}   --> B2 {'PASS' if abs(db) <= BAR_B else 'FAIL'}")
+        print("  (if B1 and B2 disagree, report both and claim neither -- cycle 50's C2 lesson)")
+
+    # ---- B2.5 THE SHAPE
+    print("\n(B2.5) THE SHAPE, tested as a PREDICTION for the first time.")
+    print("  REGISTERED: the ordering node < w < lay survives to 40 epochs.")
+    print("  REFUTATION: any other ordering --> the shape is BUDGET-SPECIFIC and must not")
+    print("  be written as a property of the partition.")
+    prof40 = {g: nm(t40, "e40", g) for g in RUNGS}
+    prof20 = {g: nm(t20, "cU", g) for g in RUNGS}
+    print(f"\n  {'budget':14}{'lay':>10}{'node':>10}{'w':>10}   ordering")
+    for lab, pr in (("20 ep (cl5 cU)", prof20), ("40 ep (bl5)", prof40)):
+        order = " < ".join(k for k, _ in sorted(
+            ((k, v) for k, v in pr.items() if v is not None), key=lambda kv: kv[1]))
+        print(f"  {lab:14}{fmt(pr['lay']):>10}{fmt(pr['node']):>10}{fmt(pr['w']):>10}   {order}")
+    am40, dec40 = argmin_rung(prof40)
+    print(f"\n  argmin at 40 epochs = {am40}  ({'decided' if dec40 else 'UNDECIDED, gap <= 0.02'})")
+    b25 = (am40 == "node") and dec40 and prof40["w"] is not None and prof40["lay"] is not None \
+        and prof40["node"] < prof40["w"] < prof40["lay"]
+    print(f"  --> B2.5 {'PASS -- node < w < lay survives the budget doubling' if b25 else 'REFUTED -- the ordering did NOT survive; the shape is budget-specific'}")
+
+    # ---- B3 ACCURACY
+    print("\n(B3) ACCURACY, reported regardless and NOT a test.  A plateau that does NOT")
+    print("  improve would mean the run is not actually training longer, voiding B1 by")
+    print("  another route.")
+    print(f"\n  {'rung':6}{'20 ep':>10}{'n':>4}{'40 ep':>10}{'n':>4}{'delta':>10}")
+    b3 = True
+    for g in RUNGS:
+        p20, n20 = plateau({"w": "cl5-w-cU", "node": "cl5-node-cU", "lay": "cl5-lay-cU"}[g])
+        p40, n40 = plateau(f"bl5-{g}-e40")
+        b3 &= p40 > p20
+        print(f"  {g:6}{p20:>10.3f}{n20:>4}{p40:>10.3f}{n40:>4}{p40 - p20:>+10.3f}")
+    print(f"  --> 40 epochs beats 20 on {'ALL' if b3 else 'NOT all'} three rungs")
+
+    # ---- B4 THE VELOCITY
+    print("\n(B4) THE VELOCITY, recorded because it is the cycle-51 addendum's own quantity")
+    print("  and this is the only batch that can measure it past 20 epochs.")
+    print(f"\n  {'rung':6}{'v_Q4/vmax @40ep':>18}{'@20ep':>10}{'final max':>12}"
+          f"{'headroom':>11}{'extra epochs':>14}")
+    import glob as _g
+    for g in RUNGS:
+        hs = [headroom(d, 0.0) for d in sorted(_g.glob(arms[g]))]
+        hs20 = [headroom(d, 0.0) for d in sorted(_g.glob(ctrl[g]))]
+        fv = mean([h["frac_vmax"] for h in hs])
+        fv20 = mean([h["frac_vmax"] for h in hs20])
+        mx = mean([h["max_final"] for h in hs])
+        # worst seed, never the mean -- CORRECTIONS 67
+        worst = min(hs, key=lambda h: h["rec_to_hit"])
+        ex = worst["rec_to_hit"] / 100.0
+        print(f"  {g:6}{fv:>18.3f}{fv20:>10.3f}{mx:>12.3f}{0.0 - mx:>11.3f}"
+              f"{(f'{ex:.1f} (worst)' if math.isfinite(ex) else 'inf'):>14}")
+    print("  (extra epochs is the WORST SEED, never the mean -- CORRECTIONS 67.)")
+
+
+def neff_table_window(root, window):
+    """neff_table, but on an explicit window.  Shells out to the same selftested
+    instrument through its NEW --window option, so B1.5 and B1 differ in exactly
+    one argument and nothing else."""
+    import re
+    import subprocess
+    out = subprocess.run(
+        [sys.executable, os.path.join(HERE, "neff_instrument.py"),
+         root, f"--window={window[0]:g}-{window[1]:g}"],
+        capture_output=True, text=True).stdout
+    row = re.compile(r"^\s+(lay|node|w|blk6)\s+([\d,]+)\s+(\d+)\s+\S+\s+\S+\s+"
+                     r"([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)\s")
+    res, fam = {}, None
+    for ln in out.splitlines():
+        m = re.match(r"=== family (\S+) ===", ln)
+        if m:
+            fam = m.group(1)
+            res[fam] = {}
+            continue
+        m = row.match(ln)
+        if m and fam:
+            mm = int(m.group(2).replace(",", ""))
+            nv = float(m.group(6).replace(",", ""))
+            res[fam][m.group(1)] = (mm, nv, nv / mm)
+    return res
+
+
+# =============================================================== ns5, in order
+def score_ns5():
+    rule()
+    print("NS5 -- THE NODEWISE-MINIMUM ONSET LADDER.  ms in {2e-4, 5e-4}, R18, box-free")
+    print("  Registered in bin/c52_nodemin_onset.sh.  SCORING ORDER: N0, N0.3, N1, N2, N3.")
+    rule()
+
+    LAD = [("1e-4", f"{P}/probes_ml5_m4", "m4", "probe_{g}_m4_s*", 3),
+           ("2e-4", f"{P}/probes_ns5", "m2p4", "probe_{g}_m2p4_s*", 2),
+           ("5e-4", f"{P}/probes_ns5", "m5p4", "probe_{g}_m5p4_s*", 2),
+           ("1e-3", f"{P}/probes_cl5", "cU", "probe_{g}_cU_s*", 3)]
+
+    # ---- N0 VALIDITY (new rungs only; the controls are already in the record)
+    print("\n(N0) VALIDITY GATE  (the two NEW stepsizes)")
+    print(f"  {'ms':7}{'rung':6}{'n_dirs':>8}{'T':>7}{'n_beta':>14}{'byte-match':>12}{'beta MOVED':>12}")
+    # The seed count is NOT a validity condition and must not be folded into one
+    # (cycle 54).  This check read `n == 2` hard-coded; when `ns6-*` delivered the
+    # THIRD seed at ms=2e-4 -- a seed this campaign deliberately bought -- N0 went
+    # FAIL and printed "a n_beta mismatch VOIDS the ladder" while every byte-match
+    # cell in its own table read `yes`.  The verdict was right about nothing and
+    # the message named a cause that had not occurred.  What VOIDS the ladder is a
+    # n_beta mismatch, a wrong T, or beta not moving; a changed seed count is data.
+    n0, seedcounts = True, {}
+    for ms, root, fam, pat, _ in LAD[1:3]:
+        for g in RUNGS:
+            a, n = agg(os.path.join(root, pat.format(g=g)), -30.0, 0.0)
+            moved = a["min_final"] != a["max_final"]
+            match = a["n_beta"] == NBETA[g]
+            n0 &= (a["T"] == 2000) and moved and match
+            seedcounts[(ms, g)] = n
+            print(f"  {ms:7}{g:6}{n:>8}{a['T']:>7}{a['n_beta']:>14,}"
+                  f"{('yes' if match else 'NO'):>12}{('yes' if moved else 'NO'):>12}")
+    print(f"  --> N0 {'PASS' if n0 else 'FAIL -- n_beta mismatch / wrong T / beta did not move. VOIDS the ladder.'}")
+    _uneven = sorted({(ms, n) for (ms, _g), n in seedcounts.items()})
+    print(f"  seed counts (DATA, not a gate): " +
+          "   ".join(f"ms={ms} n={n}" for ms, n in _uneven))
+
+    # ---- N0.3 THE BOX-FREE GATE, SCORED FIRST
+    print("\n(N0.3) **THE BOX-FREE GATE, SCORED FIRST**, for the fifth time in this campaign.")
+    print("  Expected to pass trivially -- ms=1e-3 already passed at 0.0% and a SMALLER")
+    print("  stepsize travels LESS -- so a FAILURE means something other than the")
+    print("  meta-stepsize changed and the batch is VOID rather than interesting.")
+    print("  It is scored anyway because 'expected to pass trivially' is the exact")
+    print("  reasoning that made cycle 50 move the wrong wall.")
+    print(f"\n  {'ms':7}{'rung':6}{'%rec LO':>10}{'%rec HI':>10}{'%coordLO':>11}"
+          f"{'%coordHI':>11}{'final min':>12}{'final max':>12}")
+    n03 = True
+    for ms, root, fam, pat, _ in LAD[1:3]:
+        for g in RUNGS:
+            a, _n = agg(os.path.join(root, pat.format(g=g)), -30.0, 0.0)
+            n03 &= max(a["rec_lo"], a["rec_hi"]) < BAR_BOXFREE
+            print(f"  {ms:7}{g:6}{pct(a['rec_lo']):>10}{pct(a['rec_hi']):>10}"
+                  f"{pct(a['coord_lo']):>11}{pct(a['coord_hi']):>11}"
+                  f"{a['min_final']:>12.3f}{a['max_final']:>12.3f}")
+    print(f"  --> N0.3 {'PASS -- all six new arms are box-free; the four-point ladder is box-free end to end' if n03 else 'FAIL -- the batch is VOID'}")
+
+    # ---- N1 THE PRIMARY TEST
+    print("\n(N1) THE PRIMARY TEST -- WHERE DOES argmin FLIP?")
+    print("  argmin of N_eff/m over {lay, node, w}; VARIANCE instrument, STEADY half.")
+    print("  Controls: ms=1e-4 -> **w**;  ms=1e-3 -> **node**.")
+    print("  PREDICTION: the flip is MONOTONE in ms -- exactly one crossing in [1e-4, 1e-3],")
+    print("  so the admissible outcomes at (2e-4, 5e-4) are (w,w), (w,node) or (node,node).")
+    print("  REFUTATION: **(node, w)** -- the shape is not a monotone function of ms and")
+    print("  CORRECTIONS 70 must be reported as holding at a POINT, not on an interval.")
+    print("\n  Report the FULL three-number profile at every rung, never just the argmin.")
+
+    tabs = {}
+    for ms, root, fam, pat, _n in LAD:
+        tabs[ms] = neff_table(root).get(fam, {})
+    print(f"\n  {'ms':7}{'n':>3}{'lay':>10}{'node':>10}{'w':>10}{'argmin':>9}"
+          f"{'decided':>9}   ordering")
+    profiles = {}
+    for ms, root, fam, pat, nseed in LAD:
+        pr = {g: (tabs[ms].get(g)[2] if tabs[ms].get(g) else None) for g in RUNGS}
+        profiles[ms] = pr
+        am, dec = argmin_rung(pr)
+        order = " < ".join(k for k, _ in sorted(
+            ((k, v) for k, v in pr.items() if v is not None), key=lambda kv: kv[1]))
+        # COUNT THE SEEDS THAT ARE ON DISK; DO NOT PRINT THE TABLE LITERAL (cycle 54).
+        # This column printed LAD's hard-coded `nseed`, so after `ns6-*` landed the
+        # third seed at ms=2e-4 the row still read "n 2" while the N_eff/m values
+        # beside it HAD moved (w 0.2054 -> 0.2128, node 0.2244 -> 0.2271) because
+        # neff_table globs the directories.  A provenance label that disagrees with
+        # the number it labels is worse than no label.
+        nreal = len(glob.glob(os.path.join(root, pat.format(g="w"))))
+        flag = "" if nreal == nseed else f"  <-- n differs from the registration's {nseed}"
+        print(f"  {ms:7}{nreal:>3}{fmt(pr['lay']):>10}{fmt(pr['node']):>10}{fmt(pr['w']):>10}"
+              f"{str(am):>9}{('yes' if dec else 'NO'):>9}   {order}{flag}")
+
+    n1_undecided = False
+    seq = [argmin_rung(profiles[ms])[0] for ms, *_ in LAD]
+    dec = [argmin_rung(profiles[ms])[1] for ms, *_ in LAD]
+    mid = (seq[1], seq[2])
+    print(f"\n  argmin sequence across the four-point ladder: "
+          f"{' -> '.join(str(s) for s in seq)}")
+
+    # AN UNDECIDED RUNG IS NOT ITS NOMINAL argmin.  The ns5 header registered the
+    # tolerance and the consequence in the same sentence: "If two rungs come back
+    # within 0.02 of each other, say UNDECIDED and buy the third seed then."
+    # Reading the nominal minimum anyway is how a coin-flip becomes a result.
+    und = [ms for (ms, *_), d in zip(LAD, dec) if not d]
+    if und:
+        print(f"\n  *** UNDECIDED RUNGS: {', '.join(und)} -- the two smallest N_eff/m are")
+        print("      within the registered 0.02 tolerance, so the argmin there is a")
+        print("      COIN FLIP and not a measurement.")
+        for ms in und:
+            pr = profiles[ms]
+            two = sorted(((k, v) for k, v in pr.items() if v is not None), key=lambda kv: kv[1])[:2]
+            alt = tuple(k for k, _ in two)
+            print(f"      ms={ms}: {alt[0]} {pr[alt[0]]:.4f} vs {alt[1]} {pr[alt[1]]:.4f}"
+                  f"  (gap {abs(pr[alt[0]] - pr[alt[1]]):.4f} < 0.02)")
+        # is the REGISTERED REFUTATION one of the admissible readings?
+        if not dec[1] and seq[2] == "w":
+            alt2 = sorted(((k, v) for k, v in profiles["2e-4"].items() if v is not None),
+                          key=lambda kv: kv[1])[:2]
+            if "node" in [k for k, _ in alt2]:
+                print("\n  --> N1 IS UNDECIDED, NOT PASSED.  With ms=2e-4 a coin flip between w")
+                print("      and node, the two admissible readings of (2e-4, 5e-4) are")
+                print("      (w, w) -- ADMISSIBLE, boundary between 5e-4 and 1e-3 -- and")
+                print("      (node, w) -- **THE REGISTERED REFUTATION**.  A test whose")
+                print("      refutation branch is live cannot be reported as a pass.")
+                print("      ACTION, and it is the one the header registered in advance:")
+                print("      BUY THE THIRD SEED AT ms=2e-4 (3 jobs) and score N1 then.")
+                n1_undecided = True
+    if n1_undecided:
+        print("\n  (the verdict branches below are printed for the record only; N1's")
+        print("   verdict is UNDECIDED above and that is the one that counts)")
+    if mid == ("node", "w"):
+        print("  --> N1 REFUTED.  (node, w) is the registered refutation: the shape is NOT a")
+        print("      monotone function of the meta-stepsize.  CORRECTIONS 70 must be rewritten")
+        print("      as holding at a POINT rather than on an interval.")
+    elif mid in (("w", "w"), ("w", "node"), ("node", "node")):
+        print("  --> N1 PASSES.  The flip is monotone in ms with exactly one crossing.")
+        cross = {("w", "w"): "between 5e-4 and 1e-3",
+                 ("w", "node"): "between 2e-4 and 5e-4",
+                 ("node", "node"): "between 1e-4 and 2e-4"}[mid]
+        print(f"      THE BOUNDARY IS {cross}.  CORRECTIONS 70's scope becomes an INTERVAL.")
+    else:
+        print(f"  --> N1 UNDECIDABLE: argmin sequence contains a None/undecided rung {mid}.")
+        print("      An unresolved rung makes the argmin UNDECIDABLE, never a default.")
+
+    # ---- N2 THE MECHANISM
+    print("\n(N2) THE MECHANISM CANDIDATE, registered BEFORE the data landed.")
+    print("  PREDICTION: the argmin flips to `node` at the stepsize whose WEIGHTWISE beta")
+    print("  SPAN first exceeds ~5 log units, and the flip tracks SPAN better than ms.")
+    print("  Span grows SUBLINEARLY in ms (measured 4.9x for 10x), so the two orderings")
+    print("  are not the same ordering and a four-point ladder can separate them.")
+    print(f"\n  {'ms':7}{'rung':6}{'beta span':>12}{'travel(max)':>14}{'N_eff/m':>10}")
+    spans = {}
+    for ms, root, fam, pat, _n in LAD:
+        for g in RUNGS:
+            sp, tr, n = beta_span(os.path.join(root, pat.format(g=g)))
+            if g == "w":
+                spans[ms] = sp
+            pr = profiles[ms][g]
+            print(f"  {ms:7}{g:6}{fmt(sp, 3):>12}{fmt(tr, 3):>14}{fmt(pr):>10}")
+    print(f"\n  weightwise SPAN vs the argmin:")
+    print(f"  {'ms':9}{'span (w)':>12}{'> 5 log units?':>17}{'argmin':>9}")
+    for ms, *_ in LAD:
+        sp = spans.get(ms)
+        am = argmin_rung(profiles[ms])[0]
+        print(f"  {ms:9}{fmt(sp, 3):>12}{('YES' if (sp or 0) > 5.0 else 'no'):>17}{str(am):>9}")
+    hits = [(ms, (spans.get(ms) or 0) > 5.0, argmin_rung(profiles[ms])[0] == "node")
+            for ms, *_ in LAD]
+    agree = all(a == b for _, a, b in hits)
+    print(f"\n  --> N2 {'CONFIRMED' if agree else 'REFUTED'}: the '>5 log units of span' predicate "
+          f"{'matches' if agree else 'does NOT match'} the argmin==node predicate on "
+          f"{sum(1 for _, a, b in hits if a == b)} of {len(hits)} rungs.")
+    if agree:
+        print("      CORRECTIONS 70 can be rewritten in terms of ADAPTATION EXTENT rather than")
+        print("      meta-stepsize -- a better statement: it transfers across optimizers and")
+        print("      budgets, and it PREDICTS the nodewise minimum should also appear at")
+        print("      ms=1e-4 given a LONGER run.  That is directly testable against bl5.")
+    else:
+        print("      The flip tracks ms and not span.  70 stays scoped to the meta-stepsize")
+        print("      and the mechanism stays OPEN.  Say so; do not retro-fit a second variable.")
+
+    # ---- N3 ACCURACY
+    print("\n(N3) ACCURACY, reported regardless and NOT a test.")
+    print(f"\n  {'ms':9}{'lay':>10}{'node':>10}{'w':>10}")
+    for ms, pre in (("1e-4", "ml5-{g}-m4"), ("2e-4", "ns5-{g}-m2p4"),
+                    ("5e-4", "ns5-{g}-m5p4"), ("1e-3", "cl5-{g}-cU")):
+        vs = []
+        for g in RUNGS:
+            p, n = plateau(pre.format(g=g))
+            vs.append(f"{p:.3f}" if n else "--")
+        print(f"  {ms:9}{vs[0]:>10}{vs[1]:>10}{vs[2]:>10}")
+    print("  (a smaller meta-stepsize should train more slowly; recorded, not scored)")
+
+
+def main():
+    score_bl5()
+    print("\n")
+    score_ns5()
+    return 0
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    sys.exit(main())

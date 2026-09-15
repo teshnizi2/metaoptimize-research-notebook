@@ -1,0 +1,1028 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cH1_hb1_score.py -- THE REGISTERED SCORER FOR `hb1`, THE HEAD/BACKBONE SPLIT.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any hb1 run exists.  Every
+# bar, band, gate and refusal below is frozen here.  --selftest RE-DERIVES every
+# archived constant from results/all_runs.csv rather than quoting prose, asserts
+# that the corpus contains ZERO hb1 rows and ZERO explicit-int-list granularity
+# rows at registration time, and cross-checks each constant against
+# bin/cH1_head_backbone.sh's OWN TEXT so registration and batch cannot drift.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments (--runs, --manifest, --selftest) is NOT editing it.  Once
+# an hb1 run exists this file is frozen for good.
+#
+# =============================================================================
+# THE HYPOTHESIS
+# =============================================================================
+# Nine mechanisms have been tested in this campaign and all nine died.  This is
+# the tenth, and it is the first the data actively points at.
+#
+# A scalar step size must serve the backbone AND a classifier head whose share
+# of the model grows with the class count.  MEASURED on the live tree, not
+# assumed (build_network.ResNet18_c100, 62 parameter tensors, 11,220,132
+# parameters): the head is `linear.weight` (100 x 512) + `linear.bias` (100),
+# 51,300 parameters, 0.4572% of the model.  At 10 classes the same head is
+# 5,130 parameters; at 489 it is 250,857.
+#
+# IF that is the mechanism, THEN an m = 2 partition {backbone, head} should
+# capture most of CIFAR-100's layerwise-minus-scalar gap, which is +46.526 pp.
+#
+# =============================================================================
+# NO CODE PATCH IS NEEDED.  VERIFIED ON THE LIVE TREE BEFORE THIS FILE EXISTED
+# =============================================================================
+# Optimizers/HF.py::polish_the_stepsize_groups already accepts an explicit int
+# list as a STRING of the form "[a,b,...]":
+#
+#     elif stepsize_groups[0]=='[' and stepsize_groups[-1]==']':
+#         stepsize_groups = [int(x) for x in stepsize_groups[1:-1].split(',')]
+#     ...
+#     if not (sum(stepsize_groups)==len(net_param_names_and_size)): 0/0
+#
+# and init_meta routes any unrecognised string to `blockwise`.  Executed against
+# the live ResNet18_c100 on cluster_b (account_b), reading net.named_parameters()
+# rather than assuming an ordering:
+#
+#     NUM_PARAM_TENSORS = 62      indices 60,61 = linear.weight, linear.bias
+#     "[60,2]"   -> m=2  group0 conv1.weight .. layer4.1.bn2.bias  (60)
+#                        group1 linear.weight .. linear.bias       (2)   <- HEAD
+#     "[2,60]"   -> m=2  group0 conv1.weight .. bn1.weight         (2)
+#                        group1 bn1.bias .. linear.bias            (60)
+#     "[31,31]"  -> m=2  group0 conv1.weight .. layer3.0.conv1.weight
+#                        group1 layer3.0.bn1.weight .. linear.bias
+#     "resnet18_blocks" -> [3,12,15,15,15,2], final group = the head, exactly.
+#
+# That last line matters: `resnet18_blocks` ALREADY isolates the head.  Its
+# archived CIFAR-100 capture is therefore the ceiling this hypothesis is aiming
+# at, and it is re-derived below, not quoted.
+#
+# The launcher re-runs that live-tree check at submission time and writes
+# PARTITION-MANIFEST.txt; GATE G1 below REFUSES to score a batch whose manifest
+# does not show the head as its own group.
+#
+# =============================================================================
+# THE DESIGN.  18 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85)=5.47, p 6.9e-13; SEED is null, F 1.21, p 0.213) -- is held constant
+# and EVERY contrast below is WITHIN this batch.
+# =============================================================================
+#   scal   scalar        m = 1     the ceiling-free baseline
+#   head   "[60,2]"      m = 2     THE HYPOTHESIS: {backbone, head}
+#   stem   "[2,60]"      m = 2     CONTROL, size-matched, wrong END of the net
+#   mid    "[31,31]"     m = 2     CONTROL, balanced m=2, wrong PLACE
+#   blk    resnet18_blocks m = 6   in-batch bridge to the archived 0.650 capture
+#   lay    layerwise     m = 62    the ceiling
+#   x seed in {0,1,2}
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / meta-stepsize 1e-3 /
+#   alpha0 1e-6 / 100 epochs / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 /
+#   AUGMENT=1 / HIER unset / PROBE=0.  Matched cell-for-cell to the archived
+#   CIFAR-100 rows the bars are derived from.
+#
+# WHY TWO CONTROLS AND NOT ONE.  "m=2 helps" and "the HEAD helps" make the same
+# prediction for the `head` arm alone.  `mid` is the balanced m=2 split and
+# `stem` is size-matched to `head` (a group of 2 and a group of 60) at the
+# opposite end of the tensor order, so between them they measure what an
+# ARBITRARY m=2 partition buys.  `stem`'s small group is {conv1.weight,
+# bn1.weight}, which splits bn1's weight from its bias; that is semantically
+# odd and is disclosed here rather than discovered later.  It is a size control,
+# not a semantic one, and it is not asked to be anything else.
+#
+# =============================================================================
+# THE PRIMARY STATISTIC, FROZEN
+# =============================================================================
+#   plateau5 = mean of the LAST 5 test epochs.  The CSV `plateau` column
+#   (mean-of-last-20) is BANNED as primary and is never read by this file;
+#   `best_test` is not a plateau and is never read either.
+#
+#   CAPTURE(arm) = ( M(arm) - M(scal) ) / ( M(lay) - M(scal) )
+#                  the fraction of the layerwise-minus-scalar gap that arm
+#                  recovers.  Denominator measured IN-BATCH, never archived.
+#   CAP_HEAD  = CAPTURE(head)                             PRIMARY
+#   SPEC      = CAP_HEAD - max(CAPTURE(mid), CAPTURE(stem))   CO-PRIMARY
+#
+# =============================================================================
+# THE BARS, CHOSEN AND JUSTIFIED BEFORE ANY RUN EXISTS
+# =============================================================================
+# "What fraction of the gap must m=2 capture to count as the mechanism?"
+#
+# MECH_BAR = 0.50.  Re-derived from the corpus, not asserted: the archived
+#   CIFAR-100 arms at this exact cell are scalar 22.776 (n=5, 2 batches),
+#   resnet18_blocks 53.020 (n=5, 2 batches), layerwise 69.302 (n=8, 3 batches),
+#   so the gap is 46.526 pp and BLOCKWISE ALREADY CAPTURES 0.650 of it with
+#   m = 6.  Blockwise's only head-related act is the very split this batch
+#   isolates; its other five groups carve the backbone.  Requiring m = 2 to
+#   reach 0.50 is requiring it to reach 77% of what m = 6 achieves, i.e. ONE
+#   binary cut recovering more than half of what 62 independent step sizes buy.
+#   That is what "most of the gap" has to mean for the word "mechanism" to be
+#   earned.
+#
+# PARTIAL_BAR = 0.25.  Below this the head split has not captured the gap in any
+#   useful sense and the hypothesis is REFUTED.  It is set above every
+#   generic-granularity interpolation available before the fact: capture linear
+#   in (m-1)/61 predicts 0.016 at m=2 (and 0.082 at m=6, already refuted by the
+#   observed 0.650), and capture proportional to log m / log 62 predicts 0.168
+#   at m=2 (0.433 at m=6, still short of 0.650).  0.25 sits above both, so a
+#   result that merely follows a generic m-curve does NOT clear it.
+#
+# SPEC_BAR = 0.25, SPEC_NULL_BAR = 0.10.  A magnitude alone cannot establish a
+#   mechanism.  If an arbitrary m=2 cut captures as much as the head cut, the
+#   mechanism is partition COUNT, not the head -- and that would be a genuine
+#   finding, recorded as one, not softened into support.
+#
+# T_BAR = 2.0 on the head-vs-scalar contrast.
+#
+# POWER, arithmetic done in advance.  noise_floor_from_csv() re-derives the
+# pooled WITHIN-CELL SD of plateau5 over the 7 populated (batch x granularity)
+# cells of the archived CIFAR-100 configuration: SIGMA_W = 0.4034 pp (df 11).
+# SE of a 3-seed mean = 0.2329 pp; SE of a difference of two = 0.3294 pp; and
+# because the denominator is ~46.5 pp, SE(CAPTURE) ~ 0.0071 and SE(SPEC) ~
+# 0.0100.  PARTIAL_BAR is ~35 SE from zero and SPEC_NULL_BAR is ~10 SE.  Seed
+# noise is not the uncertainty in this design; the science is.
+#
+# =============================================================================
+# WHAT WOULD REFUTE THE HEAD HYPOTHESIS.  STATED BEFORE THE DATA EXIST
+# =============================================================================
+#   R0  REFUTED-HURTS         M(head) < M(scal) - 0.50 pp.  Freeing the head
+#                             makes things worse.
+#   R1  REFUTED-SMALL         CAP_HEAD < 0.25.  The head split does not capture
+#                             the gap.  This is the direct refutation.
+#   R2  REFUTED-NOTSPECIFIC   SPEC <= 0.10.  An arbitrary m=2 partition captures
+#                             as much.  The head account dies EVEN IF CAP_HEAD
+#                             is 0.9; what survives is a NEW claim about
+#                             partition count, which is to be reported as a
+#                             positive finding in its own right and NOT as
+#                             support for the head.
+#   R3  INCONSISTENT-TRAIN    (registered, non-overriding)  The class-count law's
+#                             mechanism is that the scalar arm cannot FIT: at
+#                             this cell archived final_train is 22.97 (scalar)
+#                             against 98.96 (layerwise).  If CAP_HEAD >= 0.50
+#                             but TRAINCAP < 0.40, the head split bought test
+#                             accuracy without buying training fit, which
+#                             contradicts the underfitting account.  Printed as
+#                             a named flag; it does not overturn the primary
+#                             verdict, and it may not be quietly dropped either.
+#
+# WHAT DOES NOT COUNT AS REFUTATION, AND EQUALLY DOES NOT COUNT AS RESCUE
+#   * 0.25 <= CAP_HEAD < 0.50 with SPEC >= 0.25 is HEAD_PARTIAL.  An honest
+#     intermediate.  It may not be reported as "the mechanism".
+#   * 0.10 < SPEC < 0.25 is UNRESOLVED-SPECIFICITY.  Not a win.
+#   * CAP_HEAD > 1 (m=2 beating layerwise) is allowed, reported, and changes no
+#     bar.
+#   * The in-batch blockwise capture differing from the archived 0.650 is
+#     DESCRIPTIVE.  It never changes the primary verdict.
+#   * No post-hoc change of statistic, window or scale.  plateau5, CAPTURE and
+#     SPEC are fixed here.
+#
+# =============================================================================
+# THE GATES, IN ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# =============================================================================
+#   G0  PROVENANCE (RULE 20), ABSOLUTELY GATING.  Every arm is MEASURED from the
+#       run's OWN `ARGS:`/`ENV:` lines, never from its filename.  No repeated
+#       flag; dataset CIFAR100; NN-name ResNet18_c100; alpha0 1e-6;
+#       meta-stepsize 1e-3; num-epochs 100; batch-size 100; gamma 1;
+#       alg-base SGDm; alg-meta Lion; AUGMENT=1; BETA_CLIP=-15:-2.3026;
+#       HIER unset; and a --stepsize-groups value that is one of the six
+#       registered arm strings.
+#   G1  THE PARTITION GATE.  The launcher's PARTITION-MANIFEST.txt, written from
+#       the LIVE model's named_parameters(), must show 62 tensors, "[60,2]" as
+#       m=2 whose LAST group is exactly {linear.weight, linear.bias}, "[2,60]"
+#       as m=2 whose FIRST group has 2 members, and "[31,31]" as m=2 with sizes
+#       31,31.  A missing or disagreeing manifest is VOID-PARTITION: without it
+#       "head/backbone" is a claim about a string, not about a network.
+#   G2  COMPLETENESS.  >= 95 of 100 epochs and all 5 tail epochs present.
+#       Any cell with fewer than 2 usable seeds VOIDS the batch.
+#   G3  THE ARCHIVE GATE.  In-batch scal and lay must land within +/-2.00 pp of
+#       their archived means (22.776 and 69.302).  That band is ~4x the observed
+#       between-batch spread of these arm means and is a gross-breakage
+#       detector, not a precision test.  A miss is VOID-TREE.
+#   G4  THE MANIFOLD GATE.  In-batch (lay - scal) must be >= 23.263 pp, half the
+#       archived gap.  Without the gap there is no gap to capture and CAPTURE is
+#       a ratio of noise: VOID-NOMANIFOLD, and no verdict is issued.
+#   G5  THE PRIMARY.  CAP_HEAD and SPEC against the frozen bars.
+#   G6  DESCRIPTIVE, NEVER GATING.  In-batch blockwise capture vs archived
+#       0.650; TRAINCAP and the R3 flag; the full capture table.
+#
+# =============================================================================
+# WHAT THIS SCORER WILL NOT DO
+# =============================================================================
+#   * It will not read the CSV `plateau` (last-20) column, or `best_test`.
+#   * It will not pool hb1 with any archived batch to raise n.  The archived
+#     rows enter only as G3's and G4's registered comparators and as the source
+#     of the bars.
+#   * It will not claim anything about CIFAR-10, Tiny-ImageNet, ImageNet-489,
+#     ResNet-50, alpha0 1e-3, any meta-stepsize but 1e-3, any optimiser pair but
+#     SGDm+Lion, or any hierarchical/shrinkage operator (HIER is unset in every
+#     arm).
+#   * It will not name an optimum over m: six arms at three m values cannot
+#     locate one.
+#   * It will not soften a bar after the fact.  If the answer lands in a gap,
+#     the deliverable is the word UNRESOLVED.
+#
+# =============================================================================
+# USAGE
+#   python3 analysis/cH1_hb1_score.py --selftest
+#   python3 analysis/cH1_hb1_score.py --runs /cluster/account_b/metaopt/runs
+#   python3 analysis/cH1_hb1_score.py --runs <dir> --manifest <path>
+# =============================================================================
+
+from __future__ import print_function
+
+import argparse
+import collections
+import csv
+import glob
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cH1_head_backbone.sh")
+
+# ---- FROZEN REGISTRATION ----------------------------------------------------
+PREFIX = "hb1-"
+NET, DSET = "ResNet18_c100", "CIFAR100"
+MS, ALPHA0, CLIP, AUG = "1e-3", "1e-6", "-15:-2.3026", "1"
+EPOCHS, BATCH, GAMMA = 100, 100, "1"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+SEEDS = (0, 1, 2)
+
+HEAD_SPEC = "[60,2]"
+STEM_SPEC = "[2,60]"
+MID_SPEC = "[31,31]"
+BLK_SPEC = "resnet18_blocks"
+N_TENSORS = 62
+HEAD_NAMES = ("linear.weight", "linear.bias")
+
+ARMS = collections.OrderedDict([        # tag -> --stepsize-groups value
+    ("scal", "scalar"),
+    ("head", HEAD_SPEC),
+    ("stem", STEM_SPEC),
+    ("mid", MID_SPEC),
+    ("blk", BLK_SPEC),
+    ("lay", "layerwise"),
+])
+CONTROL_ARMS = ("mid", "stem")
+
+# archived comparators, re-derived by archived_arms() in --selftest
+ARCH_SCAL = 22.776
+ARCH_BLK = 53.020
+ARCH_LAY = 69.302
+ARCH_GAP = 46.526
+ARCH_BLK_CAPTURE = 0.650
+ARCH_TRAIN_SCAL = 22.97
+ARCH_TRAIN_LAY = 98.96
+SIGMA_W = 0.4034
+SIGMA_DF = 11
+
+# bars
+MECH_BAR = 0.50
+PARTIAL_BAR = 0.25
+SPEC_BAR = 0.25
+SPEC_NULL_BAR = 0.10
+T_BAR = 2.0
+HURT_BAR = 0.50
+TREE_BAND = 2.00
+MANIFOLD_BAR = 23.263          # exactly half of ARCH_GAP
+TRAINCAP_BAR = 0.40
+BLK_NOTE_BAND = 0.15           # descriptive only
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+
+
+# =============================================================================
+# re-derivation from the corpus.  Nothing below is quoted from prose.
+# =============================================================================
+def _csv_rows(path=CSV):
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if (r.get("superseded") or "0") != "1"]
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r):
+    """True iff the archived row sits in the matched CIFAR-100 comparison cell."""
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["meta_stepsize"] == MS and r["alpha0"] == ALPHA0
+            and r["gamma"] == GAMMA and r["augment"] == AUG
+            and r["beta_clip"] == CLIP and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH) and r["epochs_done"] == str(EPOCHS)
+            and r["collapsed"] == "0")
+
+
+def _cell_p5(r):
+    if not _in_cell(r):
+        return None
+    try:
+        return float(r["plateau5"])
+    except (TypeError, ValueError):
+        return None
+
+
+def archived_arms(path=CSV):
+    """{granularity: (mean plateau5, n, distinct batches, mean final_train)}."""
+    acc = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is None:
+            continue
+        try:
+            tr = float(r["final_train"])
+        except (TypeError, ValueError):
+            tr = None
+        acc[r["granularity"]].append((p5, _batch_of(r["run"]), tr))
+    out = {}
+    for k, v in acc.items():
+        trs = [t for _, _, t in v if t is not None]
+        out[k] = (statistics.mean(x for x, _, _ in v), len(v),
+                  len(set(b for _, b, _ in v)),
+                  statistics.mean(trs) if trs else float("nan"))
+    return out
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN-CELL SD of plateau5 over (batch x granularity) cells."""
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is not None:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(p5)
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc
+
+
+def premise_no_hb1_rows(path=CSV):
+    """RULE 21: no hb1 run and no explicit int-list partition may exist yet."""
+    n_name = n_spec = 0
+    for r in _csv_rows(path):
+        if str(r.get("run") or "").startswith(PREFIX):
+            n_name += 1
+        g = str(r.get("granularity") or "")
+        if g.startswith("[") and g.endswith("]"):
+            n_spec += 1
+    return n_name, n_spec
+
+
+# =============================================================================
+# reading the runs.  The arm of a run is MEASURED from its own flags.
+# =============================================================================
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals, j = [], i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff, seen = collections.OrderedDict(), collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    return eff, dict((f, v) for f, v in seen.items() if len(v) > 1)
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    test, train = {}, {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    test[int(m.group(1))] = float(m.group(2))
+                m = EPTR_RE.search(line)
+                if m:
+                    train[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "test": test, "train": train,
+            "path": path}
+
+
+def tail5(series, budget=EPOCHS, w=5):
+    """PRIMARY window.  Mean of the LAST 5 epochs; train.py prints 0-indexed."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_of(a):
+    """The arm a run ACTUALLY ran, from its own flags.  None if it is not ours."""
+    if a.get("dataset") != DSET or a.get("NN-name") != NET:
+        return None
+    g = a.get("stepsize-groups")
+    for tag, spec in ARMS.items():
+        if g == spec:
+            return tag
+    return None
+
+
+# =============================================================================
+# G0 provenance
+# =============================================================================
+def gate0(recs):
+    kept, voided = [], []
+    for r in recs:
+        a, e = r["args"], r["env"]
+        why = []
+        if r["dup"]:
+            why.append("REPEATED FLAG %s" % sorted(r["dup"]))
+        tag = arm_of(a)
+        if tag is None:
+            why.append("arm not in the registered design (dataset=%s NN=%s groups=%s)"
+                       % (a.get("dataset"), a.get("NN-name"), a.get("stepsize-groups")))
+        for flag, want in (("meta-stepsize", MS), ("alpha0", ALPHA0),
+                           ("num-epochs", str(EPOCHS)), ("batch-size", str(BATCH)),
+                           ("gamma", GAMMA), ("alg-base", BASE_ALG),
+                           ("alg-meta", META_ALG)):
+            got = a.get(flag)
+            same = (norm_num(got) == norm_num(want)) if norm_num(want) is not None \
+                else (got == want)
+            if not same:
+                why.append("%s=%s (want %s)" % (flag, got, want))
+        if e.get("AUGMENT") != AUG:
+            why.append("AUGMENT=%s" % e.get("AUGMENT"))
+        if e.get("BETA_CLIP") != CLIP:
+            why.append("BETA_CLIP=%s" % e.get("BETA_CLIP"))
+        if (e.get("HIER") or "none") != "none":
+            why.append("HIER=%s (this batch is a PARTITION ladder; HIER must be unset)"
+                       % e.get("HIER"))
+        r["arm"] = tag
+        r["seed"] = a.get("seed")
+        (voided if why else kept).append((r, why))
+    return kept, voided
+
+
+# =============================================================================
+# G1 the partition gate -- the split must be a fact about the network
+# =============================================================================
+MAN_RE = re.compile(
+    r"^SPEC\s+(\S+)\s+M\s+(\d+)\s+SIZES\s+(\S+)\s+FIRSTGROUP\s+(.*?)\s+LASTGROUP\s+(.*?)\s*$")
+
+
+def read_manifest(path):
+    if not path or not os.path.exists(path):
+        return None
+    out = {}
+    ntens = None
+    with open(path) as fh:
+        for line in fh:
+            m = re.match(r"^NUM_PARAM_TENSORS\s+(\d+)\s*$", line.strip())
+            if m:
+                ntens = int(m.group(1))
+                continue
+            m = MAN_RE.match(line.strip())
+            if m:
+                out[m.group(1)] = {
+                    "m": int(m.group(2)),
+                    "sizes": [int(x) for x in m.group(3).split(",") if x != ""],
+                    "first": m.group(4).split(),
+                    "last": m.group(5).split(),
+                }
+    return {"n_tensors": ntens, "specs": out}
+
+
+def gate1(man):
+    """[] if the manifest proves the registered partitions; else the reasons."""
+    if man is None:
+        return ["PARTITION-MANIFEST.txt is missing"]
+    why = []
+    if man["n_tensors"] != N_TENSORS:
+        why.append("NUM_PARAM_TENSORS=%s (want %d)" % (man["n_tensors"], N_TENSORS))
+    s = man["specs"]
+    h = s.get(HEAD_SPEC)
+    if h is None:
+        why.append("no manifest line for %s" % HEAD_SPEC)
+    else:
+        if h["m"] != 2 or h["sizes"] != [60, 2]:
+            why.append("%s is m=%d sizes=%s (want m=2 [60,2])"
+                       % (HEAD_SPEC, h["m"], h["sizes"]))
+        if tuple(h["last"]) != HEAD_NAMES:
+            why.append("%s last group is %s (want %s) -- the head is NOT isolated"
+                       % (HEAD_SPEC, h["last"], list(HEAD_NAMES)))
+    t = s.get(STEM_SPEC)
+    if t is None:
+        why.append("no manifest line for %s" % STEM_SPEC)
+    elif t["m"] != 2 or t["sizes"] != [2, 60]:
+        why.append("%s is m=%d sizes=%s (want m=2 [2,60])" % (STEM_SPEC, t["m"], t["sizes"]))
+    d = s.get(MID_SPEC)
+    if d is None:
+        why.append("no manifest line for %s" % MID_SPEC)
+    elif d["m"] != 2 or d["sizes"] != [31, 31]:
+        why.append("%s is m=%d sizes=%s (want m=2 [31,31])" % (MID_SPEC, d["m"], d["sizes"]))
+    b = s.get(BLK_SPEC)
+    if b is None:
+        why.append("no manifest line for %s" % BLK_SPEC)
+    elif tuple(b["last"]) != HEAD_NAMES:
+        why.append("%s last group is %s (want %s)" % (BLK_SPEC, b["last"], list(HEAD_NAMES)))
+    return why
+
+
+# =============================================================================
+# statistics
+# =============================================================================
+def mean_se(v):
+    m = statistics.mean(v)
+    return (m, float("nan")) if len(v) < 2 else (m, statistics.stdev(v) / math.sqrt(len(v)))
+
+
+def contrast(a, b):
+    """(diff, se, t, df) for mean(a) - mean(b), independent 3-seed arms."""
+    ma, mb = statistics.mean(a), statistics.mean(b)
+    if len(a) < 2 or len(b) < 2:
+        return ma - mb, float("nan"), float("nan"), 0
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    t = (ma - mb) / se if se > 0 else float("inf")
+    return ma - mb, se, t, len(a) + len(b) - 2
+
+
+def capture(m_arm, m_scal, m_lay):
+    return (m_arm - m_scal) / (m_lay - m_scal)
+
+
+def verdict(cap_head, cap_controls, t_head, hurt):
+    """THE FROZEN DECISION TREE.  Exhaustive and deterministic.
+
+    cap_head     CAPTURE(head)
+    cap_controls list of CAPTURE(mid), CAPTURE(stem)  (may be empty -> UNRESOLVED)
+    t_head       t of M(head) - M(scal)
+    hurt         M(head) - M(scal) in pp
+    """
+    if hurt < -HURT_BAR:
+        return "REFUTED-HURTS", float("nan")
+    if not cap_controls:
+        return "UNRESOLVED-NOCONTROL", float("nan")
+    spec = cap_head - max(cap_controls)
+    if cap_head < PARTIAL_BAR:
+        return "REFUTED-SMALL", spec
+    if spec <= SPEC_NULL_BAR:
+        return "REFUTED-NOTSPECIFIC", spec
+    if spec < SPEC_BAR:
+        return "UNRESOLVED-SPECIFICITY", spec
+    if cap_head >= MECH_BAR:
+        if not math.isnan(t_head) and t_head >= T_BAR:
+            return "HEAD_MECHANISM", spec
+        return "UNRESOLVED-NOISE", spec
+    return "HEAD_PARTIAL", spec
+
+
+# =============================================================================
+# selftest
+# =============================================================================
+def selftest():
+    fails = []
+
+    def ok(label, cond, extra=""):
+        print("  %-64s %s %s" % (label, "PASS" if cond else "**FAIL**", extra))
+        if not cond:
+            fails.append(label)
+
+    print("cH1_hb1_score selftest -- every constant re-derived, none quoted")
+    print("-- the archived CIFAR-100 cell -------------------------------------")
+    g = archived_arms()
+    for k in ("scalar", "resnet18_blocks", "layerwise"):
+        ok("archived %s arm present" % k, k in g,
+           ("mean %.3f n=%d batches=%d train %.2f" % g[k]) if k in g else "")
+    if all(k in g for k in ("scalar", "resnet18_blocks", "layerwise")):
+        gap = g["layerwise"][0] - g["scalar"][0]
+        blkcap = (g["resnet18_blocks"][0] - g["scalar"][0]) / gap
+        ok("ARCH_SCAL matches the CSV", abs(g["scalar"][0] - ARCH_SCAL) < 0.02,
+           "%.3f" % g["scalar"][0])
+        ok("ARCH_BLK matches the CSV", abs(g["resnet18_blocks"][0] - ARCH_BLK) < 0.02,
+           "%.3f" % g["resnet18_blocks"][0])
+        ok("ARCH_LAY matches the CSV", abs(g["layerwise"][0] - ARCH_LAY) < 0.02,
+           "%.3f" % g["layerwise"][0])
+        ok("ARCH_GAP matches the CSV", abs(gap - ARCH_GAP) < 0.02, "%.3f pp" % gap)
+        ok("ARCH_BLK_CAPTURE matches the CSV",
+           abs(blkcap - ARCH_BLK_CAPTURE) < 0.005, "%.4f" % blkcap)
+        ok("MANIFOLD_BAR is exactly half the archived gap",
+           abs(MANIFOLD_BAR - gap / 2.0) < 0.01, "%.3f" % (gap / 2.0))
+        ok("archived scalar UNDERFITS (train ~= test, the law's mechanism)",
+           abs(g["scalar"][3] - ARCH_TRAIN_SCAL) < 0.1
+           and abs(g["scalar"][3] - g["scalar"][0]) < 2.0,
+           "train %.2f vs test %.3f" % (g["scalar"][3], g["scalar"][0]))
+        ok("archived layerwise FITS", abs(g["layerwise"][3] - ARCH_TRAIN_LAY) < 0.1,
+           "train %.2f" % g["layerwise"][3])
+    sd, df, nc = noise_floor_from_csv()
+    ok("SIGMA_W matches the CSV", abs(sd - SIGMA_W) < 0.01,
+       "re-derived %.4f df=%d cells=%d" % (sd, df, nc))
+    ok("SIGMA_DF matches the CSV", df == SIGMA_DF, "%d" % df)
+
+    print("-- RULE 21 premise: nothing of this batch may exist yet ------------")
+    n_name, n_spec = premise_no_hb1_rows()
+    ok("corpus holds ZERO hb1- rows", n_name == 0, "found %d" % n_name)
+    ok("corpus holds ZERO explicit int-list partitions", n_spec == 0, "found %d" % n_spec)
+
+    print("-- the power arithmetic the bars rest on ---------------------------")
+    se_mean = SIGMA_W / math.sqrt(3.0)
+    se_diff = SIGMA_W * math.sqrt(2.0 / 3.0)
+    ok("SE of a 3-seed mean", abs(se_mean - 0.2329) < 0.002, "%.4f pp" % se_mean)
+    ok("SE of a difference of two 3-seed means", abs(se_diff - 0.3294) < 0.002,
+       "%.4f pp" % se_diff)
+    se_cap = se_diff / ARCH_GAP
+    ok("SE(CAPTURE) is ~0.007 at this gap", abs(se_cap - 0.00708) < 0.0005,
+       "%.5f" % se_cap)
+    ok("PARTIAL_BAR is >= 20 SE from zero", PARTIAL_BAR / se_cap >= 20,
+       "%.1f SE" % (PARTIAL_BAR / se_cap))
+    ok("SPEC_NULL_BAR is >= 5 SE from zero", SPEC_NULL_BAR / (se_cap * math.sqrt(2)) >= 5,
+       "%.1f SE" % (SPEC_NULL_BAR / (se_cap * math.sqrt(2))))
+
+    print("-- the bars sit above every generic-m interpolation ----------------")
+    lin = (2.0 - 1) / (N_TENSORS - 1)
+    logm = math.log(2.0) / math.log(float(N_TENSORS))
+    ok("linear-in-m predicts far less than PARTIAL_BAR at m=2",
+       lin < PARTIAL_BAR, "%.4f" % lin)
+    ok("log-m predicts less than PARTIAL_BAR at m=2", logm < PARTIAL_BAR, "%.4f" % logm)
+    ok("linear-in-m is already refuted at m=6 by the archived blockwise capture",
+       (6.0 - 1) / (N_TENSORS - 1) < ARCH_BLK_CAPTURE,
+       "%.4f vs %.3f" % ((6.0 - 1) / (N_TENSORS - 1), ARCH_BLK_CAPTURE))
+    ok("log-m is also short of the archived blockwise capture at m=6",
+       math.log(6.0) / math.log(float(N_TENSORS)) < ARCH_BLK_CAPTURE,
+       "%.4f vs %.3f" % (math.log(6.0) / math.log(float(N_TENSORS)), ARCH_BLK_CAPTURE))
+    ok("MECH_BAR is 0.50 and is below the archived m=6 capture",
+       MECH_BAR == 0.50 and MECH_BAR < ARCH_BLK_CAPTURE,
+       "0.50 vs %.3f (%.0f%% of it)" % (ARCH_BLK_CAPTURE,
+                                        100 * MECH_BAR / ARCH_BLK_CAPTURE))
+
+    print("-- the decision tree is exercised in EVERY direction ---------------")
+    ok("HEAD_MECHANISM", verdict(0.80, [0.20, 0.15], 9.0, 37.0)[0] == "HEAD_MECHANISM")
+    ok("HEAD_MECHANISM exactly at both bars",
+       verdict(MECH_BAR, [MECH_BAR - SPEC_BAR], T_BAR, 20.0)[0] == "HEAD_MECHANISM")
+    ok("HEAD_PARTIAL between the bars",
+       verdict(0.40, [0.05], 9.0, 18.0)[0] == "HEAD_PARTIAL")
+    ok("HEAD_PARTIAL exactly at PARTIAL_BAR",
+       verdict(PARTIAL_BAR, [0.0], 9.0, 12.0)[0] == "HEAD_PARTIAL")
+    ok("REFUTED-SMALL just below PARTIAL_BAR",
+       verdict(PARTIAL_BAR - 0.001, [0.0], 9.0, 11.0)[0] == "REFUTED-SMALL")
+    ok("REFUTED-SMALL even when a control does well",
+       verdict(0.10, [0.90], 9.0, 4.0)[0] == "REFUTED-SMALL")
+    ok("REFUTED-NOTSPECIFIC when a control matches a LARGE head capture",
+       verdict(0.90, [0.85], 9.0, 41.0)[0] == "REFUTED-NOTSPECIFIC")
+    ok("REFUTED-NOTSPECIFIC exactly at SPEC_NULL_BAR",
+       verdict(0.90, [0.90 - SPEC_NULL_BAR], 9.0, 41.0)[0] == "REFUTED-NOTSPECIFIC")
+    ok("UNRESOLVED-SPECIFICITY in the specificity gap",
+       verdict(0.90, [0.72], 9.0, 41.0)[0] == "UNRESOLVED-SPECIFICITY")
+    ok("UNRESOLVED-NOISE when t misses at a big capture",
+       verdict(0.80, [0.20], 1.5, 37.0)[0] == "UNRESOLVED-NOISE")
+    ok("REFUTED-HURTS dominates everything",
+       verdict(0.90, [0.0], 9.0, -0.6)[0] == "REFUTED-HURTS")
+    ok("a small hurt is NOT REFUTED-HURTS",
+       verdict(0.90, [0.0], 9.0, -0.4)[0] != "REFUTED-HURTS")
+    ok("UNRESOLVED-NOCONTROL when both controls are missing",
+       verdict(0.90, [], 9.0, 41.0)[0] == "UNRESOLVED-NOCONTROL")
+    ok("SPEC is head minus the BEST control",
+       abs(verdict(0.80, [0.20, 0.55], 9.0, 37.0)[1] - 0.25) < 1e-9)
+    ok("capture arithmetic", abs(capture(53.020, 22.776, 69.302) - 0.65) < 0.001)
+
+    print("-- the parsers, on adversarial input -------------------------------")
+    eff, dup = parse_args_line("--alg-meta Lion --dataset CIFAR100 --alg-meta RMSProp")
+    ok("a repeated flag is DETECTED", "alg-meta" in dup, str(dup))
+    ok("argparse's last-wins is reproduced", eff["alg-meta"] == "RMSProp")
+    eff2, dup2 = parse_args_line("--dataset CIFAR100 --NN-name ResNet18_c100 "
+                                 "--stepsize-groups [60,2] --seed 0")
+    ok("no false positive on a clean line", not dup2)
+    ok("the bracket spec survives tokenisation",
+       eff2.get("stepsize-groups") == HEAD_SPEC, eff2.get("stepsize-groups"))
+    ok("arm_of reads the head arm from the flags", arm_of(eff2) == "head")
+    ok("arm_of rejects the CIFAR-10 network",
+       arm_of({"dataset": "CIFAR10", "NN-name": "ResNet18",
+               "stepsize-groups": "layerwise"}) is None)
+    ok("arm_of rejects an unregistered partition",
+       arm_of({"dataset": DSET, "NN-name": NET, "stepsize-groups": "[30,32]"}) is None)
+    ok("tail5 needs all 5 tail epochs",
+       tail5({e: 50.0 for e in range(95, 100)}) == 50.0
+       and tail5({e: 50.0 for e in range(96, 100)}) is None)
+    ok("tail5 ignores everything but the tail",
+       abs(tail5(dict([(e, 1.0) for e in range(95)]
+                      + [(e, 7.0) for e in range(95, 100)])) - 7.0) < 1e-9)
+
+    print("-- the partition gate, on a good and a bad manifest ----------------")
+    good = ("NUM_PARAM_TENSORS 62\n"
+            "SPEC [60,2] M 2 SIZES 60,2 FIRSTGROUP conv1.weight layer4.1.bn2.bias "
+            "LASTGROUP linear.weight linear.bias\n"
+            "SPEC [2,60] M 2 SIZES 2,60 FIRSTGROUP conv1.weight bn1.weight "
+            "LASTGROUP bn1.bias linear.bias\n"
+            "SPEC [31,31] M 2 SIZES 31,31 FIRSTGROUP conv1.weight layer3.0.conv1.weight "
+            "LASTGROUP layer3.0.bn1.weight linear.bias\n"
+            "SPEC resnet18_blocks M 6 SIZES 3,12,15,15,15,2 FIRSTGROUP conv1.weight "
+            "bn1.bias LASTGROUP linear.weight linear.bias\n")
+    tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "hb1_selftest_manifest.txt")
+    with open(tmp, "w") as fh:
+        fh.write(good)
+    ok("a correct manifest passes G1", gate1(read_manifest(tmp)) == [],
+       str(gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write(good.replace("LASTGROUP linear.weight linear.bias\nSPEC [2,60]",
+                              "LASTGROUP layer4.1.bn2.weight layer4.1.bn2.bias\nSPEC [2,60]"))
+    ok("a manifest whose head group is NOT the head FAILS G1",
+       any("head is NOT isolated" in w for w in gate1(read_manifest(tmp))))
+    ok("a missing manifest FAILS G1", gate1(read_manifest(tmp + ".nope")) != [])
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+    print("-- the batch script's own text must match this registration --------")
+    if not os.path.exists(BATCH_SH):
+        ok("bin/cH1_head_backbone.sh exists", False, BATCH_SH)
+    else:
+        txt = open(BATCH_SH).read()
+        for label, needle in (
+                ("run-name prefix hb1-", "hb1-"),
+                ("dataset CIFAR100", "DSET=CIFAR100"),
+                ("network ResNet18_c100", "NET=ResNet18_c100"),
+                ("the head arm [60,2]", "'[60,2]'"),
+                ("the stem control [2,60]", "'[2,60]'"),
+                ("the mid control [31,31]", "'[31,31]'"),
+                ("the blockwise bridge", "resnet18_blocks"),
+                ("a scalar arm", "G=scalar"),
+                ("a layerwise arm", "G=layerwise"),
+                ("meta-stepsize 1e-3", "MST=1e-3"),
+                ("alpha0 1e-6", "ALPHA0=1e-6"),
+                ("100 epochs", "EPOCHS=100"),
+                ("batch 100", "BATCH=100"),
+                ("box -15:-2.3026", 'CLIP="-15:-2.3026"'),
+                ("AUGMENT=1", "AUG=1"),
+                ("SGDm base", "--alg-base SGDm"),
+                ("Lion meta", "--alg-meta Lion"),
+                ("HIER=none", "HIER=none"),
+                ("seeds 0 1 2", 'SEEDS="0 1 2"'),
+                ("it writes the partition manifest", "PARTITION-MANIFEST.txt"),
+                ("it protects its prefix", "PROTECTED.txt"),
+        ):
+            ok("batch script declares %s" % label, needle in txt)
+
+    print("=" * 72)
+    if fails:
+        print("SELFTEST FAIL -- %d checks failed" % len(fails))
+        for f in fails:
+            print("   %s" % f)
+        return 1
+    print("SELFTEST PASS")
+    return 0
+
+
+# =============================================================================
+# the score
+# =============================================================================
+def score(runs_dir, manifest):
+    paths = sorted(glob.glob(os.path.join(runs_dir, "**", PREFIX + "*.out"),
+                             recursive=True))
+    print("cH1_hb1_score -- `hb1`, the CIFAR-100 head/backbone partition test")
+    print("runs dir: %s" % runs_dir)
+    print("%d .out files match %s*" % (len(paths), PREFIX))
+    if not paths:
+        print("VERDICT: NO DATA -- the batch has not produced any output yet.")
+        return 3
+    recs = [r for r in (read_out(p) for p in paths) if r]
+    print("%d carry an ARGS line" % len(recs))
+
+    print("\n-- G0 PROVENANCE (RULE 20): the arm is read from each run's own flags --")
+    kept, voided = gate0(recs)
+    for r, why in voided:
+        print("   VOID %-30s %s" % (os.path.basename(r["path"]), "; ".join(why)))
+    print("   %d runs pass provenance, %d VOID" % (len(kept), len(voided)))
+    if not kept:
+        print("VERDICT: VOID -- no run survived provenance.")
+        return 2
+
+    print("\n-- G1 PARTITION GATE: the split must be a fact about the network --")
+    if manifest is None:
+        for c in (os.path.join(runs_dir, "hb1", "PARTITION-MANIFEST.txt"),
+                  os.path.join(runs_dir, "PARTITION-MANIFEST.txt")):
+            if os.path.exists(c):
+                manifest = c
+                break
+    man = read_manifest(manifest)
+    why1 = gate1(man)
+    print("   manifest: %s" % (manifest or "<not found>"))
+    if man:
+        for spec in ARMS.values():
+            d = man["specs"].get(spec)
+            if d:
+                print("      %-16s m=%d sizes=%s  first=[%s ... %s]  last=[%s ... %s]"
+                      % (spec, d["m"], ",".join(str(x) for x in d["sizes"]),
+                         d["first"][0] if d["first"] else "?",
+                         d["first"][-1] if d["first"] else "?",
+                         d["last"][0] if d["last"] else "?",
+                         d["last"][-1] if d["last"] else "?"))
+    for w in why1:
+        print("   FAIL %s" % w)
+    if why1:
+        print("VERDICT: VOID-PARTITION -- without the manifest, 'head/backbone' is a "
+              "claim about a string, not about a network.")
+        return 2
+    print("   PASS -- %d parameter tensors; %s isolates {%s} as its own group"
+          % (man["n_tensors"], HEAD_SPEC, ", ".join(HEAD_NAMES)))
+
+    print("\n-- G2 COMPLETENESS: >= 95/100 epochs and all 5 tail epochs present --")
+    cells = collections.defaultdict(list)
+    incomplete = []
+    for r, _ in kept:
+        done = (max(r["test"]) + 1) if r["test"] else 0
+        p5 = tail5(r["test"])
+        t5 = tail5(r["train"])
+        if p5 is None or done < 0.95 * EPOCHS:
+            incomplete.append((os.path.basename(r["path"]), done))
+            continue
+        cells[r["arm"]].append((p5, t5, r["seed"], os.path.basename(r["path"])))
+    for n, d in incomplete:
+        print("   DROPPED %-32s %d epochs" % (n, d))
+    print("   %d complete runs in %d arms" % (sum(len(v) for v in cells.values()),
+                                              len(cells)))
+    thin = [a for a in ARMS if len(cells.get(a, [])) < 2]
+    if thin:
+        print("   arms with fewer than 2 usable seeds: %s" % ", ".join(thin))
+        print("VERDICT: VOID -- a registered arm has fewer than 2 usable seeds.")
+        return 2
+
+    print("\n-- the arms ---------------------------------------------------------")
+    print("   %-6s %-16s %-3s %-9s %-8s %-9s  %s"
+          % ("arm", "stepsize-groups", "n", "plateau5", "se", "train5", "seeds"))
+    p5s, t5s = {}, {}
+    for arm, spec in ARMS.items():
+        v = cells.get(arm, [])
+        if not v:
+            continue
+        a = [x for x, _, _, _ in v]
+        b = [y for _, y, _, _ in v if y is not None]
+        p5s[arm] = a
+        if b:
+            t5s[arm] = b
+        m, se = mean_se(a)
+        print("   %-6s %-16s %-3d %-9.3f %-8.3f %-9s  %s"
+              % (arm, spec, len(v), m, se,
+                 ("%.3f" % statistics.mean(b)) if b else "--",
+                 " ".join("s%s=%.2f" % (s, x) for x, _, s, _ in
+                          sorted(v, key=lambda z: str(z[2])))))
+
+    print("\n-- G3 ARCHIVE GATE: does this batch reproduce the archived cell? ----")
+    g = archived_arms()
+    bad = []
+    for arm, key, want in (("scal", "scalar", ARCH_SCAL), ("lay", "layerwise", ARCH_LAY)):
+        got = statistics.mean(p5s[arm])
+        ref = g[key][0] if key in g else float("nan")
+        d = got - ref
+        print("   %-4s in-batch %.3f   archived %.3f (n=%d, %d batches)   %+.3f pp"
+              % (arm, got, ref, g[key][1], g[key][2], d))
+        if not (abs(d) <= TREE_BAND):
+            bad.append("%s off by %+.3f pp (band +/-%.2f)" % (arm, d, TREE_BAND))
+    if bad:
+        for b in bad:
+            print("   FAIL %s" % b)
+        print("VERDICT: VOID-TREE -- the batch does not reproduce the archived "
+              "CIFAR-100 cell; nothing here is comparable.")
+        return 2
+    print("   PASS -- both anchors inside +/-%.2f pp" % TREE_BAND)
+
+    print("\n-- G4 MANIFOLD GATE: there must be a gap to capture ------------------")
+    m_scal, m_lay = statistics.mean(p5s["scal"]), statistics.mean(p5s["lay"])
+    gap = m_lay - m_scal
+    print("   in-batch GAP = M(lay) - M(scal) = %+.3f pp   (archived %+.3f, bar %.3f)"
+          % (gap, ARCH_GAP, MANIFOLD_BAR))
+    if gap < MANIFOLD_BAR:
+        print("VERDICT: VOID-NOMANIFOLD -- the granularity gap did not appear in this "
+              "batch, so CAPTURE is a ratio of noise and no verdict is issued.")
+        return 2
+    print("   PASS")
+
+    print("\n-- G5 THE PRIMARY ----------------------------------------------------")
+    caps = {}
+    print("   %-6s %-16s %-9s %-9s" % ("arm", "stepsize-groups", "plateau5", "CAPTURE"))
+    for arm, spec in ARMS.items():
+        if arm not in p5s:
+            continue
+        c = capture(statistics.mean(p5s[arm]), m_scal, m_lay)
+        caps[arm] = c
+        print("   %-6s %-16s %-9.3f %+.4f" % (arm, spec, statistics.mean(p5s[arm]), c))
+
+    d_head, se_h, t_head, df_h = contrast(p5s["head"], p5s["scal"])
+    ctrl = [caps[a] for a in CONTROL_ARMS if a in caps]
+    v, spec = verdict(caps["head"], ctrl, t_head, d_head)
+    print("")
+    print("   M(head) - M(scal) = %+.3f pp   se %.3f   t %+.2f (df %d)"
+          % (d_head, se_h, t_head, df_h))
+    print("   CAP_HEAD = %.4f" % caps["head"])
+    print("   controls: %s" % ", ".join("%s %.4f" % (a, caps[a])
+                                        for a in CONTROL_ARMS if a in caps))
+    print("   SPEC = CAP_HEAD - max(control) = %+.4f" % spec)
+    print("   frozen bars: MECHANISM CAP>=%.2f with SPEC>=%.2f and t>=%.1f | "
+          "PARTIAL CAP>=%.2f | REFUTED-SMALL CAP<%.2f | REFUTED-NOTSPECIFIC "
+          "SPEC<=%.2f | REFUTED-HURTS d<%.2f"
+          % (MECH_BAR, SPEC_BAR, T_BAR, PARTIAL_BAR, PARTIAL_BAR, SPEC_NULL_BAR,
+             -HURT_BAR))
+    print("   VERDICT (the head/backbone hypothesis): %s" % v)
+
+    print("\n-- G6 DESCRIPTIVE, NEVER GATING --------------------------------------")
+    if "blk" in caps:
+        d = caps["blk"] - ARCH_BLK_CAPTURE
+        print("   in-batch blockwise capture %.4f vs archived %.4f (%+.4f)%s"
+              % (caps["blk"], ARCH_BLK_CAPTURE, d,
+                 "   NOTE: outside +/-%.2f" % BLK_NOTE_BAND
+                 if abs(d) > BLK_NOTE_BAND else ""))
+    flag = ""
+    if all(a in t5s for a in ("head", "scal", "lay")):
+        ts, tl = statistics.mean(t5s["scal"]), statistics.mean(t5s["lay"])
+        th = statistics.mean(t5s["head"])
+        tc = (th - ts) / (tl - ts) if tl != ts else float("nan")
+        print("   train5: scal %.3f  head %.3f  lay %.3f   TRAINCAP = %.4f"
+              % (ts, th, tl, tc))
+        if caps["head"] >= MECH_BAR and not math.isnan(tc) and tc < TRAINCAP_BAR:
+            flag = "INCONSISTENT-TRAIN"
+            print("   FLAG R3 INCONSISTENT-TRAIN: TRAINCAP %.4f < %.2f while CAP_HEAD "
+                  ">= %.2f.  The head split bought test accuracy without buying "
+                  "training fit, which contradicts the underfitting account."
+                  % (tc, TRAINCAP_BAR, MECH_BAR))
+        else:
+            print("   R3 not triggered")
+    else:
+        print("   train5 unavailable in at least one arm; R3 not evaluated")
+
+    print("\n-- SCOPE -------------------------------------------------------------")
+    print("   CIFAR-100 / ResNet18_c100 / SGDm+Lion / ms 1e-3 / alpha0 1e-6 / 100 ep.")
+    print("   HIER is unset in every arm: this is a PARTITION ladder and it says")
+    print("   nothing about any hierarchical or shrinkage operator, about the")
+    print("   interior r-peak, about CIFAR-10, Tiny-ImageNet or ImageNet-489, or")
+    print("   about which partition is optimal at any other class count.")
+    print("")
+    print("   FINAL: %s%s" % (v, ("  [%s]" % flag) if flag else ""))
+    return 0 if v in ("HEAD_MECHANISM", "HEAD_PARTIAL", "REFUTED-SMALL",
+                      "REFUTED-NOTSPECIFIC", "REFUTED-HURTS") else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    sys.exit(selftest() if a.selftest else score(a.runs, a.manifest))
+
+
+if __name__ == "__main__":
+    main()

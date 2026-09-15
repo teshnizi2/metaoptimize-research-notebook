@@ -1,0 +1,1281 @@
+#!/bin/bash
+# =============================================================================
+# c84_normaliser_transfer.sh -- `gn1`, NORMALISER TRANSFER AT FIXED SINGLETON
+# STRUCTURE.  Runs on cluster_a ONLY (needs PATCH_CHUNKWISE **and** the new
+# PATCH_RESNET_GN).  24 jobs: {ResNet18, ResNet18_gn} x {nodewise, chunk777} x
+# seeds 0-5, ms=1e-4, 100 ep, BETA_CLIP=-25:-2.3026, probe ON.
+#
+# THE PATCH THIS BATCH NEEDS IS TO `build_network.py`, **NOT** TO `HF.py`.
+# `patches/patch_resnet_gn.py` + `tests/test_resnet18_gn.py`.  GUARD 1d refuses
+# to run if it is absent from the LIVE tree; GUARD 1e re-runs the suite on CPU.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+#   IS THE PARTITION GAP CARRIED BY THE DEGENERATE SIZE-1 TAIL **PER SE**, OR BY
+#   **BATCHNORM** SPECIFICALLY?
+#
+#   The campaign's tail mechanism, four readings deep, is
+#       D = plateau5(chunk777) - plateau5(nodewise)
+#         = +0.485 (mm1) / +0.581 (pp1) / +0.727 (cc1) at ms=1e-4, IV pool +0.581
+#           (se 0.094, re-derived from the CSV by GUARD 2c at submit time)
+#   and it collapses once the tail is merged on BOTH sides
+#       G = chunk2325 - nodewise1d = +0.295 (UNDECIDED) / +0.011 / -0.001.
+#   nodewise's m = 14,420 groups contain 9,610 SIZE-1 groups (66.6436%) covering
+#   0.086004% of the weights, and every one of them sits on the 41 one-dimensional
+#   tensors -- all 40 BatchNorm scales and shifts, plus `linear.bias`.
+#
+#   **THAT SENTENCE HAS TWO READINGS AND NOTHING THE CAMPAIGN OWNS SEPARATES
+#   THEM.**  Every D was measured on a net whose only 1-D tensors are BatchNorm
+#   parameters, so "the carrier is the degenerate tail" and "the carrier is
+#   BatchNorm" are one measurement seen twice.  `gn1` separates them by changing
+#   the NORMALISER while holding the PARTITION byte-identical.
+#
+# -----------------------------------------------------------------------------
+# WHY THE TEST IS UNUSUALLY TIGHT -- VERIFIED, NOT ASSUMED
+# -----------------------------------------------------------------------------
+#   `nn.GroupNorm(G, C)` has `weight` and `bias` of shape (C,), EXACTLY as
+#   `nn.BatchNorm2d(C)` does.  BN's `running_mean`/`running_var` are BUFFERS: they
+#   never enter `named_parameters()`, so they never received a step size under any
+#   granularity and their absence changes nothing.  The GN ResNet18 census is
+#   IDENTICAL TO THE BN ROW IN EVERY COLUMN -- 11,173,962 params, 62 tensors, 41
+#   one-D tensors, nodewise m 14,420, 9,610 singletons, nodewise1d m 4,851, the
+#   same count-matched K=777 -> 14,421.  GUARD 4 MEASURES all of that from the
+#   ALLOCATED beta on both really-built networks before anything is submitted.
+#
+#   And `train.py` / `Optimizers/HF.py` contain **NO MODULE-TYPE LOGIC WHATSOEVER**
+#   -- no `BatchNorm`, no `GroupNorm`, no `named_modules`, no isinstance-on-modules.
+#   `HF.init_meta` is driven entirely by `[(name, p.data.size()) for n,p in
+#   net.named_parameters()]`.  GUARD 1c asserts that on the live file rather than
+#   quoting it.  So the partition is not merely SIMILAR across the two nets --
+#   **it is provably the same object** -- and NO OPTIMISER PATCH IS REQUIRED.
+#   Exactly one thing in the whole experiment changes.
+#
+#   G = 32 is buildable everywhere: every ResNet18 channel count is 64/128/256/512,
+#   each divisible by 32, including the three downsample shortcuts.  **LayerNorm is
+#   REJECTED**: on conv activations it is GroupNorm(1, C), the confound below in its
+#   most extreme form with no compensating advantage.
+#
+# -----------------------------------------------------------------------------
+# THE FOUR ARMS, ONE BATCH.  m MEASURED BY GUARD 4, NOT ASSERTED.
+# -----------------------------------------------------------------------------
+#     bn-node   ResNet18      nodewise   m = 14,420      <- positive control
+#     bn-ch     ResNet18      chunk777   m = 14,421      <- positive control
+#     gn-node   ResNet18_gn   nodewise   m = 14,420
+#     gn-ch     ResNet18_gn   chunk777   m = 14,421
+#   Count mismatch +1 group in 14,420 = 0.007%, identical to every previous D.
+#
+#   **ALL FOUR IN ONE BATCH** so D_BN and D_GN are WITHIN-batch.  That is not
+#   convenience: STANDING RULE 14 (CORRECTIONS 113) established that seeds do NOT
+#   pair across batches on this cluster (356 same-config same-seed pairs, median
+#   |diff| 0.171 vs across-seed sd 0.159), and the cross-batch offset has three
+#   draws with no stable sign.  Within one batch any offset common to the arms
+#   cancels exactly.
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+# Transcribed from docs/REGISTER-ideas-ABC.md section 4; the scorer
+# `analysis/c84_gn1_score.py` carries every threshold verbatim and its selftest
+# asserts them against THIS FILE'S OWN TEXT.
+# -----------------------------------------------------------------------------
+#
+#   T0    **TRAINS-AT-ALL AND BOX GATE.**  Per run, before any difference is formed.
+#         T0.1  epochs_done == epochs_requested == 100.
+#         T0.2  collapsed == 0, using the corpus detector verbatim
+#               (aggregate.py:155: int(tests[-1] <= 11.0 and max(tests) > 20.0)).
+#         T0.3  final_test > 60.0 AND plateau5 >= 85.0.
+#         T0.4  NO LATE BLOW-UP: max(test) - plateau5 <= 2.0 pp.  This is the
+#               `bd7-w-c6` phenotype (best 88.82, final 10.0) caught before it
+#               reaches the arithmetic.
+#         T0.5  BOX OCCUPANCY IN BOTH DIRECTIONS (RULE 13), **MEASURED ON THE gn
+#               ARMS AND NEVER INHERITED FROM THE bn ANCHOR** -- the GN net's beta
+#               trajectory is not the BN net's.  rec_lo <= 0.05 AND rec_hi <= 0.05
+#               on every arm.
+#         FIRING: an arm failing T0.1-T0.4 on >= 2 of its 6 seeds is VOID; an arm
+#         failing T0.5 is UNINTERPRETABLE (RULE 5) and drops.  **>= 2 of the 4 arms
+#         void or dropped => THE WHOLE BATCH IS VOID.**
+#         Expected GN cost is 0.5-1.5 pp of absolute accuracy vs BN, leaving the
+#         plateau near 91-92 against the T0.3 floor of 85 -- ample margin, but that
+#         is an EXPECTATION and T0 is what decides.
+#
+#   T0.6  **THE COMMENSURABILITY GATE.  ADDED AT CYCLE-84 REVIEW; THE T0.3 FLOOR OF
+#         85 IS FAR TOO LOOSE TO PROTECT THIS BATCH'S ARITHMETIC ON ITS OWN.**  The
+#         whole batch turns on comparing two differences measured in PERCENTAGE
+#         POINTS on two networks that need not sit at the same accuracy.  BN
+#         plateaus near 92.2, an error budget of 7.8 pp.  A GN arm at 88.0 would
+#         pass T0.1-T0.5 cleanly -- 100 epochs, collapsed=0, final > 60, plateau5
+#         >= 85, no late blow-up -- while sitting on a 12.0 pp budget, a 1.6x change
+#         in the scale the effect lives on.  If the partition gap is even partly
+#         MULTIPLICATIVE in the error budget, D_GN is distorted by ~60%, which is
+#         about 7x se(D_GN) and straddles BOTH the +0.30 TRANSFERS line and the
+#         [-0.15,+0.15] null band: a T2 firing could then be a pure accuracy-regime
+#         artefact rather than a statement about carriers.
+#           GATE: |mean plateau5 over the 2 GN arms - mean over the 2 BN arms|
+#                 <= 2.0 pp.  Evaluated AFTER T0.1-T0.5 and BEFORE T2.
+#           IF IT FIRES: the batch is reported as "GroupNorm sits in a DIFFERENT
+#                 ACCURACY REGIME; D_GN and D_BN are not commensurable in pp" and
+#                 **NO transfer verdict is issued at all.**  It is not a null.
+#           AND, REPORTED ALWAYS, PASS OR FAIL: the error-budget-normalised
+#                 statistic D / (100 - plateau5) per net, printed beside the pp
+#                 numbers, so a reader can see for themselves whether a verdict is a
+#                 scale artefact.  It is DESCRIPTIVE and gates nothing -- registering
+#                 two primaries would just move the argmax problem.
+#
+#   T1    **THE POSITIVE-CONTROL GATE.**  If D_BN < +0.30 OR t(D_BN) < 2, **THE
+#         BATCH IS VOID AS A TEST OF GROUPNORM.**  You cannot ask whether an effect
+#         transfers in a batch where your own control does not show it.  D_BN is
+#         then recorded as a failed sixth replication of D -- a serious finding in
+#         its own right -- but NOTHING ABOUT GROUPNORM MAY BE CONCLUDED.
+#
+#   T2    **THE MECHANISM REFUTATION.**  With T0 and T1 passed:
+#           PRIMARY     D_GN = plateau5(gn-ch) - plateau5(gn-node), Welch 8v8.
+#           CO-PRIMARY  D_BN = plateau5(bn-ch) - plateau5(bn-node), Welch 4v4,
+#                       same batch.  It is a GATE, so it carries the smaller n.
+#           SECONDARY   dD  = D_GN - D_BN.
+#         THREE BRIGHT LINES, NO REINTERPRETABLE MIDDLE.  The failure this avoids is
+#         bn1's, which landed at +0.295 -- 0.005 pp under its own threshold -- and
+#         had to be closed UNDECIDED.
+#           TRANSFERS        D_GN >= +0.30 AND t(D_GN) >= 2.  The line is ~half the
+#                pooled anchor +0.581; attenuation is expected and is NOT failure,
+#                because GroupNorm is a different network at a different level.
+#           DOES NOT TRANSFER  D_GN in [-0.15, +0.15] AND THE EQUIVALENCE IS
+#                POWERED: se(D_GN) <= 0.113.  That threshold is FIXED HERE IN
+#                ADVANCE at 1.3x the planning se of 0.0870 (n=8) and is NOT to be
+#                recomputed post hoc.
+#           UNDECIDED        anything else, including D_GN in (0.15, 0.30), and
+#                including ANY NULL WHOSE se EXCEEDS 0.113.  **An underpowered null
+#                is UNDECIDED and MAY NOT be reported as "no gap".**
+#           SECONDARY on dD (se 0.151): |dD| <= 0.30 => the two normalisers agree
+#                within resolution; dD <= -0.30 with t <= -2 => RESOLVED ATTENUATION
+#                under GroupNorm, reported as attenuation and NOT as collapse unless
+#                D_GN independently lands in the null band.
+#
+#         THE TAIL MECHANISM AS CURRENTLY WRITTEN IS **REFUTED** if, in the same
+#         batch, D_GN in [-0.15,+0.15] with se(D_GN) <= 0.113 WHILE D_BN >= +0.30
+#         with t >= 2.  That is a within-batch dissociation at byte-identical
+#         partition structure -- same 9,610 size-1 groups, same 41 one-D tensors,
+#         same chunk777 count-match -- so the carrier would not be the degenerate
+#         size-1 tail per se.
+#         **CONSEQUENCES, WRITTEN NOW SO THEY CANNOT BE SOFTENED LATER:** the paper's
+#         prescriptive sentence narrows from "do not give normalisation scalars their
+#         own step sizes" to "do not give **BATCHNORM** scalars their own step
+#         sizes", with NO LICENCE TO GENERALISE to normalisation layers at large.
+#
+#         **T2's AMBIGUITY, REGISTERED IN ADVANCE.**  A T2 firing DOES NOT IDENTIFY
+#         THE REPLACEMENT CARRIER.  `nn.GroupNorm(32, C)` takes num_groups=32, so it
+#         forms **32 GROUPS OF C/32 CHANNELS** -- 2, 4, 8 and 16 channels per group
+#         at ResNet18's widths 64/128/256/512.  (An earlier draft of this file said
+#         "blocks of 32 channels".  THAT WAS BACKWARDS and it was the sole basis of
+#         this paragraph, so it is corrected here, BEFORE any run, at cycle-84
+#         review.)  Per-channel scale invariance -- which BatchNorm does provide,
+#         making gamma_c the sole controller of a channel's effective magnitude --
+#         therefore does NOT hold; only the PARTITION role of a singleton is
+#         preserved, not its FUNCTIONAL role.
+#         **AND THE DEPARTURE IS GRADED BY DEPTH, WHICH THE ORIGINAL WORDING HID.**
+#         At layer1 (C=64) GN(32,64) puts TWO channels per group and is very nearly
+#         per-channel; at layer4 (C=512) it puts SIXTEEN.  So the loss of scale
+#         invariance is mild where the net is wide-shallow and strongest where it is
+#         deep.  A null therefore CANNOT be attributed uniformly to "loss of
+#         per-channel scale invariance", and the registered GN(num_groups == C)
+#         disambiguator is a SMALLER perturbation from GN(32,C) than the original
+#         text implied, which makes it a cheaper follow-up than registered.
+#         The test is ASYMMETRIC: **a POSITIVE IS CLEAN** (the gap survives a
+#         normaliser change at byte-identical singleton structure; no alternative
+#         reading), **A NULL IS AMBIGUOUS BETWEEN THREE READINGS** and this batch
+#         separates NONE of them:
+#           (i)   the carrier is batch statistics;
+#           (ii)  the carrier is per-channel scale invariance (graded by depth, as
+#                 above);
+#           (iii) **THE TUNING READING (RULE 11).**  This batch runs a DIFFERENT
+#                 NETWORK at a cell -- alpha0=1e-3, ms=1e-4 -- inherited wholesale
+#                 from BatchNorm, and no arm's argmax is located on either net.  A
+#                 null at a MISTUNED cell is observationally identical to "the
+#                 carrier is BatchNorm-specific".  This is the same structural
+#                 defect that (correctly) killed the BN-free arm, one level up.
+#         **CONSEQUENCE, BINDING: a null from gn1 ALONE may NOT be written as a
+#         mechanism narrowing.**  It is reported as "DOES NOT TRANSFER AT THIS CELL,
+#         three unseparated readings", and the prescriptive sentence may not be
+#         narrowed until `gn2` has run.
+#         **`gn2`, THE CONDITIONAL FOLLOW-UP, IS SPECIFIED NOW SO IT CANNOT BE
+#         DESIGNED AFTER SEEING THE ANSWER.  It runs ONLY if T2 fires:**
+#           gn2a  THE TUNING BRACKET, which discharges reading (iii): all four arms
+#                 re-run at alpha0=3e-4 (beta0 = -8.1117), n=4, 16 jobs.  **THAT
+#                 CELL IS PROVABLY FREE IN BOTH DIRECTIONS** by the same Lion
+#                 identity GUARD 8 applies here -- reach 5.0 nats gives
+#                 [-13.112, -3.112], so the -15 floor AND the -2.3026 ceiling are
+#                 BOTH unreachable -- which is why alpha0, not ms, is the bracket
+#                 axis: at ms=3e-4 there is NO free box for the singleton arm (fa1's
+#                 nodewise arm reads rec_hi 0.0000/0.1672/0.0023/0.0137/0.2192/
+#                 0.0600, i.e. 3 of 6 seeds OVER the 5% T0.5 threshold, so the
+#                 bracket arm would be dropped as uninterpretable before it was
+#                 read).  BOTH nets are re-run so a null at gn2a cannot be confused
+#                 with "the a0=3e-4 cell kills the gap for everyone".
+#           gn2b  THE CARRIER DISAMBIGUATOR, which separates (i) from (ii):
+#                 GroupNorm(num_groups == C), restoring per-channel scale invariance
+#                 exactly and leaving batch-vs-sample statistics as the sole
+#                 difference.  It is a weaker network, so it is not the primary;
+#                 running it first would trade a clean test for a poor one.
+#
+#   T3    **ANTI-NARRATION.**
+#         T3.1  A VOID GN CELL IS NOT EVIDENCE OF ANYTHING.  If T0 voids the GN arms
+#               the batch reports "GroupNorm did not train to a usable plateau at
+#               this cell" and stops.  It may NOT be reported as an absent gap, and
+#               it may NOT be salvaged by adding seeds after seeing which side it
+#               fell on (the move CORRECTIONS 108.6(a) already refused for bn1).
+#         T3.2  **NO REBRANDING.**  This batch may NOT be written up as a
+#               no-BatchNorm test, a norm-free test, or a falsification of the
+#               singleton mechanism by removal.  **IT REMOVES ZERO SINGLETONS.**
+#               Its headline is: does the gap survive a change of normaliser at
+#               FIXED singleton structure?
+#         T3.3  NO CROSS-BOX POOLING.  D_GN and D_BN come from THIS batch at
+#               ms=1e-4, -15:-2.3026.  CORRECTIONS 113 established that the box
+#               changed the OPTIMISER, not merely the instrument (nodewise1d moved
+#               -0.177, t -2.22, RESOLVED).  Every prose sentence about a D carries
+#               its cell.
+#         T3.4  NO ARGMAX HARVESTING.  The four-arm table is reported whole; the
+#               maximum cell is not "the effect".
+#
+#   MANDATORY: all four arm means reported separately with sd, n and BOTH occupancy
+#   channels.  The absolute GN level is itself the headroom check, and T0.6 turns it
+#   from a remark into a gate.
+#
+# -----------------------------------------------------------------------------
+# WHY ms = 1e-4 AND WHY THIS BOX -- AND WHY -25 IS NOT A BOX CHANGE HERE
+# -----------------------------------------------------------------------------
+#   `Lion_meta_update` with --weight-decay-meta 0 gives |dbeta| = ms EXACTLY per
+#   coordinate per step, so |beta_T - ln(alpha0)| <= ms*T for ANY velocity profile.
+#   That is a PROOF, not an extrapolation.  At ms=1e-4, T = 100 ep x 500 steps:
+#       ms*T = 5.0, beta reachable in [-11.9078, -1.9078] from beta0 = -6.907755.
+#   **The floor at -25 is therefore PROVABLY DEAD, and -25 and -15 are IDENTICAL IN
+#   EFFECT at this cell.**  GUARD 8 recomputes that table at submit time.  So this
+#   is NOT a box change relative to the mm1/pp1/bn1/cc1 anchors at ms=1e-4, and no
+#   cross-box caveat attaches on that axis; -25:-2.3026 is used for consistency with
+#   the current standard.  The ceiling at -2.3026 IS reachable and is deliberately
+#   NOT released: the corpus's only released-ceiling runs (bd7-w-c6-s0/s1, box
+#   -30:6.0) are 2/2 collapsed=1.
+#
+#   Why not ms=3e-4, where fa1 already has 6 seeds: at 3e-4 there is NO box that is
+#   free for the singleton arm.  Closing the floor at -15 pins ~12% of nodewise's
+#   coordinates (ar1: rec_lo 0.4521-0.4596 on 12/12); releasing it to -25 frees the
+#   floor but nodewise -- and ONLY nodewise, the arm that loses the contrast --
+#   touches the CEILING on 3 of 6 seeds above R4's 5% threshold.  At ms=1e-4 both
+#   guards read EXACTLY 0.0000 on 33/33 probe arms with a 1.0-nat margin.
+#
+# -----------------------------------------------------------------------------
+# NOT AVAILABLE AT THIS CELL -- RECORDED SO IT IS NOT REACHED FOR LATER
+# -----------------------------------------------------------------------------
+#   The clip-severity corroboration channel (`coord_lo`, the fraction of
+#   (record, coordinate) cells at the floor) discriminates 24-88x on BN at ar1's
+#   cell: nodewise 0.03430/0.03425/0.03406 against chunk777 0.00039-0.00040,
+#   chunk2325 0.00092-0.00093, nodewise1d 0.00138-0.00141.  **At the registered cell
+#   NO coordinate reaches either guard on any arm, so coord_lo is identically 0 and
+#   this channel yields nothing here.**  It may NOT be recovered by moving the batch
+#   to a binding box: that would trade an interpretable accuracy contrast for an
+#   uninterpretable one.  rec_lo/rec_hi are carried as the T0.5 gate only.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS BATCH EXPLICITLY DOES NOT CLAIM
+# -----------------------------------------------------------------------------
+#   * It is NOT a no-BatchNorm test.  It removes ZERO singletons (T3.2).
+#   * It does not identify the carrier if the null fires (T2's ambiguity).
+#   * It does not touch the ARCHITECTURE or the DATASET axis of the generalisation
+#     debt.  It discharges the NORMALISATION axis only.
+#   * It is 4 (BN) / 8 (GN) seeds at ONE cell on ONE architecture and ONE dataset.
+#   * It says nothing about GroupNorm as a training recipe; the absolute GN level is
+#     a headroom check, not a comparison.
+#
+# -----------------------------------------------------------------------------
+# **SEQUENCING: THIS BATCH IS NOT FIRST IN THE QUEUE, AND GUARD 9 ENFORCES THAT.**
+# -----------------------------------------------------------------------------
+#   gn1 REFINES a mechanism on ResNet18/CIFAR-10.  The campaign's own rank-1
+#   question -- does the tail prescription GENERALISE at all -- has been rank 1 for
+#   four consecutive cycles (CORRECTIONS 110.7 item 1, 111.7 item 1) and has THREE
+#   fully-built, guard-complete, pre-registered batches sitting on disk with zero
+#   rows.  GUARD 9 DISCOVERS THEM BY GLOB (bin/c83_gen_*.sh) rather than by name,
+#   because they were restructured mid-cycle -- the two ResNet34 scripts were merged
+#   into bin/c83_gen_r34_merged.sh (`g3m`, 36 jobs, D and G in ONE batch at ONE ms) --
+#   and a guard that hard-codes filenames goes quietly green the moment one is renamed.
+#   NONE of them needs a patch.
+#   AND THE CORPUS IS UNAMBIGUOUS ABOUT THE HOLE: over all 1,891 rows, nodewise1d,
+#   chunk777 and chunk2325 appear on ResNet18/CIFAR-10 AND NOWHERE ELSE (15/18/15
+#   runs); ResNet34, ResNet10 and ResNet18_c100 carry `nodewise` ONLY.  There is not
+#   one tail-relevant run on any second architecture or dataset.
+#   **IF D DOES NOT SURVIVE ON A SECOND ARCHITECTURE, gn1 IS A REFINEMENT OF
+#   SOMETHING THAT DOES NOT EXIST.**  A normaliser-transfer result would be
+#   retrospectively worthless, and it costs more than either generalisation batch.
+#   GUARD 9 therefore refuses --submit until the operator exports GN1_GEN_OK naming
+#   the generalisation batch that has been SCORED and the D leg that survived.  It
+#   is an interlock of the same kind as GN1_MIN_PER_EPOCH: it cannot check the
+#   science for you, it can only stop the batch jumping the queue silently.  It also
+#   fails CLOSED on an empty glob: if no generalisation batch is found at all, that is
+#   reported as 0 built and --submit is still refused while the tail contrasts sit on
+#   one (network, dataset) cell.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 tests/test_resnet18_gn.py       (CPU, G0 asserts determinism first)
+#   2. python3 tests/test_chunkwise.py         (CPU)
+#   3. python3 analysis/c84_gn1_score.py --selftest
+#   4. `gn1` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   5. plateau5 is PRIMARY.  The CSV `plateau` column is mean-of-last-20 and is NOT
+#      comparable across budgets.
+#
+# USAGE
+#   bash bin/c84_normaliser_transfer.sh            # DRY RUN (default)
+#   bash bin/c84_normaliser_transfer.sh --submit   # submits, ONLY if guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit) SUBMIT=1 ;;
+    *) echo "unknown argument $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+GUARD_FAILS=0
+guard_fail() {
+  GUARD_FAILS=$((GUARD_FAILS + 1))
+  echo "!!! GUARD FAIL: $1"
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! SUBMIT ABORTED -- nothing was submitted."
+    exit 1
+  fi
+  echo "    (dry run: continuing so the emitter can be validated off-cluster."
+  echo "     THIS BATCH MUST NOT BE SUBMITTED UNTIL THIS GUARD PASSES ON cluster_a.)"
+}
+
+USER_NAME="${USER:-$(whoami)}"
+# PORTABLE (cycle 85): default is cluster_a; set METAOPT_WS to run on cluster_b, whose
+# HF.py was brought to byte-identical parity on 30 Aug (md5 d3202635c3fc) with all
+# three equivalence suites green, and which carries PATCH_RESNET_GN.
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/gn1
+LIVE_TREE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+# GN_TREE exists ONLY so the guards can be validated against a SCRATCH copy before
+# the operator edits the live tree.  GUARD -1 REFUSES --submit whenever it is not the
+# live tree, so a validation override can never become a submission.
+TREE="${GN_TREE:-$LIVE_TREE}"
+HF_PY=$TREE/Optimizers/HF.py
+BUILD_NET=$TREE/build_network.py
+
+WALL=03:50:00                  # gpu-short caps at 4:00:00; GUARD 6b checks it against
+                               # sinfo and GUARD 7 against the CSV's own R18 rates
+                               # inflated by the GN slowdown factor.
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+TAG=gn1
+NJOBS=24                       # 4 arms, ONE batch (STANDING RULE 14).  **SEEDS ARE
+                               # NOT EQUAL ACROSS ARMS**, by design: the BN control
+                               # only has to CLEAR a gate (t >= 2 against +0.581), which
+                               # n=4 does at t = 4.7, while the GN arms carry the
+                               # PRIMARY and want every seed available.  Rebalancing
+                               # 6/6/6/6 -> 4/4/8/8 keeps the batch at 24 jobs and moves
+                               # se(D_GN) from 0.100 to 0.0870.
+SEEDS_BN="0 1 2 3"             # n=4, bn-node + bn-ch  -> se(D_BN) 0.1230, t 4.72
+SEEDS_GN="0 1 2 3 4 5 6 7"     # n=8, gn-node + gn-ch  -> se(D_GN) 0.0870
+SEEDS="$SEEDS_BN $SEEDS_GN"    # union, for the guards that only need the distinct set
+CLIP=-15:-2.3026               # **MOVED FROM -25 AT CYCLE 84 REVIEW.**  (-25,ms=1e-4)
+                               # exists in ZERO of the 1,891 corpus rows; every ms=1e-4
+                               # run sits at -15, and EVERY frozen threshold in this
+                               # file (the +0.30 T1 gate, the +0.5805 anchor, sigma
+                               # 0.1740) is computed from -15 data.  GUARD 8 proves the
+                               # two floors are IDENTICAL IN EFFECT here, so the move is
+                               # free -- and it makes the cell byte-identical to the
+                               # anchors instead of a gratuitous cross-box import.
+MST=1e-4                       # the ONLY cell where both guards read EXACTLY 0.0000
+ALPHA0=1e-3                    # beta_0 = ln(alpha0) = -6.907755
+GAMMA=1
+EPOCHS=100
+BATCH=100
+DSET=CIFAR10
+STEPS_PER_EPOCH=500            # 50,000 CIFAR-10 train images / batch 100
+PROBE_EVERY=5                  # -> 50,000/5 = 10,000 records, the corpus denominator
+WRITE_EVERY=500
+
+NET_BN=ResNet18
+NET_GN=ResNet18_gn             # PATCH_RESNET_GN.  GUARD 1d asserts it is applied.
+CHUNK_K=777                    # m(777) = 14,421 = m(nodewise) + 1.  777 > 512 = the
+                               # largest 1-D tensor, so every 1-D tensor is ONE chunk
+                               # and the chunk arm IS the prescription arm.
+M_NODE=14420
+M_CHUNK=14421
+N_TENSORS=62                   # ResNet18 named_parameters(), BOTH nets
+N_1D=41                        # 1-D tensors: 40 normaliser scale/shift + linear.bias
+MAX_1D_NUMEL=512               # the largest 1-D tensor; MUST be < CHUNK_K
+SINGLETONS=9610                # size-1 nodewise groups = 66.6436% of m over 0.086004%
+PARAMS=11173962
+GN_GROUPS=32                   # nn.GroupNorm(32, C); 32 divides 64/128/256/512
+N_NORM_MODULES=20              # 1 stem + 16 in blocks + 3 shortcuts
+
+ANCHOR=0.5805                  # the ms=1e-4 inverse-variance pool of D (mm1/pp1/cc1),
+ANCHOR_SE=0.0939               # re-derived by GUARD 2c from the CSV at submit time
+SIGMA=0.174                    # pooled within-cell sd of plateau5 at this cell
+SE_D=0.0870                    # = SIGMA*sqrt(2/8), the planning se of D_GN at n=8
+SE_D_BN=0.1230                 # = SIGMA*sqrt(2/4), the planning se of D_BN at n=4
+SE_DD=0.1507                   # = sqrt(SE_D^2 + SE_D_BN^2), the planning se of dD
+NULL_HALF=0.15                 # the null band, IDENTICAL to bn1's T1 and ar1's A1
+DECIDE=0.30                    # the TRANSFERS line, ~half the anchor
+SE_MAX=0.113                   # THE POWERED-NULL THRESHOLD, FIXED IN ADVANCE at
+                               # 1.3x SE_D = 1.3 x 0.0870.  NOT to be recomputed post
+                               # hoc.  At p90 corpus noise (sd 0.24) the realised se
+                               # would be 0.120 > 0.113 and the verdict would be
+                               # UNDECIDED -- that conservatism is intended.
+COMM_MAX=2.0                   # **THE COMMENSURABILITY GATE (T0.6).**  |mean plateau5
+                               # over the GN arms - mean over the BN arms| must not
+                               # exceed this.  D_GN and D_BN are compared in PERCENTAGE
+                               # POINTS, which is only meaningful if the two nets sit
+                               # on comparable error budgets: BN plateaus near 92.2
+                               # (budget 7.8 pp); a GN arm at 88.0 would clear every
+                               # other T0 gate while sitting on a 12.0 pp budget, a
+                               # 1.6x change in the scale the effect lives on.  If the
+                               # gap is even partly multiplicative in the error budget
+                               # that distorts D_GN by ~60% = 6x se, straddling BOTH
+                               # the +0.30 line and the null band -- so a T2 firing
+                               # could be a pure accuracy-regime artefact.
+GN_SLOWDOWN=1.60               # GroupNorm has no cuDNN-fused kernel.  GUARD 7 uses
+                               # the MEASURED rate from the smoke run when
+                               # GN1_MIN_PER_EPOCH is exported, and refuses to submit
+                               # without it.
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  $TAG -- DOES THE PARTITION GAP SURVIVE A CHANGE OF NORMALISER"
+echo "         AT BYTE-IDENTICAL SINGLETON STRUCTURE?"
+echo "    $NET_BN vs $NET_GN (GroupNorm($GN_GROUPS,C)) / $DSET / bs $BATCH / ${EPOCHS} ep"
+echo "    node(m=$M_NODE) vs chunk${CHUNK_K}(m=$M_CHUNK)  [+1 group = 0.007%]"
+echo "    4 arms x seeds $SEEDS = $NJOBS jobs, ms=$MST, BETA_CLIP=$CLIP"
+echo "    PRIMARY    D_GN = gn-ch - gn-node   (Welch 6v6, within-batch)"
+echo "    CO-PRIMARY D_BN = bn-ch - bn-node   -- a GATE (T1), not a result"
+echo "    SECONDARY  dD   = D_GN - D_BN"
+echo "      TRANSFERS: D_GN >= +$DECIDE and t >= 2"
+echo "      DOES NOT TRANSFER: D_GN in [-$NULL_HALF,+$NULL_HALF] AND se(D_GN) <= $SE_MAX"
+echo "      UNDECIDED: everything else, INCLUDING any underpowered null"
+echo "    **NOT a no-BatchNorm test.  It removes ZERO singletons (T3.2).**"
+echo "    **A POSITIVE IS CLEAN; A NULL IS AMBIGUOUS and does not name a carrier.**"
+echo "=============================================================="
+
+# --- GUARD -1 -- a validation override may NEVER become a submission -------
+if [ "$TREE" != "$LIVE_TREE" ]; then
+  echo "guard -1: GN_TREE is OVERRIDDEN to $TREE (not the live tree)."
+  echo "          Guards 1c/1d/1e/4 will inspect THAT tree.  This is for validating"
+  echo "          the patch on a scratch copy WITHOUT editing the live file."
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! REFUSING TO SUBMIT: the jobs would import $LIVE_TREE, which is NOT the"
+    echo "!!! tree these guards inspected.  Unset GN_TREE, apply the patch to the live"
+    echo "!!! tree, and re-run."
+    exit 1
+  fi
+else
+  echo "guard -1: inspecting the LIVE tree $TREE"
+fi
+
+# --- GUARD 0 -- the runner and the CSV exist -------------------------------
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$RUNNER" ] || guard_fail "guard 0: no runner at $RUNNER"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$HF_PY" <<'PYEOF' || guard_fail "guard 1: HF.py probe wiring"
+import os, re, sys
+hf = sys.argv[1]
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if "probe.jsonl" not in src:
+    sys.exit("GUARD FAIL: HF.py does not write probe.jsonl -- box occupancy would be "
+             "UNMEASURABLE and T0.5 could not be evaluated (RULE 5)")
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script "
+             "exports for")
+print("guard 1: HF.py writes probe.jsonl and gates the sign-count writer on "
+      "PROBE5 == '1'")
+PYEOF
+
+# --- GUARD 1b -- **THE ENV/ARGS PIN CHECK.**  Every registered flag is asserted
+# against THE EMITTER REGION OF THIS FILE ONLY.  The marker literals are BUILT BY
+# CONCATENATION inside the checker so the checker cannot match itself -- that is
+# CORRECTIONS 112's self-referential-guard failure, fixed by construction here.
+python3 - "$0" "$CLIP" "$EPOCHS" "$ALPHA0" "$BATCH" "$DSET" "$GAMMA" "$PROBE_EVERY" \
+  "$MST" "$NJOBS" "$PARTS" <<'PYEOF' || guard_fail "guard 1b: ENV/ARGS pin"
+import sys
+me, clip, epochs, alpha0, batch, dset, gamma, probe, mst, njobs, parts = sys.argv[1:12]
+lines = open(me).read().splitlines()
+BEG = "# --- EMITTER " + "BEGIN ---"
+END = "# --- EMITTER " + "END ---"
+b = [i for i, l in enumerate(lines) if l.strip() == BEG]
+e = [i for i, l in enumerate(lines) if l.strip() == END]
+if len(b) != 1 or len(e) != 1 or not (b[0] < e[0]):
+    sys.exit("GUARD FAIL: emitter markers are not a single well-ordered pair "
+             "(%d begin, %d end)" % (len(b), len(e)))
+region = "\n".join(lines[b[0] + 1:e[0]])
+if len(region.strip()) < 200:
+    sys.exit("GUARD FAIL: the emitter region is empty or truncated")
+
+# 1. THE COLON.  BETA_CLIP without a colon is the campaign's oldest footgun: the
+#    runner parses "lo:hi" and a hyphen-only form silently yields NO BOX AT ALL.
+if ":" not in clip:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r has NO COLON -- the runner would not parse a "
+             "box and every occupancy number would be a fiction" % clip)
+try:
+    lo, hi = (float(x) for x in clip.split(":"))
+except Exception:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r does not parse as lo:hi floats" % clip)
+if not lo < hi:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r is not ordered lo < hi" % clip)
+print("guard 1b-1: BETA_CLIP=%s parses as (%.4f, %.4f), ordered" % (clip, lo, hi))
+
+# 2. exactly one --export line, and its exact key set.
+exp = [l for l in region.splitlines() if l.strip().startswith('--export="ALL,')]
+if len(exp) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line in the emitter, found %d"
+             % len(exp))
+exp = exp[0]
+for need in ("AUGMENT=1", "BETA_CLIP=${CLIP}", "HIER=none", "SCHED=none",
+             "PROBE=${PROBE_EVERY}", "PROBE5=1", "PROBE5_WRITE_EVERY=", "PROBE_DIR="):
+    if need not in exp:
+        sys.exit("GUARD FAIL: --export line is missing %r" % need)
+# HIER/SCHED must be PINNED: --export=ALL otherwise inherits them from the submitting
+# shell and _apply_hier('additive') moves beta by more than ms.
+for forbidden in ("HIER=additive", "HIER=shrink", "HIER=zpool", "SCHED=cos", "PROBE6"):
+    if forbidden in exp:
+        sys.exit("GUARD FAIL: --export line carries %r, which this batch registered "
+                 "as ABSENT" % forbidden)
+print("guard 1b-2: --export pins AUGMENT=1, BETA_CLIP, HIER=none, SCHED=none, "
+      "PROBE=%s, PROBE5=1, PROBE5_WRITE_EVERY, PROBE_DIR" % probe)
+
+# 3. the ARGS pins, literal, in the emitter region only.
+PINS = ['--max-time 999:00:00',
+        '--dataset "$DSET"', '--NN-name "$NET"', '--batch-size "$BATCH"',
+        '--gamma "$GAMMA"', '--meta-stepsize "$MST"', '--alpha0 "$ALPHA0"',
+        '--num-epochs "$EPOCHS"', '--stepsize-groups "$GRAN"', '--seed "$S"',
+        '--save-directory "$SAVE"', '--run-name "$RN"',
+        '--optimizer HF', '--alg-base SGDm', '--alg-meta Lion',
+        '--weight-decay-meta 0', '--partition="$PARTS"']
+missing = [p for p in PINS if p not in region]
+if missing:
+    sys.exit("GUARD FAIL: the emitter is missing registered ARGS pin(s): %s" % missing)
+for banned in ('--hier', '--lam', '--eta-ratio', '--optimizer AdamW', '--alg-meta fixed'):
+    if banned in region:
+        sys.exit("GUARD FAIL: the emitter carries %r, which this batch forbids "
+                 "(HIER=none, free meta, SGDm base)" % banned)
+if parts.count(",") < 1:
+    sys.exit("GUARD FAIL: PARTS=%r is not a MULTI-partition list -- a single-partition "
+             "batch queues behind one reservation and gpu-short alone caps at 4h" % parts)
+print("guard 1b-3: all %d ARGS pins present; PARTS is %d partitions; no "
+      "hier/lam/eta-ratio flag; --max-time 999:00:00 present"
+      % (len(PINS), len(parts.split(","))))
+
+# 4. BOTH networks and BOTH granularities appear in the arm table, exactly the four.
+# The table is a single `for ARM in ...` statement continued over two lines, so the
+# tokens are matched against the WHOLE emitter region and the statement is required to
+# be unique.  Each arm must appear EXACTLY ONCE: a duplicated arm would silently halve
+# the batch and double one cell.
+arms = [l for l in region.splitlines() if l.strip().startswith("for ARM in")]
+if len(arms) != 1:
+    sys.exit("GUARD FAIL: expected exactly one arm table, found %d" % len(arms))
+for need in ("ResNet18:nodewise:bn-node:BN", "ResNet18:chunk${CHUNK_K}:bn-ch:BN",
+             "ResNet18_gn:nodewise:gn-node:GN", "ResNet18_gn:chunk${CHUNK_K}:gn-ch:GN"):
+    if region.count('"%s"' % need) != 1:
+        sys.exit("GUARD FAIL: the arm table carries %r %d times, not exactly once"
+                 % (need, region.count('"%s"' % need)))
+if region.count("ResNet18_gn:") != 2 or region.count('"ResNet18:') != 2:
+    sys.exit("GUARD FAIL: the arm table is not 2 BatchNorm arms and 2 GroupNorm arms")
+# **THE 4/4/8/8 SPLIT IS ASSERTED FROM THE EMITTER, NOT FROM PROSE.**  A silent
+# collapse back to one shared seed list would change the primary's se without
+# changing the job count, which is the kind of drift a guard exists to catch.
+if 'ARM_SEEDS="$SEEDS_BN"' not in region or 'ARM_SEEDS="$SEEDS_GN"' not in region:
+    sys.exit("GUARD FAIL: the emitter does not select a PER-ARM seed list -- the "
+             "registered 4/4/8/8 rebalance is not in force")
+if "for S in $ARM_SEEDS" not in region:
+    sys.exit("GUARD FAIL: the emitter's seed loop is not driven by ARM_SEEDS")
+print("guard 1b-4: the arm table is exactly the 4 registered arms "
+      "(bn-node, bn-ch, gn-node, gn-ch), each selecting its own seed list")
+print("guard 1b-5: registered scalars -- ms %s, epochs %s, alpha0 %s, batch %s, "
+      "dataset %s, gamma %s, njobs %s" % (mst, epochs, alpha0, batch, dset, gamma, njobs))
+PYEOF
+
+# --- GUARD 1c -- THE PATCHES, AND **THE NO-MODULE-TYPE-LOGIC CLAIM** --------
+# The whole tightness of this test rests on HF.py partitioning by SHAPE ALONE.  If it
+# ever branched on module type, the two nets would not carry the same partition and
+# the batch would be measuring something else.  Asserted on the live file.
+python3 - "$HF_PY" "$TREE" "$CHUNK_K" <<'PYEOF' || guard_fail "guard 1c: HF.py partition logic"
+import os, sys
+hf, tree, K = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(hf).read()
+if "PATCH_CHUNKWISE" not in src:
+    sys.exit("GUARD FAIL: PATCH_CHUNKWISE is NOT applied to %s.  THIS IS THE cluster_b "
+             "TREE -- chunk%s would fall through to a default branch and the batch "
+             "would silently measure something else." % (hf, K))
+for need in ("chunkwise", "chunk_size"):
+    if need not in src:
+        sys.exit("GUARD FAIL: PATCH_CHUNKWISE present but %r missing -- partial patch" % need)
+if src.count("self.stepsize_type == 'nodewise'") != 3:
+    sys.exit("GUARD FAIL: expected 3 plain-nodewise branches, found %d -- the nodewise "
+             "arm is not the audited implementation"
+             % src.count("self.stepsize_type == 'nodewise'"))
+if "'nodewise' in self.stepsize_type" in src or '"nodewise" in self.stepsize_type' in src:
+    sys.exit("GUARD FAIL: a SUBSTRING dispatch on nodewise exists -- another "
+             "granularity could leak into the nodewise arm")
+# **THE CLAIM THAT MAKES gn1 A CONTROLLED TEST: NO MODULE-TYPE LOGIC.**
+# COMMENT lines are excluded and that is not a loophole -- it is the claim.  HF.py's
+# PATCH_NODEBN comment says the words "the BatchNorm scales and shifts" while the code
+# beneath it branches on ndim alone; what would void gn1 is a module-type branch in
+# EXECUTABLE code, and that is what is asserted here.
+tr = open(os.path.join(tree, "train.py")).read()
+for fname, txt in (("HF.py", src), ("train.py", tr)):
+    code = [l for l in txt.splitlines() if not l.lstrip().startswith("#")]
+    for token in ("BatchNorm", "GroupNorm", "LayerNorm", "named_modules",
+                  "isinstance(m", "modules()"):
+        hits = [l.strip() for l in code if token in l]
+        if hits:
+            sys.exit("GUARD FAIL: %s has EXECUTABLE code mentioning %r: %r.  The "
+                     "partition would then be able to depend on MODULE TYPE, and "
+                     "ResNet18 / ResNet18_gn would NOT carry the same partition "
+                     "object.  gn1's premise is void." % (fname, token, hits[:2]))
+if "named_parameters" not in src:
+    sys.exit("GUARD FAIL: HF.py does not read named_parameters -- the partition is not "
+             "shape-driven and gn1's premise cannot be checked")
+print("guard 1c: PATCH_CHUNKWISE present, plain nodewise undisturbed (3 branches), "
+      "and NEITHER HF.py NOR train.py contains ANY module-type logic IN EXECUTABLE "
+      "CODE (comments excluded, deliberately) -- the partition "
+      "is driven by named_parameters() shapes alone, so it is the SAME OBJECT on both "
+      "networks.  This is the cluster_a tree.")
+PYEOF
+
+# --- GUARD 1d -- **PATCH_RESNET_GN IS APPLIED, AND IT IS INERT.** ----------
+python3 - "$BUILD_NET" "$NET_GN" "$GN_GROUPS" <<'PYEOF' || guard_fail "guard 1d: PATCH_RESNET_GN"
+import os, sys
+p, net_gn, g = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if not os.path.exists(p):
+    sys.exit("GUARD FAIL: %s absent" % p)
+src = open(p).read()
+if "PATCH_RESNET_GN" not in src:
+    sys.exit("GUARD FAIL: PATCH_RESNET_GN is NOT applied to %s.  Apply it with "
+             "`python3 patches/patch_resnet_gn.py` (back the file up first) and re-run "
+             "tests/test_resnet18_gn.py.  Without it `--NN-name %s` hits build_network's "
+             "0/0 fallback and all 12 GN jobs die at startup." % (p, net_gn))
+if src.count("network_name == '%s'" % net_gn) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 dispatch for %s, found %d"
+             % (net_gn, src.count("network_name == '%s'" % net_gn)))
+if "nn.GroupNorm(GN_GROUPS, c)" not in src or "GN_GROUPS = %d" % g not in src:
+    sys.exit("GUARD FAIL: the factory does not build nn.GroupNorm(%d, C)" % g)
+if src.count("norm='gn'") != 1:
+    sys.exit("GUARD FAIL: norm='gn' appears %d times; it must appear ONLY in the "
+             "%s dispatch, or some other network silently became a GN net"
+             % (src.count("norm='gn'"), net_gn))
+# INERTNESS: every pre-existing name still dispatches, and the _soft classes were
+# not touched (they still construct BatchNorm2d directly and take no norm kwarg).
+for name in ('M1', 'M2', 'ResNet18', 'ResNet18_c100', 'ResNet10', 'ResNet34',
+             'ResNet10_c100', 'ResNet34_c100', 'ResNet18_soft', 'ResNet50',
+             'ResNet101', 'ResNet152'):
+    if "network_name == '%s'" % name not in src:
+        sys.exit("GUARD FAIL: the dispatch for %s went missing -- the patch was not "
+                 "additive" % name)
+if "def __init__(self, in_planes, planes, stride=1):\n        super(BasicBlock_soft" \
+        not in src:
+    sys.exit("GUARD FAIL: BasicBlock_soft's signature changed -- it must not")
+bn_code = sum(l.count("nn.BatchNorm2d(") for l in src.splitlines()
+              if not l.lstrip().startswith("#"))
+if bn_code != 5:
+    sys.exit("GUARD FAIL: %d nn.BatchNorm2d( code sites; expected 5 (1 factory + 4 in "
+             "the untouched _soft classes)" % bn_code)
+if "def __init__(self, block, num_blocks, num_classes=10, norm='bn')" not in src:
+    sys.exit("GUARD FAIL: ResNet's norm kwarg does not default to 'bn' -- the "
+             "pre-existing networks would not take the BatchNorm path")
+print("guard 1d: PATCH_RESNET_GN applied; %s dispatches exactly once to "
+      "GroupNorm(%d, C); all 12 pre-existing names intact and defaulting to 'bn'; "
+      "the _soft classes untouched" % (net_gn, g))
+PYEOF
+
+# --- GUARD 1e -- THE EQUIVALENCE SUITES PASS ON THIS TREE, ON CPU ----------
+# STANDING RULE 20: an equivalence suite must run on a deterministic device and its
+# FIRST assertion must be that a configuration equals ITSELF.  Re-run against the tree
+# the jobs will import -- do not trust an earlier run.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate" 2>/dev/null
+  cd "$REPO" || exit 1
+  for T in tests/test_resnet18_gn.py tests/test_chunkwise.py; do
+    [ -f "$T" ] || { echo "GUARD FAIL: $T absent"; exit 1; }
+    CIFAR10_DIR="$TREE" NODEBN_TEST_DEVICE=cpu python3 "$T" > /tmp/gn1_t.$$ 2>&1
+    if [ $? -ne 0 ]; then
+      echo "GUARD FAIL: $T did NOT pass on this tree:"; tail -25 /tmp/gn1_t.$$
+      rm -f /tmp/gn1_t.$$; exit 1
+    fi
+    echo "guard 1e: $T $(grep -c PASS /tmp/gn1_t.$$) PASS, 0 FAIL, on CPU, LIVE tree"
+    rm -f /tmp/gn1_t.$$
+  done
+) || guard_fail "guard 1e: equivalence suites"
+
+# --- GUARD 2 -- every CSV precondition, RE-DERIVED AT SUBMIT TIME -----------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$MST" "$ALPHA0" "$BATCH" "$DSET" "$NET_BN" \
+  "$NET_GN" "$TAG" "$ANCHOR" "$ANCHOR_SE" "$SIGMA" "$DECIDE" "$SEEDS_BN" "$SEEDS_GN" \
+  "$NJOBS" \
+  <<'PYEOF' || guard_fail "guard 2: CSV preconditions"
+import csv, math, statistics, sys
+(csvp, clip, epochs, mst, alpha0, batch, dset, net_bn, net_gn, tag,
+ anchor, anchor_se, sigma, decide, seeds_bn, seeds_gn, njobs) = sys.argv[1:18]
+anchor, anchor_se, sigma, decide = float(anchor), float(anchor_se), float(sigma), float(decide)
+SIGMA, ANCHOR_D = sigma, anchor
+rd = list(csv.DictReader(open(csvp)))
+P = {r["run"]: float(r["plateau5"]) for r in rd if (r.get("plateau5") or "").strip()}
+
+def sem(v):
+    return statistics.stdev(v) / math.sqrt(len(v)) if len(v) > 1 else float("nan")
+
+def welch(a, b):
+    d = statistics.mean(a) - statistics.mean(b)
+    se = math.sqrt(sem(a) ** 2 + sem(b) ** 2)
+    return d, se, (d / se if se > 0 else float("nan"))
+
+# 2a -- NAME COLLISION.  No gn1-* run may already exist.
+clash = [r["run"] for r in rd if r["run"].startswith(tag + "-")]
+if clash:
+    sys.exit("GUARD FAIL: %d %s-* runs already in the CSV: %s"
+             % (len(clash), tag, clash[:5]))
+print("guard 2a: no %s-* run name already exists in the CSV (%d rows)" % (tag, len(rd)))
+
+# 2b -- THE GN NET HAS NEVER BEEN RUN.  If it had, the batch would not be reading
+# unread data and the smoke-run/T0 reasoning would already have an answer.
+prior = [r["run"] for r in rd if r["network"] == net_gn]
+if prior:
+    sys.exit("GUARD FAIL: %d %s rows already exist (%s) -- this is not a first read"
+             % (len(prior), net_gn, prior[:5]))
+nets = sorted({r["network"] for r in rd})
+print("guard 2b: %s has NO rows in the CSV.  networks present: %s" % (net_gn, nets))
+
+# 2c -- **THE ANCHOR, RE-DERIVED WITHIN-BATCH, NEVER QUOTED FROM PROSE.**
+# D at ms=1e-4 in the three batches that own it, each WITHIN its own batch
+# (STANDING RULE 14: seeds do not pair across batches).
+BATCHES = (("mm1", (0, 1, 2)), ("pp1", (0, 1, 2)), ("cc1", (3, 4, 5)))
+Ds = []
+for b, ss in BATCHES:
+    try:
+        ch = [P["%s-ch-s%d" % (b, s)] for s in ss]
+        nd = [P["%s-node-s%d" % (b, s)] for s in ss]
+    except KeyError as e:
+        sys.exit("GUARD FAIL: the anchor batch %s is missing %s from the CSV" % (b, e))
+    d, se, t = welch(ch, nd)
+    Ds.append((b, d, se))
+    print("guard 2c: %s  D = %+.3f  se %.3f  t %+.2f  (n=%d v %d)"
+          % (b, d, se, t, len(ch), len(nd)))
+w = [1.0 / se ** 2 for _, _, se in Ds]
+pool = sum(wi * d for wi, (_, d, _) in zip(w, Ds)) / sum(w)
+pool_se = math.sqrt(1.0 / sum(w))
+print("guard 2c: IV-POOLED anchor D at ms=%s = %+.4f (se %.4f) over %d batches"
+      % (mst, pool, pool_se, len(Ds)))
+if abs(pool - anchor) > 0.01 or abs(pool_se - anchor_se) > 0.01:
+    sys.exit("GUARD FAIL: the CSV now pools to %+.4f (se %.4f) but this script "
+             "registers %+.4f (se %.4f).  The CSV moved under the registration -- "
+             "re-derive before submitting." % (pool, pool_se, anchor, anchor_se))
+if pool < decide:
+    sys.exit("GUARD FAIL: the anchor D is %+.4f, BELOW the %.2f line this batch asks "
+             "GroupNorm to clear.  There is no effect to transfer and T1 could not "
+             "pass -- do not submit." % (pool, decide))
+
+# 2d -- SIGMA, re-derived from the within-cell sds at this cell.  It sets the power
+# claim and the FROZEN se(D_GN) <= 0.13 threshold, so it may not be quoted either.
+cells = []
+for b, ss in (("mm1", (0, 1, 2)), ("pp1", (0, 1, 2)), ("cc1", (3, 4, 5)),
+              ("bn1", (0, 1, 2))):
+    for a in ("node", "ch", "n1d", "c23"):
+        v = [P[k] for k in ("%s-%s-s%d" % (b, a, s) for s in ss) if k in P]
+        if len(v) > 1:
+            cells.append((len(v) - 1, statistics.stdev(v)))
+num = sum(df * s * s for df, s in cells)
+den = sum(df for df, _ in cells)
+sig = math.sqrt(num / den)
+print("guard 2d: pooled within-cell sigma at ms=%s = %.4f over %d dof and %d cells "
+      "(registered %.3f) -> se(D_GN) at n=8 = %.4f, se(D_BN) at n=4 = %.4f, "
+      "se(dD) = %.4f" % (mst, sig, den, len(cells), sigma, sig * math.sqrt(2 / 8),
+                         sig * math.sqrt(2 / 4),
+                         sig * math.sqrt(2 / 8 + 2 / 4)))
+if abs(sig - sigma) > 0.03:
+    sys.exit("GUARD FAIL: sigma re-derives to %.4f, not the %.3f registered.  The "
+             "frozen se(D_GN) <= 0.113 threshold was computed from %.3f and may not be "
+             "silently re-based." % (sig, sigma, sigma))
+
+# 2e -- THE ARMS AT THIS EXACT CELL.  Since the cycle-84 move to -15 this cell is the
+# SAME cell as mm1/pp1/cc1/tw0, so existing rows are expected here and are PRINTED --
+# but they are NOT reused: seeds do not pair across batches (RULE 14) and D_BN must be
+# WITHIN-batch to be T1's gate.  Their existence is what makes every frozen threshold
+# in this batch a same-cell number rather than a cross-box import.
+def cell_rows(gran, net):
+    return [r["run"] for r in rd
+            if r["granularity"] == gran and r["network"] == net
+            and r["meta_stepsize"] == mst and r["beta_clip"] == clip
+            and r["epochs_done"] == epochs and r["augment"] == "1"
+            and r["alpha0"] == alpha0 and r["dataset"] == dset
+            and r["batch_size"] == batch]
+for gran in ("nodewise", "chunk777"):
+    ex = cell_rows(gran, net_bn)
+    print("guard 2e: %-9s at ms=%s / %s: %d existing rows %s"
+          % (gran, mst, clip, len(ex), ex[:4]))
+print("guard 2e: the bn arms are re-run IN THIS BATCH rather than read from cc1 -- "
+      "seeds do not pair across batches (RULE 14) and D_BN must be WITHIN-batch to "
+      "be T1's gate.")
+
+# 2f -- the seeds this batch claims, PER ARM.  The BN control and the GN primary
+# deliberately carry different n; the guard checks BOTH lists and the resulting
+# standard errors, so a rebalance cannot happen silently.
+bn = sorted(int(x) for x in seeds_bn.split())
+gn = sorted(int(x) for x in seeds_gn.split())
+if bn != sorted(set(bn)) or len(bn) != 4:
+    sys.exit("GUARD FAIL: SEEDS_BN=%r is not 4 distinct seeds" % seeds_bn)
+if gn != sorted(set(gn)) or len(gn) != 8:
+    sys.exit("GUARD FAIL: SEEDS_GN=%r is not 8 distinct seeds" % seeds_gn)
+if 2 * len(bn) + 2 * len(gn) != int(njobs):
+    sys.exit("GUARD FAIL: 2*%d + 2*%d != NJOBS=%s" % (len(bn), len(gn), njobs))
+se_bn = SIGMA * (2.0 / len(bn)) ** 0.5
+se_gn = SIGMA * (2.0 / len(gn)) ** 0.5
+if se_gn > 0.09:
+    sys.exit("GUARD FAIL: se(D_GN) = %.4f exceeds the registered 0.0870+eps -- the "
+             "primary lost power" % se_gn)
+if ANCHOR_D / se_bn < 2.0:
+    sys.exit("GUARD FAIL: the T1 gate could not clear at n=%d (t = %.2f)"
+             % (len(bn), ANCHOR_D / se_bn))
+print("guard 2f: BN seeds %s (n=%d, se(D_BN) %.4f, T1 clears at t=%.2f); GN seeds %s "
+      "(n=%d, se(D_GN) %.4f).  The PRIMARY carries the seeds; the control only has to "
+      "clear a gate." % (bn, len(bn), se_bn, ANCHOR_D / se_bn, gn, len(gn), se_gn))
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs (STANDING RULE 19) -
+python3 - "$REPO" "$CLIP" "$TAG" <<'PYEOF' || guard_fail "guard 3: box registration"
+import sys, os
+repo, clip, tag = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if tag not in c55.BOXES:
+    sys.exit("GUARD FAIL: `%s` is not registered in c55_neff_noise.BOXES.  Register it "
+             "from THIS script's CLIP= line BEFORE submitting or the root is skipped."
+             % tag)
+lo, hi, prov = c55.BOXES[tag]
+want = tuple(float(x) for x in clip.split(":"))
+if (lo, hi) != want:
+    sys.exit("GUARD FAIL: c55 registers %s as %s but CLIP= is %s" % (tag, (lo, hi), want))
+# The referent is NOT fa1 (-25, ms=3e-4).  It is the box every ms=1e-4 ANCHOR was
+# measured in, because that is where this batch's frozen thresholds come from.
+ANCHOR_BOX = (-15.0, -2.3026)
+if (lo, hi) != ANCHOR_BOX:
+    sys.exit("GUARD FAIL: %s registers %s but the ms=1e-4 anchor box is %s.  Every "
+             "frozen threshold in this batch (+0.30, +0.5805, sigma 0.1740) was "
+             "computed from rows in the anchor box; running elsewhere would make "
+             "each one a cross-box import, which CORRECTIONS 113 forbids."
+             % (tag, (lo, hi), ANCHOR_BOX))
+print("guard 3: %s registered as (%.1f, %.4f) from %s -- the ms=1e-4 ANCHOR box, so "
+      "no threshold in this batch crosses a box" % (tag, lo, hi, prov))
+PYEOF
+
+# --- GUARD 4 -- **THE BETA-ALLOCATION GUARD.  m IS MEASURED, NEVER ASSERTED.** -
+# Both contrasts are MATCHED-COUNT and the whole premise is that the two NETWORKS
+# carry the SAME partition, so both are measured HERE, on the really-built networks,
+# from the beta the optimizer actually allocates, on the tree the jobs will import.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate" 2>/dev/null
+  cd "$TREE" || exit 1
+  python - "$CHUNK_K" "$M_NODE" "$M_CHUNK" "$MST" "$NET_BN" "$NET_GN" "$ALPHA0" \
+           "$N_TENSORS" "$N_1D" "$MAX_1D_NUMEL" "$SINGLETONS" "$PARAMS" \
+           "$GN_GROUPS" "$N_NORM_MODULES" <<'PYEOF' || exit 1
+import sys, torch
+import torch.nn as nn
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+K = int(sys.argv[1]); want_node = int(sys.argv[2]); want_chunk = int(sys.argv[3])
+MST = float(sys.argv[4]); NET_BN = sys.argv[5]; NET_GN = sys.argv[6]
+A0 = float(sys.argv[7]); want_tensors = int(sys.argv[8]); want_1d = int(sys.argv[9])
+want_max1d = int(sys.argv[10]); want_sing = int(sys.argv[11]); want_par = int(sys.argv[12])
+G = int(sys.argv[13]); want_norm = int(sys.argv[14])
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": MST, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def build(net_name, gran):
+    torch.manual_seed(0)
+    net = build_network(net_name, "cpu")
+    return HF(net, stepsize_groups=gran, alpha0=A0, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+def lens(opt):
+    return [int(b.numel()) for b in opt.beta]
+
+nets = {n: build_network(n, "cpu") for n in (NET_BN, NET_GN)}
+named = {n: [(k, tuple(p.shape)) for k, p in nets[n].named_parameters()] for n in nets}
+
+# 4a -- the shape census the whole design rests on, on the BN net.
+shapes = [s for _, s in named[NET_BN]]
+ones = [s for s in shapes if len(s) == 1]
+sing = sum(s[0] for s in ones)
+par = sum(int(torch.Size(s).numel()) for s in shapes)
+print("guard 4a: %s has %d tensors / %d weights, %d of them 1-D, largest 1-D numel %d, "
+      "%d size-1 nodewise groups" % (NET_BN, len(shapes), par, len(ones),
+                                     max(s[0] for s in ones), sing))
+for lbl, got, want in (("tensors", len(shapes), want_tensors),
+                       ("weights", par, want_par),
+                       ("1-D tensors", len(ones), want_1d),
+                       ("max 1-D numel", max(s[0] for s in ones), want_max1d),
+                       ("size-1 groups", sing, want_sing)):
+    if got != want:
+        sys.exit("GUARD FAIL: %s is %d, not the %d registered -- the network changed "
+                 "under the registration" % (lbl, got, want))
+
+# 4b -- THE STRUCTURAL CLAIM: K must exceed EVERY 1-D tensor, so each gets ONE chunk
+# and the chunk arm IS the "one step size per normaliser tensor" prescription.
+if not K > max(s[0] for s in ones):
+    sys.exit("GUARD FAIL: chunk K=%d is NOT greater than the largest 1-D tensor (%d). "
+             "The chunk arm would SPLIT the very tensors whose merging is the "
+             "prescription." % (K, max(s[0] for s in ones)))
+print("guard 4b: K=%d > %d, so ALL %d 1-D tensors get EXACTLY ONE chunk"
+      % (K, max(s[0] for s in ones), len(ones)))
+
+# 4c -- **THE IDENTITY gn1 RESTS ON.**  The two nets present the SAME list.
+if named[NET_BN] != named[NET_GN]:
+    bad = [(i, a, b) for i, (a, b) in enumerate(zip(named[NET_BN], named[NET_GN])) if a != b]
+    sys.exit("GUARD FAIL: the two networks' named_parameters() lists DIFFER at %d "
+             "positions, first %s.  HF.init_meta reads that list POSITIONALLY, so the "
+             "partitions would NOT be the same object and gn1 would not be a "
+             "controlled test." % (len(bad), bad[:2]))
+print("guard 4c: %s and %s present ELEMENTWISE IDENTICAL (name, shape) lists -- "
+      "%d tensors, same names, same order" % (NET_BN, NET_GN, len(named[NET_BN])))
+
+# 4d -- m OFF THE ALLOCATED BETA, for all four arms.  Not a formula, not a comment.
+got = {}
+for net_name in (NET_BN, NET_GN):
+    for gran, want in (("nodewise", want_node), ("chunk%d" % K, want_chunk)):
+        o = build(net_name, gran)
+        got[(net_name, gran)] = (m_of(o), lens(o))
+        print("guard 4d: %-12s %-10s ALLOCATED beta m=%-8d (registered %d)"
+              % (net_name, gran, m_of(o), want))
+        if m_of(o) != want:
+            sys.exit("GUARD FAIL: m(%s, %s) is %d, not the %d registered"
+                     % (net_name, gran, m_of(o), want))
+for gran in ("nodewise", "chunk%d" % K):
+    if got[(NET_BN, gran)][1] != got[(NET_GN, gran)][1]:
+        sys.exit("GUARD FAIL: the PER-TENSOR beta lengths differ between the two nets "
+                 "under %s" % gran)
+d = got[(NET_BN, "chunk%d" % K)][0] - got[(NET_BN, "nodewise")][0]
+if abs(d) > 1:
+    sys.exit("GUARD FAIL: the matched-count pair is %d groups apart, not <= 1" % d)
+print("guard 4e: per-tensor beta lengths are elementwise equal ACROSS NETS under both "
+      "granularities; the count match is %+d group = %.4f%%"
+      % (d, 100.0 * d / got[(NET_BN, "nodewise")][0]))
+
+# 4f -- ANTI-VACUITY: the normaliser really changed.  Without this, 4c/4d could pass
+# because ResNet18_gn is secretly ResNet18.
+mods = {n: ([m for m in nets[n].modules() if isinstance(m, nn.BatchNorm2d)],
+            [m for m in nets[n].modules() if isinstance(m, nn.GroupNorm)]) for n in nets}
+b_bn, g_bn = mods[NET_BN]
+b_gn, g_gn = mods[NET_GN]
+if not (len(b_bn) == want_norm and len(g_bn) == 0):
+    sys.exit("GUARD FAIL: %s holds %d BatchNorm2d and %d GroupNorm, not %d/0"
+             % (NET_BN, len(b_bn), len(g_bn), want_norm))
+if not (len(g_gn) == want_norm and len(b_gn) == 0):
+    sys.exit("GUARD FAIL: %s holds %d GroupNorm and %d BatchNorm2d, not %d/0 -- the "
+             "GN arm would be a DUPLICATE OF THE CONTROL"
+             % (NET_GN, len(g_gn), len(b_gn), want_norm))
+if not all(m.num_groups == G for m in g_gn):
+    sys.exit("GUARD FAIL: not every GroupNorm has num_groups == %d" % G)
+if not all(m.num_channels % G == 0 for m in g_gn):
+    sys.exit("GUARD FAIL: some GroupNorm channel count is not divisible by %d" % G)
+nb = {n: len(list(nets[n].named_buffers())) for n in nets}
+if nb[NET_GN] != 0:
+    sys.exit("GUARD FAIL: %s carries %d buffers; GroupNorm has none" % (NET_GN, nb[NET_GN]))
+print("guard 4f: %s = %d GroupNorm(%d, C) and 0 BatchNorm2d; %s = %d BatchNorm2d and "
+      "0 GroupNorm.  Buffers: %d vs %d -- BN's running stats are buffers and NEVER "
+      "entered named_parameters(), so they never carried a step size."
+      % (NET_GN, len(g_gn), G, NET_BN, len(b_bn), nb[NET_BN], nb[NET_GN]))
+PYEOF
+) || guard_fail "guard 4: beta allocation / census on the built networks"
+
+# --- GUARD 4g -- THE ANALYTIC CROSS-CHECK, second instrument, runs anywhere ---
+# analysis/c82_singleton_census.py's shape arithmetic is VALIDATED 7/7 against
+# ResNet18's known census.  It reproduces guard 4's numbers WITHOUT torch, so a
+# disagreement between the two instruments is caught even off-cluster.
+python3 - "$REPO" "$CHUNK_K" "$M_NODE" "$M_CHUNK" "$N_TENSORS" "$N_1D" "$SINGLETONS" \
+  "$PARAMS" <<'PYEOF' || guard_fail "guard 4g: analytic census cross-check"
+import os, sys, io, contextlib, importlib.util
+repo, K, m_node, m_chunk, n_t, n_1d, sing, par = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+    int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7]), int(sys.argv[8]))
+spec = importlib.util.spec_from_file_location(
+    "census", os.path.join(repo, "analysis", "c82_singleton_census.py"))
+mod = importlib.util.module_from_spec(spec)
+with contextlib.redirect_stdout(io.StringIO()):
+    spec.loader.exec_module(mod)            # its own R18 validation runs on import
+P = mod.resnet_params(mod.basicblock, [2, 2, 2, 2], 10)
+c = mod.census(P)
+got = {"tensors": c["tensors"], "1-D tensors": c["n_1d_tensors"],
+       "nodewise m": c["node_m"], "size-1 groups": c["singletons"],
+       "weights": c["params"], "chunk%d m" % K: mod.chunk_count(P, K)}
+want = {"tensors": n_t, "1-D tensors": n_1d, "nodewise m": m_node,
+        "size-1 groups": sing, "weights": par, "chunk%d m" % K: m_chunk}
+bad = [k for k in want if got[k] != want[k]]
+for k in sorted(want):
+    print("guard 4g: analytic %-16s got %-10d registered %-10d %s"
+          % (k, got[k], want[k], "OK" if got[k] == want[k] else "MISMATCH"))
+if bad:
+    sys.exit("GUARD FAIL: the analytic census disagrees with the registration on %s" % bad)
+print("guard 4g: singleton fraction %.4f%% over %.6f%% of the weights.  **This is the "
+      "structure the GN net reproduces EXACTLY -- GroupNorm's weight/bias are (C,) "
+      "just as BatchNorm2d's are, so the census is normaliser-independent.**"
+      % (100 * c["sing_frac"], 100 * c["sing_wfrac"]))
+PYEOF
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" "$NJOBS" <<'PYEOF' || guard_fail "guard 5: disk"
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+njobs = int(sys.argv[2])
+# MEASURED: a 10,000-record probe.jsonl at m ~ 14,420 runs ~114 MB, plus the
+# neg_counts npy.  Budget 0.15 GB per job and demand 20x.
+need_gb = njobs * 0.15
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)"
+             % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed for %d jobs (20x margin)  OK"
+      % (free_gb, need_gb, njobs))
+PYEOF
+
+# --- GUARD 6 -- queue depth, and the WALL against the tightest partition ----
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS"
+if [ "${PEND:-0}" -gt 40 ]; then
+  guard_fail "guard 6: $PEND already pending, over the 40 cap"
+fi
+if [ "$(( ${PEND:-0} + NJOBS ))" -gt 40 ]; then
+  guard_fail "guard 6: $PEND pending + $NJOBS would exceed the 40 cap"
+fi
+
+python3 - "$WALL" "$PARTS" <<'PYEOF' || guard_fail "guard 6b: --time vs partition MaxTime"
+import subprocess, sys
+def secs(t):
+    d, _, rest = t.partition("-")
+    if not rest:
+        d, rest = 0, t
+    p = [int(x) for x in rest.split(":")]
+    while len(p) < 3:
+        p.insert(0, 0)
+    return int(d) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+want, parts = sys.argv[1], sys.argv[2].split(",")
+if len(parts) < 2:
+    sys.exit("GUARD FAIL: PARTS is not a multi-partition list")
+out = subprocess.run(["sinfo", "-h", "-o", "%P %l"], capture_output=True, text=True).stdout
+lim = {}
+for ln in out.split("\n"):
+    f = ln.split()
+    if len(f) == 2 and f[1] not in ("infinite", "n/a"):
+        lim[f[0].rstrip("*")] = secs(f[1])
+tight = [(p, lim[p]) for p in parts if p in lim]
+if not tight:
+    sys.exit("GUARD FAIL: sinfo returned no limit for any requested partition")
+name, cap = min(tight, key=lambda kv: kv[1])
+if secs(want) > cap:
+    sys.exit("GUARD FAIL: --time=%s exceeds %s's MaxTime (%d:%02d) -- sbatch would "
+             "reject the WHOLE batch" % (want, name, cap // 3600, cap % 3600 // 60))
+print("guard 6b: --time=%s fits the tightest of the %d requested partitions (%s, "
+      "%d:%02d)  OK" % (want, len(parts), name, cap // 3600, cap % 3600 // 60))
+PYEOF
+
+# --- GUARD 7 -- THROUGHPUT HEADROOM, AND THE SMOKE-RUN REQUIREMENT ---------
+# **THERE IS NO MEASURED GroupNorm RATE IN THE CORPUS** -- 1,891 runs, all BatchNorm.
+# So the projection below uses a DECLARED slowdown factor, and that is not good enough
+# to submit on: the registration requires a 3-epoch smoke run first.  Export the
+# measured minutes-per-epoch as GN1_MIN_PER_EPOCH and this guard uses THAT instead.
+python3 - "$WALL" "$CSVP" "$EPOCHS" "$NET_BN" "$GN_SLOWDOWN" "${GN1_MIN_PER_EPOCH:-}" \
+  "$SUBMIT" <<'PYEOF' || guard_fail "guard 7: throughput / smoke run"
+import csv, statistics, sys
+def secs(t):
+    p = [int(x) for x in t.split(":")]
+    return p[0] * 3600 + p[1] * 60 + p[2]
+wall_min = secs(sys.argv[1]) / 60.0
+rd = list(csv.DictReader(open(sys.argv[2])))
+epochs, net, slow = sys.argv[3], sys.argv[4], float(sys.argv[5])
+measured, submit = sys.argv[6].strip(), sys.argv[7]
+
+w = [int(r["wallclock_min"]) for r in rd
+     if r["network"] == net and r["dataset"] == "CIFAR10"
+     and r["granularity"] in ("nodewise", "chunk777")
+     and r["epochs_done"] == epochs and r["wallclock_min"].strip()]
+if len(w) < 20:
+    sys.exit("GUARD FAIL: only %d %s %s-epoch wallclocks -- headroom unmeasurable"
+             % (len(w), net, epochs))
+worst = max(w)
+proj = worst * slow
+print("guard 7: %s %s-ep BN wallclock median %.0f / worst %d min (n=%d); declared "
+      "GroupNorm slowdown %.2fx -> projected worst %.0f min against a %.0f min wall "
+      "= %.2fx headroom" % (net, epochs, statistics.median(w), worst, len(w), slow,
+                            proj, wall_min, wall_min / proj))
+if proj > wall_min:
+    sys.exit("GUARD FAIL: the projected worst-case GN run (%.0f min) EXCEEDS the wall "
+             "(%.0f min) -- jobs would truncate and T0.1 would VOID them" % (proj, wall_min))
+if wall_min / proj < 1.20:
+    sys.exit("GUARD FAIL: only %.2fx headroom, below the 1.20x floor" % (wall_min / proj))
+if measured:
+    got = float(measured) * int(epochs)
+    print("guard 7b: MEASURED from the smoke run: %.2f min/epoch -> %.0f min for %s "
+          "epochs = %.2fx headroom" % (float(measured), got, epochs, wall_min / got))
+    if got > wall_min:
+        sys.exit("GUARD FAIL: the MEASURED GN rate projects %.0f min, over the %.0f min "
+                 "wall.  Raise --time and drop gpu-short from PARTS." % (got, wall_min))
+elif submit == "1":
+    sys.exit("GUARD FAIL: GN1_MIN_PER_EPOCH is not set.  **THE CORPUS CONTAINS NO "
+             "GroupNorm RUN**, so the wall is being justified by a DECLARED factor "
+             "rather than a measurement.  Run the registered 3-epoch smoke job first "
+             "(1 job, gn-node, seed 0, ~5 min), then export the observed minutes per "
+             "epoch as GN1_MIN_PER_EPOCH and re-run.")
+else:
+    print("guard 7b: GN1_MIN_PER_EPOCH unset -- the SMOKE RUN IS STILL OWED.  Refused "
+          "at --submit; allowed in a dry run so the emitter can be validated.")
+PYEOF
+
+# --- GUARD 8 -- **THE ALGEBRAIC BOX-REACHABILITY PROOF.** ------------------
+# Lion's meta update with --weight-decay-meta 0 moves each beta coordinate by exactly
+# 0 or +-ms per step, so |beta_T - ln(alpha0)| <= ms*T for ANY velocity profile.  This
+# is a PROOF, not an extrapolation (CORRECTIONS 72's rule).  It is what licenses using
+# the -25 floor here and still comparing against the -15 anchors.
+python3 - "$CLIP" "$ALPHA0" "$EPOCHS" "$STEPS_PER_EPOCH" "$MST" \
+  <<'PYEOF' || guard_fail "guard 8: box reachability"
+import math, sys
+clip, a0, ep, spe, ms = sys.argv[1], float(sys.argv[2]), int(sys.argv[3]), \
+    int(sys.argv[4]), float(sys.argv[5])
+lo, hi = (float(x) for x in clip.split(":"))
+b0 = math.log(a0)
+T = ep * spe
+span = ms * T
+rlo, rhi = b0 - span, b0 + span
+print("guard 8: beta_0 = ln(%g) = %.6f;  T = %d ep x %d = %d steps;  ms*T = %.2f"
+      % (a0, b0, ep, spe, T, span))
+print("guard 8: beta is reachable ONLY in [%.4f, %.4f];  box = (%.4f, %.4f)"
+      % (rlo, rhi, lo, hi))
+if rlo <= lo:
+    sys.exit("GUARD FAIL: the FLOOR %.4f is REACHABLE at ms=%g (from epoch %.1f).  The "
+             "batch would not share its box status with the mm1/pp1/cc1 anchors and "
+             "T0.5 would be at risk on the singleton arm -- exactly ar1's failure."
+             % (lo, ms, (b0 - lo) / ms / spe))
+if rhi < hi:
+    print("guard 8: NOTE the ceiling is ALSO unreachable -- the box is inert on both "
+          "sides at this cell.")
+else:
+    print("guard 8: the ceiling %.4f IS reachable (from epoch %.1f) and is DELIBERATELY "
+          "NOT RELEASED: the corpus's only released-ceiling runs (bd7-w-c6-s0/s1, box "
+          "-30:6.0) are 2/2 collapsed=1." % (hi, (hi - b0) / ms / spe))
+print("guard 8: **the floor is PROVABLY DEAD at this cell, so -25 and -15 are "
+      "IDENTICAL IN EFFECT.  -15 is chosen because it is the box EVERY ms=1e-4 "
+      "anchor was measured in, so no frozen threshold in this batch is a "
+      "cross-box import (CORRECTIONS 113).**")
+PYEOF
+
+# --- GUARD 9 -- **THE SEQUENCING INTERLOCK.** ------------------------------
+# gn1 refines a mechanism; generalisation has outranked it for four cycles and has
+# three built batches waiting.  This guard cannot judge the science -- it exists so
+# that jumping the queue has to be a DECISION someone typed, not a default.
+python3 - "$REPO" "$CSVP" "${GN1_GEN_OK:-}" "$SUBMIT" \
+  <<'PY9EOF' || guard_fail "guard 9: sequencing"
+import csv, glob, os, sys
+repo, csvp, token, submit = sys.argv[1], sys.argv[2], sys.argv[3].strip(), sys.argv[4]
+rd = list(csv.DictReader(open(csvp)))
+TAIL = ("nodewise1d", "chunk777", "chunk2325")
+where = {}
+for r in rd:
+    if r["granularity"] in TAIL:
+        where[(r["network"], r["dataset"])] = where.get((r["network"], r["dataset"]), 0) + 1
+print("guard 9: tail-relevant granularities %s appear on: %s"
+      % (list(TAIL), sorted("%s/%s x%d" % (k[0], k[1], v) for k, v in where.items())))
+# **DISCOVERED BY GLOB, NOT HARD-CODED.**  The generalisation batches were
+# restructured mid-cycle (the two ResNet34 scripts were merged into one), and a guard
+# that names files by hand goes quietly green the moment someone renames one.  Any
+# bin/c83_gen_*.sh is a generalisation batch by construction of the naming scheme.
+built = sorted(os.path.basename(f)
+               for f in glob.glob(os.path.join(repo, "bin", "c83_gen_*.sh")))
+print("guard 9: %d built-and-unrun generalisation batches on disk: %s"
+      % (len(built), built))
+if len(where) == 1 and not token and submit == "1":
+    sys.exit("GUARD FAIL: the tail contrasts exist on EXACTLY ONE (network, dataset) "
+             "cell, %s, and %d generalisation batches are built and unrun.  gn1 is a "
+             "REFINEMENT: if D does not survive on a second architecture it refines "
+             "nothing.  Run one of %s FIRST, score it, then export "
+             "GN1_GEN_OK='<tag>: D=<value> (t=<value>) on <net>' to record WHY gn1 may "
+             "now jump the queue."
+             % (list(where)[0], len(built), built))
+if token:
+    print("guard 9: GN1_GEN_OK = %r -- the operator has recorded a generalisation "
+          "result; gn1 proceeds on that basis." % token)
+elif submit != "1":
+    print("guard 9: GN1_GEN_OK unset -- REFUSED at --submit, allowed in a dry run so "
+          "the emitter can be validated.")
+PY9EOF
+
+# ---------------------------------------------------------------------------
+if [ "$SUBMIT" = "1" ]; then
+  mkdir -p "$SAVE" || { echo "GUARD FAIL: cannot create $SAVE"; exit 1; }
+else
+  mkdir -p "$SAVE" 2>/dev/null || true
+fi
+N=0
+FAIL=0
+# --- EMITTER BEGIN ---
+# GUARD 1b checks EVERY registered flag against this region and nothing outside it,
+# so the base/meta optimiser pins live INSIDE it, not above it.
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+# The arm table carries its OWN seed list per arm (field 4) so the 4/4/8/8 split is
+# declared in ONE place and GUARD 1b-4 reads it from here.
+for ARM in "ResNet18:nodewise:bn-node:BN" "ResNet18:chunk${CHUNK_K}:bn-ch:BN" \
+           "ResNet18_gn:nodewise:gn-node:GN" "ResNet18_gn:chunk${CHUNK_K}:gn-ch:GN"; do
+  NET="${ARM%%:*}"; REST="${ARM#*:}"; GRAN="${REST%%:*}"
+  REST2="${REST#*:}"; SHORT="${REST2%%:*}"; WHICH="${REST2##*:}"
+  if [ "$WHICH" = "BN" ]; then ARM_SEEDS="$SEEDS_BN"; else ARM_SEEDS="$SEEDS_GN"; fi
+  for S in $ARM_SEEDS; do
+    RN="${TAG}-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},HIER=none,SCHED=none,PROBE=${PROBE_EVERY},PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_${TAG}_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset "$DSET" --NN-name "$NET" --batch-size "$BATCH"
+      --max-time 999:00:00 --gamma "$GAMMA" --meta-stepsize "$MST" --alpha0 "$ALPHA0"
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+# --- EMITTER END ---
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+echo "---- REGISTERED n = 4 on the BN control arms and n = 8 on the GN arms, 4 arms,"
+echo "---- ONE batch.  D_BN and D_GN are both WITHIN this batch, so STANDING RULE 14 is"
+echo "---- satisfied by construction and the cross-batch offset cancels.  NO contrast in"
+echo "---- this batch crosses a batch or a box boundary. ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+if [ "$GUARD_FAILS" -gt 0 ]; then
+  echo "=============================================================="
+  echo "!!! $GUARD_FAILS GUARD(S) FAILED.  The emitter above is VALIDATED; the batch is NOT."
+  echo "!!! Nothing was submitted and nothing may be submitted until every guard"
+  echo "!!! passes ON cluster_a, on the LIVE tree, with the patch applied."
+  echo "!!! A dry run with failed guards is not a green light."
+  echo "=============================================================="
+  exit 2
+fi
+exit 0

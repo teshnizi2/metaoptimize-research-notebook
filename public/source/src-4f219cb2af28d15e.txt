@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+# =============================================================================
+# train_in489.py -- MetaOptimize on ImageNet-489 (ResNet, 224x224).
+#
+# WHAT THIS IS.  The campaign has never run at ImageNet resolution; every one of
+# its runs so far is CIFAR-resolution.  The parent paper's motivating anomaly
+# (layerwise BEATS scalar on small networks, LOSES to scalar on ImageNet) is an
+# ImageNet phenomenon, so the campaign cannot test it without a 224px harness.
+#
+# WHY IT IS A NEW FILE AND NOT A PATCH.  Two pre-existing ImageNet harnesses were
+# read first:
+#
+#   /cluster/account_a/MetaStep/MetaStep/imagenet/train_imagenet.py
+#       + Optimizers/HF.py           -- advertises layerwise/nodewise/weightwise
+#         in its own docstring, but the code for them is DEAD:
+#            init_meta layerwise: `[np.log(a0)*torch.ones(n)].cuda()`
+#                                  -> AttributeError, list has no .cuda()
+#            init_meta blockwise: `torch.log(alpha0)` on a python float
+#                                  -> TypeError
+#            init_meta nodewise/weightwise: beta built on CPU while the
+#                                  meta-gradient arrives on GPU -> device
+#                                  mismatch in the first meta update.
+#         Only `scalar` can run.  Its train loop also has no `ARGS:` line
+#         (RULE 20 unenforceable) and checkpoints to a fixed filename in the
+#         CWD, which collides between concurrent runs.
+#
+#   .../MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+#       -- the campaign's MAINTAINED optimizer.  Its PATCH_GRANULARITY block is
+#          the working, GPU-resident implementation of layerwise / nodewise /
+#          weightwise, and it is the exact code that produced every granularity
+#          number in the campaign so far.
+#
+# So this harness supplies the ImageNet data path and training loop ONLY, and
+# imports the campaign's cifar10 HF **unedited** for the optimizer.  The ladder
+# then compares like with like: the same optimizer object the CIFAR results came
+# from, on 224px data.  Nothing in the cifar10 tree is modified.
+#
+# SCOPE, WHICH IS NOT OPTIONAL BOILERPLATE:
+#   * 489 classes, NOT 1000.  This is ImageNet-489.  Numbers here are NOT
+#     comparable to published ImageNet-1k results.
+#   * Validation is 24,450 images, exactly 50 per class, whose labels were
+#     recovered from the per-image XML annotations under
+#     ILSVRC/Annotations/CLS-LOC/val/ -- not from a devkit.
+#   * Chance accuracy is 1/489 = 0.2045%.  The head is built with
+#     num_classes=489 so chance is 1/489 and not 1/1000.
+#
+# OUTPUT CONTRACT.  Per-epoch lines are byte-compatible with the campaign's
+# existing `aggregate.py` regexes, so ImageNet-489 runs ingest with no change to
+# the analysis tree:
+#     Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%
+#     <int>  minutes
+# The `ARGS:` / `NODE=` / `ENV:` lines come from the sbatch wrapper
+# (jobs/run_in489.sh), exactly as jobs/run_cifar.sh provides them, so
+# analysis/argsline_guard.py works unchanged.  This file additionally prints an
+# `EFFECTIVE:` line of post-argparse values, which is strictly stronger than
+# RULE 20's ARGS line because it survives any flag-repetition ambiguity.
+# =============================================================================
+
+import time
+start_time = time.time()
+
+import argparse
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.datasets as datasets
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.tensorboard import SummaryWriter
+
+# The campaign's maintained optimizer, imported UNEDITED from the cifar10 tree.
+CIFAR_TREE = os.environ.get(
+    'MO_CIFAR_TREE',
+    '/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10')
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description='MetaOptimize on ImageNet-489')
+
+    # General
+    p.add_argument("--data", type=str,
+                   default='/cluster/account_a/metaopt/data/imagenet489',
+                   help="root holding train/ and validation/ in ImageFolder layout")
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--save-directory", type=str, default='outputs')
+    p.add_argument("--run-name", type=str, default="test")
+    p.add_argument("--NN-name", type=str, default='resnet18',
+                   help="torchvision model name, e.g. resnet18 / resnet50")
+    p.add_argument("--num-classes", type=int, default=489,
+                   help="asserted against the number of ImageFolder classes")
+    p.add_argument("--verbos", type=int, default=1)
+    p.add_argument("--max-time", type=str, default="00:05:00",
+                   help="wall budget hh:mm:ss; the loop stops before overrunning it")
+
+    # Training
+    p.add_argument("--optimizer", type=str, default='HF')
+    p.add_argument("--num-epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--num-workers", type=int, default=16)
+    p.add_argument("--steps-per-epoch", type=int, default=0,
+                   help="0 = a real full pass over all 627,329 train images. "
+                        ">0 truncates the epoch to that many optimizer steps; a "
+                        "run using it is a SHORT-EPOCH run and must be labelled one.")
+
+    # Base / meta algorithms -- names identical to cifar10/train.py
+    p.add_argument("--alg-base", type=str, default="AdamW")
+    p.add_argument("--normalizer-param-base", type=float, default=0.999)
+    p.add_argument("--momentum-param-base", type=float, default=0.9)
+    p.add_argument("--weight-decay-base", type=float, default=0.1)
+    p.add_argument("--Lion-beta2-base", type=float, default=-1)
+
+    p.add_argument("--alg-meta", type=str, default="Lion")
+    p.add_argument("--normalizer-param-meta", type=float, default=-1)
+    p.add_argument("--momentum-param-meta", type=float, default=0.99)
+    p.add_argument("--weight-decay-meta", type=float, default=0)
+    p.add_argument("--Lion-beta2-meta", type=float, default=0.9)
+
+    p.add_argument("--stepsize-groups", type=str, default="scalar")
+    p.add_argument("--gamma", type=float, default=1)
+    p.add_argument("--meta-stepsize", type=float, default=10e-3)
+    p.add_argument("--alpha0", type=float, default=1e-6)
+
+    return p.parse_args()
+
+
+def sentinel_to_none(args):
+    """-1 means 'not applicable', exactly as cifar10/train.py resolves it."""
+    for name in ['normalizer_param_base', 'momentum_param_base', 'weight_decay_base',
+                 'Lion_beta2_base', 'normalizer_param_meta', 'momentum_param_meta',
+                 'weight_decay_meta', 'Lion_beta2_meta', 'meta_stepsize']:
+        if getattr(args, name) == -1:
+            setattr(args, name, None)
+    return args
+
+
+def build_hf(net, args, writer):
+    """Mirror of cifar10/Optimizers/build_optimizer.py's HF branch, verbatim in
+    behaviour.  Kept here rather than importing build_optimizer so this harness
+    does not silently pick up a non-HF path."""
+    sys.path.insert(0, CIFAR_TREE)
+    from Optimizers.HF import HF
+    import Optimizers.HF as _hfmod
+    print("HF_SOURCE: %s" % os.path.realpath(_hfmod.__file__), flush=True)
+    args_base = {n: getattr(args, n + '_base')
+                 for n in ['alg', 'normalizer_param', 'momentum_param',
+                           'weight_decay', 'Lion_beta2']
+                 if getattr(args, n + '_base') is not None}
+    args_meta = {n: getattr(args, n + '_meta')
+                 for n in ['alg', 'normalizer_param', 'momentum_param',
+                           'weight_decay', 'Lion_beta2']
+                 if getattr(args, n + '_meta') is not None}
+    args_meta['meta_stepsize'] = args.meta_stepsize
+    return HF(net, stepsize_groups=args.stepsize_groups, alpha0=args.alpha0,
+              args_base=args_base, args_meta=args_meta, gamma=args.gamma,
+              writer=writer)
+
+
+class FixedStepBaseline:
+    """A non-meta control (--optimizer SGD / AdamW).  Present so a smoke test can
+    separate 'the data pipeline is broken' from 'the meta-optimizer has not
+    escaped alpha0 yet'.  It is NOT part of the ladder."""
+
+    def __init__(self, net, args):
+        if args.optimizer == 'SGD':
+            self.opt = torch.optim.SGD(net.parameters(), lr=args.alpha0,
+                                       momentum=0.9)
+        elif args.optimizer == 'AdamW':
+            self.opt = torch.optim.AdamW(net.parameters(), lr=args.alpha0)
+        else:
+            raise ValueError('unsupported --optimizer %r' % args.optimizer)
+
+    def step(self, net, loss):
+        net.zero_grad()
+        loss.backward()
+        self.opt.step()
+
+
+def count_groups(optimizer):
+    """m, the number of independently adapted step sizes, read off the LIVE beta
+    on the LIVE tree -- never from a table."""
+    beta = getattr(optimizer, 'beta', None)
+    if beta is None:
+        return None, None
+    m = int(sum(int(np.prod(list(b.shape))) if b.dim() > 0 else 1 for b in beta))
+    return m, len(beta)
+
+
+@torch.no_grad()
+def evaluate(net, loader, device):
+    net.eval()
+    correct = 0
+    total = 0
+    for images, target in loader:
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        pred = net(images).argmax(dim=1)
+        correct += (pred == target).sum().item()
+        total += target.size(0)
+    net.train()
+    return 100.0 * correct / total, total
+
+
+def main():
+    args = sentinel_to_none(parse_args())
+
+    print("EFFECTIVE: " + " ".join(
+        "--%s %s" % (k.replace('_', '-'), v) for k, v in sorted(vars(args).items())),
+        flush=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = True
+
+    max_time_s = sum(int(args.max_time.split(':')[i]) * 3600 / (60 ** i)
+                     for i in range(3))
+
+    writer = SummaryWriter(os.path.join(args.save_directory,
+                                        'Tensorboard_outputs', args.run_name))
+
+    # ---------------- data ----------------
+    traindir = os.path.join(args.data, 'train')
+    valdir = os.path.join(args.data, 'validation')
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+    t_scan = time.time()
+    train_ds = datasets.ImageFolder(traindir, transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        normalize]))
+    val_ds = datasets.ImageFolder(valdir, transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize]))
+    scan_s = time.time() - t_scan
+
+    # GUARD 1 -- a train/val label permutation would be silent and would make
+    # every val number meaningless.  ImageFolder indexes by sorted dirname, so
+    # the maps must be byte-identical.  Assert it rather than trust it.
+    if train_ds.class_to_idx != val_ds.class_to_idx:
+        only_tr = sorted(set(train_ds.class_to_idx) - set(val_ds.class_to_idx))
+        only_va = sorted(set(val_ds.class_to_idx) - set(train_ds.class_to_idx))
+        raise SystemExit("GUARD_FAIL class_to_idx mismatch; train-only=%s val-only=%s"
+                         % (only_tr[:5], only_va[:5]))
+    # GUARD 2 -- the head width must equal the real class count.
+    if len(train_ds.classes) != args.num_classes:
+        raise SystemExit("GUARD_FAIL num_classes=%d but ImageFolder found %d classes"
+                         % (args.num_classes, len(train_ds.classes)))
+
+    print("DATA: root=%s classes=%d train_images=%d val_images=%d scan_sec=%.1f "
+          "chance_acc=%.4f%%" % (args.data, len(train_ds.classes), len(train_ds),
+                                 len(val_ds), scan_s,
+                                 100.0 / len(train_ds.classes)), flush=True)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        persistent_workers=args.num_workers > 0)
+    val_loader = torch.utils.data.DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0)
+
+    steps_full = len(train_loader)
+    steps_per_epoch = steps_full if args.steps_per_epoch <= 0 else min(
+        args.steps_per_epoch, steps_full)
+    short = steps_per_epoch < steps_full
+    print("EPOCH_DEF: steps_per_epoch=%d full_epoch_steps=%d short_epoch=%s "
+          "images_per_epoch=%d" % (steps_per_epoch, steps_full, short,
+                                   steps_per_epoch * args.batch_size), flush=True)
+
+    # ---------------- model ----------------
+    net = models.__dict__[args.NN_name](num_classes=args.num_classes).to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
+    n_params = sum(p.numel() for p in net.parameters())
+
+    if args.optimizer == 'HF':
+        optimizer = build_hf(net, args, writer)
+    else:
+        optimizer = FixedStepBaseline(net, args)
+
+    m, n_beta_tensors = count_groups(optimizer)
+    print("GROUPS: stepsize_groups=%s m=%s n_beta_tensors=%s n_param_tensors=%d "
+          "n_params=%d arch=%s" % (args.stepsize_groups, m, n_beta_tensors,
+                                   len(list(net.parameters())), n_params,
+                                   args.NN_name), flush=True)
+
+    # ---------------- train ----------------
+    for epoch in range(args.num_epochs):
+        epoch_t = time.time()
+        correct = 0
+        total = 0
+        running_loss = 0.0
+        seen_steps = 0
+        t_train = time.time()
+        for images, target in train_loader:
+            images = images.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+            out = net(images)
+            loss = criterion(out, target)
+
+            running_loss += loss.item()
+            correct += (out.detach().argmax(dim=1) == target).sum().item()
+            total += target.size(0)
+
+            optimizer.step(net, loss)
+
+            seen_steps += 1
+            if seen_steps >= steps_per_epoch:
+                break
+        torch.cuda.synchronize() if device.type == 'cuda' else None
+        train_s = time.time() - t_train
+
+        train_accuracy = 100.0 * correct / total
+        train_loss = running_loss / max(seen_steps, 1)
+
+        t_val = time.time()
+        test_accuracy, n_val = evaluate(net, val_loader, device)
+        val_s = time.time() - t_val
+
+        writer.add_scalar("Performance/train_loss", train_loss, epoch)
+        writer.add_scalar("Performance/train_accuracy", train_accuracy, epoch)
+        writer.add_scalar("Performance/test_accuracy", test_accuracy, epoch)
+
+        if args.verbos:
+            # This line's wording is load-bearing: aggregate.py greps
+            # "Train Accuracy: ([0-9.]+)" and "Test Accuracy: ([0-9.]+)".
+            print('Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%'
+                  % (epoch, train_accuracy, test_accuracy), flush=True)
+            print('THROUGHPUT epoch=%d train_images=%d train_sec=%.1f '
+                  'img_per_sec=%.1f val_images=%d val_sec=%.1f loss=%.4f'
+                  % (epoch, total, train_s, total / train_s, n_val, val_s,
+                     train_loss), flush=True)
+
+        if time.time() - start_time > max_time_s - 1.2 * (time.time() - epoch_t) - 60:
+            print("STOP: wall budget reached after epoch %d" % epoch, flush=True)
+            break
+
+    writer.close()
+    print(int((time.time() - start_time) / 60), ' minutes', flush=True)
+
+
+if __name__ == '__main__':
+    main()

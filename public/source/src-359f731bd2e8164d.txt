@@ -1,0 +1,130 @@
+"""PATCH_PROBE6 -- per-COORDINATE sign time series, and the exact per-TENSOR sign split.
+
+WHY.  Three separate open items in this campaign all reduce to the same missing instrument,
+and they were reached from three unrelated directions:
+
+  1. `KILLTEST-idea2.md` section 5, caveat 1.  "The decisive sub-tensor test is impossible
+     with stored data -- the probe never writes per-coordinate signs."  Whether the weights
+     INSIDE a tensor form clusters that cross tensor boundaries is Idea 2's only surviving
+     question, and it is untested.
+  2. CORRECTIONS 89.7 / FINDINGS 61.4-61.5.  *Why* `conv1` and not `conv2`.  Cycle 61 showed
+     the per-TENSOR z time series IS recoverable from the cumulative moments already stored
+     (`analysis/c61_z_timecourse.py`) and used it -- and the answer was the pre-registered
+     NULL: the exception leaves no signature in the tensor MEAN.  That is expected under H_B,
+     because a spatial mean over rows destroys within-tensor structure by construction.  The
+     question needs a per-ROW or per-COORDINATE series, which nothing on disk has.
+  3. Direction C, the headline measurement.  "53.1% of 11.17M per-weight meta-gradients agree
+     in sign" is a statement about COORDINATES, but every correlation-structure statistic the
+     campaign has been able to compute is at tensor or row granularity.
+
+One ~15-line addition serves all three.
+
+WHAT THIS ADDS.  Two arrays, both written beside `probe.jsonl`, neither touching the jsonl
+schema -- so every existing reducer keeps working byte-identically (CORRECTIONS 18 is what
+that rule is for):
+
+  * `coord_signs.npy`  [n_written, k] int8 in {-1, 0, +1}
+        The sign of the meta-gradient at k FIXED coordinates, one row per probe record.
+        The coordinate set is drawn ONCE with a fixed seed and saved as `coord_idx.npy`, so
+        the same weights are tracked for the whole run and are mappable to (tensor, row) by
+        the cumulative-size map `analysis/c59_row_premise.py::build_index` already validates
+        (gates A0/A1/A2).  This gives within-tensor, across-tensor and across-block PAIRWISE
+        agreement at true coordinate granularity, which is the statistic Idea 2 is about and
+        the one 61.5 could not reach.
+  * `tensor_signs.npy` [n_written, n_tensors, 3] int64 -> (n_neg, n_zero, n_total)
+        The EXACT within-tensor sign split, size-weighted, no subsampling and no modelling.
+        This is KILLTEST section 5's item (a), and it is exact rather than estimated.
+
+WHY NOT IN THE JSONL.  CORRECTIONS 18 records what happens when a probe field looks
+interchangeable across format generations and is not: a 7pp disagreement that was nearly
+published.  Adding fields to `rec` would create a third format generation and every reducer
+would need a new guard.  Separate sidecars with their own meta file cannot be confused with
+anything, and `probe.jsonl` stays bit-identical to every earlier batch.
+
+COST.  k=20,000 tracked coordinates at 2,000 records = 40 MB int8 per run; the tensor split
+is 62*3*2000*8 = 3 MB.  One GPU->CPU sync per probe RECORD (not per step), so at PROBE=25 it
+is 1/25th of the step rate.  Compute is a single gather plus one sign() over the 20k subset,
+plus n_tensors reductions that are already the same order as the existing frac_neg pass.
+
+INERTNESS.  Pure read-only accumulation inside the existing emission block, which is inside
+`torch.no_grad()` and already runs after meta_update.  It never touches z, beta or optimizer
+state.  Gated on PROBE6=1, so a PROBE-only or PROBE5-only run stays byte-identical to every
+earlier batch.  It is inserted at the SAME anchor PATCH_PROBE5 uses and composes with it.
+
+DECISION RULE, pre-registered here per KILLTEST section 5 and not to be edited after data:
+measure within-tensor and across-tensor pairwise agreement against the circular-shift null.
+  * across-tensor dependence <= 0.1 pp above the null  -> Idea 2 is DEAD OUTRIGHT and the
+    sign-agreement statistic belongs in the measurement paper as a characterisation only.
+  * > ~0.5 pp AND the surviving pairs are NOT concentrated at |delta block| = 1  -> Idea 2
+    has a target and differentiator (ii) survives.
+  * anything between  -> UNDECIDED, and it is written that way, not rounded to a verdict.
+"""
+import sys, os
+
+P = os.environ.get(
+    "HF_PATH",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/"
+    "MetaOptimize/cifar10/Optimizers/HF.py")
+src = open(P).read()
+
+if "PATCH_PROBE6" in src:
+    print("ALREADY_PATCHED")
+    sys.exit(0)
+
+# Same anchor PATCH_PROBE5 uses.  `zall` is the arm's OWN partition vector: 62 entries
+# layerwise, 14,420 nodewise, 11.17M weightwise.  `z` is the per-parameter-tensor list on
+# the weightwise/nodewise arms and a 1-element list elsewhere.
+anchor = ("        frac_neg = (zall < 0).sum().item() / max(n_tot, 1)\n"
+          "        frac_zero = (zall == 0).sum().item() / max(n_tot, 1)\n")
+assert src.count(anchor) == 1, f"anchor count={src.count(anchor)} -- refusing to patch"
+
+add = '''        # --- PATCH_PROBE6: per-coordinate sign series + exact per-tensor sign split ---
+        if os.environ.get('PROBE6', '') == '1':
+            import numpy as _np6
+            _k6 = min(int(os.environ.get('PROBE6_K', '20000')), int(n_tot))
+            if getattr(self, '_p6_idx', None) is None or self._p6_n_tot != int(n_tot):
+                _g6 = torch.Generator(device='cpu')
+                _g6.manual_seed(int(os.environ.get('PROBE6_SEED', '0')))
+                self._p6_idx = torch.randperm(int(n_tot), generator=_g6)[:_k6].to(zall.device)
+                self._p6_n_tot = int(n_tot)
+                self._p6_sig = []
+                self._p6_tns = []
+                self._p6_n = 0
+                _np6.save(os.path.join(self._probe_dir, 'coord_idx.npy'),
+                          self._p6_idx.detach().cpu().numpy().astype('int64'))
+            self._p6_sig.append(
+                torch.sign(zall[self._p6_idx]).to(torch.int8).detach().cpu().numpy())
+            self._p6_tns.append(_np6.asarray(
+                [[int((zi < 0).sum()), int((zi == 0).sum()), int(zi.numel())] for zi in z],
+                dtype='int64'))
+            self._p6_n += 1
+            _e6 = int(os.environ.get('PROBE6_WRITE_EVERY', '20'))
+            if self._p6_n % max(_e6, 1) == 0:
+                for _nm6, _buf6 in (('coord_signs', self._p6_sig), ('tensor_signs', self._p6_tns)):
+                    _t6 = os.path.join(self._probe_dir, _nm6 + '.npy.tmp')
+                    _d6 = os.path.join(self._probe_dir, _nm6 + '.npy')
+                    # numpy.save APPENDS '.npy' to a STRING path that does not already end
+                    # in it, so a '.npy.tmp' path becomes '.npy.tmp.npy' and the os.replace
+                    # below raises FileNotFoundError.  This is the exact bug PATCH_PROBE5
+                    # shipped with and patch_probe5_fix.py repaired in cycle 47; handing
+                    # numpy an open file OBJECT suppresses the extension logic and keeps
+                    # the atomic write-then-rename semantics.  Do not "simplify" this back.
+                    with open(_t6, 'wb') as _fh6b:
+                        _np6.save(_fh6b, _np6.stack(_buf6))
+                    os.replace(_t6, _d6)
+                with open(os.path.join(self._probe_dir, 'coord_meta.json'), 'w') as _fh6:
+                    json.dump({'n_records': int(self._p6_n), 'n_tot': int(n_tot),
+                               'k': int(_k6), 'n_tensors': len(z),
+                               'seed': int(os.environ.get('PROBE6_SEED', '0')),
+                               'probe_every': int(self._probe_every),
+                               'stepsize_type': self.stepsize_type}, _fh6)
+'''
+
+src = src.replace(anchor, anchor + add, 1)
+
+# `json` is imported at the top of _probe as `import json, os`; assert that so the inserted
+# block cannot reference a name that is not bound.
+assert "import json, os" in src, "expected `import json, os` inside _probe"
+
+open(P, "w").write(src)
+print("PATCHED PATCH_PROBE6 ->", P)

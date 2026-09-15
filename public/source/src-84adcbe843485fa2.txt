@@ -1,0 +1,344 @@
+#!/bin/bash
+# =============================================================================
+# c75_tuned_agreement_ladder.sh -- `at1`, THE ALL-RUNGS-TUNED AGREEMENT LADDER.
+# Runs on cluster_a.  6 jobs: blk6 @ ms=1e-4 and nodewise @ ms=3e-4, seeds 0-2.
+#
+# WHY THIS BATCH EXISTS
+#   `tw0` (cycle 74/75) put the instrument on three rungs at ms=1e-4 and produced
+#   the campaign's FIRST CLEAN N_eff/m reading -- all 9 arms box-free at BOTH
+#   guards, argmin `w` DECIDED at gap/SE 22.75.  But ms=1e-4 is the argmax for
+#   weightwise, layerwise and scalar and NOT for nodewise, whose own argmax over
+#   its swept grid is 3e-4.  So tw0's agreement curve pairs two TUNED rungs with
+#   one MISTUNED one, and 72.1b is the standing warning that a granularity
+#   contrast read at a shared ms measures distance-from-optimum, not granularity.
+#   `blk6` (m=6) has tuned ACCURACY in the same 13-axis cell (92.652) but has
+#   never been probed there at all, so the coarse end of the agreement curve is
+#   missing entirely.
+#
+#   This batch closes both gaps.  With it, all FOUR instrumented rungs sit at
+#   their OWN argmax in ONE matched cell:  blk6 6 @1e-4, lay 62 @1e-4,
+#   node 14420 @3e-4, w 11173962 @1e-4.
+#
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+#
+#   A0    VALIDITY.  n_records == 10000 (100 ep x 500 steps / stride 5) on every
+#         dir; n_beta == {blk6 6, node 14420} on EVERY record, not just record 0;
+#         beta moved; epochs_done == epochs_requested == 100.
+#
+#   A0.2  THE INSTRUMENT FIRED.  neg_counts.json present, n_tot == n_beta for the
+#         rung, neg_counts.npy shape == (n_tot,) READ FROM ITS HEADER.  This is
+#         bf8's failure (PROBE=5 exported, PROBE5=1 never) and c74_bf9_score's
+#         own first-draft failure (shape inferred from size assuming int64; the
+#         array is int32).  STANDING RULE (19).
+#
+#   A0.3  BOX-FREE AT BOTH GUARDS, per seed, c52_boxfree.occupancy, the PUBLISHED
+#         rec_-based 5% gate, PRIMARY and UNCHANGED.  coord_lo/coord_hi reported
+#         ALONGSIDE and NEVER the gate (CORRECTIONS 102.4).  tw0 measured 0.0000
+#         on all four columns for all 9 arms in THIS box at 100 ep, so a bind
+#         here would be a property of these two rungs, not of the box.
+#
+#   A1    ACCURACY REPRODUCTION.  **CAN ONLY VOID.**  Bar |diff| <= 0.50 pp
+#         (STANDING RULE 9's level bar), per arm, against the SAME 13-axis cell:
+#             blk6 @1e-4  vs  rs-blk6-1e4  = 92.652  (n=2)
+#             node @3e-4  vs  rs-/hz9-node-3e4 = 92.450  (n=5)
+#         FAILS -> the probe perturbed training and A2 is not a statement about
+#         the tuned ladder.  tw0's T2 already measured this bar as +0.219 pp on
+#         weightwise, so the probe is expected to be inert; this MEASURES it
+#         again on two rungs where it has not been measured.
+#
+#   A2    **THE REGISTERED OUT-OF-SAMPLE PREDICTION.  THIS IS WHY THE BATCH RUNS.**
+#         Sign agreement `a_raw` (neff_instrument.agreement_stats, steady half,
+#         the same reducer every published number came through) is a MONOTONE
+#         DECREASING function of the group count m across the tuned ladder.
+#         Already measured at tw0, and NOT re-derivable from this batch:
+#             lay  m=62         a_raw = 0.65693
+#             node m=14420      a_raw = 0.53836   (at ms=1e-4, MISTUNED)
+#             w    m=11173962   a_raw = 0.50117
+#         **PREDICTS: blk6 (m=6) a_raw > 0.65693**, i.e. above layerwise.
+#         **PREDICTS: node@3e-4 (m=14420) a_raw strictly inside (0.50117, 0.65693).**
+#         REFUTES if blk6 <= layerwise, or if node@3e-4 leaves that interval.
+#         A refutation means agreement is NOT a function of block size alone and
+#         the mechanism story for the weightwise accuracy deficit loses its
+#         proposed carrier.
+#
+#   A2b   **THE ms CONTROL THAT A2 MAKES POSSIBLE, AND ITS DIRECTION IS NOT
+#         REGISTERED.**  node@3e-4 vs node@1e-4 (0.53836) is the SAME m at two
+#         meta-stepsizes.  If they agree, `a_raw` is a function of m and not of
+#         ms, which is what A2's monotone reading assumes.  If they differ
+#         materially, THAT is the finding and A2's curve must be re-read as a
+#         joint function of (m, ms).  No direction is registered because no
+#         measurement of this contrast exists to predict from; registering one
+#         would be theatre.
+#
+#   A3    THE ACCURACY LADDER'S ARGMAX.  **REPLICATION, NOT DISCOVERY.**  The
+#         five-rung tuned ladder in this cell currently peaks at layerwise
+#         (scalar 92.262, blk6 92.652, lay 92.887, node 92.450, w 91.146).  That
+#         peak was observed POST HOC.  These 6 jobs raise blk6 from n=2 to n=5
+#         and node from n=5 to n=8, which is what decides whether the interior
+#         peak is resolved.  A confirmation REPLICATES a post-hoc window and IS
+#         NEVER A DISCOVERY.
+#
+# WHAT THIS BATCH DELIBERATELY DOES NOT DO
+#   * It does NOT add a rung between node (14420) and w (11173962).  The
+#     optimizer supports only scalar / blockwise-of-LAYERS / layerwise /
+#     nodewise / weightwise, so `blockwise` is COARSER than layerwise and cannot
+#     interpolate the fine end.  Reaching into that 3-decade gap needs a patch to
+#     HF.py, which is a code change and does not belong in the same batch as a
+#     measurement.
+#   * It does NOT probe scalar.  At m=1 the agreement statistic is degenerate.
+#   * It does NOT re-open the 80-epoch N_eff point (CORRECTIONS 103.4, closed).
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 analysis/c75_tw0_score.py   --selftest     (51/51)
+#   2. python3 analysis/c55_neff_noise.py  --selftest     (51/51)
+#   3. python3 analysis/c52_boxfree.py     --selftest     (27/27)
+#   4. `at1` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   5. plateau5 is PRIMARY.  best_test inflates ~0.37 pp, the size of this effect.
+#
+# USAGE
+#   bash c75_tuned_agreement_ladder.sh            # dry run: prints every sbatch line
+#   bash c75_tuned_agreement_ladder.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/at1
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=$(whoami)
+
+NJOBS=6
+CLIP=-15:-2.3026               # tw0's box EXACTLY -- not a new box
+EPOCHS=100
+WALL=03:50:00
+WRITE_EVERY=500                # as bd7, bf9 and tw0 used
+EXP_RECORDS=10000              # 100 ep x 500 steps / stride 5
+
+# The two arms, each at its OWN argmax over its own swept grid.  Guard 2b
+# re-derives both FROM THE CSV rather than trusting these strings.
+BLK_MS=1e-4
+NODE_MS=3e-4
+
+# The repo path is passed IN, never derived from __file__ inside a heredoc:
+# heredoc-fed python has __file__ == '<stdin>' and resolves against CWD, which
+# silently read a stale Aug-20 CSV once already (CORRECTIONS 101.11).
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  at1 -- the ALL-RUNGS-TUNED agreement ladder, WITH the probe"
+echo "    blk6 @ ms=$BLK_MS  and  nodewise @ ms=$NODE_MS"
+echo "    BETA_CLIP=$CLIP fixed, ${EPOCHS}ep, seeds 0,1,2 = $NJOBS jobs"
+echo "    A2 is the registered out-of-sample gate: a_raw MONOTONE in m,"
+echo "    blk6 > lay's 0.65693 and node@3e-4 inside (0.50117, 0.65693)."
+echo "=============================================================="
+
+# ---------------------------------------------------------------------------
+# GUARD 0 -- the things that must simply exist.
+# ---------------------------------------------------------------------------
+[ -f "$CSVP" ] || { echo "GUARD FAIL: no CSV at $CSVP"; exit 1; }
+[ -x "$RUNNER" ] || [ -f "$RUNNER" ] || { echo "GUARD FAIL: no runner at $RUNNER"; exit 1; }
+echo "guard 0: runner and CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# ---------------------------------------------------------------------------
+# GUARD 1 -- THE PATCH IS PRESENT **AND ENABLED**.  STANDING RULE (19).
+# Identical in structure to tw0's guard 1, and it diffs this script's export
+# line against tw0's -- the batch CONFIRMED to have fired 9/9 (n_tot correct,
+# npy shape correct, read from the header).
+# ---------------------------------------------------------------------------
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || exit 1
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent -- the patched optimizer is not where the "
+             "runner imports it from" % hf)
+src = open(hf).read()
+if "PROBE5" not in src:
+    sys.exit("GUARD FAIL: HF.py carries no PROBE5 gate -- patch_probe5.py is not applied")
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the ==\"1\" form this script "
+             "exports for.  Read the patch before assuming the variable name.")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+
+# --- this script's own export line (a self-reading guard must not match itself)
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+line = mine[0]
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in line:
+        sys.exit("GUARD FAIL: this script's --export line is missing %r.  That is "
+                 "EXACTLY bf8's bug: the stride without the instrument." % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+
+# --- diff against tw0, the batch CONFIRMED to have fired 9/9
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+if not os.path.exists(tw0):
+    sys.exit("GUARD FAIL: tw0's script is absent, so there is nothing to diff against")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(ref) != 1:
+    sys.exit("GUARD FAIL: could not isolate tw0's export line")
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+if keys(line) != keys(ref[0]):
+    sys.exit("GUARD FAIL: export KEYS differ from tw0's confirmed-firing line:\n"
+             "  at1: %s\n  tw0: %s" % (keys(line), keys(ref[0])))
+print("guard 1c: export keys identical to tw0's CONFIRMED-FIRING line  %s" % keys(line))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# GUARD 2 -- THE 13-AXIS SIGNATURE, re-derived FROM THE CSV, never from a
+# comment (STANDING RULE 1, 15).  A1 compares this batch's accuracy against rows
+# in that cell, so a mismatch makes the comparison meaningless.
+# ---------------------------------------------------------------------------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$BLK_MS" "$NODE_MS" <<'PYEOF' || exit 1
+import csv, sys, statistics
+csvp, clip, epochs, blk_ms, node_ms = sys.argv[1:6]
+rd = list(csv.DictReader(open(csvp)))
+AX = ['network','dataset','batch_size','base','meta','alpha0','gamma',
+      'augment','beta_clip','hier','lam','eta_ratio','epochs_done']
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row -- cannot derive the signature")
+sig = {a: ref[0][a] for a in AX}
+mine = {'network':'ResNet18','dataset':'CIFAR10','batch_size':'100','base':'SGDm',
+        'meta':'Lion','alpha0':'1e-3','gamma':'1','augment':'1',
+        'beta_clip':clip,'epochs_done':epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a,m,s in bad: print("  axis %s: this batch %r vs reference %r" % (a,m,s))
+    sys.exit("GUARD FAIL: at1 does not match the ladder's axis signature")
+for a in ('hier','lam','eta_ratio'):
+    if sig[a] not in ('','na'):
+        sys.exit("GUARD FAIL: reference has %s=%r; this batch sets no hierarchical "
+                 "operator, so it is not the same arm" % (a, sig[a]))
+print("guard 2: all 13 axes match the rs-lay-1e4 signature read FROM THE CSV")
+
+# --- guard 2b: each arm's ms must REALLY be that rung's argmax over its own
+# swept grid, IN THIS CELL, re-derived here rather than trusted from a comment.
+def cell(gran):
+    out = {}
+    for r in rd:
+        if r.get('granularity') != gran: continue
+        if not r.get('plateau5','').strip(): continue
+        if any(r.get(a,'') != sig[a] for a in AX): continue
+        out.setdefault(r['meta_stepsize'], []).append(float(r['plateau5']))
+    return out
+
+for gran, want, label in (('resnet18_blocks', blk_ms, 'blk6'),
+                          ('nodewise',        node_ms, 'node')):
+    c = cell(gran)
+    if len(c) < 3:
+        sys.exit("GUARD FAIL: %s has only %d swept ms rungs in this cell -- an "
+                 "argmax over that is not an argmax" % (label, len(c)))
+    best = max(c, key=lambda k: statistics.mean(c[k]))
+    grid = sorted(c, key=float)
+    if best in (grid[0], grid[-1]):
+        sys.exit("GUARD FAIL: %s's argmax ms=%s is at a grid EDGE (grid %s).  An "
+                 "edge argmax means the grid is wrong, not that the rung is tuned."
+                 % (label, best, grid))
+    if float(best) != float(want):
+        sys.exit("GUARD FAIL: %s's argmax over its swept grid is ms=%s (%.3f), not "
+                 "the %s this script sets.  Do not submit a 'tuned' arm at an ms "
+                 "the data does not pick." % (label, best, statistics.mean(c[best]), want))
+    print("guard 2b: %-5s argmax ms=%-6s plateau5=%.3f (n=%d), INTERIOR in grid %s"
+          % (label, best, statistics.mean(c[best]), len(c[best]), grid))
+
+# --- guard 2c: A1's reference values must exist and be what the header claims.
+for label, gran, ms, want, n_want in (('blk6','resnet18_blocks',blk_ms,92.652,2),
+                                      ('node','nodewise',       node_ms,92.450,5)):
+    v = cell(gran).get(ms, [])
+    if len(v) != n_want:
+        sys.exit("GUARD FAIL: A1's %s reference should have n=%d, CSV has n=%d"
+                 % (label, n_want, len(v)))
+    got = statistics.mean(v)
+    if abs(got - want) > 0.001:
+        sys.exit("GUARD FAIL: A1's %s reference is %.3f in the CSV, not the %.3f "
+                 "this script registered" % (label, got, want))
+    print("guard 2c: A1 reference %-5s = %.3f (n=%d)  as registered" % (label, got, len(v)))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# GUARD 3 -- the box is registered in the SHARED registry BEFORE any job runs,
+# or c55/scoring silently SKIPS the root (T4's rule, carried forward).
+# ---------------------------------------------------------------------------
+python3 - "$REPO" "$CLIP" <<'PYEOF' || exit 1
+import sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if "at1" not in c55.BOXES:
+    sys.exit("GUARD FAIL: `at1` is not registered in c55_neff_noise.BOXES.  Register "
+             "it from THIS script's CLIP= line BEFORE submitting, or the root is "
+             "silently skipped at scoring time.")
+lo, hi, prov = c55.BOXES["at1"]
+want_lo, want_hi = (float(x) for x in clip.split(":"))
+if (lo, hi) != (want_lo, want_hi):
+    sys.exit("GUARD FAIL: c55 registers at1 as (%s, %s) but this script's CLIP= is "
+             "(%s, %s)" % (lo, hi, want_lo, want_hi))
+print("guard 3: at1 registered as (%.1f, %.4f) from %s" % (lo, hi, prov))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# GUARD 4 -- disk.  blk6 and nodewise probes are small (tw0's node dirs were
+# 109 MB, its lay dirs 55 MB); no weightwise arm is in this batch.
+# ---------------------------------------------------------------------------
+python3 - "$WS" <<'PYEOF' || exit 1
+import shutil, sys
+ws = sys.argv[1]
+free_gb = shutil.disk_usage(ws).free / 1e9
+need_gb = 3 * 0.110 + 3 * 0.055
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed and this guard wants 20x"
+             % (free_gb, need_gb))
+print("guard 4: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# ---------------------------------------------------------------------------
+# GUARD 5 -- queue depth.  6 jobs is well inside the ~20-job / 0.5%-RawUsage rule.
+# ---------------------------------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: FairShare=${FS:-unknown} (informational), pending=$PEND, adding $NJOBS"
+if [ "$PEND" -gt 40 ]; then
+  echo "GUARD FAIL: $PEND already pending, over the 40 cap"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for ARM in "resnet18_blocks:blk6:$BLK_MS" "nodewise:node:$NODE_MS"; do
+  G="${ARM%%:*}"; REST="${ARM#*:}"; SHORT="${REST%%:*}"; MST="${REST##*:}"
+  for S in 0 1 2; do
+    RN="at1-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_at1_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "$G" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+exit 0

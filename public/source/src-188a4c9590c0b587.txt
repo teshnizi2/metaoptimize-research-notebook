@@ -1,0 +1,54 @@
+set -e
+cd /cluster/account_a/metaopt
+R=/cluster/account_a/metaopt/runs
+# CYCLE 19.
+# E2: extend the scale ladder past ResNet34. The axis that matters is N (the number of
+#     layerwise groups), and bottleneck nets jump it: R34 ~36 conv layers, R50 ~53,
+#     R101 ~104. Run BOTH alpha0 so the ladder is never again single-alpha0 (the
+#     confound E1 is testing on R10/R18/R34).
+# E3: ResNet34 seeds 3,4 at alpha0=1e-6 -> n=5 on what is now a headline row.
+# HIER MUST STAY UNSET on non-hierarchical arms: HF.py does
+#   self._hier = os.environ.get('HIER','')  then  `if self._hier:`
+# so HIER=none is TRUTHY and would silently enable the hierarchy branch.
+PARTS_SHORT=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+PARTS_LONG=gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+C="BETA_CLIP=-15:-2.3026"
+BASE="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset CIFAR10 --batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --num-epochs 100"
+
+# $1=name $2=NN $3=groups $4=seed $5=alpha0 $6=extra-env $7=parts $8=time $9=savedir
+sub(){ sbatch --parsable --job-name=$1-s$4 --partition=$7 --gres=gpu:1 \
+  --cpus-per-task=6 --mem=14G --time=$8 \
+  --export="ALL,AUGMENT=1,$C$6" \
+  jobs/run_cifar.sh $BASE --alpha0 $5 --NN-name $2 --stepsize-groups $3 --seed $4 \
+  --save-directory $9 --run-name $1-s$4 >/dev/null; }
+
+ADD=",HIER=additive,ETA_RATIO=0.06"
+# ---- E2: ResNet50 (fits gpu-short) ----
+for s in 0 1; do
+  for a in 1e-6 1e-3; do
+    t=$(echo $a | tr -d '.-'); 
+    sub sc50-$t-scal  ResNet50 scalar    $s $a ""    $PARTS_SHORT 03:50:00 $R/sc50
+    sub sc50-$t-layer ResNet50 layerwise $s $a ""    $PARTS_SHORT 03:50:00 $R/sc50
+    sub sc50-$t-add   ResNet50 layerwise $s $a "$ADD" $PARTS_SHORT 03:50:00 $R/sc50
+  done
+done
+# ---- E2: ResNet101 (too long for gpu-short's 4h cap) ----
+for s in 0 1; do
+  for a in 1e-6 1e-3; do
+    t=$(echo $a | tr -d '.-')
+    sub sc101-$t-scal  ResNet101 scalar    $s $a ""    $PARTS_LONG 07:30:00 $R/sc101
+    sub sc101-$t-layer ResNet101 layerwise $s $a ""    $PARTS_LONG 07:30:00 $R/sc101
+    sub sc101-$t-add   ResNet101 layerwise $s $a "$ADD" $PARTS_LONG 07:30:00 $R/sc101
+  done
+done
+# ---- E3: ResNet34 to n=5 at alpha0=1e-6 (same names/dir as existing sc-ResNet34-*) ----
+for s in 3 4; do
+  sub sc-ResNet34-scal  ResNet34 scalar    $s 1e-6 ""     $PARTS_SHORT 03:50:00 $R/sc
+  sub sc-ResNet34-layer ResNet34 layerwise $s 1e-6 ""     $PARTS_SHORT 03:50:00 $R/sc
+  sub sc-ResNet34-add   ResNet34 layerwise $s 1e-6 "$ADD" $PARTS_SHORT 03:50:00 $R/sc
+done
+sleep 3
+echo "E2_R50=$(squeue -h -u account_a -o '%j' | grep -c '^sc50-')"
+echo "E2_R101=$(squeue -h -u account_a -o '%j' | grep -c '^sc101-')"
+echo "E3_R34_new=$(squeue -h -u account_a -o '%j' | grep -cE '^sc-ResNet34-.*-s[34]$')"
+echo "TOTAL_QUEUE=$(squeue -h -u account_a | wc -l)"

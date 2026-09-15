@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cJ1_cbl1_score.py -- THE REGISTERED SCORER FOR `cbl1`, THE COUNT LADDER AND
+#                      THE BALANCE LADDER, SCORED AS ONE BATCH.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any cbl1 run exists.
+# Every bar, band, gate, statistic and refusal below is frozen here.
+# --selftest RE-DERIVES every archived constant from results/all_runs.csv,
+# re-derives every partition's size vector and balance from its own spec string,
+# asserts that the corpus contains ZERO cbl1 rows at registration time, and
+# cross-checks each constant against bin/cJ1_count_balance_ladder.sh's OWN TEXT
+# so registration and batch cannot drift.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments (--runs, --manifest, --hb1-runs, --selftest) is NOT
+# editing it.  Once a cbl1 run exists this file is frozen for good.
+#
+# =============================================================================
+# WHERE THIS COMES FROM
+# =============================================================================
+# `hb1` (18 jobs, CIFAR-100, one submission, scored by its own registered scorer
+# UNEDITED) tested the head/backbone account and returned REFUTED-SMALL.  Its
+# ladder, re-derived here by running that scorer -- not quoted from prose:
+#
+#     arm    groups            m     plateau5   CAPTURE
+#     scal   scalar             1     22.841    +0.0000
+#     head   [60,2]             2     24.775    +0.0412
+#     stem   [2,60]             2     22.709    -0.0028
+#     mid    [31,31]            2     32.995    +0.2165
+#     blk    resnet18_blocks    6     53.261    +0.6486
+#     lay    layerwise         62     69.745    +1.0000
+#
+# SPEC = CAP_HEAD - max(control) = -0.1753.  The head split is five times worse
+# than an arbitrary midpoint split.  Two things survive that batch, and this one
+# measures them:
+#
+#   (a) CAPTURE rises with the group COUNT m: 0 -> 0.2165 -> 0.6486 -> 1.0000 at
+#       m = 1, 2, 6, 62.  Four points, two of them fixed at 0 and 1 by
+#       construction, is not a curve.
+#   (b) At FIXED m = 2, WHERE the cut goes matters: [31,31] captures 0.2165
+#       while [60,2] captures 0.0412 and [2,60] captures -0.0028.
+#
+# (a) and (b) are rival accounts of the same six numbers.  This batch separates
+# them by varying ONE at a time inside a SINGLE submission -- BATCH is the unit
+# of replication (F(62,85)=5.47, p 6.9e-13; SEED is null, F 1.21, p 0.213), so
+# every contrast below is WITHIN batch and no cross-batch difference is ever
+# used as evidence.
+#
+# =============================================================================
+# NO CODE PATCH.  VERIFIED ON THE LIVE MODEL BEFORE THIS FILE EXISTED
+# =============================================================================
+# Optimizers/HF.py::polish_the_stepsize_groups already accepts an explicit int
+# list given as the STRING "[a,b,...]", cuts the parameter tensors into
+# CONTIGUOUS groups of those sizes in named_parameters() order, and refuses
+# (0/0) unless the sizes sum to the tensor count.  init_meta routes any
+# unrecognised string to `blockwise`.  Executed against the live
+# ResNet18_c100 on cluster_b (account_b) by reading net.named_parameters() rather
+# than assuming an ordering:
+#
+#     NUM_PARAM_TENSORS = 62,  TOTAL_PARAMS = 11,220,132
+#     [16,16,15,15]                 -> m= 4  sizes 16,16,15,15
+#     [8,8,8,8,8,8,7,7]             -> m= 8  sizes 8x6,7x2
+#     [4 x14, 3,3]                  -> m=16  sizes 4x14,3x2
+#     [2 x30, 1,1]                  -> m=32  sizes 2x30,1x2
+#     [31,31] [45,17] [55,7] [60,2] [17,45]  -> m= 2
+#     resnet18_blocks               -> m= 6  sizes 3,12,15,15,15,2
+#
+# The launcher re-runs that live-model check at submission time and writes
+# PARTITION-MANIFEST.txt; GATE G1 below REFUSES to score a batch whose manifest
+# does not reproduce every registered size vector.  Without it, "m = 8" is a
+# claim about a string, not about a network.
+#
+# =============================================================================
+# THE DESIGN.  33 jobs, ONE submission
+# =============================================================================
+# A.  THE COUNT LADDER -- balanced partitions, m = 1, 2, 4, 8, 16, 32, 62.
+#
+#     c01  scalar                     m= 1   B = 1.00000   anchor
+#     c02  [31,31]                    m= 2   B = 1.00000
+#     c04  [16,16,15,15]              m= 4   B = 0.99962
+#     c08  [8,8,8,8,8,8,7,7]          m= 8   B = 0.99923
+#     c16  [4x14,3,3]                 m=16   B = 0.99859
+#     c32  [2x30,1,1]                 m=32   B = 0.99729
+#     c62  layerwise                  m=62   B = 1.00000   anchor
+#
+#     Geometric in m, so the seven points are evenly spaced in log2 m
+#     (0,1,2,3,4,5,5.954) -- the spacing a log-m law would need to be tested at.
+#     m=1 and m=62 are run IN BATCH even though archived values exist; that is
+#     what makes the ladder within-batch rather than a splice.
+#
+# B.  THE BALANCE LADDER -- fixed m = 2, the cut moved along the tensor order.
+#
+#     c02  [31,31]   B = 1.00000     (shared with the count ladder)
+#     b45  [45,17]   B = 0.84742
+#     b17  [17,45]   B = 0.84742     MIRROR CONTROL of b45
+#     b55  [55,7]    B = 0.50861
+#     b60  [60,2]    B = 0.20559     (the hb1 `head` arm, re-run in batch)
+#
+#     x seed in {0,1,2}.  11 arms x 3 seeds = 33 jobs.
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / meta-stepsize 1e-3 /
+#   alpha0 1e-6 / 100 epochs / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 /
+#   AUGMENT=1 / HIER unset / PROBE=0.  Matched cell-for-cell to hb1 and to the
+#   archived CIFAR-100 rows, so the two batches compose.
+#
+# WHY b17 EXISTS, disclosed before the data.  With contiguous groups and the
+# second group always taken as the TAIL, balance and cut POSITION are perfectly
+# collinear at m = 2: [45,17], [55,7], [60,2] are simultaneously more imbalanced
+# AND cut further along the network.  b17 = [17,45] has the SAME balance as b45
+# and the OPPOSITE cut position.  If balance is the operative variable the two
+# must agree; if cut position is, they must not.  Without b17 the balance
+# statistic registered below would be untestable against its only serious rival
+# inside this batch.  hb1's [2,60] vs [60,2] (+0.0412 vs -0.0028 at identical
+# balance) is the cross-batch version of the same check and is DESCRIPTIVE only.
+#
+# =============================================================================
+# THE PRIMARY STATISTIC, FROZEN
+# =============================================================================
+#   plateau5 = mean of the LAST 5 test epochs.  The CSV `plateau` column
+#   (mean-of-last-20) is BANNED as primary and is never read by this file;
+#   `best_test` is not a plateau and is never read either.  train5 = mean of the
+#   last 5 TRAIN epochs, reported for every arm because hb1 established the
+#   scalar failure is train-side (train5 scal 23.037 vs lay 98.960): a count law
+#   must be checked on FITTING, not only on generalisation.
+#
+#   CAPTURE(arm) = ( M(arm) - M(c01) ) / ( M(c62) - M(c01) )   on plateau5,
+#   both anchors measured IN BATCH.  CAPTURE(c01) = 0 and CAPTURE(c62) = 1 by
+#   construction; the science is entirely in the interior.
+#
+#   DISCLOSED CONFOUND, not discovered later: the two anchors use the `scalar`
+#   and `layerwise` code paths in HF.init_meta while every interior arm uses the
+#   `blockwise` path.  [62] and [1]x62 are not run.  This is inherited from the
+#   archive and from hb1 so that G3 can compare like with like; it rescales
+#   CAPTURE but cannot reorder the interior arms, which all share one path.
+#
+# =============================================================================
+# THE IMBALANCE STATISTIC, CHOSEN AND JUSTIFIED BEFORE ANY RUN EXISTS
+# =============================================================================
+#   B(g) = H(p) / log(m),   p_i = |g_i| / 62,   H(p) = -sum p_i log p_i,
+#   with B := 1 when m = 1.  Normalised entropy of the GROUP-SIZE distribution.
+#   B = 1 is a perfectly even split; B -> 0 is maximal imbalance.
+#
+#   Four reasons, all stated before the fact:
+#     1. It is defined for EVERY m, so the count ladder and the balance ladder
+#        live on one axis and "count at fixed balance" is a statement with a
+#        number attached (every count-ladder arm has B >= 0.99729).
+#     2. It is DIRECTION-BLIND: [60,2] and [2,60] receive the same B = 0.20559.
+#        That is what the word "balance" means, and it is a risk, not a
+#        convenience -- hb1 measured those two arms at +0.0412 and -0.0028, and
+#        b17 tests the same thing in batch.  A statistic that could not be wrong
+#        here would not be worth registering.
+#     3. It is maximised exactly at the even split, which is the thing the
+#        balance ladder is asking about.
+#     4. It was not chosen from these data: no cbl1 run exists.  The obvious
+#        rival, the size RATIO max/min (1.00, 2.65, 2.65, 7.86, 30.00), is
+#        recorded below as SECONDARY DESCRIPTIVE and may NOT replace B after the
+#        fact, whichever of the two draws the prettier curve.
+#
+# =============================================================================
+# THE COUNT LAW, STATED SO IT CAN DIE
+# =============================================================================
+# "Capture rises with m" is close to unfalsifiable as written: CAPTURE is 0 at
+# m=1 and 1 at m=62 BY CONSTRUCTION, so any interior value whatsoever is
+# consistent with "it rises".  The registered law is therefore three claims,
+# each with its own refutation:
+#
+#   L1  MONOTONE.   CAPTURE is non-decreasing along m = 1,2,4,8,16,32,62 at
+#                   B ~ 1.
+#   L2  NOT FLAT.   The count effect is real in magnitude, not merely in sign:
+#                   CAPTURE(c32) - CAPTURE(c02) >= 0.10.  A sixteen-fold
+#                   increase in the group count that buys less than a tenth of
+#                   the gap is a null, however monotone it is.
+#   L3  COUNT DOMINATES BALANCE.  The spread of CAPTURE produced by MOVING the
+#                   cut at fixed m = 2 is smaller than the spread produced by
+#                   MULTIPLYING m at fixed balance.
+#
+# REFUTATION CONDITIONS, frozen, checked in this order:
+#
+#   R1  NONMONOTONE       max adjacent DROP along the count ladder > 0.05.
+#                         Kills L1.  0.05 in CAPTURE units is 2.33 pp, which is
+#                         7.1 SE of a 3-seed difference at the archived noise
+#                         floor -- a reversal, not a wobble.
+#   R2  BALANCE-DOMINATES BAL_RANGE >= CNT_RANGE, where BAL_RANGE is the range
+#                         of CAPTURE over the five m=2 arms and CNT_RANGE the
+#                         range over the six count-ladder arms with m >= 2.
+#                         If shuffling 62 tensors between two groups buys as
+#                         much as multiplying the group count by 31, then COUNT
+#                         is not the operative variable and the ladder in (a)
+#                         was a balance effect wearing a count costume.
+#                         PREDICTION ON RECORD from hb1: BAL_RANGE ~ 0.22 and
+#                         CNT_RANGE ~ 0.78, so R2 needs the observed ratio to be
+#                         3.5x the other way.  This is a real risk.
+#   R3  FLAT              CAPTURE(c32) - CAPTURE(c02) < 0.10.  Kills L2.
+#                         Monotone-but-flat is a REFUTATION, not a confirmation;
+#                         this is the clause that makes L1 non-vacuous.
+#   R4  ANTI-BALANCE      some arm with B < 0.60 beats c02 by more than 0.05.
+#                         The balanced split is then NOT the m=2 maximum and the
+#                         balance half of the briefing is wrong in SIGN.  This
+#                         refutes the balance claim, not the count claim, and is
+#                         reported as its own positive finding.
+#   R5  MIRROR-BREAK      |CAPTURE(b45) - CAPTURE(b17)| > 0.10 at identical
+#                         B = 0.84742.  Then normalised entropy is NOT the
+#                         operative variable -- cut POSITION is -- and the
+#                         registered statistic is DISQUALIFIED as an
+#                         explanation and reported as such.  It is not replaced
+#                         by whichever statistic then fits better; that would be
+#                         choosing the statistic from the data.
+#
+# WHAT DOES NOT COUNT AS REFUTATION, AND EQUALLY DOES NOT COUNT AS RESCUE
+#   * A drop of <= 0.05 anywhere on the count ladder.  Reported with its t, not
+#     promoted to a reversal.
+#   * CAPTURE > 1 at an interior m (some partition beating layerwise).  Allowed,
+#     reported, changes no bar.
+#   * The in-batch c02 or b60 differing from hb1's 0.2165 / 0.0412.  hb1 is
+#     ANOTHER BATCH and batch is the unit of replication; that comparison is
+#     printed as description and is never a gate and never a contrast.
+#   * A pretty fit of some functional form nobody registered.  The two candidate
+#     laws below are named in advance; anything else is a hypothesis for a later
+#     batch, not a result of this one.
+#   * No post-hoc change of statistic, window, scale or imbalance measure.
+#
+# =============================================================================
+# THE TWO CANDIDATE FUNCTIONAL FORMS, NAMED IN ADVANCE, NEVER GATING
+# =============================================================================
+#   LOG law   CAPTURE(m) = log m / log 62
+#             predictions  m=2 0.16795  4 0.33590  8 0.50385  16 0.67180
+#                          32 0.83974
+#   LIN law   CAPTURE(m) = (m-1)/61
+#             predictions  m=2 0.01639  4 0.04918  8 0.11475  16 0.24590
+#                          32 0.50820
+#
+#   Band +/-0.15 per point.  EXPECTATION RECORDED NOW SO THAT AGREEMENT WOULD BE
+#   A SURPRISE RATHER THAN A CONFIRMATION: the LOG law is already in trouble
+#   before this batch runs.  It predicts 0.4341 at m = 6, and hb1's blockwise
+#   arm -- an m = 6 partition, though at B = 0.89585, not balanced -- measured
+#   0.6486, a miss of +0.2145.  If the balanced ladder rises at least as fast,
+#   the LOG law will be REJECTED at m = 4 and/or m = 8 and CAPTURE will turn out
+#   to saturate faster than log m.  The LIN law is already dead at m = 6
+#   (predicts 0.0820).  Both numbers are printed either way.
+#
+#   SATURATION, registered statistic:  M90 = the smallest ladder m in
+#   {2,4,8,16,32} whose CAPTURE >= 0.90, or "none" if only m = 62 reaches it.
+#   Descriptive.  M90 = 2 would mean the count effect is exhausted by a single
+#   binary cut, which would ALSO contradict hb1's [31,31] = 0.2165 and is
+#   flagged COUNT-SATURATES-AT-2 rather than quietly reported.
+#
+# =============================================================================
+# THE TRAIN-SIDE CHECK, REGISTERED, NON-OVERRIDING
+# =============================================================================
+#   TRAINCAP(arm) = ( T(arm) - T(c01) ) / ( T(c62) - T(c01) ) on train5.
+#   hb1 found the scalar failure is a FITTING failure (train5 23.037 vs 98.960),
+#   so the count law is a claim about fitting as well.  T1 TRAIN-TEST-DIVERGENCE
+#   is flagged when the test ladder is monotone (R1 not triggered) but the train
+#   ladder has an adjacent drop greater than 0.05.  It is a named flag; it does
+#   not overturn the primary verdict and it may not be quietly dropped either.
+#
+# =============================================================================
+# THE GATES, IN ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# =============================================================================
+#   G0  PROVENANCE (RULE 20), ABSOLUTELY GATING.  Every arm is MEASURED from the
+#       run's OWN `ARGS:`/`ENV:` lines, never from its filename.  No repeated
+#       flag; dataset CIFAR100; NN-name ResNet18_c100; alpha0 1e-6;
+#       meta-stepsize 1e-3; num-epochs 100; batch-size 100; gamma 1;
+#       alg-base SGDm; alg-meta Lion; AUGMENT=1; BETA_CLIP=-15:-2.3026;
+#       HIER unset; and a --stepsize-groups value that is one of the eleven
+#       registered arm strings.
+#   G1  THE PARTITION GATE.  PARTITION-MANIFEST.txt, written by the launcher
+#       from the LIVE model's named_parameters(), must show 62 tensors and, for
+#       every one of the nine explicit specs, exactly the registered size vector
+#       and therefore the registered m and B.
+#   G2  COMPLETENESS.  >= 95 of 100 epochs and all 5 tail epochs present.  Any
+#       registered arm with fewer than 2 usable seeds VOIDS the batch.
+#   G3  THE ARCHIVE GATE.  In-batch c01 and c62 must land within +/-2.00 pp of
+#       their archived means (22.776 and 69.302).  A miss is VOID-TREE.
+#   G4  THE MANIFOLD GATE.  In-batch (c62 - c01) must be >= 23.263 pp, half the
+#       archived gap.  Without the gap, CAPTURE is a ratio of noise:
+#       VOID-NOMANIFOLD, and no verdict is issued.
+#   G5  THE PRIMARY.  R1..R3 -> the COUNT verdict; R4, R5 -> the BALANCE verdict.
+#   G6  DESCRIPTIVE, NEVER GATING.  Candidate laws, M90, train ladder, size
+#       ratio, and the cross-batch hb1 comparison.
+#
+# =============================================================================
+# WHAT THIS SCORER WILL NOT DO
+# =============================================================================
+#   * It will not read the CSV `plateau` (last-20) column, or `best_test`.
+#   * It will not pool cbl1 with hb1 or with any archived batch to raise n.
+#     Archived rows enter only as G3's and G4's registered comparators and as
+#     the source of the noise floor; hb1 enters only as printed description.
+#   * It will not claim anything about CIFAR-10, Tiny-ImageNet, ImageNet-489,
+#     ResNet-50, alpha0 1e-3, any meta-stepsize but 1e-3, any optimiser pair but
+#     SGDm+Lion, or any hierarchical/shrinkage operator (HIER is unset in every
+#     arm).  In particular it says NOTHING about whether the optimum in m moves
+#     with class count: this batch is CIFAR-100 only, and the CIFAR-10 side of
+#     that observation is a cross-batch pool that no single batch can settle.
+#   * It will not name an optimum in m.  Seven m values on one dataset locate a
+#     shape, not an argmax, and CAPTURE is pinned to 1 at m = 62 by
+#     construction, so this design cannot see m = 62 being beaten except through
+#     an interior CAPTURE > 1, which is reported if it happens and is not
+#     dressed up as an optimum.
+#   * It will not soften a bar after the fact.  If the answer lands in a gap,
+#     the deliverable is the word UNRESOLVED.
+#
+# =============================================================================
+# USAGE
+#   python3 analysis/cJ1_cbl1_score.py --selftest
+#   python3 analysis/cJ1_cbl1_score.py --runs /cluster/account_b/metaopt/runs
+#   python3 analysis/cJ1_cbl1_score.py --runs <dir> --manifest <path>
+#   python3 analysis/cJ1_cbl1_score.py --selftest --hb1-runs <dir with hb1-*.out>
+# =============================================================================
+
+from __future__ import print_function
+
+import argparse
+import collections
+import csv
+import glob
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cJ1_count_balance_ladder.sh")
+
+# ---- FROZEN REGISTRATION ----------------------------------------------------
+PREFIX = "cbl1-"
+NET, DSET = "ResNet18_c100", "CIFAR100"
+MS, ALPHA0, CLIP, AUG = "1e-3", "1e-6", "-15:-2.3026", "1"
+EPOCHS, BATCH, GAMMA = 100, 100, "1"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+SEEDS = (0, 1, 2)
+N_TENSORS = 62
+
+SPEC_C04 = "[16,16,15,15]"
+SPEC_C08 = "[8,8,8,8,8,8,7,7]"
+SPEC_C16 = "[" + ",".join(["4"] * 14 + ["3", "3"]) + "]"
+SPEC_C32 = "[" + ",".join(["2"] * 30 + ["1", "1"]) + "]"
+
+ARMS = collections.OrderedDict([        # tag -> --stepsize-groups value
+    ("c01", "scalar"),
+    ("c02", "[31,31]"),
+    ("c04", SPEC_C04),
+    ("c08", SPEC_C08),
+    ("c16", SPEC_C16),
+    ("c32", SPEC_C32),
+    ("c62", "layerwise"),
+    ("b45", "[45,17]"),
+    ("b17", "[17,45]"),
+    ("b55", "[55,7]"),
+    ("b60", "[60,2]"),
+])
+
+# (tag, m) in ladder order.  c01 and c62 are the CAPTURE anchors.
+COUNT_LADDER = (("c01", 1), ("c02", 2), ("c04", 4), ("c08", 8),
+                ("c16", 16), ("c32", 32), ("c62", 62))
+# every m = 2 arm, in DECREASING balance
+BALANCE_LADDER = ("c02", "b45", "b17", "b55", "b60")
+MIRROR_PAIR = ("b45", "b17")
+ANCHOR_LO, ANCHOR_HI = "c01", "c62"
+
+# archived comparators, ALL re-derived by archived_arms() in --selftest
+ARCH_SCAL = 22.776
+ARCH_BLK = 53.020
+ARCH_LAY = 69.302
+ARCH_GAP = 46.526
+ARCH_BLK_CAPTURE = 0.650
+ARCH_TRAIN_SCAL = 22.97
+ARCH_TRAIN_LAY = 98.96
+SIGMA_W = 0.4034
+SIGMA_DF = 11
+
+# hb1 comparators.  DESCRIPTIVE ONLY -- another batch, never a contrast.
+# Re-derived in --selftest from hb1-*.out when those files are reachable.
+HB1 = {"scal": 22.841, "head": 24.775, "stem": 22.709,
+       "mid": 32.995, "blk": 53.261, "lay": 69.745}
+HB1_SPEC = {"scal": "scalar", "head": "[60,2]", "stem": "[2,60]",
+            "mid": "[31,31]", "blk": "resnet18_blocks", "lay": "layerwise"}
+HB1_MID_CAP = 0.2165
+HB1_HEAD_CAP = 0.0412
+HB1_BLK_CAP = 0.6486
+HB1_BLK_M = 6
+HB1_BLK_B = 0.89585
+
+# bars
+MONO_BAR = 0.05           # R1: an adjacent DROP bigger than this is a reversal
+FLAT_BAR = 0.10           # R3/L2: CAPTURE(c32) - CAPTURE(c02) must clear this
+DOMINANCE_BAR = 0.50      # L3: BAL_RANGE must be under this fraction of CNT_RANGE
+ANTIBAL_BAR = 0.05        # R4: an imbalanced arm beating c02 by more than this
+ANTIBAL_B = 0.60          # "imbalanced" means B below this
+MIRROR_BAR = 0.10         # R5: the mirror pair may not differ by more than this
+BAL_EFFECT_BAR = 0.10     # balance "matters" only above this
+BAL_NULL_BAR = 0.05       # below this the whole m=2 ladder is flat
+TREE_BAND = 2.00
+MANIFOLD_BAR = 23.263     # exactly half of ARCH_GAP
+LAW_BAND = 0.15
+M90_BAR = 0.90
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+
+
+# =============================================================================
+# the partition algebra.  Sizes and balance come from the SPEC STRING, so the
+# manifest and this file can be compared without either quoting the other.
+# =============================================================================
+def spec_sizes(spec):
+    """The size vector a spec string denotes, or None if it is not a list."""
+    if not (spec.startswith("[") and spec.endswith("]")):
+        return None
+    return [int(x) for x in spec[1:-1].split(",")]
+
+
+def balanced_sizes(m, total=N_TENSORS):
+    """The registered 'as evenly as possible' partition at count m."""
+    q, r = divmod(total, m)
+    return [q + 1] * r + [q] * (m - r)
+
+
+def balance(sizes):
+    """B = H(p)/log(m), p_i = |g_i|/sum.  B := 1 for m = 1.  Frozen."""
+    m = len(sizes)
+    if m <= 1:
+        return 1.0
+    tot = float(sum(sizes))
+    h = -sum((s / tot) * math.log(s / tot) for s in sizes)
+    return h / math.log(m)
+
+
+def size_ratio(sizes):
+    """SECONDARY DESCRIPTIVE ONLY.  Never enters a verdict."""
+    return float(max(sizes)) / float(min(sizes))
+
+
+def arm_sizes(tag):
+    """Size vector of a registered arm; the anchors are named, not listed."""
+    spec = ARMS[tag]
+    if spec == "scalar":
+        return [N_TENSORS]
+    if spec == "layerwise":
+        return [1] * N_TENSORS
+    return spec_sizes(spec)
+
+
+def arm_m(tag):
+    return len(arm_sizes(tag))
+
+
+def arm_balance(tag):
+    return balance(arm_sizes(tag))
+
+
+# =============================================================================
+# re-derivation from the corpus.  Nothing below is quoted from prose.
+# =============================================================================
+def _csv_rows(path=CSV):
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if (r.get("superseded") or "0") != "1"]
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r):
+    """True iff the archived row sits in the matched CIFAR-100 comparison cell."""
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["meta_stepsize"] == MS and r["alpha0"] == ALPHA0
+            and r["gamma"] == GAMMA and r["augment"] == AUG
+            and r["beta_clip"] == CLIP and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH) and r["epochs_done"] == str(EPOCHS)
+            and r["collapsed"] == "0")
+
+
+def _cell_p5(r):
+    if not _in_cell(r):
+        return None
+    try:
+        return float(r["plateau5"])
+    except (TypeError, ValueError):
+        return None
+
+
+def archived_arms(path=CSV):
+    """{granularity: (mean plateau5, n, distinct batches, mean final_train)}."""
+    acc = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is None:
+            continue
+        try:
+            tr = float(r["final_train"])
+        except (TypeError, ValueError):
+            tr = None
+        acc[r["granularity"]].append((p5, _batch_of(r["run"]), tr))
+    out = {}
+    for k, v in acc.items():
+        trs = [t for _, _, t in v if t is not None]
+        out[k] = (statistics.mean(x for x, _, _ in v), len(v),
+                  len(set(b for _, b, _ in v)),
+                  statistics.mean(trs) if trs else float("nan"))
+    return out
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN-CELL SD of plateau5 over (batch x granularity) cells."""
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is not None:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(p5)
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc
+
+
+def premise_no_cbl1_rows(path=CSV):
+    """RULE 21: no run of this batch may exist in the corpus yet."""
+    return sum(1 for r in _csv_rows(path)
+               if str(r.get("run") or "").startswith(PREFIX))
+
+
+# =============================================================================
+# reading the runs.  The arm of a run is MEASURED from its own flags.
+# =============================================================================
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals, j = [], i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff, seen = collections.OrderedDict(), collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    return eff, dict((f, v) for f, v in seen.items() if len(v) > 1)
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    test, train = {}, {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    test[int(m.group(1))] = float(m.group(2))
+                m = EPTR_RE.search(line)
+                if m:
+                    train[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "test": test, "train": train,
+            "path": path}
+
+
+def tail5(series, budget=EPOCHS, w=5):
+    """PRIMARY window.  Mean of the LAST 5 epochs; train.py prints 0-indexed."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_of(a):
+    """The arm a run ACTUALLY ran, from its own flags.  None if it is not ours."""
+    if a.get("dataset") != DSET or a.get("NN-name") != NET:
+        return None
+    g = a.get("stepsize-groups")
+    for tag, spec in ARMS.items():
+        if g == spec:
+            return tag
+    return None
+
+
+# =============================================================================
+# G0 provenance
+# =============================================================================
+def gate0(recs):
+    kept, voided = [], []
+    for r in recs:
+        a, e = r["args"], r["env"]
+        why = []
+        if r["dup"]:
+            why.append("REPEATED FLAG %s" % sorted(r["dup"]))
+        tag = arm_of(a)
+        if tag is None:
+            why.append("arm not in the registered design (dataset=%s NN=%s groups=%s)"
+                       % (a.get("dataset"), a.get("NN-name"), a.get("stepsize-groups")))
+        for flag, want in (("meta-stepsize", MS), ("alpha0", ALPHA0),
+                           ("num-epochs", str(EPOCHS)), ("batch-size", str(BATCH)),
+                           ("gamma", GAMMA), ("alg-base", BASE_ALG),
+                           ("alg-meta", META_ALG)):
+            got = a.get(flag)
+            same = (norm_num(got) == norm_num(want)) if norm_num(want) is not None \
+                else (got == want)
+            if not same:
+                why.append("%s=%s (want %s)" % (flag, got, want))
+        if e.get("AUGMENT") != AUG:
+            why.append("AUGMENT=%s" % e.get("AUGMENT"))
+        if e.get("BETA_CLIP") != CLIP:
+            why.append("BETA_CLIP=%s" % e.get("BETA_CLIP"))
+        if (e.get("HIER") or "none") != "none":
+            why.append("HIER=%s (this batch is a PARTITION ladder; HIER must be unset)"
+                       % e.get("HIER"))
+        r["arm"] = tag
+        r["seed"] = a.get("seed")
+        (voided if why else kept).append((r, why))
+    return kept, voided
+
+
+# =============================================================================
+# G1 the partition gate -- every split must be a fact about the network
+# =============================================================================
+MAN_RE = re.compile(
+    r"^SPEC\s+(\S+)\s+M\s+(\d+)\s+SIZES\s+(\S+)\s+FIRSTGROUP\s+(.*?)\s+LASTGROUP\s+(.*?)\s*$")
+
+
+def read_manifest(path):
+    if not path or not os.path.exists(path):
+        return None
+    out, ntens = {}, None
+    with open(path) as fh:
+        for line in fh:
+            m = re.match(r"^NUM_PARAM_TENSORS\s+(\d+)\s*$", line.strip())
+            if m:
+                ntens = int(m.group(1))
+                continue
+            m = MAN_RE.match(line.strip())
+            if m:
+                out[m.group(1)] = {
+                    "m": int(m.group(2)),
+                    "sizes": [int(x) for x in m.group(3).split(",") if x != ""],
+                    "first": m.group(4).split(),
+                    "last": m.group(5).split(),
+                }
+    return {"n_tensors": ntens, "specs": out}
+
+
+def gate1(man):
+    """[] if the manifest proves every registered partition; else the reasons."""
+    if man is None:
+        return ["PARTITION-MANIFEST.txt is missing"]
+    why = []
+    if man["n_tensors"] != N_TENSORS:
+        why.append("NUM_PARAM_TENSORS=%s (want %d)" % (man["n_tensors"], N_TENSORS))
+    for tag, spec in ARMS.items():
+        want = spec_sizes(spec)
+        if want is None:                     # scalar / layerwise: named, not listed
+            continue
+        got = man["specs"].get(spec)
+        if got is None:
+            why.append("no manifest line for %s (arm %s)" % (spec, tag))
+            continue
+        if got["sizes"] != want:
+            why.append("%s (arm %s) composed to sizes %s on the live model, "
+                       "registered %s" % (spec, tag, got["sizes"], want))
+        if got["m"] != len(want):
+            why.append("%s (arm %s) is m=%d, registered m=%d"
+                       % (spec, tag, got["m"], len(want)))
+        if sum(got["sizes"]) != N_TENSORS:
+            why.append("%s (arm %s) sizes sum to %d, not %d"
+                       % (spec, tag, sum(got["sizes"]), N_TENSORS))
+    return why
+
+
+# =============================================================================
+# statistics
+# =============================================================================
+def mean_se(v):
+    m = statistics.mean(v)
+    return (m, float("nan")) if len(v) < 2 else (m, statistics.stdev(v) / math.sqrt(len(v)))
+
+
+def contrast(a, b):
+    """(diff, se, t, df) for mean(a) - mean(b), independent 3-seed arms."""
+    ma, mb = statistics.mean(a), statistics.mean(b)
+    if len(a) < 2 or len(b) < 2:
+        return ma - mb, float("nan"), float("nan"), 0
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    t = (ma - mb) / se if se > 0 else float("inf")
+    return ma - mb, se, t, len(a) + len(b) - 2
+
+
+def capture(m_arm, m_lo, m_hi):
+    return (m_arm - m_lo) / (m_hi - m_lo)
+
+
+def max_adjacent_drop(seq):
+    """Largest DECREASE between consecutive entries; 0.0 if non-decreasing.
+    Returns (drop, index_of_the_left_member)."""
+    worst, at = 0.0, -1
+    for i in range(len(seq) - 1):
+        d = seq[i] - seq[i + 1]
+        if d > worst:
+            worst, at = d, i
+    return worst, at
+
+
+def rng(vals):
+    return (max(vals) - min(vals)) if vals else float("nan")
+
+
+def log_law(m):
+    return math.log(float(m)) / math.log(float(N_TENSORS))
+
+
+def lin_law(m):
+    return (float(m) - 1.0) / (float(N_TENSORS) - 1.0)
+
+
+def count_verdict(caps_ladder, bal_range, cnt_range):
+    """THE FROZEN COUNT DECISION TREE.  Exhaustive and deterministic.
+
+    caps_ladder  CAPTURE in count-ladder order, m = 1,2,4,8,16,32,62
+    bal_range    range of CAPTURE over the m = 2 arms
+    cnt_range    range of CAPTURE over the count-ladder arms with m >= 2
+    """
+    drop, _ = max_adjacent_drop(caps_ladder)
+    if drop > MONO_BAR:
+        return "COUNT-LAW-REFUTED-NONMONOTONE"
+    if not math.isnan(bal_range) and bal_range >= cnt_range:
+        return "COUNT-LAW-REFUTED-BALANCE-DOMINATES"
+    span = caps_ladder[5] - caps_ladder[1]        # CAPTURE(c32) - CAPTURE(c02)
+    if span < FLAT_BAR:
+        return "COUNT-LAW-REFUTED-FLAT"
+    if not math.isnan(bal_range) and bal_range >= DOMINANCE_BAR * cnt_range:
+        return "COUNT-LAW-UNRESOLVED-BALANCE-COMPARABLE"
+    return "COUNT-LAW-HOLDS"
+
+
+def balance_verdict(caps_by_tag):
+    """THE FROZEN BALANCE DECISION TREE.  Exhaustive and deterministic."""
+    have = [t for t in BALANCE_LADDER if t in caps_by_tag]
+    if "c02" not in caps_by_tag or len(have) < 3:
+        return "BALANCE-UNRESOLVED-THIN", float("nan")
+    c_bal = caps_by_tag["c02"]
+    imbal = [caps_by_tag[t] for t in have
+             if t != "c02" and arm_balance(t) < ANTIBAL_B]
+    if imbal and (max(imbal) - c_bal) > ANTIBAL_BAR:
+        return "BALANCE-REFUTED-NOTPEAK", rng([caps_by_tag[t] for t in have])
+    br = rng([caps_by_tag[t] for t in have])
+    if imbal and (c_bal - max(imbal)) >= BAL_EFFECT_BAR:
+        return "BALANCE-MATTERS", br
+    if br < BAL_NULL_BAR:
+        return "BALANCE-NULL", br
+    return "BALANCE-UNRESOLVED", br
+
+
+# =============================================================================
+# hb1, for the descriptive cross-batch line only
+# =============================================================================
+def hb1_arms(runs_dir):
+    """{hb1 tag: mean plateau5} re-derived from hb1-*.out, or None."""
+    if not runs_dir or not os.path.isdir(runs_dir):
+        return None
+    paths = sorted(glob.glob(os.path.join(runs_dir, "**", "hb1-*.out"), recursive=True))
+    if not paths:
+        return None
+    acc = collections.defaultdict(list)
+    for p in paths:
+        r = read_out(p)
+        if not r:
+            continue
+        g = r["args"].get("stepsize-groups")
+        p5 = tail5(r["test"])
+        if p5 is None:
+            continue
+        for tag, spec in HB1_SPEC.items():
+            if g == spec:
+                acc[tag].append(p5)
+    return dict((k, statistics.mean(v)) for k, v in acc.items() if v) or None
+
+
+def _find_hb1(runs_dir_hint):
+    for c in (runs_dir_hint,
+              "/cluster/account_b/metaopt/runs",
+              os.path.join(REPO, "..", "runs_cluster_b"),
+              os.path.join(REPO, "..", "runs")):
+        if c and os.path.isdir(c) and glob.glob(os.path.join(c, "hb1-*.out")):
+            return c
+    return None
+
+
+# =============================================================================
+# selftest
+# =============================================================================
+def selftest(hb1_runs=None):
+    fails = []
+
+    def ok(label, cond, extra=""):
+        print("  %-66s %s %s" % (label, "PASS" if cond else "**FAIL**", extra))
+        if not cond:
+            fails.append(label)
+
+    print("cJ1_cbl1_score selftest -- every constant re-derived, none quoted")
+
+    print("-- the archived CIFAR-100 cell -------------------------------------")
+    g = archived_arms()
+    for k in ("scalar", "resnet18_blocks", "layerwise"):
+        ok("archived %s arm present" % k, k in g,
+           ("mean %.3f n=%d batches=%d train %.2f" % g[k]) if k in g else "")
+    if all(k in g for k in ("scalar", "resnet18_blocks", "layerwise")):
+        gap = g["layerwise"][0] - g["scalar"][0]
+        blkcap = (g["resnet18_blocks"][0] - g["scalar"][0]) / gap
+        ok("ARCH_SCAL matches the CSV", abs(g["scalar"][0] - ARCH_SCAL) < 0.02,
+           "%.3f" % g["scalar"][0])
+        ok("ARCH_BLK matches the CSV", abs(g["resnet18_blocks"][0] - ARCH_BLK) < 0.02,
+           "%.3f" % g["resnet18_blocks"][0])
+        ok("ARCH_LAY matches the CSV", abs(g["layerwise"][0] - ARCH_LAY) < 0.02,
+           "%.3f" % g["layerwise"][0])
+        ok("ARCH_GAP matches the CSV", abs(gap - ARCH_GAP) < 0.02, "%.3f pp" % gap)
+        ok("ARCH_BLK_CAPTURE matches the CSV",
+           abs(blkcap - ARCH_BLK_CAPTURE) < 0.005, "%.4f" % blkcap)
+        ok("MANIFOLD_BAR is exactly half the archived gap",
+           abs(MANIFOLD_BAR - gap / 2.0) < 0.01, "%.3f" % (gap / 2.0))
+        ok("archived scalar UNDERFITS (the failure is train-side)",
+           abs(g["scalar"][3] - ARCH_TRAIN_SCAL) < 0.1
+           and abs(g["scalar"][3] - g["scalar"][0]) < 2.0,
+           "train %.2f vs test %.3f" % (g["scalar"][3], g["scalar"][0]))
+        ok("archived layerwise FITS", abs(g["layerwise"][3] - ARCH_TRAIN_LAY) < 0.1,
+           "train %.2f" % g["layerwise"][3])
+    sd, df, nc = noise_floor_from_csv()
+    ok("SIGMA_W matches the CSV", abs(sd - SIGMA_W) < 0.01,
+       "re-derived %.4f df=%d cells=%d" % (sd, df, nc))
+    ok("SIGMA_DF matches the CSV", df == SIGMA_DF, "%d" % df)
+
+    print("-- RULE 21 premise: nothing of this batch may exist yet ------------")
+    n = premise_no_cbl1_rows()
+    ok("corpus holds ZERO %s rows" % PREFIX, n == 0, "found %d" % n)
+
+    print("-- the partition algebra, re-derived from the spec strings ---------")
+    ok("11 registered arms", len(ARMS) == 11, str(list(ARMS)))
+    ok("every explicit spec sums to %d tensors" % N_TENSORS,
+       all(sum(spec_sizes(s)) == N_TENSORS
+           for s in ARMS.values() if spec_sizes(s) is not None))
+    for tag, m in COUNT_LADDER:
+        want = balanced_sizes(m)
+        ok("count-ladder %s is the BALANCED partition at m=%d" % (tag, m),
+           arm_sizes(tag) == want and arm_m(tag) == m,
+           "sizes %s" % ("[%d]x%d" % (want[0], len(want)) if len(set(want)) == 1
+                         else str(want)))
+    ok("the count ladder is geometric in m",
+       [m for _, m in COUNT_LADDER] == [1, 2, 4, 8, 16, 32, 62])
+    ok("every count-ladder arm is balanced to within 0.003",
+       all(arm_balance(t) >= 0.997 for t, _ in COUNT_LADDER),
+       "min B %.5f" % min(arm_balance(t) for t, _ in COUNT_LADDER))
+    ok("every balance-ladder arm has m = 2",
+       all(arm_m(t) == 2 for t in BALANCE_LADDER))
+    for t in BALANCE_LADDER:
+        print("      %-4s %-12s m=%d sizes=%-9s B=%.5f ratio=%.2f"
+              % (t, ARMS[t], arm_m(t), str(arm_sizes(t)), arm_balance(t),
+                 size_ratio(arm_sizes(t))))
+    ok("the balance ladder is strictly decreasing in B after the mirror pair",
+       arm_balance("c02") > arm_balance("b45") > arm_balance("b55")
+       > arm_balance("b60"),
+       "%.5f > %.5f > %.5f > %.5f" % (arm_balance("c02"), arm_balance("b45"),
+                                      arm_balance("b55"), arm_balance("b60")))
+    ok("the MIRROR PAIR has IDENTICAL balance",
+       abs(arm_balance(MIRROR_PAIR[0]) - arm_balance(MIRROR_PAIR[1])) < 1e-12,
+       "%.5f vs %.5f" % (arm_balance(MIRROR_PAIR[0]), arm_balance(MIRROR_PAIR[1])))
+    ok("the mirror pair is genuinely mirrored, not the same partition",
+       arm_sizes(MIRROR_PAIR[0]) == list(reversed(arm_sizes(MIRROR_PAIR[1]))))
+    ok("B is maximal at the even split", abs(arm_balance("c02") - 1.0) < 1e-12)
+    ok("B is direction-blind", abs(balance([60, 2]) - balance([2, 60])) < 1e-12,
+       "%.5f" % balance([60, 2]))
+    ok("B([60,2]) is the registered 0.20559", abs(balance([60, 2]) - 0.20559) < 5e-5,
+       "%.5f" % balance([60, 2]))
+    ok("B([45,17]) is the registered 0.84742", abs(balance([45, 17]) - 0.84742) < 5e-5,
+       "%.5f" % balance([45, 17]))
+    ok("B([55,7]) is the registered 0.50861", abs(balance([55, 7]) - 0.50861) < 5e-5,
+       "%.5f" % balance([55, 7]))
+    ok("B(resnet18_blocks) is the registered 0.89585",
+       abs(balance([3, 12, 15, 15, 15, 2]) - HB1_BLK_B) < 5e-5,
+       "%.5f" % balance([3, 12, 15, 15, 15, 2]))
+    ok("the anchors bracket every interior arm in m",
+       arm_m(ANCHOR_LO) == 1 and arm_m(ANCHOR_HI) == N_TENSORS)
+
+    print("-- the power arithmetic the bars rest on ---------------------------")
+    se_mean = SIGMA_W / math.sqrt(3.0)
+    se_diff = SIGMA_W * math.sqrt(2.0 / 3.0)
+    ok("SE of a 3-seed mean", abs(se_mean - 0.2329) < 0.002, "%.4f pp" % se_mean)
+    ok("SE of a difference of two 3-seed means", abs(se_diff - 0.3294) < 0.002,
+       "%.4f pp" % se_diff)
+    se_cap = se_diff / ARCH_GAP
+    ok("SE(CAPTURE difference) is ~0.007 at this gap",
+       abs(se_cap - 0.00708) < 0.0005, "%.5f" % se_cap)
+    ok("MONO_BAR is >= 5 SE (a reversal, not a wobble)", MONO_BAR / se_cap >= 5,
+       "%.1f SE = %.2f pp" % (MONO_BAR / se_cap, MONO_BAR * ARCH_GAP))
+    ok("FLAT_BAR is >= 10 SE", FLAT_BAR / se_cap >= 10,
+       "%.1f SE = %.2f pp" % (FLAT_BAR / se_cap, FLAT_BAR * ARCH_GAP))
+    ok("MIRROR_BAR is >= 10 SE", MIRROR_BAR / se_cap >= 10,
+       "%.1f SE" % (MIRROR_BAR / se_cap))
+
+    print("-- the registered candidate laws ----------------------------------")
+    for m in (2, 4, 8, 16, 32):
+        print("      m=%-2d  LOG %.5f   LIN %.5f" % (m, log_law(m), lin_law(m)))
+    ok("LOG law at m=2 is the registered 0.16795", abs(log_law(2) - 0.16795) < 5e-5)
+    ok("LOG law at m=8 is the registered 0.50385", abs(log_law(8) - 0.50385) < 5e-5)
+    ok("LOG law at m=32 is the registered 0.83974", abs(log_law(32) - 0.83974) < 5e-5)
+    ok("LIN law at m=32 is the registered 0.50820", abs(lin_law(32) - 0.50820) < 5e-5)
+    ok("both laws are pinned at the anchors",
+       abs(log_law(1)) < 1e-12 and abs(log_law(N_TENSORS) - 1) < 1e-12
+       and abs(lin_law(1)) < 1e-12 and abs(lin_law(N_TENSORS) - 1) < 1e-12)
+    ok("the LOG law is ALREADY missed by hb1's m=6 arm, as registered",
+       (HB1_BLK_CAP - log_law(HB1_BLK_M)) > LAW_BAND,
+       "observed %.4f vs LOG %.4f, miss +%.4f > band %.2f"
+       % (HB1_BLK_CAP, log_law(HB1_BLK_M), HB1_BLK_CAP - log_law(HB1_BLK_M), LAW_BAND))
+    ok("the LIN law is ALREADY dead at hb1's m=6 arm",
+       (HB1_BLK_CAP - lin_law(HB1_BLK_M)) > LAW_BAND,
+       "observed %.4f vs LIN %.4f" % (HB1_BLK_CAP, lin_law(HB1_BLK_M)))
+
+    print("-- the count decision tree, exercised in EVERY direction -----------")
+    good = [0.0, 0.22, 0.40, 0.60, 0.80, 0.92, 1.0]
+    ok("COUNT-LAW-HOLDS on a clean rising ladder",
+       count_verdict(good, 0.22, 0.78) == "COUNT-LAW-HOLDS")
+    bad = [0.0, 0.22, 0.40, 0.30, 0.80, 0.92, 1.0]
+    ok("REFUTED-NONMONOTONE on a real reversal",
+       count_verdict(bad, 0.22, 0.78) == "COUNT-LAW-REFUTED-NONMONOTONE")
+    # MONO_BAR is a STRICT bar: drop > MONO_BAR refutes.  Probed either side of
+    # it with exactly-representable values so the check cannot be a float artefact.
+    ok("a drop of 0.03125, just under MONO_BAR, is NOT a reversal",
+       count_verdict([0.0, 0.25, 0.5, 0.46875, 0.8, 0.92, 1.0], 0.22, 0.78)
+       != "COUNT-LAW-REFUTED-NONMONOTONE",
+       "drop %.5f vs bar %.2f" % (0.5 - 0.46875, MONO_BAR))
+    ok("a drop of 0.0625, just over MONO_BAR, IS a reversal",
+       count_verdict([0.0, 0.25, 0.5, 0.4375, 0.8, 0.92, 1.0], 0.22, 0.78)
+       == "COUNT-LAW-REFUTED-NONMONOTONE",
+       "drop %.5f vs bar %.2f" % (0.5 - 0.4375, MONO_BAR))
+    ok("REFUTED-BALANCE-DOMINATES when the m=2 spread matches the count spread",
+       count_verdict(good, 0.80, 0.78) == "COUNT-LAW-REFUTED-BALANCE-DOMINATES")
+    ok("BALANCE-DOMINATES outranks FLAT",
+       count_verdict([0.0, 0.90, 0.91, 0.92, 0.93, 0.94, 1.0], 0.95, 0.10)
+       == "COUNT-LAW-REFUTED-BALANCE-DOMINATES")
+    ok("REFUTED-FLAT when monotone but the count buys nothing",
+       count_verdict([0.0, 0.90, 0.91, 0.92, 0.93, 0.95, 1.0], 0.02, 0.10)
+       == "COUNT-LAW-REFUTED-FLAT")
+    ok("a flat ladder is refuted even though it is monotone",
+       count_verdict([0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 1.0], 0.01, 1.0)
+       == "COUNT-LAW-REFUTED-FLAT")
+    ok("UNRESOLVED when balance is comparable but smaller",
+       count_verdict(good, 0.50, 0.78)
+       == "COUNT-LAW-UNRESOLVED-BALANCE-COMPARABLE")
+    # FLAT_BAR probed either side with exactly-representable spans.
+    ok("a span of 0.125, above FLAT_BAR, is not refuted for flatness",
+       count_verdict([0.0, 0.25, 0.28, 0.30, 0.34, 0.375, 1.0], 0.05, 0.80)
+       == "COUNT-LAW-HOLDS", "span %.5f vs bar %.2f" % (0.375 - 0.25, FLAT_BAR))
+    ok("a span of 0.0625, below FLAT_BAR, IS refuted for flatness",
+       count_verdict([0.0, 0.25, 0.28, 0.29, 0.30, 0.3125, 1.0], 0.02, 0.10)
+       == "COUNT-LAW-REFUTED-FLAT",
+       "span %.5f vs bar %.2f" % (0.3125 - 0.25, FLAT_BAR))
+    ok("max_adjacent_drop finds the worst drop and its position",
+       max_adjacent_drop([0.0, 0.5, 0.1, 0.4, 0.2]) == (0.4, 1))
+    ok("max_adjacent_drop is 0 on a non-decreasing sequence",
+       max_adjacent_drop([0.0, 0.1, 0.1, 0.9])[0] == 0.0)
+
+    print("-- the balance decision tree, exercised in EVERY direction ---------")
+    base = {"c02": 0.22, "b45": 0.18, "b17": 0.17, "b55": 0.09, "b60": 0.04}
+    ok("BALANCE-MATTERS when the even split leads by >= 0.10",
+       balance_verdict(base)[0] == "BALANCE-MATTERS")
+    flat = {"c02": 0.22, "b45": 0.21, "b17": 0.21, "b55": 0.20, "b60": 0.20}
+    ok("BALANCE-NULL on a flat m=2 ladder",
+       balance_verdict(flat)[0] == "BALANCE-NULL")
+    anti = {"c02": 0.22, "b45": 0.20, "b17": 0.20, "b55": 0.19, "b60": 0.40}
+    ok("BALANCE-REFUTED-NOTPEAK when an imbalanced arm wins",
+       balance_verdict(anti)[0] == "BALANCE-REFUTED-NOTPEAK")
+    mid = {"c02": 0.22, "b45": 0.20, "b17": 0.20, "b55": 0.16, "b60": 0.14}
+    ok("BALANCE-UNRESOLVED in the gap", balance_verdict(mid)[0] == "BALANCE-UNRESOLVED")
+    ok("BALANCE-UNRESOLVED-THIN with too few m=2 arms",
+       balance_verdict({"c02": 0.22, "b45": 0.18})[0] == "BALANCE-UNRESOLVED-THIN")
+    ok("only B < %.2f arms count as 'imbalanced' for R4" % ANTIBAL_B,
+       arm_balance("b45") > ANTIBAL_B and arm_balance("b55") < ANTIBAL_B
+       and arm_balance("b60") < ANTIBAL_B,
+       "b45 %.5f  b55 %.5f  b60 %.5f" % (arm_balance("b45"), arm_balance("b55"),
+                                         arm_balance("b60")))
+    ok("capture arithmetic", abs(capture(53.020, 22.776, 69.302) - 0.65) < 0.001)
+    ok("CAPTURE is 0 and 1 at the anchors by construction",
+       capture(22.841, 22.841, 69.745) == 0.0
+       and capture(69.745, 22.841, 69.745) == 1.0)
+
+    print("-- the parsers, on adversarial input -------------------------------")
+    eff, dup = parse_args_line("--alg-meta Lion --dataset CIFAR100 --alg-meta RMSProp")
+    ok("a repeated flag is DETECTED", "alg-meta" in dup, str(dup))
+    ok("argparse's last-wins is reproduced", eff["alg-meta"] == "RMSProp")
+    line = ("--dataset CIFAR100 --NN-name ResNet18_c100 --stepsize-groups %s --seed 0"
+            % SPEC_C32)
+    eff2, dup2 = parse_args_line(line)
+    ok("no false positive on a clean line", not dup2)
+    ok("the 65-character m=32 bracket spec survives tokenisation",
+       eff2.get("stepsize-groups") == SPEC_C32, eff2.get("stepsize-groups"))
+    ok("arm_of reads the m=32 arm from the flags", arm_of(eff2) == "c32")
+    for tag, spec in ARMS.items():
+        ok("arm_of round-trips %s" % tag,
+           arm_of({"dataset": DSET, "NN-name": NET, "stepsize-groups": spec}) == tag)
+    ok("arm_of rejects the CIFAR-10 network",
+       arm_of({"dataset": "CIFAR10", "NN-name": "ResNet18",
+               "stepsize-groups": "layerwise"}) is None)
+    ok("arm_of rejects an unregistered partition",
+       arm_of({"dataset": DSET, "NN-name": NET,
+               "stepsize-groups": "[30,32]"}) is None)
+    ok("arm_of rejects hb1's head and stem arms (they are NOT cbl1 arms)",
+       arm_of({"dataset": DSET, "NN-name": NET,
+               "stepsize-groups": "[2,60]"}) is None)
+    ok("tail5 needs all 5 tail epochs",
+       tail5({e: 50.0 for e in range(95, 100)}) == 50.0
+       and tail5({e: 50.0 for e in range(96, 100)}) is None)
+    ok("tail5 ignores everything but the tail",
+       abs(tail5(dict([(e, 1.0) for e in range(95)]
+                      + [(e, 7.0) for e in range(95, 100)])) - 7.0) < 1e-9)
+
+    print("-- the partition gate, on a good and a bad manifest ----------------")
+    lines = ["NUM_PARAM_TENSORS 62"]
+    for spec in ARMS.values():
+        s = spec_sizes(spec)
+        if s is None:
+            continue
+        lines.append("SPEC %s M %d SIZES %s FIRSTGROUP conv1.weight a "
+                     "LASTGROUP b linear.bias"
+                     % (spec, len(s), ",".join(str(x) for x in s)))
+    tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cbl1_selftest_manifest.txt")
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    ok("a correct manifest passes G1", gate1(read_manifest(tmp)) == [],
+       str(gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines).replace("SIZES 8,8,8,8,8,8,7,7",
+                                          "SIZES 8,8,8,8,8,8,8,6") + "\n")
+    ok("a manifest whose m=8 arm is NOT the balanced partition FAILS G1",
+       any("registered" in w for w in gate1(read_manifest(tmp))),
+       str(gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(l for l in lines if "[45,17]" not in l) + "\n")
+    ok("a manifest missing an arm FAILS G1",
+       any("no manifest line" in w for w in gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines).replace("NUM_PARAM_TENSORS 62",
+                                          "NUM_PARAM_TENSORS 60") + "\n")
+    ok("a manifest with the wrong tensor count FAILS G1",
+       any("NUM_PARAM_TENSORS" in w for w in gate1(read_manifest(tmp))))
+    ok("a missing manifest FAILS G1", gate1(read_manifest(tmp + ".nope")) != [])
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+    print("-- hb1's numbers, re-derived from its own .out files ---------------")
+    d = _find_hb1(hb1_runs)
+    h = hb1_arms(d) if d else None
+    if not h:
+        print("  hb1-*.out not reachable from this host; the hb1 constants are")
+        print("  DESCRIPTIVE-ONLY comparators and are NOT re-derived here.")
+        print("  Re-derive on cluster_b with --hb1-runs /cluster/account_b/metaopt/runs.")
+    else:
+        print("  hb1 runs found in %s" % d)
+        for k in ("scal", "head", "stem", "mid", "blk", "lay"):
+            if k in h:
+                ok("hb1 %s re-derives to the registered value" % k,
+                   abs(h[k] - HB1[k]) < 0.01, "%.3f vs %.3f" % (h[k], HB1[k]))
+        if all(k in h for k in ("scal", "lay", "mid", "head", "blk")):
+            gp = h["lay"] - h["scal"]
+            ok("hb1 CAPTURE([31,31]) re-derives to %.4f" % HB1_MID_CAP,
+               abs((h["mid"] - h["scal"]) / gp - HB1_MID_CAP) < 0.001,
+               "%.4f" % ((h["mid"] - h["scal"]) / gp))
+            ok("hb1 CAPTURE([60,2]) re-derives to %.4f" % HB1_HEAD_CAP,
+               abs((h["head"] - h["scal"]) / gp - HB1_HEAD_CAP) < 0.001,
+               "%.4f" % ((h["head"] - h["scal"]) / gp))
+            ok("hb1 CAPTURE(resnet18_blocks) re-derives to %.4f" % HB1_BLK_CAP,
+               abs((h["blk"] - h["scal"]) / gp - HB1_BLK_CAP) < 0.001,
+               "%.4f" % ((h["blk"] - h["scal"]) / gp))
+
+    print("-- the batch script's own text must match this registration --------")
+    if not os.path.exists(BATCH_SH):
+        ok("bin/cJ1_count_balance_ladder.sh exists", False, BATCH_SH)
+    else:
+        txt = open(BATCH_SH).read()
+        for label, needle in (
+                ("run-name prefix cbl1-", "cbl1-"),
+                ("dataset CIFAR100", "DSET=CIFAR100"),
+                ("network ResNet18_c100", "NET=ResNet18_c100"),
+                ("meta-stepsize 1e-3", "MST=1e-3"),
+                ("alpha0 1e-6", "ALPHA0=1e-6"),
+                ("100 epochs", "EPOCHS=100"),
+                ("batch 100", "BATCH=100"),
+                ("box -15:-2.3026", 'CLIP="-15:-2.3026"'),
+                ("AUGMENT=1", "AUG=1"),
+                ("SGDm base", "--alg-base SGDm"),
+                ("Lion meta", "--alg-meta Lion"),
+                ("HIER=none", "HIER=none"),
+                ("seeds 0 1 2", 'SEEDS="0 1 2"'),
+                ("the m=1 anchor", "G=scalar"),
+                ("the m=62 anchor", "G=layerwise"),
+                ("it writes the partition manifest", "PARTITION-MANIFEST.txt"),
+                ("it protects its prefix", "PROTECTED.txt"),
+                ("it names this scorer", "cJ1_cbl1_score.py"),
+        ):
+            ok("batch script declares %s" % label, needle in txt)
+        for tag, spec in ARMS.items():
+            if spec_sizes(spec) is None:
+                continue
+            ok("batch script composes arm %s as %s" % (tag, spec),
+               ("'%s'" % spec) in txt)
+
+    print("=" * 74)
+    if fails:
+        print("SELFTEST FAIL -- %d checks failed" % len(fails))
+        for f in fails:
+            print("   %s" % f)
+        return 1
+    print("SELFTEST PASS")
+    return 0
+
+
+# =============================================================================
+# the score
+# =============================================================================
+def score(runs_dir, manifest, hb1_runs):
+    paths = sorted(glob.glob(os.path.join(runs_dir, "**", PREFIX + "*.out"),
+                             recursive=True))
+    print("cJ1_cbl1_score -- `cbl1`, the CIFAR-100 COUNT ladder and BALANCE ladder")
+    print("runs dir: %s" % runs_dir)
+    print("%d .out files match %s*" % (len(paths), PREFIX))
+    if not paths:
+        print("VERDICT: NO DATA -- the batch has not produced any output yet.")
+        return 3
+    recs = [r for r in (read_out(p) for p in paths) if r]
+    print("%d carry an ARGS line" % len(recs))
+
+    print("\n-- G0 PROVENANCE (RULE 20): the arm is read from each run's own flags --")
+    kept, voided = gate0(recs)
+    for r, why in voided:
+        print("   VOID %-32s %s" % (os.path.basename(r["path"]), "; ".join(why)))
+    print("   %d runs pass provenance, %d VOID" % (len(kept), len(voided)))
+    if not kept:
+        print("VERDICT: VOID -- no run survived provenance.")
+        return 2
+
+    print("\n-- G1 PARTITION GATE: every split must be a fact about the network --")
+    if manifest is None:
+        for c in (os.path.join(runs_dir, "cbl1", "PARTITION-MANIFEST.txt"),
+                  os.path.join(runs_dir, "PARTITION-MANIFEST.txt")):
+            if os.path.exists(c):
+                manifest = c
+                break
+    man = read_manifest(manifest)
+    why1 = gate1(man)
+    print("   manifest: %s" % (manifest or "<not found>"))
+    if man:
+        for tag, spec in ARMS.items():
+            d = man["specs"].get(spec)
+            if d:
+                print("      %-4s m=%-3d sizes sum %-3d B=%.5f  %s"
+                      % (tag, d["m"], sum(d["sizes"]), balance(d["sizes"]), spec))
+    for w in why1:
+        print("   FAIL %s" % w)
+    if why1:
+        print("VERDICT: VOID-PARTITION -- without the manifest, 'm = 8' is a claim "
+              "about a string, not about a network.")
+        return 2
+    print("   PASS -- %d parameter tensors; all 9 explicit specs compose exactly "
+          "as registered" % man["n_tensors"])
+
+    print("\n-- G2 COMPLETENESS: >= 95/100 epochs and all 5 tail epochs present --")
+    cells = collections.defaultdict(list)
+    incomplete = []
+    for r, _ in kept:
+        done = (max(r["test"]) + 1) if r["test"] else 0
+        p5 = tail5(r["test"])
+        t5 = tail5(r["train"])
+        if p5 is None or done < 0.95 * EPOCHS:
+            incomplete.append((os.path.basename(r["path"]), done))
+            continue
+        cells[r["arm"]].append((p5, t5, r["seed"], os.path.basename(r["path"])))
+    for n, d in incomplete:
+        print("   DROPPED %-34s %d epochs" % (n, d))
+    print("   %d complete runs in %d arms" % (sum(len(v) for v in cells.values()),
+                                              len(cells)))
+    thin = [a for a in ARMS if len(cells.get(a, [])) < 2]
+    if thin:
+        print("   arms with fewer than 2 usable seeds: %s" % ", ".join(thin))
+        print("VERDICT: VOID -- a registered arm has fewer than 2 usable seeds.")
+        return 2
+
+    print("\n-- the arms ---------------------------------------------------------")
+    print("   %-4s %-3s %-8s %-8s %-3s %-9s %-8s %-9s  %s"
+          % ("arm", "m", "B", "ratio", "n", "plateau5", "se", "train5", "seeds"))
+    p5s, t5s = {}, {}
+    for arm in ARMS:
+        v = cells.get(arm, [])
+        if not v:
+            continue
+        a = [x for x, _, _, _ in v]
+        b = [y for _, y, _, _ in v if y is not None]
+        p5s[arm] = a
+        if b:
+            t5s[arm] = b
+        m, se = mean_se(a)
+        sz = arm_sizes(arm)
+        print("   %-4s %-3d %-8.5f %-8.2f %-3d %-9.3f %-8.3f %-9s  %s"
+              % (arm, len(sz), balance(sz), size_ratio(sz), len(v), m, se,
+                 ("%.3f" % statistics.mean(b)) if b else "--",
+                 " ".join("s%s=%.2f" % (s, x) for x, _, s, _ in
+                          sorted(v, key=lambda z: str(z[2])))))
+
+    print("\n-- G3 ARCHIVE GATE: does this batch reproduce the archived cell? ----")
+    g = archived_arms()
+    bad = []
+    for arm, key, want in ((ANCHOR_LO, "scalar", ARCH_SCAL),
+                           (ANCHOR_HI, "layerwise", ARCH_LAY)):
+        got = statistics.mean(p5s[arm])
+        ref = g[key][0] if key in g else float("nan")
+        d = got - ref
+        print("   %-4s in-batch %.3f   archived %.3f (n=%d, %d batches)   %+.3f pp"
+              % (arm, got, ref, g[key][1], g[key][2], d))
+        if not (abs(d) <= TREE_BAND):
+            bad.append("%s off by %+.3f pp (band +/-%.2f)" % (arm, d, TREE_BAND))
+    if bad:
+        for b in bad:
+            print("   FAIL %s" % b)
+        print("VERDICT: VOID-TREE -- the batch does not reproduce the archived "
+              "CIFAR-100 cell; nothing here is comparable.")
+        return 2
+    print("   PASS -- both anchors inside +/-%.2f pp" % TREE_BAND)
+
+    print("\n-- G4 MANIFOLD GATE: there must be a gap to capture ------------------")
+    m_lo, m_hi = statistics.mean(p5s[ANCHOR_LO]), statistics.mean(p5s[ANCHOR_HI])
+    gap = m_hi - m_lo
+    print("   in-batch GAP = M(%s) - M(%s) = %+.3f pp   (archived %+.3f, bar %.3f)"
+          % (ANCHOR_HI, ANCHOR_LO, gap, ARCH_GAP, MANIFOLD_BAR))
+    if gap < MANIFOLD_BAR:
+        print("VERDICT: VOID-NOMANIFOLD -- the granularity gap did not appear in this "
+              "batch, so CAPTURE is a ratio of noise and no verdict is issued.")
+        return 2
+    print("   PASS")
+
+    caps = dict((a, capture(statistics.mean(p5s[a]), m_lo, m_hi)) for a in p5s)
+    t_lo = statistics.mean(t5s[ANCHOR_LO]) if ANCHOR_LO in t5s else None
+    t_hi = statistics.mean(t5s[ANCHOR_HI]) if ANCHOR_HI in t5s else None
+    tcaps = {}
+    if t_lo is not None and t_hi is not None and t_hi != t_lo:
+        tcaps = dict((a, capture(statistics.mean(t5s[a]), t_lo, t_hi)) for a in t5s)
+
+    print("\n-- G5 THE PRIMARY, PART A: THE COUNT LADDER (balanced, B ~ 1) --------")
+    print("   %-4s %-3s %-9s %-9s %-9s %-9s %-9s"
+          % ("arm", "m", "plateau5", "CAPTURE", "TRAINCAP", "LOG law", "LIN law"))
+    ladder, tladder, have_all = [], [], True
+    for tag, m in COUNT_LADDER:
+        if tag not in caps:
+            have_all = False
+            continue
+        ladder.append(caps[tag])
+        tladder.append(tcaps.get(tag, float("nan")))
+        print("   %-4s %-3d %-9.3f %+9.4f %9s %9.4f %9.4f"
+              % (tag, m, statistics.mean(p5s[tag]), caps[tag],
+                 ("%+.4f" % tcaps[tag]) if tag in tcaps else "--",
+                 log_law(m), lin_law(m)))
+    if not have_all or len(ladder) != len(COUNT_LADDER):
+        print("VERDICT: VOID -- the count ladder is incomplete.")
+        return 2
+
+    drop, at = max_adjacent_drop(ladder)
+    if at >= 0:
+        lt, lm = COUNT_LADDER[at]
+        rt, rm = COUNT_LADDER[at + 1]
+        d, se_d, t_d, df_d = contrast(p5s[rt], p5s[lt])
+        print("\n   largest adjacent DROP: m=%d -> m=%d, CAPTURE %+.4f -> %+.4f "
+              "(drop %.4f)" % (lm, rm, ladder[at], ladder[at + 1], drop))
+        print("   that step in pp: %+.3f  se %.3f  t %+.2f (df %d)"
+              % (d, se_d, t_d, df_d))
+    else:
+        print("\n   the count ladder is NON-DECREASING at every step (no drop).")
+    span = caps["c32"] - caps["c02"]
+    d_s, se_s, t_s, df_s = contrast(p5s["c32"], p5s["c02"])
+    print("   L2 SPAN = CAPTURE(c32) - CAPTURE(c02) = %+.4f  (bar %.2f)"
+          % (span, FLAT_BAR))
+    print("      in pp: %+.3f  se %.3f  t %+.2f (df %d)" % (d_s, se_s, t_s, df_s))
+    print("   per-doubling increments (m=2->4->8->16->32): %s"
+          % "  ".join("%+.4f" % (ladder[i + 1] - ladder[i]) for i in range(1, 5)))
+
+    print("\n-- G5 THE PRIMARY, PART B: THE BALANCE LADDER (fixed m = 2) ----------")
+    print("   %-4s %-12s %-8s %-8s %-9s %-9s %-9s"
+          % ("arm", "sizes", "B", "ratio", "plateau5", "CAPTURE", "TRAINCAP"))
+    for tag in BALANCE_LADDER:
+        if tag not in caps:
+            continue
+        sz = arm_sizes(tag)
+        print("   %-4s %-12s %-8.5f %-8.2f %-9.3f %+9.4f %9s"
+              % (tag, str(sz), balance(sz), size_ratio(sz),
+                 statistics.mean(p5s[tag]), caps[tag],
+                 ("%+.4f" % tcaps[tag]) if tag in tcaps else "--"))
+    bal_caps = [caps[t] for t in BALANCE_LADDER if t in caps]
+    cnt_caps = [caps[t] for t, m in COUNT_LADDER if t in caps and m >= 2]
+    bal_range, cnt_range = rng(bal_caps), rng(cnt_caps)
+    print("\n   BAL_RANGE (spread of CAPTURE over the %d m=2 arms)   = %.4f"
+          % (len(bal_caps), bal_range))
+    print("   CNT_RANGE (spread of CAPTURE over the m>=2 count arms) = %.4f"
+          % cnt_range)
+    print("   ratio BAL_RANGE / CNT_RANGE = %.3f   (R2 fires at >= 1.000; "
+          "UNRESOLVED at >= %.3f)"
+          % (bal_range / cnt_range if cnt_range else float("nan"), DOMINANCE_BAR))
+
+    mv = float("nan")
+    if all(t in caps for t in MIRROR_PAIR):
+        mv = abs(caps[MIRROR_PAIR[0]] - caps[MIRROR_PAIR[1]])
+        d_m, se_m, t_m, df_m = contrast(p5s[MIRROR_PAIR[0]], p5s[MIRROR_PAIR[1]])
+        print("   MIRROR %s %s vs %s %s at IDENTICAL B=%.5f: CAPTURE %+.4f vs %+.4f, "
+              "|diff| %.4f (bar %.2f)"
+              % (MIRROR_PAIR[0], ARMS[MIRROR_PAIR[0]], MIRROR_PAIR[1],
+                 ARMS[MIRROR_PAIR[1]], arm_balance(MIRROR_PAIR[0]),
+                 caps[MIRROR_PAIR[0]], caps[MIRROR_PAIR[1]], mv, MIRROR_BAR))
+        print("      in pp: %+.3f  se %.3f  t %+.2f (df %d)" % (d_m, se_m, t_m, df_m))
+
+    cv = count_verdict(ladder, bal_range, cnt_range)
+    bv, _ = balance_verdict(caps)
+    mirror_flag = ""
+    if not math.isnan(mv) and mv > MIRROR_BAR:
+        mirror_flag = "R5 MIRROR-BREAK"
+
+    print("\n   frozen bars: R1 NONMONOTONE drop>%.2f | R2 BALANCE-DOMINATES "
+          "BAL>=CNT | R3 FLAT span<%.2f | R4 ANTI-BALANCE an arm with B<%.2f "
+          "beating c02 by >%.2f | R5 MIRROR-BREAK |diff|>%.2f"
+          % (MONO_BAR, FLAT_BAR, ANTIBAL_B, ANTIBAL_BAR, MIRROR_BAR))
+    print("   VERDICT (the COUNT law):   %s" % cv)
+    print("   VERDICT (the BALANCE law): %s" % bv)
+    if mirror_flag:
+        print("   FLAG %s: %s and %s have identical balance %.5f but CAPTURE "
+              "differs by %.4f.  Normalised entropy is NOT the operative variable "
+              "here; cut POSITION is.  The registered statistic is DISQUALIFIED as "
+              "an explanation and is NOT replaced by a better-fitting one."
+              % (mirror_flag, MIRROR_PAIR[0], MIRROR_PAIR[1],
+                 arm_balance(MIRROR_PAIR[0]), mv))
+
+    print("\n-- G6 DESCRIPTIVE, NEVER GATING --------------------------------------")
+    rl = math.sqrt(statistics.mean([(caps[t] - log_law(m)) ** 2
+                                    for t, m in COUNT_LADDER if t in caps]))
+    rn = math.sqrt(statistics.mean([(caps[t] - lin_law(m)) ** 2
+                                    for t, m in COUNT_LADDER if t in caps]))
+    out_log = [(m, caps[t] - log_law(m)) for t, m in COUNT_LADDER
+               if t in caps and abs(caps[t] - log_law(m)) > LAW_BAND]
+    out_lin = [(m, caps[t] - lin_law(m)) for t, m in COUNT_LADDER
+               if t in caps and abs(caps[t] - lin_law(m)) > LAW_BAND]
+    print("   LOG law  RMSE %.4f   outside the +/-%.2f band at m = %s"
+          % (rl, LAW_BAND, ", ".join("%d (%+.3f)" % x for x in out_log) or "none"))
+    print("   LIN law  RMSE %.4f   outside the +/-%.2f band at m = %s"
+          % (rn, LAW_BAND, ", ".join("%d (%+.3f)" % x for x in out_lin) or "none"))
+    print("   verdict on the named candidate laws: LOG %s, LIN %s"
+          % ("REJECTED" if len(out_log) >= 2 else
+             ("MARGINAL" if out_log else "NOT REJECTED"),
+             "REJECTED" if len(out_lin) >= 2 else
+             ("MARGINAL" if out_lin else "NOT REJECTED")))
+    m90 = None
+    for tag, m in COUNT_LADDER:
+        if 2 <= m < N_TENSORS and tag in caps and caps[tag] >= M90_BAR:
+            m90 = m
+            break
+    print("   M90 (smallest ladder m with CAPTURE >= %.2f, excluding the anchors): %s"
+          % (M90_BAR, m90 if m90 is not None else "none -- only m=62 reaches it"))
+    if m90 == 2:
+        print("   FLAG COUNT-SATURATES-AT-2: a single balanced binary cut already "
+              "recovers %.0f%% of the gap.  The ladder above m=2 is then nearly "
+              "flat by construction, and this ALSO disagrees with hb1's [31,31] "
+              "at %.4f." % (100 * caps["c02"], HB1_MID_CAP))
+    if any(caps[t] > 1.0 for t, m in COUNT_LADDER if t in caps and 1 < m < N_TENSORS):
+        print("   NOTE: an interior arm has CAPTURE > 1, i.e. it beat layerwise. "
+              "Reported; it changes no bar and is not an optimum claim.")
+
+    train_flag = ""
+    if len(tladder) == len(COUNT_LADDER) and not any(math.isnan(x) for x in tladder):
+        tdrop, tat = max_adjacent_drop(tladder)
+        print("   TRAIN ladder TRAINCAP: %s"
+              % "  ".join("m=%d %+.3f" % (m, tladder[i])
+                          for i, (t, m) in enumerate(COUNT_LADDER)))
+        print("   train5 anchors: %s %.3f -> %s %.3f (span %.3f pp)"
+              % (ANCHOR_LO, t_lo, ANCHOR_HI, t_hi, t_hi - t_lo))
+        print("   largest adjacent drop on the TRAIN ladder: %.4f (bar %.2f)"
+              % (tdrop, MONO_BAR))
+        if drop <= MONO_BAR and tdrop > MONO_BAR:
+            train_flag = "T1 TRAIN-TEST-DIVERGENCE"
+            print("   FLAG %s: the test ladder is monotone but the TRAIN ladder "
+                  "reverses at m=%d.  hb1 established the scalar failure is a "
+                  "FITTING failure, so a count law that does not hold on fitting "
+                  "is incomplete.  Non-overriding."
+                  % (train_flag, COUNT_LADDER[tat][1]))
+        else:
+            print("   T1 not triggered")
+    else:
+        print("   train5 unavailable in at least one arm; T1 not evaluated")
+
+    print("\n   CROSS-BATCH, DESCRIPTIVE ONLY (hb1 is ANOTHER BATCH and batch is the")
+    print("   unit of replication; these are NOT contrasts and gate nothing):")
+    d = _find_hb1(hb1_runs)
+    h = hb1_arms(d) if d else None
+    if h and "scal" in h and "lay" in h:
+        gp = h["lay"] - h["scal"]
+        print("      hb1 runs re-read from %s" % d)
+        for tag, hk in (("c02", "mid"), ("b60", "head")):
+            if hk in h and tag in caps:
+                print("      %-4s %-9s cbl1 CAPTURE %+.4f   hb1 CAPTURE %+.4f   %+.4f"
+                      % (tag, ARMS[tag], caps[tag], (h[hk] - h["scal"]) / gp,
+                         caps[tag] - (h[hk] - h["scal"]) / gp))
+        if "stem" in h and "b60" in caps:
+            print("      hb1's [2,60] (B %.5f, the mirror of [60,2]) captured %+.4f "
+                  "against [60,2]'s %+.4f -- the cross-batch version of the mirror "
+                  "check" % (balance([2, 60]), (h["stem"] - h["scal"]) / gp,
+                             (h["head"] - h["scal"]) / gp))
+        if "blk" in h:
+            print("      hb1's resnet18_blocks (m=%d, B %.5f) captured %+.4f; the "
+                  "balanced m=8 arm here captured %s"
+                  % (HB1_BLK_M, HB1_BLK_B, (h["blk"] - h["scal"]) / gp,
+                     ("%+.4f" % caps["c08"]) if "c08" in caps else "--"))
+    else:
+        print("      hb1-*.out not reachable from this host; nothing printed.")
+
+    print("\n-- SCOPE -------------------------------------------------------------")
+    print("   CIFAR-100 / ResNet18_c100 / SGDm+Lion / ms 1e-3 / alpha0 1e-6 / 100 ep.")
+    print("   HIER is unset in every arm: this is a PARTITION ladder and it says")
+    print("   nothing about any hierarchical or shrinkage operator, about the")
+    print("   interior r-peak, about CIFAR-10, Tiny-ImageNet, ImageNet-489 or")
+    print("   ResNet-50, and NOTHING about whether the optimum in m moves with")
+    print("   class count -- that observation rests on CROSS-BATCH CIFAR-10 pools")
+    print("   which one CIFAR-100 batch cannot settle.  CAPTURE is 0 at m=1 and 1")
+    print("   at m=62 by construction, so no optimum in m is named here.")
+    print("")
+    print("   FINAL: COUNT %s | BALANCE %s%s%s"
+          % (cv, bv, ("  [%s]" % mirror_flag) if mirror_flag else "",
+             ("  [%s]" % train_flag) if train_flag else ""))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--hb1-runs", dest="hb1_runs", default=None)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    sys.exit(selftest(a.hb1_runs) if a.selftest
+             else score(a.runs, a.manifest, a.hb1_runs))
+
+
+if __name__ == "__main__":
+    main()

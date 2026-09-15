@@ -1,0 +1,1031 @@
+#!/usr/bin/env bash
+# =============================================================================
+# c83_gen_r34_merged.sh -- `g3m`, THE ResNet34 GENERALISATION OF THE TAIL
+# PRESCRIPTION.  D AND G IN **ONE** BATCH, AT **ONE** META-STEPSIZE, n=9.
+#
+# 36 jobs: {nodewise, chunk835, nodewise1d, chunk2500} x seeds 0-8, ms=1e-4,
+# ResNet34/CIFAR-10, 100 ep, AUGMENT=1, SGDm+Lion, alpha0=1e-3, BETA_CLIP=-15:-2.3026,
+# PROBE=5 (occupancy only).  cluster_a ONLY (needs PATCH_CHUNKWISE/PATCH_NODEBN).
+#
+# -----------------------------------------------------------------------------
+# THIS FILE SUPERSEDES TWO EARLIER, DELETED SCRIPTS.  READ THIS FIRST.
+# -----------------------------------------------------------------------------
+# cycle 83 first registered the ResNet34 generalisation as TWO batches:
+#     bin/c83_gen_r34_dleg.sh  (`g3d`)  D leg: {nodewise, chunk835} x 3 ms x 3 seeds
+#     bin/c83_gen_r34_tail.sh  (`g34`)  G leg: {nodewise1d, chunk2500} x 9 seeds,
+#                                       at an ms DERIVED from g3d's argmax
+# Adversarial review killed that design on TWO fatal grounds and both files are
+# DELETED.  The reasons are recorded here because they are the reason this file
+# exists in the shape it does:
+#
+#   (F1) THE MECHANISM TEST WAS DESIGNED CROSS-BATCH AND CROSS-ms.  The paper's
+#        load-bearing sentence is not "chunk beats nodewise"; it is "D is large
+#        AND G is null -- the whole gap lives in the size-1 tail".  On ResNet18
+#        that comparison is WITHIN ONE BATCH: cc1 is 12 runs, FOUR arms
+#        (chunk777, nodewise, chunk2325, nodewise1d), ONE ms, ONE box,
+#        jobs 4715633-4715644.  Splitting it across g3d and g34 put the campaign's
+#        own measured batch random effect (sd_batch ~ 0.21 pp, F(62,85)=5.47,
+#        p=6.9e-13 -- STANDING RULE 14) INSIDE the D-minus-G contrast:
+#            se(D-G) = sqrt(se_D^2 + se_G^2 + 2*sd_batch^2) = 0.33 pp,
+#        so a true D-G of +0.5 would have landed at t=1.5.  The ResNet18 original,
+#        within-batch, reads D-G = 0.727-0.011 = 0.716 at t=2.9.  The two-batch
+#        replication would have had roughly HALF the power of the thing it
+#        replicates, for the SAME 36 jobs.  **THIS BATCH IS cc1-SHAPED: four arms,
+#        one ms, one box, one submission.  The batch offset cancels by
+#        construction and never enters D, G or D-G.**
+#
+#   (F2) THE ms WAS CHOSEN BY A GUARD WITH NO BOX CHECK.  g34 derived its ms from
+#        g3d's nodewise argmax.  ResNet18's nodewise argmax is 3e-4 -- the rung at
+#        which ar1 bound on the floor 12/12 -- and g34's own scorer VOIDS on box
+#        binding.  The modal outcome of the design was 18 jobs returning VOID.
+#        **THIS BATCH PINS ms=1e-4 AND SAYS WHY IN THE OPEN (below).**
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTRATION
+# -----------------------------------------------------------------------------
+#
+# THE QUESTION.  The campaign's central surviving sentence is the TAIL
+# PRESCRIPTION: at a MATCHED GROUP COUNT a uniform within-tensor chunking beats
+# the architecture-aligned nodewise partition (D > 0), and the whole gap lives in
+# the degenerate size-1 tail -- remove the tail and the gap vanishes (G = 0).
+# Every reading of both legs is ResNet18 / CIFAR-10.  D, re-derived from
+# results/all_runs.csv at write time (plateau5, never quoted from prose):
+#     mm1  D = chunk777 - nodewise   +0.485  se 0.161  t 3.01   ms=1e-4
+#     pp1  D                          +0.581  se 0.141  t 4.11   ms=1e-4
+#     cc1  D                          +0.727  se 0.200  t 3.63   ms=1e-4
+#     ar1  D                          +0.697  se 0.118  t 5.90   ms=3e-4 (LO-bound 12/12)
+#     fa1  D                          +0.629  se 0.123  t 5.11   ms=3e-4, box -25:-2.3026
+#   ms=1e-4 inverse-variance pool (mm1/pp1/cc1) = +0.5805 +- 0.0939, Q 0.88 on 2 df.
+# And G, the tail-removed leg at an EXACT count match on ResNet18:
+#     bn1  G = chunk2325 - nodewise1d  +0.295  se 0.048
+#     ar1  G                           -0.139  se 0.072
+#     cc1  G                           +0.011  se 0.147  t 0.08   <-- the anchor
+#     fa1  G                           -0.001  se 0.076
+#   The four R18 G readings are HETEROGENEOUS (Q = 26.2 on 2 df, p 2e-6, re-derived
+#   at write time) and this batch REFUSES to pool them.  cc1 is the anchor because
+#   it is the EXACT-count reading at the same ms and box as this batch.
+#
+# PREDICTED OUTCOME, STATED BEFORE THE DATA.  D_r34 in [+0.3, +0.8] and G_r34 in
+#   [-0.15, +0.15].  ResNet34 carries the structure in the same proportion:
+#   17,034 of 25,556 nodewise groups are size-1 (66.65% of m, covering 0.0800% of
+#   the weights) against ResNet18's 9,610 of 14,420 (66.64%, 0.0860%).  f = 2/3 is
+#   a structural constant of the conv->BN idiom (cycle 82).
+#   **IF THE STRUCTURE IS IDENTICAL AND D IS NOT, THE STRUCTURAL ATTRIBUTION IS
+#   WRONG.  That is the point of the batch.**
+#
+# REFUTATION CONDITIONS, FIXED HERE, BOTH LEGS.
+#   H1 (D):  D_r34 in [-0.15,+0.15] (NULL) or <= -0.30 (REVERSES) **and**
+#            separated from the R18 ms=1e-4 pool at |t| >= 2.  Either branch means
+#            the tail prescription is a ResNet18/CIFAR-10 curiosity and the
+#            paper's central sentence must be rescoped in the TITLE.
+#   H2 (G):  "THE NULL REPLICATES" may be DECLARED only if a TOST at
+#            delta = +-0.30 pp passes at alpha=0.05.  delta is 0.30 and NOT 0.15
+#            because a TOST at 0.15 is arithmetically unreachable at any n this
+#            campaign can afford: at the planning sd it needs |G| < 0.007.
+#            If |G| >= +0.30 with |t| >= 2 vs cc1, the mechanism claim
+#            ("the gap lives entirely in the size-1 tail") is REFUTED on R34.
+#   H3 (D-G): the mechanism contrast, WITHIN-BATCH, no cross-batch floor.
+#            R18/cc1 reads D-G = +0.716.  H3 CONFIRMS if D-G >= +0.30 at |t| >= 2.
+#
+# -----------------------------------------------------------------------------
+# WHY n=9 PER ARM, AND WHY THE PLANNING sd IS **NOT** ResNet34's
+# -----------------------------------------------------------------------------
+#   The deleted g3d sized itself on ResNet34's own within-cell sd, median 0.156 pp.
+#   That is measured on LAYERWISE (m=37) and SCALAR (m=1) cells -- ARMS THIS BATCH
+#   DOES NOT RUN.  There is no within-architecture evidence that a ResNet34
+#   nodewise or chunk arm is a 0.156-pp arm, and every scrap of evidence about the
+#   arms actually being run points HIGHER.  The honest planning sd is ResNet18's
+#   own FOUR-ARM pooled sd at this exact ms/alpha0/box, re-derived from the CSV:
+#       nodewise   sd 0.167 (n=16)    chunk777   sd 0.216 (n=9)
+#       nodewise1d sd 0.164 (n=6)     chunk2325  sd 0.123 (n=6)
+#       POOLED sd = 0.1742 pp on 33 df       <-- GUARD 2g re-derives and REFUSES
+#   At n=9 per arm:  se(D) = se(G) = 0.174*sqrt(2/9) = 0.082 pp.
+#       D = +0.5 lands at t = 6.1 against zero.
+#       vs the R18 pool, se_diff = sqrt(0.082^2 + 0.0939^2) = 0.125, so a
+#       REFUTATION needs D <= +0.331 to clear |t| >= 2.  A D of +0.40 bands
+#       ATTENUATED on the point estimate but is NOT separated from ResNet18
+#       (t -1.45): registered in advance as CONSISTENT-WITH-R18 (UNDERPOWERED),
+#       and it may NOT be written up as a refutation.
+#       TOST at delta 0.30 needs |G| < 0.157 -- reachable.  At 0.15 it needs
+#       |G| < 0.007 -- unreachable, which is why H2's delta is 0.30.
+#       se(D-G) = 0.116 WITHIN BATCH, so R18's D-G of +0.716 would land at t 6.2.
+#   **THE SPEND IS DELIBERATELY LOPSIDED TOWARD THE NULL.**  On ResNet18 the G
+#   null was declared at n=3 per arm (cc1 se 0.147), which only excludes effects
+#   above +-0.29.  Replicating a weak null weakly is worthless.  At n=9 the second
+#   architecture carries a STRONGER mechanism test than the first.
+#
+# -----------------------------------------------------------------------------
+# WHY ms=1e-4 IS PINNED, AND THE RULE-11 GAP THIS BATCH DOES **NOT** CLOSE
+# -----------------------------------------------------------------------------
+#   ms=1e-4 is chosen for TWO reasons, neither of them optimality:
+#     (i)  It is the ms of the R18 anchor pool (mm1/pp1/cc1) and of the EXACT-count
+#          G anchor (cc1).  H1 and H2 are read against those, so sharing the ms is
+#          what makes them comparable at all.
+#     (ii) It is the ONLY rung in this box that is algebraically FLOOR-FREE.  With
+#          --weight-decay-meta 0 the Lion update gives |dbeta| = ms EXACTLY, so
+#          over T = 100 x 500 = 50,000 updates beta can travel ms*T nats from
+#          beta_0 = ln(1e-3) = -6.9078.  The floor -15 is 8.0922 nats away:
+#              ms=1e-4  ms*T =  5.0 nats  -> FLOOR UNREACHABLE
+#              ms=3e-4  ms*T = 15.0 nats  -> floor reachable from epoch 54.0
+#                                            (and ar1 DID bind LO 12/12 there)
+#              ms=1e-3  ms*T = 50.0 nats  -> floor reachable from epoch 16.2
+#          GUARD 8 recomputes this and REFUSES if the emitted ms is floor-reachable.
+#
+#   **THE CEILING IS A DIFFERENT MATTER AND IS DISCLOSED, NOT HIDDEN.**  The
+#   ceiling -2.3026 is only 4.6052 nats above beta_0, and ms*T = 5.0 > 4.6052, so
+#   the CEILING is algebraically reachable from step 46,052 = epoch 92.1 -- which
+#   is INSIDE the plateau5 window (epochs 96-100).  Two things make this a
+#   disclosed risk rather than a defect: (a) at this exact ms and box on ResNet18,
+#   rec_hi measured 0.0000 on 24/24 arms (cc1 + mm1 + pp1), so the ceiling is
+#   empirically free even though it is algebraically reachable; (b) ResNet34
+#   carries 25,556 coordinates against ResNet18's 14,420, i.e. ~1.8x more chances,
+#   so it is NOT safe to assume.  THE SCORER THEREFORE REPORTS rec_hi PER SEED AS A
+#   FIRST-CLASS NUMBER, not merely as a drop criterion, and an ARM-ASYMMETRIC
+#   ceiling (|rec_hi_chunk - rec_hi_node| > 0.10) VOIDS the affected contrast.
+#
+#   RULE 11 IS **NOT** SATISFIED AND THE SCORER SAYS SO IN ITS OWN OUTPUT.  No
+#   arm's own ms argmax is measured on ResNet34 by this batch.  The deleted g3d
+#   bought a 3-rung ladder, but two of its three rungs were floor-dirty by the
+#   algebra above, so the ladder could never have issued a RULE-11 certificate
+#   anyway -- it would have spent 12 of 18 jobs on rungs registered in advance as
+#   uninterpretable.  Those 12 jobs are not replaced; they are CUT.  The permitted
+#   sentence is "D and G on ResNet34 at the R18 anchor's own ms", never "at
+#   ResNet34's optimum".
+#
+# -----------------------------------------------------------------------------
+# THE ARMS, AND WHY THESE FOUR COUNTS
+# -----------------------------------------------------------------------------
+#   nodewise    m = 25,556   the architecture-aligned partition (sum of shape[0])
+#   chunk835    m = 25,562   count-matched to nodewise, +6 groups
+#   nodewise1d  m =  8,595   the TAIL-REMOVED partition (1-D tensors get 1 group)
+#   chunk2500   m =  8,587   count-matched to nodewise1d, -8 groups
+#   D = chunk835 - nodewise        G = chunk2500 - nodewise1d
+#
+#   777 and 2325 are ResNet18/CIFAR-10 CONSTANTS and are WRONG on any other net.
+#   835 and 2500 were found by binary search on the (monotone non-increasing)
+#   chunk count against ResNet34's own shapes; 835 is the UNIQUE K within 8 groups
+#   of nodewise, and NO K gives an exact nodewise1d match -- the chunk count skips
+#   8,595 entirely.  GUARD 4 MEASURES all four m off the ALLOCATED beta on the real
+#   built network and REFUSES on any mismatch; GUARD 4e cross-checks with a second,
+#   torch-free instrument.
+#
+#   THE COUNT RESIDUAL IS HARMLESS AND IS QUANTIFIED, NOT ASSUMED.  The count slope
+#   re-derived from the CSV at write time (chunk777 92.580 n=9 vs chunk2325 92.812
+#   n=6 at ms=1e-4, 0.4732 decades apart) is -0.4906 pp per decade of m.  +6 groups
+#   on 25,556 = 1.020e-4 decades = 5.0e-5 pp of bias; -8 on 8,595 = 4.0e-4 decades
+#   = 2.0e-4 pp.  Both are 250-1,000x below the 0.05 pp resolution floor, and the
+#   +6 is SMALLER than the +1-group bias ResNet18's own chunk777 already carries.
+#
+#   K=835 AND K=2500 ARE BOTH > 512 = the largest 1-D tensor on ResNet34, so ALL 73
+#   1-D tensors get EXACTLY ONE chunk in BOTH chunk arms.  That is the property
+#   that makes them the structurally identical comparators to R18's chunk777 /
+#   chunk2325.  **IT IS ALSO WHY ResNet50 IS STRUCTURALLY EXCLUDED FROM THIS
+#   PROGRAMME AT ANY PRICE:** its largest 1-D tensor is 2,048 and every
+#   count-matching K (295, 885) is BELOW it, so a chunk arm there would SPLIT the
+#   very BatchNorm tensors whose merging is the prescription.  GUARD 4 enforces
+#   K > max-1-D and would refuse a ResNet50 port outright.
+#
+# -----------------------------------------------------------------------------
+# WHAT THIS BATCH MAY **NOT** CLAIM.  Registered before any data exists.
+# -----------------------------------------------------------------------------
+#   * NOT a tuned-arm (RULE 11) result on ResNet34.  No argmax is measured.
+#   * NOT a fifth replication of the R18 D series -- it is a DIFFERENT architecture
+#     and is reported as a generalisation test, never pooled with mm1/pp1/cc1.
+#   * NO FIELD STATISTIC OF ANY KIND.  PROBE=5 is exported for BOX OCCUPANCY ONLY.
+#     PROBE5 is deliberately NOT exported (GUARD 1b asserts its absence), no
+#     neg_counts is written, and rho_w / N_eff belong to Direction C, which was
+#     DROPPED on its own pre-registered adoption gate.
+#   * NOTHING about CIFAR-100 (that is `gc1`, bin/c83_gen_c100_screen.sh) and
+#     NOTHING about ResNet50 (structurally excluded above).
+#   * NO cross-architecture LAW.  Two architectures is two points.
+#   * NO amendment to cc1's, bn1's, ar1's or fa1's own readings.
+#   * T2 = nodewise1d - nodewise is COUNT-CONFOUNDED by construction (25,556 ->
+#     8,595 = 0.4732 decades = +0.232 pp of pure count effect at the measured
+#     slope) and is DESCRIPTIVE ONLY.  It is NOT "tail removal" and the scorer
+#     refuses to label it so.
+#
+# STANDING RULES HONOURED: 10 (the series holds the arm fixed), 13 (every guard
+# tested in BOTH directions before submission), 14 (every scored contrast is
+# WITHIN this one batch, so the batch offset cancels and no floor applies), 19
+# (this file and analysis/c83_gen_score.py are git-committed BEFORE any run exists).
+# =============================================================================
+set -u
+
+SUBMIT=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit) SUBMIT=1 ;;
+    *) echo "unknown argument $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+GUARD_FAILS=0
+guard_fail() {
+  GUARD_FAILS=$((GUARD_FAILS + 1))
+  echo "!!! GUARD FAIL: $1"
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! SUBMIT ABORTED -- nothing was submitted."
+    exit 1
+  fi
+  echo "    (dry run: continuing so the emitter can be validated off-cluster."
+  echo "     THIS BATCH MUST NOT BE SUBMITTED UNTIL THIS GUARD PASSES ON cluster_a.)"
+}
+
+USER_NAME="${USER:-$(whoami)}"
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/g3m
+
+# --- PROJECT ENVIRONMENT (cycle 85, fix 3) ----------------------------------
+# Several guards import torch (guard 4 builds the LIVE network to MEASURE the
+# beta allocation; the equivalence suites need it too).  A bare ssh shell has no
+# torch, so those guards aborted a VALID batch on a MISSING INTERPRETER -- a
+# false negative three times running.  Activate ONCE here so every guard below
+# sees the same interpreter the JOBS will use.  Failures stay silent on purpose:
+# if the venv is genuinely broken the importing guards still fail loudly and
+# correctly, which is the behaviour we want.  (c82/gc1/gn1 activate per-block;
+# this script has 14 python3 sites, so activating once is the safer form.)
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# WALL / PARTS.  gpu-short (4:00:00 cap) IS DELIBERATELY EXCLUDED.  GUARD 7
+# projects the worst-case cost of THE ARMS THIS BATCH ACTUALLY SUBMITS -- not of
+# layerwise, which is what the deleted g3d wrongly measured.  The worst 100-ep
+# ResNet34 wallclock in the CSV is 120 min, and ResNet18's MEASURED cost ratios
+# against layerwise are nodewise 1.452, nodewise1d 1.710, chunk777 1.726,
+# chunk2325 1.806.  Taking the MAX over the submitted arms (1.806) projects a
+# worst case of 217 min.  At 4:00:00 that is 1.11x headroom -- REFUSED.  At
+# 6:00:00 it is 1.66x.  GUARD 7 refuses below 1.40x and re-derives every ratio
+# from the CSV rather than trusting this comment.
+WALL=06:00:00
+PARTS=gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+NJOBS=36                       # 4 arms x 9 seeds, ONE ms, ONE batch
+CLIP=-15:-2.3026               # cc1's / mm1's / pp1's / ar1's box EXACTLY
+MST=1e-4                       # PINNED.  The R18 anchor's ms AND the only
+                               # floor-free rung in this box (GUARD 8).
+ALPHA0=1e-3                    # beta_0 = ln(alpha0) = -6.907755
+GAMMA=1
+EPOCHS=100
+BATCH=100
+STEPS_PER_EPOCH=500            # 50,000 CIFAR-10 train images / batch 100
+PROBE_EVERY=5                  # -> 50,000/5 = 10,000 records, cc1's own denominator
+NET=ResNet34
+DSET=CIFAR10
+SEEDS="0 1 2 3 4 5 6 7 8"
+
+CHUNK_KD=835                   # D leg comparator: m = 25,562 = m(nodewise) + 6
+CHUNK_KG=2500                  # G leg comparator: m =  8,587 = m(nodewise1d) - 8
+M_NODE=25556
+M_CHUNK_D=25562
+M_N1D=8595
+M_CHUNK_G=8587
+N_TENSORS=110                  # ResNet34 named_parameters()
+N_1D=73                        # 1-D tensors (every BN scale/shift + linear.bias)
+MAX_1D_NUMEL=512               # the largest 1-D tensor; MUST be < both K
+SINGLETONS=17034               # size-1 nodewise groups = 66.65% of m, 0.0800% of weights
+NPARAM=21282122
+
+ANCHOR_D=0.5805                # R18 ms=1e-4 inverse-variance D pool (mm1/pp1/cc1)
+ANCHOR_D_SE=0.0939             # Q = 0.88 on 2 df -- homogeneous, pooling legal
+ANCHOR_G=0.011                 # cc1's EXACT-count G, the ONLY legal G anchor
+ANCHOR_G_SE=0.147              # the R18 G readings are HETEROGENEOUS (Q 26.2/2df)
+COUNT_SLOPE=-0.4906            # pp per decade of m, re-derived by GUARD 2e
+SD_PLAN=0.1742                 # R18 FOUR-ARM pooled sd on 33 df, GUARD 2g re-derives
+SD_CAP=0.30                    # refuse if the re-derived sd exceeds this
+NULL_HALF=0.15                 # H1's five-way band, IDENTICAL to cc1's / bn1's T1
+DECIDE=0.30                    # H1 REVERSES / H2 TOST delta / H3 confirm threshold
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  g3m -- THE ResNet34 GENERALISATION, D AND G IN ONE BATCH"
+echo "    $NET / $DSET / bs $BATCH / ${EPOCHS} ep / AUGMENT=1 / SGDm+Lion"
+echo "    FOUR arms x 9 seeds at ms=$MST, BETA_CLIP=$CLIP  = $NJOBS jobs"
+echo "      node(m=$M_NODE)  chunk${CHUNK_KD}(m=$M_CHUNK_D)   [+6 groups]"
+echo "      n1d (m=$M_N1D)   chunk${CHUNK_KG}(m=$M_CHUNK_G)   [-8 groups]"
+echo "    H1 D = chunk${CHUNK_KD} - nodewise    vs R18 pool +$ANCHOR_D +-$ANCHOR_D_SE"
+echo "       > +0.30 GENERALISES | [-0.15,+0.15] NULL | <= -0.30 REVERSES"
+echo "       declared ONLY at |t| >= 2 vs R18; else CONSISTENT-WITH-R18 (UNDERPOWERED)"
+echo "    H2 G = chunk${CHUNK_KG} - nodewise1d  vs cc1 +$ANCHOR_G +-$ANCHOR_G_SE"
+echo "       'NULL REPLICATES' requires a TOST at delta +-$DECIDE (NOT +-0.15,"
+echo "        which needs |G| < 0.007 and is unreachable at any affordable n)"
+echo "    H3 D-G  THE MECHANISM CONTRAST, WITHIN-BATCH (R18/cc1 reads +0.716)"
+echo "    **EVERY SCORED CONTRAST IS WITHIN THIS ONE BATCH -- RULE 14 by construction.**"
+echo "    **RULE 11 IS NOT SATISFIED: no ResNet34 argmax is measured.  ms is PINNED**"
+echo "    **to the R18 anchor's ms, which is also the only floor-free rung (GUARD 8).**"
+echo "    **NO FIELD STATISTIC.  PROBE=5 = box occupancy only; PROBE5 NOT exported.**"
+echo "    SUPERSEDES the deleted bin/c83_gen_r34_dleg.sh (g3d) and"
+echo "    bin/c83_gen_r34_tail.sh (g34) -- see the header for why."
+echo "=============================================================="
+
+# --- GUARD 0 -- the runner and the CSV exist -------------------------------
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$RUNNER" ] || guard_fail "guard 0: no runner at $RUNNER"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND writes probe.jsonl ----------
+python3 - "$WS" <<'PYEOF' || guard_fail "guard 1: HF.py probe gate"
+import os, re, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if "PROBE" not in src:
+    sys.exit("GUARD FAIL: HF.py carries no PROBE wiring at all")
+if "PATCH_PROBE4" not in src and "probe.jsonl" not in src:
+    sys.exit("GUARD FAIL: HF.py does not write probe.jsonl -- box occupancy would be "
+             "UNMEASURABLE and every number in this batch uninterpretable")
+print("guard 1: HF.py writes probe.jsonl; box occupancy is measurable")
+PYEOF
+
+# --- GUARD 1b -- THE ENV/ARGS PIN CHECK, against THE EMITTER REGION ONLY.
+# Marker literals are BUILT BY CONCATENATION so the checker cannot match itself
+# (CORRECTIONS 112's self-referential-guard failure, fixed by construction).
+python3 - "$0" "$CLIP" "$EPOCHS" "$ALPHA0" "$BATCH" "$NET" "$DSET" "$GAMMA" "$PROBE_EVERY" "$MST" \
+  <<'PYEOF' || guard_fail "guard 1b: ENV/ARGS pin"
+import sys
+me, clip, epochs, alpha0, batch, net, dset, gamma, probe, mst = sys.argv[1:11]
+lines = open(me).read().splitlines()
+BEG = "# --- EMITTER " + "BEGIN ---"
+END = "# --- EMITTER " + "END ---"
+b = [i for i, l in enumerate(lines) if l.strip() == BEG]
+e = [i for i, l in enumerate(lines) if l.strip() == END]
+if len(b) != 1 or len(e) != 1 or not (b[0] < e[0]):
+    sys.exit("GUARD FAIL: emitter markers are not a single well-ordered pair "
+             "(%d begin, %d end)" % (len(b), len(e)))
+region = "\n".join(lines[b[0] + 1:e[0]])
+if len(region.strip()) < 200:
+    sys.exit("GUARD FAIL: the emitter region is empty or truncated")
+
+# 1b-1.  The colon.  BETA_CLIP without a colon is the campaign's oldest footgun:
+# the runner parses "lo:hi" and a hyphen-only form silently yields NO BOX AT ALL.
+if ":" not in clip:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r has NO COLON -- the runner would not parse a "
+             "box and every occupancy number would be a fiction" % clip)
+try:
+    lo, hi = (float(x) for x in clip.split(":"))
+except Exception:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r does not parse as two floats" % clip)
+if not lo < hi:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r is not ordered lo<hi" % clip)
+print("guard 1b-1: BETA_CLIP=%s parses as (%.4f, %.4f), ordered" % (clip, lo, hi))
+
+# 1b-2.  The --export key set.  PROBE5 must be ABSENT: this batch reads no field
+# statistic, so no neg_counts may be written, and the scorer treats a neg_counts
+# on disk as evidence the submitted export line was not the registered one.
+exp = [l for l in region.splitlines() if "--export=" in l]
+if len(exp) != 1:
+    sys.exit("GUARD FAIL: expected exactly one --export line in the emitter, found %d" % len(exp))
+exp = exp[0]
+for k in ("AUGMENT=1", "BETA_CLIP=", "HIER=none", "SCHED=none", "PROBE=", "PROBE_DIR="):
+    if k not in exp:
+        sys.exit("GUARD FAIL: --export line is missing %r" % k)
+for bad in ("PROBE5", "LAM=", "ETA_RATIO="):
+    if bad in exp:
+        sys.exit("GUARD FAIL: --export line carries %r, which this batch registered "
+                 "as ABSENT" % bad)
+print("guard 1b-2: --export pins AUGMENT=1, BETA_CLIP, HIER=none, SCHED=none, "
+      "PROBE=%s, PROBE_DIR; PROBE5 absent as registered" % probe)
+
+# 1b-3.  Every registered ARGS pin, and every forbidden flag.
+PINS = ["--optimizer HF", "--alg-base SGDm", "--momentum-param-base 0.99",
+        "--weight-decay-base 0.1", "--alg-meta Lion", "--momentum-param-meta 0.99",
+        "--Lion-beta2-meta 0.9", "--weight-decay-meta 0", "--max-time 999:00:00"]
+missing = [p for p in PINS if p not in region]
+if missing:
+    sys.exit("GUARD FAIL: the emitter is missing registered ARGS pin(s): %s" % missing)
+for bad in ("--hier", "--lam", "--eta-ratio"):
+    if bad in region:
+        sys.exit("GUARD FAIL: the emitter carries %r, which this batch forbids" % bad)
+# the scalar axes must be interpolated from the constants the guards use
+for var in ("DSET", "NET", "BATCH", "GAMMA", "MST", "ALPHA0", "EPOCHS", "CLIP"):
+    if ("$" + var) not in region and ("${" + var + "}") not in region:
+        sys.exit("GUARD FAIL: the emitter hard-codes an axis instead of "
+                 "interpolating $%s from the constant the guards check" % var)
+print("guard 1b-3: all %d ARGS pins present; no hier/lam/eta-ratio flag; every axis "
+      "interpolated from a guarded constant" % len(PINS))
+
+# 1b-4.  ONE meta-stepsize.  The whole point of the merge is that D, G and D-G
+# share a batch AND a stepsize.  A loop over stepsizes here would re-open F1.
+whole = "\n".join(lines)
+for pat in ("MST_LIST", "MSTS=", "for MST", "for ms in"):
+    if pat in region or any(l.strip().startswith(pat) for l in lines):
+        sys.exit("GUARD FAIL: this file declares or loops over a LIST of "
+                 "meta-stepsizes (%r).  This batch is cc1-shaped BY DESIGN -- four "
+                 "arms, ONE ms, ONE box, ONE submission -- because splitting D and G "
+                 "across stepsizes or batches puts 2*sd_batch^2 inside D-minus-G, "
+                 "which is the contrast the replication exists to measure." % pat)
+if len([l for l in lines if l.startswith("MST=")]) != 1:
+    sys.exit("GUARD FAIL: expected exactly one MST= assignment in this file")
+print("guard 1b-4: exactly one meta-stepsize (%s) in the whole file -- D, G and D-G "
+      "share it" % mst)
+
+# 1b-5.  FOUR arms, and the two count-matched pairs.
+for a in ("nodewise:node", "nodewise1d:n1d"):
+    if a not in region:
+        sys.exit("GUARD FAIL: the emitter is missing arm %r" % a)
+if region.count("chunk${CHUNK_KD}") < 1 or region.count("chunk${CHUNK_KG}") < 1:
+    sys.exit("GUARD FAIL: the emitter does not carry both chunk arms")
+print("guard 1b-5: four arms present -- nodewise/chunkKD (D leg) and "
+      "nodewise1d/chunkKG (G leg), so D-G is a within-batch contrast")
+PYEOF
+
+# --- GUARD 1c -- THE PATCHES THIS BATCH NEEDS, AND THE cluster_a-ONLY ASSERTION -
+python3 - "$WS" <<'PYEOF' || guard_fail "guard 1c: PATCH_CHUNKWISE / PATCH_NODEBN"
+import os, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+for m in ("PATCH_CHUNKWISE", "PATCH_NODEBN", "PATCH_GRANULARITY"):
+    if m not in src:
+        sys.exit("GUARD FAIL: %s is NOT in the loaded HF.py.  This batch is cluster_a-ONLY; "
+                 "cluster_b does not carry these patches." % m)
+if "nodewise1d" not in src:
+    sys.exit("GUARD FAIL: HF.py has no nodewise1d branch -- the G leg cannot be built")
+print("guard 1c: PATCH_GRANULARITY / PATCH_CHUNKWISE / PATCH_NODEBN all present; "
+      "nodewise1d reachable; plain nodewise undisturbed")
+PYEOF
+
+# --- GUARD 1c2 -- THE ENVIRONMENT LEAK.  --export=ALL carries the submitting
+# shell's variables into all 36 jobs.  A stray HIER=additive would silently turn
+# this into a hierarchical-pooling batch (the dc-aw-* failure mode).
+for V in HIER SCHED LAM ETA_RATIO AUGMENT BETA_CLIP PROBE PROBE5; do
+  eval "SET=\${$V+x}"
+  if [ -n "${SET:-}" ]; then
+    eval "VAL=\$$V"
+    guard_fail "guard 1c2: the submitting shell sets $V=$VAL, and --export=ALL would "\
+"carry that into all $NJOBS jobs.  unset it and re-run."
+  fi
+done
+echo "guard 1c2: the submitting shell sets none of HIER/SCHED/LAM/ETA_RATIO/AUGMENT/"\
+"BETA_CLIP/PROBE/PROBE5"
+
+# --- GUARD 1d -- THE EQUIVALENCE SUITES PASS ON THIS TREE, ON CPU ----------
+# Both suites are needed: this batch runs BOTH chunk arms (test_chunkwise) AND
+# nodewise1d (test_nodebn).  gc1 needs only the former; g3m needs both.
+for T in test_chunkwise.py test_nodebn.py; do
+  if [ -f "$REPO/tests/$T" ]; then
+    if command -v timeout >/dev/null 2>&1; then TO="timeout 3600"; else TO=""; fi
+    # FIX (cycle 85): the suite needs the project venv, exactly as c82 does at its
+    # guard 1e.  Without it python3 has no torch and the guard aborts a VALID batch
+    # on a MISSING INTERPRETER -- a false negative, not a real precondition failure.
+    # FIX 2 (cycle 85): score the suite on its EXIT CODE, as c82's guard 1e does.
+    # The previous form string-matched `tail -3`, but test_chunkwise.py prints
+    # "ALL CHUNKWISE TESTS PASS" and THEN a 7-line m(K) ladder, so the marker is
+    # never in the last 3 lines and a PASSING suite was read as a failure.
+    # Exit code is authoritative (sys.exit(0)/sys.exit(1)); the marker grep is a
+    # second, independent condition -- BOTH must hold.
+    ( module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+      # shellcheck disable=SC1091
+      . "$WS/envs/mo/bin/activate" 2>/dev/null
+      cd "$REPO" && NODEBN_TEST_DEVICE=cpu $TO python3 "tests/$T" ) > "/tmp/g3m_t.$$" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] && grep -qE "^ALL[A-Z ]*PASS|[0-9]+ PASS, 0 FAIL" "/tmp/g3m_t.$$"; then
+      echo "guard 1d: tests/$T PASS (exit 0, marker present)"
+    else
+      echo "  tests/$T output tail:"; tail -8 "/tmp/g3m_t.$$"
+      guard_fail "guard 1d: tests/$T did NOT pass on this tree (exit $RC)"
+    fi
+    rm -f "/tmp/g3m_t.$$"
+  else
+    guard_fail "guard 1d: $REPO/tests/$T absent -- the granularity code path this "\
+"batch depends on has no equivalence suite"
+  fi
+done
+
+# --- GUARD 2 -- every CSV precondition, RE-DERIVED AT SUBMIT TIME ----------
+python3 - "$CSVP" "$NET" "$DSET" "$EPOCHS" "$MST" "$ALPHA0" "$CLIP" "$BATCH" "$GAMMA" \
+    "$ANCHOR_D" "$ANCHOR_D_SE" "$ANCHOR_G" "$COUNT_SLOPE" "$SD_PLAN" "$SD_CAP" \
+    "$M_NODE" "$M_CHUNK_D" "$M_N1D" "$M_CHUNK_G" \
+  <<'PYEOF' || guard_fail "guard 2: CSV preconditions"
+import csv, math, sys, statistics as st
+from collections import defaultdict
+(csvp, net, dset, epochs, mst, alpha0, clip, batch, gamma,
+ anch_d, anch_d_se, anch_g, slope, sd_plan, sd_cap,
+ m_node, m_chd, m_n1d, m_chg) = sys.argv[1:20]
+anch_d, anch_d_se, anch_g = float(anch_d), float(anch_d_se), float(anch_g)
+slope, sd_plan, sd_cap = float(slope), float(sd_plan), float(sd_cap)
+R = list(csv.DictReader(open(csvp)))
+def f(x):
+    try: return float(x)
+    except Exception: return None
+def complete(r):
+    return (r["collapsed"] == "0" and r["superseded"] in ("0", "")
+            and r["epochs_done"] == r["epochs_requested"])
+
+# 2a -- THE PREMISE.  Both legs must be UNREAD on this architecture, or the batch
+# is not measuring what it says it measures.
+n_node = sum(1 for r in R if r["network"] == net and r["dataset"] == dset
+             and r["granularity"] == "nodewise" and r["epochs_done"] == epochs)
+n_n1d = sum(1 for r in R if r["network"] == net and r["granularity"] == "nodewise1d")
+n_ch = sum(1 for r in R if r["network"] == net and r["granularity"].startswith("chunk"))
+if n_node or n_n1d or n_ch:
+    sys.exit("GUARD FAIL: the premise does not hold -- %s already has %d nodewise@%sep, "
+             "%d nodewise1d and %d chunk* runs.  This batch would not be reading "
+             "unread data." % (net, n_node, epochs, n_n1d, n_ch))
+short = sum(1 for r in R if r["network"] == net and r["dataset"] == dset
+            and r["granularity"] == "nodewise")
+print("guard 2a: %s has 0 nodewise runs at %s ep (%d at shorter budgets), 0 nodewise1d "
+      "at any budget, 0 chunk* at any budget.  All four arms are UNREAD." % (net, epochs, short))
+
+# 2b -- THE RULE-11 DISCLOSURE.  Every existing 100-ep run on this net sits at one
+# ms, and it is NOT the one this batch uses.  That is stated, not hidden.
+msv = sorted({r["meta_stepsize"] for r in R if r["network"] == net
+              and r["dataset"] == dset and r["epochs_done"] == epochs and r["meta_stepsize"]})
+print("guard 2b: every 100-ep %s run in the corpus sits at ms in %s; this batch runs at "
+      "%s (the R18 anchor's ms).  RULE 11 IS OPEN AND THE SCORER SAYS SO." % (net, msv, mst))
+
+# 2c -- THE R18 D ANCHORS, re-derived, and the pool this batch is read against.
+def cells(gran, ms, a0, nn="ResNet18", ds="CIFAR10", box=clip):
+    out = defaultdict(list)
+    for r in R:
+        if not complete(r): continue
+        if r["network"] != nn or r["dataset"] != ds: continue
+        if r["granularity"] != gran or r["meta_stepsize"] != ms or r["alpha0"] != a0: continue
+        if r["beta_clip"] != box or r["hier"] not in ("", "none"): continue
+        if r["epochs_done"] != "100": continue
+        p = f(r["plateau5"])
+        if p is not None and p > 80:
+            out[r["run"].split("-")[0]].append(p)
+    return out
+def welch(a, b):
+    ma, mb = st.mean(a), st.mean(b)
+    va, vb = (st.variance(a) if len(a) > 1 else 0.0), (st.variance(b) if len(b) > 1 else 0.0)
+    se = math.sqrt(va / len(a) + vb / len(b))
+    return ma - mb, se
+ok = 0
+for fam in ("mm1", "pp1", "cc1"):
+    ch = cells("chunk777", "1e-4", "1e-3").get(fam, [])
+    nd = cells("nodewise", "1e-4", "1e-3").get(fam, [])
+    if len(ch) >= 2 and len(nd) >= 2:
+        d, se = welch(ch, nd)
+        print("guard 2c: R18 %s D = %+0.3f se %.3f t %.2f (n=%d v %d)"
+              % (fam, d, se, d / se if se else float("nan"), len(ch), len(nd)))
+        ok += 1
+if ok < 2:
+    sys.exit("GUARD FAIL: could not re-derive at least 2 of the 3 R18 ms=1e-4 D anchors "
+             "from the CSV -- the corpus has moved under the registration")
+
+# 2d -- THE R18 G ANCHOR (cc1) AND THE HETEROGENEITY THAT FORBIDS POOLING IT.
+ccg_ch = cells("chunk2325", "1e-4", "1e-3").get("cc1", [])
+ccg_nd = cells("nodewise1d", "1e-4", "1e-3").get("cc1", [])
+if len(ccg_ch) >= 2 and len(ccg_nd) >= 2:
+    g, gse = welch(ccg_ch, ccg_nd)
+    print("guard 2d: R18 cc1 G = %+0.3f se %.3f t %.2f (n=%d v %d) -- THE ONLY LEGAL G "
+          "ANCHOR (exact count match, same ms, same box)" % (g, gse, g / gse, len(ccg_ch), len(ccg_nd)))
+    if abs(g - anch_g) > 0.05:
+        sys.exit("GUARD FAIL: cc1's G re-derives to %+0.3f, not the %+0.3f registered"
+                 % (g, anch_g))
+else:
+    sys.exit("GUARD FAIL: cannot re-derive cc1's G leg from the CSV")
+
+# 2e -- THE COUNT SLOPE AND BOTH RESIDUAL BIASES, re-derived not assumed.
+a = [p for v in cells("chunk777", "1e-4", "1e-3").values() for p in v]
+b = [p for v in cells("chunk2325", "1e-4", "1e-3").values() for p in v]
+if len(a) < 3 or len(b) < 3:
+    sys.exit("GUARD FAIL: cannot re-derive the count slope")
+dec = math.log10(14421.0 / 4851.0)
+sl = (st.mean(a) - st.mean(b)) / dec
+print("guard 2e: count slope re-derived = %+0.4f pp/decade (registered %+0.4f)" % (sl, slope))
+if abs(sl - slope) > 0.10:
+    sys.exit("GUARD FAIL: the count slope has moved from %+0.4f to %+0.4f" % (slope, sl))
+for nm, ma, mb in (("D leg", int(m_chd), int(m_node)), ("G leg", int(m_chg), int(m_n1d))):
+    d_dec = abs(math.log10(float(ma) / float(mb)))
+    bias = sl * d_dec
+    print("guard 2e: %s -- %+d groups = %.3e decades -> count bias %+0.6f pp"
+          % (nm, ma - mb, d_dec, bias))
+    if abs(bias) > 0.005:
+        sys.exit("GUARD FAIL: %s count bias %.6f pp exceeds the 0.005 pp registered cap" % (nm, bias))
+
+# 2f -- THE PLANNING sd.  From the FOUR ARMS THIS BATCH RUNS, on ResNet18, at this
+# ms/alpha0/box -- NOT from ResNet34 layerwise/scalar, which this batch does not run.
+num = den = 0.0
+rows = []
+for gran in ("nodewise", "chunk777", "nodewise1d", "chunk2325"):
+    v = [p for vv in cells(gran, "1e-4", "1e-3").values() for p in vv]
+    if len(v) >= 3:
+        s = st.stdev(v); num += (len(v) - 1) * s * s; den += len(v) - 1
+        rows.append("%s sd %.3f (n=%d)" % (gran, s, len(v)))
+if den < 10:
+    sys.exit("GUARD FAIL: fewer than 10 df available for the planning sd")
+sp = math.sqrt(num / den)
+print("guard 2f: R18 four-arm cells -- %s" % "; ".join(rows))
+print("guard 2f: POOLED planning sd = %.4f on %d df (registered %.4f)" % (sp, int(den), sd_plan))
+if sp > sd_cap:
+    sys.exit("GUARD FAIL: the planning sd %.4f exceeds the %.2f cap -- re-size the batch"
+             % (sp, sd_cap))
+if abs(sp - sd_plan) > 0.05:
+    sys.exit("GUARD FAIL: the planning sd re-derives to %.4f, not the %.4f registered"
+             % (sp, sd_plan))
+se = sp * math.sqrt(2.0 / 9)
+sed = math.sqrt(se * se + anch_d_se * anch_d_se)
+print("guard 2f: at n=9 per arm se(D)=se(G)=%.4f; D=+0.5 lands at t=%.2f; a REFUTATION "
+      "needs D <= %+0.3f to clear |t|>=2 vs the R18 pool (se_diff %.4f)"
+      % (se, 0.5 / se, anch_d - 2 * sed, sed))
+print("guard 2f: TOST at delta 0.30 needs |G| < %.4f (reachable); at 0.15 it needs "
+      "|G| < %.4f (UNREACHABLE -- why H2's delta is 0.30)"
+      % (0.30 - 1.7459 * se, 0.15 - 1.7459 * se))
+print("guard 2f: se(D-G) = %.4f WITHIN BATCH (no cross-batch floor); R18/cc1's D-G of "
+      "+0.716 would land at t=%.2f" % (se * math.sqrt(2), 0.716 / (se * math.sqrt(2))))
+
+# 2g -- NAME COLLISION.
+clash = [r["run"] for r in R if r["run"].startswith("g3m-")]
+if clash:
+    sys.exit("GUARD FAIL: %d g3m-* runs already in the CSV: %s" % (len(clash), clash[:5]))
+print("guard 2g: no g3m-* run name exists in the CSV (%d rows scanned)" % len(R))
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs (STANDING RULE 19) -
+python3 - "$REPO" "$CLIP" <<'PYEOF' || guard_fail "guard 3: box registration"
+import re, sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+lo, hi = (float(x) for x in clip.split(":"))
+p = os.path.join(repo, "analysis", "c55_neff_noise.py")
+src = open(p).read()
+m = re.search(r'"g3m":\s*\(([-0-9.eE]+),\s*([-0-9.eE]+),', src)
+if not m:
+    sys.exit("GUARD FAIL: `g3m` is not registered in c55_neff_noise.BOXES.  RULE 19 "
+             "requires the box registered before the runs exist.")
+rlo, rhi = float(m.group(1)), float(m.group(2))
+if abs(rlo - lo) > 1e-9 or abs(rhi - hi) > 1e-9:
+    sys.exit("GUARD FAIL: c55 registers g3m as (%s, %s) but CLIP= is (%s, %s)"
+             % (rlo, rhi, lo, hi))
+print("guard 3: g3m registered as (%s, %s) from bin/c83_gen_r34_merged.sh:CLIP, "
+      "identical to cc1's/mm1's/pp1's" % (rlo, rhi))
+PYEOF
+
+# --- GUARD 3b -- the scorer exists and its own selftest passes (RULE 19) ----
+if [ -f "$REPO/analysis/c83_gen_score.py" ]; then
+  OUT="$(cd "$REPO" && python3 analysis/c83_gen_score.py --selftest 2>&1 | tail -1)" || true
+  case "$OUT" in
+    *PASS*) echo "guard 3b: analysis/c83_gen_score.py -- $OUT" ;;
+    *) guard_fail "guard 3b: the scorer's selftest did not pass: $OUT" ;;
+  esac
+else
+  guard_fail "guard 3b: analysis/c83_gen_score.py absent -- RULE 19 requires the scorer "\
+"git-committed BEFORE the runs exist"
+fi
+
+# --- GUARD 4 -- **THE BETA-ALLOCATION GUARD.  m IS MEASURED, NEVER ASSERTED.** -
+python3 - "$WS" "$NET" "$CHUNK_KD" "$CHUNK_KG" "$M_NODE" "$M_CHUNK_D" "$M_N1D" \
+    "$M_CHUNK_G" "$N_TENSORS" "$N_1D" "$MAX_1D_NUMEL" "$SINGLETONS" "$NPARAM" \
+    "$ALPHA0" "$MST" \
+  <<'PYEOF' || guard_fail "guard 4: beta allocation"
+import os, sys
+(ws, net, kd, kg, m_node, m_chd, m_n1d, m_chg,
+ n_ten, n_1d, max1d, singles, nparam, a0, mst) = sys.argv[1:16]
+kd, kg = int(kd), int(kg)
+m_node, m_chd, m_n1d, m_chg = int(m_node), int(m_chd), int(m_n1d), int(m_chg)
+n_ten, n_1d, max1d, singles, nparam = (int(n_ten), int(n_1d), int(max1d),
+                                       int(singles), int(nparam))
+base = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize", "cifar10")
+sys.path.insert(0, base)
+sys.path.insert(0, os.path.join(base, "Optimizers"))
+try:
+    import torch                                              # noqa: F401
+    from build_network import build_network                    # type: ignore
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE build_network on this host (%s).  "
+             "This guard MUST be run on cluster_a inside the venv before submission." % ex)
+net_obj = build_network(net, "cpu")   # FIX (cycle 85): signature is (network_name, device)
+shapes = [tuple(p.shape) for p in net_obj.parameters()]
+tot = sum(int(__import__("math").prod(s)) for s in shapes)
+
+# 4a -- the structural census, MEASURED.
+ones = [s for s in shapes if len(s) == 1]
+if len(shapes) != n_ten:
+    sys.exit("GUARD FAIL: %s has %d tensors, not the %d registered" % (net, len(shapes), n_ten))
+if len(ones) != n_1d:
+    sys.exit("GUARD FAIL: %s has %d 1-D tensors, not the %d registered" % (net, len(ones), n_1d))
+mx = max(s[0] for s in ones)
+if mx != max1d:
+    sys.exit("GUARD FAIL: the largest 1-D tensor is %d, not the %d registered" % (mx, max1d))
+if tot != nparam:
+    sys.exit("GUARD FAIL: %s has %d parameters, not the %d registered" % (net, tot, nparam))
+print("guard 4a: %s -- %d tensors, %d of them 1-D, largest 1-D numel %d, %d parameters"
+      % (net, len(shapes), len(ones), mx, tot))
+
+# 4b -- THE STRUCTURAL PROPERTY THE PRESCRIPTION IS ABOUT.  BOTH chunk K must
+# EXCEED the largest 1-D tensor, or the comparator SPLITS the very BatchNorm
+# tensors whose merging is the prescription.  This is the guard that structurally
+# excludes ResNet50 (largest 1-D = 2048 > every count-matching K).
+for tag, K in (("D", kd), ("G", kg)):
+    if K <= mx:
+        sys.exit("GUARD FAIL: %s-leg chunk K=%d is NOT greater than the largest 1-D "
+                 "tensor (%d).  The chunk arm would SPLIT the very tensors whose "
+                 "merging is the prescription.  THIS IS THE ResNet50 TRAP." % (tag, K, mx))
+print("guard 4b: K=%d and K=%d both exceed %d, so ALL %d 1-D tensors get EXACTLY ONE "
+      "chunk in BOTH chunk arms" % (kd, kg, mx, len(ones)))
+
+# 4c -- m MEASURED OFF THE ALLOCATED beta, for all four arms.
+from HF import HF                                              # type: ignore
+# FIX (cycle 85): HF's signature is
+#   HF(net, stepsize_groups, alpha0, args_base, args_meta, gamma, writer=None)
+# and it takes the NET, not net.parameters().  The previous form omitted four
+# required arguments.  Construction copied verbatim from
+# bin/c84_normaliser_transfer.sh, which measures m the same way and works.
+class _NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+_BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+_META = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+         "Lion_beta2": 0.9, "weight_decay": 0}
+
+
+def m_of(gran):
+    torch.manual_seed(0)
+    fresh = build_network(net, "cpu")
+    opt = HF(fresh, stepsize_groups=gran, alpha0=float(a0), args_base=dict(_BASE),
+             args_meta=dict(_META), gamma=1, writer=_NullWriter())
+    return sum(int(b.numel()) for b in opt.beta)
+got = {}
+for gran, want, label in (("nodewise", m_node, "nodewise"),
+                          ("chunk%d" % kd, m_chd, "chunk%d" % kd),
+                          ("nodewise1d", m_n1d, "nodewise1d"),
+                          ("chunk%d" % kg, m_chg, "chunk%d" % kg)):
+    g = m_of(gran)
+    got[label] = g
+    if g != want:
+        sys.exit("GUARD FAIL: m(%s) is %d, not the %d registered" % (label, g, want))
+    print("guard 4c: %-12s ALLOCATED beta m=%d (registered %d)" % (label, g, want))
+
+# 4d -- the degenerate tail, MEASURED.
+sz1 = sum(1 for s in shapes if len(s) == 1 for _ in range(s[0]))
+# nodewise puts one group per row of dim 0; a 1-D tensor of length n contributes n
+# size-1 groups.
+if sz1 != singles:
+    sys.exit("GUARD FAIL: %s has %d size-1 nodewise groups, not the %d registered -- "
+             "the network changed under the registration" % (net, sz1, singles))
+w1 = sum(s[0] for s in ones)
+print("guard 4d: the degenerate tail is %d size-1 groups = %.2f%% of m(nodewise), over "
+      "%.4f%% of the %d weights" % (sz1, 100.0 * sz1 / m_node, 100.0 * w1 / tot, tot))
+PYEOF
+
+# --- GUARD 4e -- THE ANALYTIC CROSS-CHECK, second instrument, runs anywhere ---
+# This is a CROSS-CHECK, not a gate: GUARD 4 measures m off the ALLOCATED beta on
+# the real built network and is authoritative.  4e reproduces all four m from a
+# torch-free shape model, so a DISAGREEMENT means the registration is wrong
+# somewhere and refuses; an ABSENT census means only that the second opinion is
+# unavailable, which is not a reason to block a batch guard 4 has already checked.
+if [ -f "$REPO/analysis/c82_singleton_census.py" ]; then
+  python3 - "$REPO" "$NET" "$CHUNK_KD" "$CHUNK_KG" "$M_NODE" "$M_CHUNK_D" "$M_N1D" "$M_CHUNK_G" \
+    <<'PYEOF' || guard_fail "guard 4e: analytic census cross-check"
+import sys, os, math
+repo, net, kd, kg, m_node, m_chd, m_n1d, m_chg = sys.argv[1:9]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import contextlib, io as _io
+try:
+    with contextlib.redirect_stdout(_io.StringIO()):
+        import c82_singleton_census as C   # the module prints a report at import
+except Exception as ex:
+    print("guard 4e: cannot import the analytic census (%s) -- SECOND OPINION "
+          "UNAVAILABLE, guard 4 remains authoritative" % ex)
+    raise SystemExit(0)
+if net not in getattr(C, "ARCHS", {}):
+    print("guard 4e: the analytic census has no entry for %s -- SECOND OPINION "
+          "UNAVAILABLE, guard 4 remains authoritative" % net)
+    raise SystemExit(0)
+blk, nb, nc = C.ARCHS[net]
+# resnet_params returns (name, shape) PAIRS, not bare shapes.  Take the shapes.
+shapes = [tuple(shape) for _name, shape in C.resnet_params(blk, nb, nc)]
+def m_node_f(sh):   return sum(s[0] for s in sh)
+def m_n1d_f(sh):    return sum(1 if len(s) == 1 else s[0] for s in sh)
+def m_chunk(sh, K): return sum(int(math.ceil(math.prod(s) / float(K))) for s in sh)
+vals = [("nodewise", m_node_f(shapes), int(m_node)),
+        ("chunk%s" % kd, m_chunk(shapes, int(kd)), int(m_chd)),
+        ("nodewise1d", m_n1d_f(shapes), int(m_n1d)),
+        ("chunk%s" % kg, m_chunk(shapes, int(kg)), int(m_chg))]
+for lab, got, want in vals:
+    if got != want:
+        sys.exit("GUARD FAIL (SECOND INSTRUMENT DISAGREES): %s gives m=%d, registered "
+                 "%d.  Guard 4 and guard 4e cannot both be right -- DO NOT SUBMIT."
+                 % (lab, got, want))
+ones = [s for s in shapes if len(s) == 1]
+sz1 = sum(s[0] for s in ones)
+tot = sum(int(math.prod(s)) for s in shapes)
+print("guard 4e: the torch-free census reproduces all four m independently -- %s"
+      % ", ".join("%s %d" % (l, g) for l, g, _ in vals))
+print("guard 4e: %d 1-D tensors, largest numel %d, %d size-1 nodewise groups = "
+      "%.2f%% of m over %.4f%% of %d weights"
+      % (len(ones), max(s[0] for s in ones), sz1, 100.0 * sz1 / int(m_node),
+         100.0 * sz1 / tot, tot))
+PYEOF
+else
+  echo "guard 4e: analysis/c82_singleton_census.py absent -- second instrument SKIPPED"
+fi
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+if [ -d "$WS" ]; then
+  FREE=$(df -BG "$WS" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}')
+  NEED=$(python3 -c "print('%.2f' % ($NJOBS*0.06))")
+  if [ -n "${FREE:-}" ]; then
+    OKD=$(python3 -c "print(1 if $FREE > 20*$NEED else 0)")
+    [ "$OKD" = "1" ] && echo "guard 5: ${FREE} GB free vs ~${NEED} GB needed  OK" \
+                     || guard_fail "guard 5: only ${FREE} GB free vs ~${NEED} GB needed (20x wanted)"
+  fi
+else
+  guard_fail "guard 5: $WS not reachable (run this on cluster_a before submitting)"
+fi
+if [ -d "$SAVE" ] && [ -n "$(ls -A "$SAVE" 2>/dev/null)" ]; then
+  guard_fail "guard 5b: $SAVE is NOT empty -- a previous g3m attempt left artefacts"
+fi
+
+# --- GUARD 6 -- account, queue depth, and the WALL against the partitions ---
+case "$USER_NAME" in
+  account_a) echo "guard 6a: account account_a -- the account that carries "\
+"PATCH_CHUNKWISE and PATCH_NODEBN" ;;
+  *) guard_fail "guard 6a: running as '$USER_NAME' but this batch is cluster_a-ONLY "\
+"(account_a).  cluster_b lacks PATCH_CHUNKWISE and PATCH_NODEBN." ;;
+esac
+if command -v squeue >/dev/null 2>&1; then
+  PEND=$(squeue -u "$USER_NAME" -h -t PD 2>/dev/null | wc -l | tr -d ' ')
+  RUN=$(squeue -u "$USER_NAME" -h -t R 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 6b: pending=$PEND running=$RUN, adding $NJOBS"
+  TOT=$((PEND + NJOBS))
+  [ "$TOT" -gt 40 ] && guard_fail "guard 6b: $PEND pending + $NJOBS would exceed the ~40 cap"
+  if command -v sinfo >/dev/null 2>&1; then
+    python3 - "$PARTS" "$WALL" <<'PYEOF' || guard_fail "guard 6c: WALL vs partition caps"
+import subprocess, sys
+parts, wall = sys.argv[1], sys.argv[2]
+def secs(t):
+    t = t.strip()
+    if t in ("infinite", "UNLIMITED"): return 10**9
+    d = 0
+    if "-" in t: d, t = t.split("-", 1); d = int(d)
+    p = [int(x) for x in t.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return d * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+want = secs(wall)
+out = subprocess.run(["sinfo", "-h", "-o", "%P %l"], capture_output=True, text=True).stdout
+lim = {}
+for line in out.splitlines():
+    if not line.strip(): continue
+    p, l = line.split(None, 1)
+    lim[p.rstrip("*")] = secs(l)
+bad = [p for p in parts.split(",") if p in lim and lim[p] < want]
+if bad:
+    sys.exit("GUARD FAIL: --time %s exceeds the cap on %s -- those jobs would be "
+             "REJECTED or truncated" % (wall, bad))
+print("guard 6c: --time %s fits every partition in %s" % (wall, parts))
+PYEOF
+  fi
+else
+  echo "guard 6b: squeue absent (off-cluster) -- SKIPPED"
+fi
+
+# --- GUARD 7 -- THROUGHPUT HEADROOM, FROM THE ARMS THIS BATCH ACTUALLY RUNS --
+# The deleted g3d measured this on ResNet18's nodewise/layerwise ratio ALONE and
+# reported 1.72x.  That is not the binding arm: chunk2325 runs at 1.806x layerwise
+# and would have projected 1.45x, i.e. the margin was overstated by 19%.  This
+# guard takes the MAX ratio over the four granularities actually submitted.
+G3M_PARTS="$PARTS" python3 - "$CSVP" "$NET" "$WALL" "$EPOCHS" "$CHUNK_KD" "$CHUNK_KG" \
+  <<'PYEOF' || guard_fail "guard 7: throughput headroom"
+import csv, sys, statistics as st
+csvp, net, wall, epochs, kd, kg = sys.argv[1:7]
+def secs(t):
+    p = [int(x) for x in t.split(":")]
+    return p[0] * 3600 + p[1] * 60 + p[2]
+wall_min = secs(wall) / 60.0
+R = list(csv.DictReader(open(csvp)))
+def wc(pred):
+    out = []
+    for r in R:
+        if not pred(r): continue
+        try: out.append(float(r["wallclock_min"]))
+        except Exception: pass
+    return out
+tgt = wc(lambda r: r["network"] == net and r["dataset"] == "CIFAR10"
+         and r["epochs_done"] == epochs)
+if len(tgt) < 10:
+    sys.exit("GUARD FAIL: fewer than 10 %s %s-ep runs to project from" % (net, epochs))
+worst = max(tgt)
+# R18's MEASURED cost ratios against layerwise, for the FOUR arms submitted.
+base = wc(lambda r: r["network"] == "ResNet18" and r["dataset"] == "CIFAR10"
+          and r["epochs_done"] == "100" and r["granularity"] == "layerwise")
+if len(base) < 20:
+    sys.exit("GUARD FAIL: cannot measure the R18 layerwise reference rate")
+bm = st.median(base)
+ratios = {}
+for gran, proxy in (("nodewise", "nodewise"), ("chunk%s" % kd, "chunk777"),
+                    ("nodewise1d", "nodewise1d"), ("chunk%s" % kg, "chunk2325")):
+    v = wc(lambda r, p=proxy: r["network"] == "ResNet18" and r["dataset"] == "CIFAR10"
+           and r["epochs_done"] == "100" and r["granularity"] == p)
+    if len(v) < 3:
+        sys.exit("GUARD FAIL: no R18 cost proxy for %s (proxy %s)" % (gran, proxy))
+    ratios[gran] = st.median(v) / bm
+rmax = max(ratios.values())
+arm = max(ratios, key=ratios.get)
+proj = worst * rmax
+head = wall_min / proj
+print("guard 7: %s %s-ep worst wallclock %.0f min (n=%d); R18 MEASURED ratios %s"
+      % (net, epochs, worst, len(tgt), {k: round(v, 3) for k, v in ratios.items()}))
+print("guard 7: BINDING ARM is %s at %.3fx -> projected worst %.0f min against a "
+      "%.0f min wall = %.2fx headroom" % (arm, rmax, proj, wall_min, head))
+# gpu-short caps at 4:00:00.  At the binding arm's 217 min projection that is
+# 1.11x -- below the floor -- and guard 6c, which reads the real caps from sinfo,
+# cannot run off-cluster.  Refuse it here so a dry run catches it too.
+import os as _os
+parts = _os.environ.get("G3M_PARTS", "")
+if "gpu-short" in parts:
+    sys.exit("GUARD FAIL: gpu-short is in PARTS.  Its 4:00:00 cap gives %.2fx headroom "
+             "on the binding arm (%.0f min projected), below the 1.40x floor.  The "
+             "batch gives up gpu-short's separate GPU cap rather than risk truncation."
+             % (240.0 / proj, proj))
+if head < 1.40:
+    sys.exit("GUARD FAIL: %.2fx headroom is below the 1.40x registered floor.  Raise "
+             "--time or drop the tightest partition.  Truncation is not cosmetic in "
+             "this corpus: rs-node runs killed at epochs 24-59 FLIPPED a rung's argmax."
+             % head)
+PYEOF
+
+# --- GUARD 8 -- **THE ALGEBRAIC BOX-REACHABILITY TABLE.  BOTH DIRECTIONS.** --
+python3 - "$CLIP" "$ALPHA0" "$MST" "$EPOCHS" "$STEPS_PER_EPOCH" \
+  <<'PYEOF' || guard_fail "guard 8: box reachability"
+import math, sys
+clip, a0, mst, ep, spe = sys.argv[1:6]
+lo, hi = (float(x) for x in clip.split(":"))
+b0 = math.log(float(a0))
+T = int(ep) * int(spe)
+travel = float(mst) * T           # |dbeta| = ms exactly when --weight-decay-meta 0
+d_lo, d_hi = b0 - lo, hi - b0
+lo_ok, hi_ok = travel >= d_lo, travel >= d_hi
+print("guard 8: beta_0 = ln(%s) = %.6f in box (%.4f, %.4f); T = %d updates; "
+      "ms*T = %.4f nats" % (a0, b0, lo, hi, T, travel))
+print("guard 8: FLOOR is %.4f nats away -> %s" %
+      (d_lo, ("REACHABLE from epoch %.1f" % (d_lo / float(mst) / int(spe))) if lo_ok
+       else "UNREACHABLE"))
+print("guard 8: CEILING is %.4f nats away -> %s" %
+      (d_hi, ("REACHABLE from epoch %.1f" % (d_hi / float(mst) / int(spe))) if hi_ok
+       else "UNREACHABLE"))
+if lo_ok:
+    sys.exit("GUARD FAIL: at ms=%s the FLOOR %.4f is REACHABLE.  This batch would not "
+             "share its box status with the mm1/pp1/cc1 anchor and neither H1 nor H2 "
+             "would be comparable to it.  DO NOT SUBMIT." % (mst, lo))
+if hi_ok:
+    print("guard 8: **DISCLOSED, NOT A REFUSAL** -- the CEILING is algebraically "
+          "reachable inside the plateau5 window.  At this exact ms and box on "
+          "ResNet18 rec_hi measured 0.0000 on 24/24 arms, but ResNet34 carries 1.8x "
+          "more coordinates.  THE SCORER REPORTS rec_hi PER SEED AS A FIRST-CLASS "
+          "NUMBER and VOIDS any contrast whose two arms differ by >0.10 in ceiling "
+          "occupancy.  A SYMMETRIC ceiling does NOT void an accuracy contrast: both "
+          "arms sit in the same box, which is the condition under which every "
+          "published D was measured.")
+print("guard 8: the emitted rung ms=%s is algebraically FLOOR-FREE, exactly as "
+      "mm1/pp1/cc1 are." % mst)
+PYEOF
+
+# ---------------------------------------------------------------------------
+if [ "$SUBMIT" = "1" ]; then
+  mkdir -p "$SAVE" || { echo "GUARD FAIL: cannot create $SAVE"; exit 1; }
+fi
+N=0
+FAIL=0
+# --- EMITTER BEGIN ---
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for S in $SEEDS; do
+  for ARM in "nodewise:node" "chunk${CHUNK_KD}:chd" "nodewise1d:n1d" "chunk${CHUNK_KG}:chg"; do
+    GRAN="${ARM%%:*}"; SHORT="${ARM##*:}"
+    RN="g3m-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},HIER=none,SCHED=none,PROBE=${PROBE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_g3m_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset "$DSET" --NN-name "$NET" --batch-size "$BATCH"
+      --max-time 999:00:00 --gamma "$GAMMA" --meta-stepsize "$MST" --alpha0 "$ALPHA0"
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+# --- EMITTER END ---
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+echo "---- REGISTERED n = 9 per arm, FOUR arms, ONE ms, ONE box, ONE submission."
+echo "---- D, G and D-G are ALL within-batch, so the batch offset cancels by"
+echo "---- construction and STANDING RULE 14's cross-batch floor never enters them."
+echo "---- RULE 11 IS OPEN: no ResNet34 argmax is measured and the scorer says so. ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+if [ "$GUARD_FAILS" -gt 0 ]; then
+  echo "=============================================================="
+  echo "!!! $GUARD_FAILS GUARD(S) FAILED.  The emitter above is VALIDATED; the batch is NOT."
+  echo "!!! Nothing was submitted and nothing may be submitted until every guard"
+  echo "!!! passes ON cluster_a.  A dry run with failed guards is NOT a green light."
+  echo "=============================================================="
+  exit 2
+fi
+exit 0

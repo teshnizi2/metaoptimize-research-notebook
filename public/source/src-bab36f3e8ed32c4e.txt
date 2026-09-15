@@ -1,0 +1,611 @@
+#!/bin/bash
+# =============================================================================
+# cX1_reduction_intervention.sh -- `crn1`, THE FOURTEENTH MECHANISM: THE
+#                                  PER-GROUP REDUCTION ITSELF.
+#                                  ONE SUBMISSION, 18 JOBS, 100 EPOCHS,
+#                                  SEEDS {15,16,17}.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches the other account, nothing is submitted to `cluster_a`, and
+# every guard and scancel line below is filtered on the `crn1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cX1_crn1_score.py, git-committed BEFORE this batch
+# is submitted (STANDING RULE 21).  Every bar, the noise floor (RE-DERIVED at
+# registration time from the live corpus with crn1's own rows EXCLUDED, never
+# copied), the branch maps and every account's point predictions are frozen there,
+# and its --selftest re-derives every one of them from the corpus and from
+# arithmetic rather than from prose.
+#
+# THE DOCUMENTED SCORER INVOCATION -- there is no second argument to forget:
+#     python3 analysis/cX1_crn1_score.py <runsdir>
+# `--manifest` is OPTIONAL and DEFAULTED (CORRECTIONS 164.2); guard 4b writes the
+# manifest to BOTH of the first two paths the scorer's resolver looks at, and
+# guard 8 proves the resolver finds it before any job can finish.
+#
+# -----------------------------------------------------------------------------
+# WHAT IS BEING INTERVENED ON, AND WHY THE OBVIOUS INTERVENTION IS A NULL
+# -----------------------------------------------------------------------------
+# On the LIVE source (`Optimizers/HF.py`), a group's whole meta-signal is an
+# UNNORMALISED SUM,
+#     block_product():259  scalar    [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]
+#                    :262  blockwise [torch.tensor([sum([(u[i]*v[i]).sum()
+#                                      for i in group_indices]) for ...])]
+# and `Lion_meta_update():957` consumes ONLY its sign:
+#     beta = (1-ms*wd)*beta - ms*torch.sign(b2*momentum_meta + (1-b2)*z)
+#     momentum_meta = mom*momentum_meta + (1-mom)*z        # zero-initialised
+#
+# CONSEQUENCE, PROVED NOT ARGUED (analysis/cX1_reduction_noop_proof.py, which
+# drives the LIVE meta_update methods): `momentum_meta` is a zero-initialised
+# LINEAR recursion in z, so dividing a GROUP's reduction by ANY positive
+# per-group constant -- its tensor count, its parameter count -- divides the
+# sign() argument by that constant and leaves the beta trajectory BITWISE
+# IDENTICAL, at c up to 6.3e6.  "NORMALISE THE GROUP REDUCTION" IS A NULL BY
+# CONSTRUCTION ON THIS OPTIMIZER AND IS NOT RUN HERE.
+#
+# The only reduction intervention with power is one that changes the RELATIVE
+# WEIGHT OF TENSORS WITHIN a group.  PATCH_REDNORM adds exactly that, opt-in:
+#     --stepsize-groups tn:<spec>   ->   z_G = sum_{i in G} <h_i,g_i> / numel_i
+# It is INERT at every granularity whose groups hold one tensor (layerwise,
+# nodewise, weightwise, nodewise1d, chunk*, permnode*) -- tests/test_rednorm.py
+# R5 asserts that BITWISE -- so a {scalar, layerwise} x {standard, normalised}
+# design would have THREE distinct cells, not four.  This batch therefore spends
+# its arms where the intervention can bite.
+#
+# THREE THINGS WERE MEASURED ON THE LIVE OPTIMIZER BEFORE ANY ARM RAN, AND
+# THEY CHANGED THE DESIGN.  analysis/cX1_reduction_probe.py wrapped the REAL
+# optimizer at this EXACT cell and recorded all 62 per-tensor terms at every one
+# of 6,000 meta-steps at `scalar`, `[49,13]` and `[50,12]`;
+# analysis/cX1_reduction_report.py reads them; the full output is committed at
+# results/crn1_reduction_probe/REPORT.txt.
+#  (a) AN EQUAL VOTE PER TENSOR -- all size information discarded -- gives the
+#      SAME sign as the unnormalised sum in 99.2% to 99.9% of steps at every
+#      group of every configuration.  The sum's sign is NOT hijacked by the
+#      large tensors.
+#  (b) In the `[50,12]` COARSE group, REMOVING `layer4.0.bn2.weight` (tensor 50,
+#      512 params) flips that group's sign in 0.0003 of steps -- three in ten
+#      thousand -- yet moving that tensor across the cut costs 25.068667 pp.
+#      THE CUT-POSITION CLIFF IS NOT A REDUCTION EFFECT.  The briefing's
+#      sharpest prediction, that normalising should collapse the cliff, is
+#      REFUTED AT THE MECHANISM LEVEL FOR ZERO GPU-HOURS.
+#  (c) `tn:` does not neutralise size, it INVERTS it: the 1-D BatchNorm scales
+#      and shifts are 65% of the tensors and 0.087% of the parameters, and
+#      they hold 2.6-4.6% of a group's sum|t| under the standard reduction and
+#      84-93% of it under 1/numel.  The same inversion raises tensor 50's
+#      steering power from 0.0003 to 0.1470, a 490x increase, in the OPPOSITE
+#      direction to the briefing's prediction.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  6 arms x 3 seeds = 18 jobs, ONE submission.  100 epochs.
+#   k01   scalar                    m = 1 FLOOR ANCHOR, in batch, MANDATORY
+#   k01n  tn:scalar                 the same m = 1, vote handed to the BN params
+#   k49   sets:1-49/50-62           == [49,13] EXACTLY (test_namesets N2)
+#   k49n  tn:sets:1-49/50-62        the same partition, vote handed over
+#   k50   sets:1-50/51-62           == [50,12] EXACTLY
+#   k50n  tn:sets:1-50/51-62        the same partition, vote handed over
+#   SEEDS {15,16,17} -- ZERO rows ANYWHERE in the corpus carry them.
+#
+# PRIMARY -- COMPOSITION.  Three SAME-PARTITION pairs.  Each pair is two
+# OPPOSITE extreme weightings of one partition, disagreeing in sign on a
+# MEASURED 7.62% to 19.10% of meta-steps.
+#     P01 = k01n - k01,  P49 = k49n - k49,  P50 = k50n - k50
+#   H-COMP-INERT  the composition of a group's meta-signal does not affect
+#                 outcome.  POINT PREDICTIONS P01 = P49 = P50 = 0.
+#   H-COMP-LIVE   it does.  The COMPLEMENT; it makes no point prediction, which
+#                 is why the scorer's SATURATION branches exist.
+# SECONDARY -- the cliff, D_STD = k50-k49 vs D_TN = k50n-k49n, with the
+# direction fixed IN ADVANCE by (b) and (c): H-CLIFF-GOV predicts I = 0,
+# H-CLIFF-RED predicts |D_TN| > |D_STD| (AMPLIFIED), and the briefing's
+# H-CLIFF-COLLAPSE (D_TN = 0) is registered as ALREADY EXCLUDED by (b).
+#
+# WHY PROBE STAYS 0.  Structural, unchanged: at m <= 2 `HF.block_product` has
+# already reduced <h,g> to ONE scalar PER GROUP before `_probe` is reached.
+# CONSEQUENCE, RECORDED IN ADVANCE: `crn1` MAY NOT CLAIM TO HAVE TESTED
+# 152.12 rival (c).
+#
+# RULE 20.  Every spec is ONE shell token of [A-Za-z0-9_.,:/-] -- no space, no
+# quote, no `=`, no leading dash, no glob character -- so
+# analysis/argsline_guard.py tokenises and attributes it as ONE value with NO
+# change to that file.  argsline_guard.py IS NOT EDITED.
+#
+# -----------------------------------------------------------------------------
+# WALLTIME AND PARTITIONS -- MEASURED, NOT PROJECTED
+# -----------------------------------------------------------------------------
+# cpg1 ran this EXACT cell at this EXACT horizon on these EXACT three partitions
+# on 2026-09-07/08: 15 jobs, elapsed 00:37:50 .. 01:35:36, 11.95 GPU-hours.
+# WALL = 03:00:00 is 1.88x the slowest observed run.  COST: ~14.4 GPU-hours for
+# 18 jobs.  A `tn:` arm computes the same 62 elementwise products and adds ONE
+# scalar divide per tensor per step -- 62 divides against ~11.2 M multiply-adds --
+# so it cannot be measurably slower than its standard twin.
+#
+# USAGE   bash bin/cX1_reduction_intervention.sh            # dry run, submits nothing
+#         bash bin/cX1_reduction_intervention.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/crn1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="15 16 17"
+PARTS=gpu-l4-24g,gpu-mig-40g,gpu-a100-80g
+WALL=03:00:00
+NTENS=62
+TOTPAR=11220132
+
+# ---- the registered specs, written out LITERALLY.  The scorer holds the same
+# six strings; guard 4c proves the two agree so neither can drift.
+G_K01='scalar'
+G_K01N='tn:scalar'
+G_K49='sets:1-49/50-62'
+G_K49N='tn:sets:1-49/50-62'
+G_K50='sets:1-50/51-62'
+G_K50N='tn:sets:1-50/51-62'
+ARMS="k01 k01n k49 k49n k50 k50n"
+
+echo "=============================================================="
+echo " crn1 -- THE REDUCTION ITSELF (PATCH_REDNORM, opt-in \`tn:\`)"
+echo " $DSET / $NET  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  PROBE=0"
+echo " clamp held at the campaign standard $CLIP_C"
+echo " horizon $EPOCHS epochs; seeds $SEEDS"
+echo " 6 arms x 3 seeds = 18 jobs, ONE submission"
+for A in $ARMS; do
+  case $A in
+    k01) G=$G_K01 ;; k01n) G=$G_K01N ;; k49) G=$G_K49 ;;
+    k49n) G=$G_K49N ;; k50) G=$G_K50 ;; k50n) G=$G_K50N ;;
+  esac
+  printf "   %-5s %s\n" "$A" "$G"
+done
+echo " partitions $PARTS   walltime $WALL"
+echo " scorer: analysis/cX1_crn1_score.py (registered before any run exists)"
+echo " DOCUMENTED INVOCATION: python3 analysis/cX1_crn1_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer, the patch and the tests exist, are
+# ---- committed, and the scorer selftests ------------------------------------
+SC="$REPO/analysis/cX1_crn1_score.py"
+PATCHF="$REPO/patches/patch_rednorm.py"
+TESTF="$REPO/tests/test_rednorm.py"
+NOOPF="$REPO/analysis/cX1_reduction_noop_proof.py"
+for f in "$SC" "$PATCHF" "$TESTF" "$NOOPF"; do
+  [ -f "$f" ] || guard_fail "guard 1a: missing $f"
+done
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- \
+      analysis/cX1_crn1_score.py bin/cX1_reduction_intervention.sh \
+      patches/patch_rednorm.py tests/test_rednorm.py 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer, patch, test AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires them committed BEFORE any run exists: $DIRTY"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 was verified"
+  echo "          on the host that committed the scorer, by wall clock against"
+  echo "          the earliest sacct Submit.  Not a pass, not a fail."
+fi
+python3 "$SC" --selftest >/tmp/crn1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' /tmp/crn1_selftest.$$) checks, $(grep -c '^  FAIL' /tmp/crn1_selftest.$$) failures)" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -40 /tmp/crn1_selftest.$$; }
+echo "guard 1c: scorer sha256 $( (sha256sum "$SC" 2>/dev/null || shasum -a 256 "$SC") | awk '{print $1}')"
+
+# ---- guard 1d: THE INERTNESS PROOF, RE-RUN ON THE LIVE TREE.  Every prior run
+# ---- in the corpus imports the file this batch patches, and two sibling
+# ---- batches are on the same account, so inertness is PROVED on the live pair
+# ---- rather than inherited from the trial run.
+HFLIVE="$CIF/Optimizers/HF.py"
+HFPRE="$CIF/Optimizers/HF.py.pre_rednorm"
+if [ -f "$TESTF" ] && [ -f "$HFPRE" ] && [ -f "$HFLIVE" ]; then
+  PRE_PY=/tmp/crn1_hf_pre_rednorm.$$.py
+  cp "$HFPRE" "$PRE_PY"
+  if python3 "$TESTF" --pre "$PRE_PY" --post "$HFLIVE" --cifar-dir "$CIF" \
+       --argsline-guard "$REPO/analysis/argsline_guard.py" \
+       >/tmp/crn1_rednorm.$$ 2>&1; then
+    echo "guard 1d: tests/test_rednorm.py PASSES on the LIVE tree"
+    tail -3 /tmp/crn1_rednorm.$$ | sed 's/^/          /'
+  else
+    guard_fail "guard 1d: tests/test_rednorm.py FAILED on the LIVE tree"
+    tail -40 /tmp/crn1_rednorm.$$
+  fi
+  rm -f "$PRE_PY"
+else
+  guard_fail "guard 1d: cannot run the inertness proof -- test $TESTF, pre $HFPRE or live $HFLIVE missing"
+fi
+
+# ---- guard 1e: the NO-OP proof.  RUN AGAINST THE PRE-PATCH LIVE FILE, and
+# ---- here is why, stated rather than hidden: the proof's section A QUOTES
+# ---- `block_product`'s first eight lines from the source and asserts that no
+# ---- division appears in them.  PATCH_REDNORM inserts its guarded branch INTO
+# ---- those eight lines, so that assertion is false ON THE PATCHED FILE BY
+# ---- DESIGN -- it is a statement about the reduction the CAMPAIGN'S 2,638 rows
+# ---- were produced by, which is exactly `HF.py.pre_rednorm`.  The proof file
+# ---- is REGISTERED and is NOT EDITED (RULE 16); the launcher stages the
+# ---- pre-patch file under the layout it expects and runs it UNEDITED.  Its
+# ---- sections B, C and D concern `Lion_meta_update`, which PATCH_REDNORM does
+# ---- not touch at all, and the byte-identity of that function across the patch
+# ---- is what guard 1d's R0 proves.
+PRETREE=/tmp/crn1_pretree.$$
+mkdir -p "$PRETREE/Optimizers"
+if [ -f "$HFPRE" ]; then
+  cp "$HFPRE" "$PRETREE/Optimizers/HF.py"
+  if python3 "$NOOPF" --cifar-dir "$PRETREE" >/tmp/crn1_noop.$$ 2>&1; then
+    echo "guard 1e: cX1_reduction_noop_proof.py PASSES on the PRE-PATCH live file ($(grep -c '^  PASS' /tmp/crn1_noop.$$) checks)"
+    echo "          per-group rescaling is BITWISE inert under Lion -- the obvious"
+    echo "          intervention is a null, and is NOT what this batch runs."
+    echo "          pre-patch sha256 $( (sha256sum "$HFPRE" 2>/dev/null || shasum -a 256 "$HFPRE") | awk '{print $1}')"
+  else
+    guard_fail "guard 1e: the no-op proof FAILED on the pre-patch live file"
+    tail -30 /tmp/crn1_noop.$$
+  fi
+  # and on the PATCHED file every check that does not quote block_product's
+  # first eight lines must STILL pass, which is reported, not scored.
+  python3 "$NOOPF" --cifar-dir "$CIF" >/tmp/crn1_noop_post.$$ 2>&1
+  echo "guard 1e: on the PATCHED file: $(grep -c '^  PASS' /tmp/crn1_noop_post.$$) PASS, $(grep -c '^  FAIL' /tmp/crn1_noop_post.$$) FAIL (the FAILs are section A's line-window quotes of block_product, which the patch legitimately moves):"
+  grep '^  FAIL' /tmp/crn1_noop_post.$$ | sed 's/^/          /'
+  if [ "$(grep -c 'PASS LION' /tmp/crn1_noop_post.$$)" != 5 ]; then
+    guard_fail "guard 1e: the five LION invariance checks do not all pass on the patched file"
+  else
+    echo "          all 5 LION bitwise-invariance checks PASS on the patched file too"
+  fi
+  rm -rf "$PRETREE"
+else
+  guard_fail "guard 1e: no pre-patch file at $HFPRE"
+fi
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^crn1-' "$CSVP" && guard_fail "guard 2: crn1-* already in the CSV" \
+                         || echo "guard 2: no crn1-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/crn1-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no crn1-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT crn1-*.out files already exist"
+fi
+NDUP=$(python3 - "$CSVP" <<'PYEOF'
+import sys, csv
+n = 0
+for r in csv.DictReader(open(sys.argv[1])):
+    if str(r.get("seed")) in ("15", "16", "17"):
+        n += 1
+print(n)
+PYEOF
+)
+[ "${NDUP:-1}" = 0 ] && echo "guard 2c: ZERO rows ANYWHERE in the corpus carry seed 15, 16 or 17" \
+                     || guard_fail "guard 2c: $NDUP rows already carry seed 15/16/17"
+
+# ---- guard 3: the CIFAR-100 data is actually staged on THIS account ---------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4c: the literal specs here and in the scorer agree ---------------
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+MANIFEST2="$WS/runs/crn1-PARTITION-MANIFEST.txt"
+python3 - "$SC" "$G_K01" "$G_K01N" "$G_K49" "$G_K49N" "$G_K50" "$G_K50N" <<'PYEOF' \
+  || guard_fail "guard 4c: the launcher's specs and the scorer's SPEC table disagree"
+import sys, re, ast
+sc = open(sys.argv[1]).read()
+mine = dict(zip(("k01", "k01n", "k49", "k49n", "k50", "k50n"), sys.argv[2:8]))
+m = re.search(r"^SPEC = (\{.*?^\})", sc, re.S | re.M)
+if not m:
+    print("!!! guard 4c: could not find SPEC in the scorer"); raise SystemExit(1)
+theirs = ast.literal_eval(m.group(1))
+bad = 0
+for k in mine:
+    if mine[k] != theirs.get(k):
+        print("!!! guard 4c: %s launcher=%r scorer=%r" % (k, mine[k], theirs.get(k)))
+        bad += 1
+if len(theirs) != len(mine):
+    print("!!! guard 4c: the scorer holds %d specs, the launcher %d"
+          % (len(theirs), len(mine))); bad += 1
+if bad:
+    raise SystemExit(1)
+print("guard 4c: all 6 spec strings are byte-identical in the launcher and the scorer")
+for k in ("k01", "k01n", "k49", "k49n", "k50", "k50n"):
+    print("          %-5s %s" % (k, mine[k]))
+PYEOF
+
+# ---- guard 4h: THE PATCH IS APPLIED to the tree these jobs will import ------
+if grep -q "PATCH_REDNORM" "$HFLIVE" 2>/dev/null; then
+  echo "guard 4h: PATCH_REDNORM is present in the LIVE $HFLIVE"
+  echo "          live sha256 $( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')"
+else
+  guard_fail "guard 4h: PATCH_REDNORM is NOT in the live HF.py -- apply it first:
+       cp $HFLIVE $HFPRE && HF_PATH=$HFLIVE python3 $PATCHF"
+fi
+
+# ---- guard 4: LIVE-MODEL partition manifest, the design and the code paths --
+# shellcheck disable=SC2086
+python3 - "$CIF" "$MANIFEST" "$NTENS" "$TOTPAR" "$CLIP_C" "$EPOCHS" "$BATCH" \
+         "$G_K01" "$G_K01N" "$G_K49" "$G_K49N" "$G_K50" "$G_K50N" <<'PYEOF' \
+  || guard_fail "guard 4: live partition / design / intervention check FAILED"
+import sys, os, inspect, re as _re
+cif, out, ntens, totpar = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+clip_c = sys.argv[5]
+epochs, bsz = int(sys.argv[6]), int(sys.argv[7])
+armnames = ["k01", "k01n", "k49", "k49n", "k50", "k50n"]
+specs = dict(zip(armnames, sys.argv[8:14]))
+sys.path.insert(0, cif)
+os.chdir(cif)
+import torch
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network("ResNet18_c100", "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in net.named_parameters()]
+numel = [int(p.numel()) for _, p in net.named_parameters()]
+tot = sum(numel)
+T = len(nps)
+lines = ["NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "CLIP_C %s" % clip_c, "EPOCHS %d" % epochs]
+print("guard 4: live ResNet18_c100 has %d parameter tensors, %d parameters"
+      % (T, tot))
+bad = 0
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d tensors / %d params, the batch assumes "
+          "%d / %d" % (T, tot, ntens, totpar))
+    raise SystemExit(1)
+for i in range(T):
+    lines.append("TENSOR %d %s %d" % (i + 1, names[i], numel[i]))
+print("guard 4: the cut neighbourhood, 1-BASED (the manifest carries all %d):" % T)
+for i in range(46, 53):
+    print("         %2d  %-34s %9d" % (i + 1, names[i], numel[i]))
+
+ABASE = {"alg": "SGDm", "momentum_param": 0.99, "weight_decay": 0.1}
+AMETA = {"alg": "Lion", "momentum_param": 0.99, "Lion_beta2": 0.9,
+         "weight_decay": 0.0, "meta_stepsize": 1e-3}
+built = {}
+for arm in armnames:
+    o = HF(net, stepsize_groups=specs[arm], alpha0=1e-6, args_base=dict(ABASE),
+           args_meta=dict(AMETA), gamma=1, writer=None)
+    built[arm] = o
+    if o.stepsize_type == "scalar":
+        g = [list(range(T))]
+    else:
+        g = [list(x) for x in o.param_groups_indices]
+    sizes = [len(x) for x in g]
+    pc = [sum(numel[i] for i in x) for x in g]
+    flat = sorted(i for x in g for i in x)
+    if flat != list(range(T)):
+        print("!!! guard 4: %s does not partition the tensors exactly once" % arm)
+        bad += 1
+    want_rn = specs[arm].startswith("tn:")
+    if bool(getattr(o, "_rednorm", None)) is not want_rn:
+        print("!!! guard 4: %s has _rednorm=%r, spec says %r"
+              % (arm, getattr(o, "_rednorm", None), want_rn)); bad += 1
+    lines.append("ARMSPEC %s SPEC %s M %d SIZES %s PARAMS %s REDNORM %d"
+                 % (arm, specs[arm], len(g), ",".join(str(s) for s in sizes),
+                    ",".join(str(s) for s in pc), 1 if want_rn else 0))
+    print("guard 4: %-5s %-24s type=%-9s m=%d sizes %-9s params %s  _rednorm=%s"
+          % (arm, specs[arm], o.stepsize_type, len(g), str(sizes),
+             str(pc), getattr(o, "_rednorm", None)))
+
+# ---- guard 4d: THE PAIRS ARE THE SAME PARTITION, and differ ONLY in _rednorm
+print("guard 4d: each `tn:` arm is the SAME PARTITION as its standard twin")
+for a, b in (("k01", "k01n"), ("k49", "k49n"), ("k50", "k50n")):
+    oa, ob = built[a], built[b]
+    ga = getattr(oa, "param_groups_indices", None)
+    gb = getattr(ob, "param_groups_indices", None)
+    ok = (oa.stepsize_type == ob.stepsize_type and ga == gb
+          and getattr(oa, "map_layers_to_blocks", None)
+              == getattr(ob, "map_layers_to_blocks", None)
+          and len(oa.beta) == len(ob.beta)
+          and all(tuple(x.shape) == tuple(y.shape)
+                  for x, y in zip(oa.beta, ob.beta)))
+    print("         %-4s vs %-5s  same type/groups/beta: %s" % (a, b, ok))
+    if not ok:
+        print("!!! guard 4d: %s and %s are NOT the same partition" % (a, b)); bad += 1
+    lines.append("PAIR %s %s SAME_PARTITION %d" % (a, b, 1 if ok else 0))
+
+# ---- guard 4e: THE INTERVENTION IS LIVE, measured on the live model ---------
+torch.manual_seed(20260908)
+U = [torch.randn(p.shape) * 1e-4 for p in net.parameters()]
+V = [torch.randn(p.shape) * 1e-3 for p in net.parameters()]
+print("guard 4e: the reduction actually changes -- measured, not asserted")
+for a, b in (("k01", "k01n"), ("k49", "k49n"), ("k50", "k50n")):
+    za = [x.detach().double().reshape(-1) for x in built[a].block_product(U, V)]
+    zb = [x.detach().double().reshape(-1) for x in built[b].block_product(U, V)]
+    ratio = [float(y / x) if float(x) != 0 else float("inf")
+             for x, y in zip(za[0], zb[0])]
+    same = all(bool(torch.equal(x, y)) for x, y in zip(za, zb))
+    print("         %-4s -> %-5s  z_std=%s  z_tn=%s  differ=%s"
+          % (a, b, [float(x) for x in za[0]], [float(x) for x in zb[0]], not same))
+    if same:
+        print("!!! guard 4e: %s and %s give the SAME reduction" % (a, b)); bad += 1
+    lines.append("REDUCTION_DIFFERS %s %s %d" % (a, b, 0 if same else 1))
+    # and the per-group ratios must NOT be a single common constant, or the
+    # intervention would be the per-group rescaling the no-op proof kills.
+    if len(ratio) > 1:
+        spread = max(ratio) / min(ratio) if min(ratio) > 0 else float("inf")
+        print("         per-group z_tn/z_std ratios %s (spread %.4g)"
+              % (["%.6g" % r for r in ratio], spread))
+        lines.append("RATIO_SPREAD %s %.6g" % (b, spread))
+
+# ---- guard 4f: THE NO-OP BOUNDARY, on the live model -----------------------
+print("guard 4f: `tn:` is INERT at single-tensor granularities (no power there)")
+for s in ("layerwise",):
+    o1 = HF(net, stepsize_groups=s, alpha0=1e-6, args_base=dict(ABASE),
+            args_meta=dict(AMETA), gamma=1, writer=None)
+    o2 = HF(net, stepsize_groups="tn:" + s, alpha0=1e-6, args_base=dict(ABASE),
+            args_meta=dict(AMETA), gamma=1, writer=None)
+    z1 = [x.detach().double() for x in o1.block_product(U, V)]
+    z2 = [x.detach().double() for x in o2.block_product(U, V)]
+    ident = all(bool(torch.equal(x, y)) for x, y in zip(z1, z2))
+    print("         %-10s tn: reduction BITWISE identical: %s" % (s, ident))
+    if not ident:
+        print("!!! guard 4f: tn: changed %s" % s); bad += 1
+    lines.append("SINGLE_TENSOR_INERT %s %d" % (s, 1 if ident else 0))
+
+# ---- guard 4g: the anchor's code path, and WHY PROBE=0 is not a choice ------
+src = inspect.getsource(HF.init_meta)
+mm = _re.search(r"stepsize_groups\s+in\s+\[([^\]]*)\]", src)
+if not mm:
+    print("!!! guard 4g: could not find init_meta's exact-match routing list"); bad += 1
+else:
+    named = [x.strip().strip("'\"") for x in mm.group(1).split(",")]
+    print("guard 4g: init_meta routes these names away from blockwise: %s" % named)
+    if "scalar" not in named:
+        print("!!! guard 4g: `scalar` is NOT in init_meta's named list"); bad += 1
+    for arm in ("k49", "k49n", "k50", "k50n"):
+        if specs[arm].replace("tn:", "") in named:
+            print("!!! guard 4g: %s spec collides with a named granularity" % arm)
+            bad += 1
+    lines.append("ANCHOR scalar NAMED_PATH 1")
+src_bp = inspect.getsource(HF.block_product)
+print("guard 4g: PROBE=0 is STRUCTURAL.  block_product reduces <h,g> to ONE")
+print("          SCALAR PER GROUP before _probe() is reached.  reduction "
+      "present in source: %s" % ("sum" in src_bp))
+if "sum" not in src_bp:
+    print("!!! guard 4g: block_product does not look like a reduction"); bad += 1
+lines.append("PROBE 0 REASON blockwise_reduces_to_one_scalar_per_group")
+
+# ---- guard 4i: the clamp, and the horizon's own arithmetic ------------------
+src_init = inspect.getsource(HF.__init__)
+if "BETA_CLIP" in src_init and "_beta_lo" in src_init:
+    print("guard 4i: BETA_CLIP is parsed from the environment into "
+          "(_beta_lo, _beta_hi) on the live source")
+else:
+    print("!!! guard 4i: the live HF.__init__ does not parse BETA_CLIP as assumed")
+    bad += 1
+steps = epochs * (50000 // bsz)
+print("guard 4i: %d epochs x %d meta-steps/epoch = %d meta-steps"
+      % (epochs, 50000 // bsz, steps))
+lines.append("META_STEPS %d" % steps)
+
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: 6 arms verified on the LIVE model; PARTITION-MANIFEST.txt -> %s"
+      % out)
+PYEOF
+if [ -s "$MANIFEST" ]; then
+  cp "$MANIFEST" "$MANIFEST2"
+  echo "guard 4b: manifest is non-empty ($(wc -c < "$MANIFEST") bytes) and is written to BOTH"
+  echo "          $MANIFEST"
+  echo "          $MANIFEST2"
+else
+  guard_fail "guard 4b: no manifest"
+fi
+
+# ---- guard 5: capacity, AND the walltime/partition arithmetic ---------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+MYPEND=$(squeue -h -u "$USER_NAME" -t PENDING -o '%j' 2>/dev/null | grep -c '^crn1-' || true)
+echo "guard 5: ${FREE:-?} GB free on \$WS; $RUN running, $PEND pending on this"
+echo "         account.  THIS ACCOUNT IS SHARED BY THREE BATCHES THIS CYCLE, so"
+echo "         the depth below is mostly the SIBLINGS', by job-name prefix:"
+squeue -h -u "$USER_NAME" -o '%T %j' 2>/dev/null \
+  | awk '{split($2,a,"-"); print $1, a[1]}' | sort | uniq -c | sort -rn \
+  | sed 's/^/           /'
+echo "         crn1 adds 18 jobs at $WALL on partitions whose own limits are"
+echo "         7-00:00:00, so nothing here is unschedulable (the hz3-R2 defect,"
+echo "         a 10 h walltime that sat PENDING for a week, is not in play)."
+# The cap is on MY OWN prefix, not on the account: a sibling's depth is not a
+# reason for this batch to refuse to exist, and 18 is the SMALLEST of the three
+# batches sharing the account.  The account-wide number is REPORTED, and only a
+# genuinely extreme total (a runaway) aborts.
+[ "${MYPEND:-0}" -eq 0 ] || guard_fail "guard 5: $MYPEND crn1- jobs are ALREADY pending"
+[ "${PEND:-0}" -le 200 ] || guard_fail "guard 5: $PEND pending account-wide -- that is a runaway, not a sibling"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  TL=$(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)
+  R=$(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+  D=$(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 5b: $P timelimit $TL   running $R   pending $D"
+  case "$TL" in
+    *-*) : ;;   # a d-hh:mm:ss limit is necessarily above 3 h
+    *) guard_fail "guard 5b: $P has a sub-day time limit ($TL); check $WALL fits" ;;
+  esac
+done
+
+# ---- guard 8: THE SCORER'S DEFAULT MANIFEST RESOLUTION ACTUALLY FINDS IT ----
+python3 - "$SC" "$WS/runs" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, importlib.util
+spec = importlib.util.spec_from_file_location("cx1", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to"
+      % sys.argv[1].split("/")[-1])
+print("         %s" % p)
+print("         (%s)" % how)
+raise SystemExit(0 if p else 1)
+PYEOF
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01)  G=$G_K01 ;;
+      k01n) G=$G_K01N ;;
+      k49)  G=$G_K49 ;;
+      k49n) G=$G_K49N ;;
+      k50)  G=$G_K50 ;;
+      k50n) G=$G_K50N ;;
+      *)    echo "!!! unknown arm $ARM"; exit 2 ;;
+    esac
+    CMD="sbatch --job-name=crn1-$ARM-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups '$G' --seed $S --save-directory $SAVE --run-name crn1-$ARM-s$S"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for crn1-$ARM-s$S"
+      guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if ! guard_presubmit "$CMD" "stepsize-groups=$G" >/dev/null 2>&1; then
+      echo "!!! RULE 20: --stepsize-groups does not round-trip for crn1-$ARM-s$S"
+      guard_presubmit "$CMD" "stepsize-groups=$G"; BAD=$((BAD+1))
+    fi
+    if ! guard_presubmit "$CMD" "seed=$S" "run-name=crn1-$ARM-s$S" >/dev/null 2>&1; then
+      echo "!!! RULE 20: seed / run-name do not round-trip for crn1-$ARM-s$S"
+      guard_presubmit "$CMD" "seed=$S" "run-name=crn1-$ARM-s$S"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; echo; N=$((N+1)); fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'crn1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "crn1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- crn1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "crn1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no crn1 job started inside the window.  This is NOT"
+       echo "         a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name crn1- --batch-consistency" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^crn1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH:"
+  echo "    python3 $REPO/analysis/cX1_crn1_score.py $WS/runs"
+fi

@@ -1,0 +1,166 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 44 -- PREPARED, NOT SUBMITTED (FairShare 0.3336 / 0.3356, below the 0.35 floor).
+#
+# OPEN QUESTION IT ANSWERS  (FINDINGS 44.5 / CORRECTIONS 34, the one question cycle 44 opened)
+#   Cycle 44 measured, for the first time, the per-weight meta-gradient correlation:
+#       rho_s = 1.925e-6 (t=11.7, n=5) with beta FROZEN, 8.458e-8 (t=6.8, n=10) with beta FREE
+#   and decomposed the off-equilibrium N/N_eff = 148.6 deficit into
+#       85.1% marginal bias / 14.6% common mode / 0.7% independent noise.
+#   Those numbers are LOWER BOUNDS and they stand (VALIDATION 11: the estimator cannot
+#   manufacture a common mode from heterogeneity).
+#
+#   What it could NOT answer is the SCALE PROFILE -- how correlation varies with block size,
+#   which is the "how does agreement vary with granularity" question the project is pointed
+#   at.  twochannel.py estimates the independence floor as p_bar(1-p_bar)/n from the POOLED
+#   frac_neg scalar, which is all PATCH_PROBE2 writes.  With heterogeneous groups the true
+#   floor is the smaller mean_b[p_b(1-p_b)]/n, so the common mode is under-stated -- and
+#   heterogeneity GROWS with group size (a tensor's sign is far more persistent than one
+#   weight's).  The bias is therefore worst at the coarse rungs, which depresses rho_s(coarse)
+#   and makes the implied per-weight rho FALL with k.
+#   **That is exactly the signature of short-range correlation, so the raw profile cannot
+#   distinguish "correlation has a range" from "the estimator's floor is wrong".**
+#
+#   PATCH_PROBE5 emits, per coordinate of the arm's own partition, a running count of how
+#   often its meta-gradient was negative.  That gives p_b directly, hence the corrected floor,
+#   hence a de-confounded profile.  It also gives the DISTRIBUTION of per-coordinate marginal
+#   bias -- the 85%-of-budget channel, never observed except in aggregate.
+#
+# PRE-REGISTERED PREDICTIONS (write the verdict against these, not against whatever lands)
+#   Let H(m) = mean_b[p_b(1-p_b)] / (p_bar(1-p_bar)) in (0,1], the heterogeneity ratio, and
+#   let rho_w^implied(k) be corr_range.py's inversion recomputed with the corrected floor.
+#
+#   (0) SANITY, must hold or the batch is void: H(m) <= 1 + 3 s.e. on every rung, and
+#       H(weightwise) > H(blk6) -- heterogeneity must increase with group size.
+#   (a) THE PROFILE IS AN ARTEFACT:  after correction, rho_w^implied is FLAT across the
+#       resolved rungs to within 3x.  Then the falling raw profile (85.4x on fz/a6, 25.5x on
+#       mx) is the floor bias, "short-range correlation" is withdrawn, and the honest claim
+#       is a single scale-free per-weight rho.
+#   (b) CORRELATION GENUINELY HAS A RANGE:  rho_w^implied still falls >= 10x from k=1 to
+#       k ~ 1.8e5 after correction.  Then the correlation length is real and measurable, and
+#       it is the paper's structural result.
+#   REFUTATION of FINDINGS 44.5's provisional short-range reading: outcome (a).
+#
+#   RESOLUTION LIMIT -- state it next to any null (CORRECTIONS 33's standing rule).
+#   With PROBE=5 over 20 epochs = 2000 records, twochannel's rho_min is ~8e-9 at weightwise,
+#   ~7e-6 at nodewise, ~1.5e-3 at layerwise and ~1.6e-2 at blk6.  The blk6 rung is NOT
+#   expected to resolve and must not be reported as a null without that number attached.
+#
+# DESIGN.  Field-for-field the `fz-*-a3` line (cluster_b, cycle 41 -- recovered from its own
+# ARGS:/ENV: lines, quoted below) with TWO additions and nothing else changed:
+#     PROBE=5  (2000 records instead of 100 -- p_b needs T large; sd(p_b) = 0.011 at T=2000)
+#     PROBE5=1 PROBE5_WRITE_EVERY=500  (4 dumps per run, ~180 MB I/O on the weightwise arm)
+#   Recovered fz-w-a3-s0 ARGS:
+#     --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+#     --alg-meta fixed --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+#     --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-3 --num-epochs 20
+#     --stepsize-groups weightwise --seed 0
+#   Recovered ENV:  AUGMENT=1 BETA_CLIP=-15:-2.3026   (HIER/LAM/ETA_RATIO were UNSET --
+#   `HIER=none LAM=na` is what run_cifar.sh echoes over an unset variable, and exporting
+#   those literals kills the job.  See CONTINUE-HERE gotchas.)
+#
+# MUST RUN ON cluster_b.  That is where `fz-*` ran, so the comparison is same-account.  Both
+# accounts carry PATCH_PROBE2 and the anchor (verified cycle 44), so either would work, but
+# mixing accounts adds a confound this batch does not need.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. every record must have  beta_true_max == beta_true_min   (beta really is frozen)
+#   2. neg_counts.json must exist with n_records == 2000 and n_tot matching the arm
+#   3. sum(neg_counts)/(n_records*n_tot) must equal the time-mean of frac_neg to <1e-6
+#      -- the two are the same quantity computed two ways; if they disagree the patch is wrong
+#   4. python3 tests/test_twochannel.py && python3 tests/test_corr_range.py  -> ALL PASS
+#
+# SUPERSEDES bin/c44_frozen_probe4.sh.  That batch was designed to answer whether the
+# off-equilibrium deficit is bias or correlation -- cycle 44 answered it at zero compute
+# (85%/15%), and its PATCH_PROBE4 instrument resolves only rho >= 1.7e-5, which is 50x
+# COARSER than the rho = 1.9e-6 already measured.  It would spend 4 jobs to return an
+# uninformative null.  Do not submit it; submit this instead.
+#
+# USAGE
+#   bash c44_probe5_heterogeneity.sh            # dry run: prints every sbatch line, submits nothing
+#   bash c44_probe5_heterogeneity.sh --submit   # submits, but ONLY if the guards below pass
+# =============================================================================
+set -uo pipefail
+
+SUBMIT=0
+FORCE_FS=0
+for a in "$@"; do
+  [ "$a" = "--submit" ] && SUBMIT=1
+  [ "$a" = "--force-fairshare" ] && FORCE_FS=1
+done
+
+USER_NAME=account_b
+WS=$HOME/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/p5
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+FS_FLOOR=0.35
+# Raised from 10 to the operator's actual hard limit (cycle 47).  CORRECTIONS 35
+# measured PriorityDecayHalfLife = 14 days, so the 0.35 FairShare floor cannot be
+# waited out; CORRECTIONS 37 replaces it with a batch-size rule and keeps PENDING<=40
+# as the binding constraint.  This batch is 8 jobs of ~25 min = ~0.08% of RawUsage.
+PEND_CAP=40
+
+echo "=== c44 PROBE5 heterogeneity batch ==="
+
+# ---- guard 1: the patch must be present, or every run is a silent no-op -------------
+if ! grep -q PATCH_PROBE5 "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5 not present in $HF"
+  echo "  apply it first:  python3 $WS/hierarchical-metaoptimize/patches/patch_probe5.py"
+  echo "  (set HF_PATH=$HF ; it is idempotent and prints ALREADY_PATCHED on a second run)"
+  [ "$SUBMIT" = "1" ] && exit 1
+  echo "  (dry run continues so the sbatch lines can be inspected)"
+fi
+
+# ---- guard 2: FairShare floor --------------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+echo "FairShare = ${FS:-unknown} (floor $FS_FLOOR)"
+FS_OK=$(awk -v a="${FS:-0}" -v b="$FS_FLOOR" 'BEGIN{print (a+0>=b+0)?1:0}')
+
+# ---- guard 3: pending cap ------------------------------------------------------------
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "pending  = $PEND (cap $PEND_CAP)"
+PEND_OK=$(awk -v a="$PEND" -v b="$PEND_CAP" 'BEGIN{print (a+0<=b+0)?1:0}')
+
+if [ "$FS_OK" != "1" ] && [ "$FORCE_FS" = "1" ]; then
+  echo "  --force-fairshare: OVERRIDDEN (CORRECTIONS 35/37 -- the 0.35 floor is withdrawn"
+  echo "  as miscalibrated; 14-day half-life means it cannot be waited out).  8 jobs."
+  FS_OK=1
+fi
+
+if [ "$SUBMIT" = "1" ] && { [ "$FS_OK" != "1" ] || [ "$PEND_OK" != "1" ]; }; then
+  echo "GUARD FAIL: refusing to submit (FS_OK=$FS_OK PEND_OK=$PEND_OK)"
+  exit 1
+fi
+
+mkdir -p "$SAVE"
+N=0
+for G in resnet18_blocks layerwise nodewise weightwise; do
+  case $G in
+    resnet18_blocks) TAG=blk6 ;;
+    layerwise)       TAG=lay  ;;
+    nodewise)        TAG=node ;;
+    weightwise)      TAG=w    ;;
+  esac
+  for S in 0 1; do
+    RN="p5-${TAG}-a3-s${S}"
+    PD="$SAVE/probe_${TAG}_a3_s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --time=03:50:00
+         --export="ALL,AUGMENT=1,BETA_CLIP=-15:-2.3026,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PD"
+         "$RUNNER"
+         --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+         --alg-meta fixed --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+         --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-3 --num-epochs 20
+         --stepsize-groups "$G" --seed "$S"
+         --save-directory "$SAVE" --run-name "$RN")
+    N=$((N+1))
+    if [ "$SUBMIT" = "1" ]; then
+      "${CMD[@]}"
+    else
+      printf '%q ' "${CMD[@]}"; echo
+    fi
+  done
+done
+echo "=== $N jobs $([ "$SUBMIT" = "1" ] && echo SUBMITTED || echo 'printed (dry run -- nothing submitted)') ==="

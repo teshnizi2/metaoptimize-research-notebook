@@ -1,0 +1,45 @@
+set -e
+cd /cluster/account_a/metaopt
+R=/cluster/account_a/metaopt/runs
+# a0L -- the SGDm+Lion alpha0 ladder, COMPLETE and self-contained on ONE GPU type (L4).
+#
+# Why this block exists even though a0h asks the same question on 2080ti:
+#  * a0h is 14/20 still PENDING behind a saturated gpu-2080ti-11g and has delivered
+#    seed 0 only, at alpha0 in {1e-3, 1e-6}, for 3 of the 4 arms. It carries NO 1e-4
+#    row and NO 6-block arm at any seed, so it cannot reproduce the granularity
+#    ORDERING at a given alpha0 -- only a two-point contrast.
+#  * L4 capacity is idle right now ([HOST_e8d809bd94] IDLE with 4 free GPUs, [HOST_bcfd0fc19c] 3 free) and
+#    is unreachable by a 2080ti-pinned job.
+#  * All 24 cells here share one GPU type, so the block is internally comparable on
+#    wallclock as well as on epochs/accuracy (gotcha 3). a0h on 2080ti then becomes an
+#    independent cross-GPU-type replication rather than the primary measurement.
+#
+# Design: {scalar, 6-block, layerwise plain, layerwise shrink lam=0.1} x alpha0 in
+#         {1e-3, 1e-4, 1e-6} x seeds {0,1}  =  24 cells.
+# --time sized from measurement: 140 completed 100-epoch L4 runs span 30-48 min, so
+# 2:00:00 is 2.5x the slowest ever recorded AND fits the gpu-short 4h cap (gotcha 12).
+B="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --meta-stepsize 1e-3 --gamma 1 --NN-name ResNet18 --dataset CIFAR10 --num-epochs 100 --batch-size 100 --max-time 999:00:00"
+C="BETA_CLIP=-15:-2.3026"
+
+sub () { # 1=name 2=granularity 3=extra-env 4=seed 5=alpha0
+  sbatch --parsable --job-name=$1-s$4 \
+    --partition=gpu-l4-24g,gpu-short --gres=gpu:l4:1 \
+    --time=02:00:00 --export="ALL,AUGMENT=1,$C,$3" \
+    jobs/run_cifar.sh $B --alpha0 $5 --stepsize-groups $2 --seed $4 \
+    --save-directory $R/a0L --run-name $1_s$4 >/dev/null
+}
+
+for s in 0 1; do
+  for a in 1e-3 1e-4 1e-6; do
+    t=$(echo $a | tr -d '-')          # 1e3 / 1e4 / 1e6
+    sub a0L-scal-$t   scalar           "HIER="               $s $a
+    sub a0L-blk6-$t   resnet18_blocks  "HIER="               $s $a
+    sub a0L-lplain-$t layerwise        "HIER="               $s $a
+    sub a0L-lsh01-$t  layerwise        "HIER=shrink,LAM=0.1" $s $a
+  done
+done
+
+sleep 5
+echo "A0L_SUBMITTED=$(squeue -h -u account_a -o '%j' | grep -c '^a0L-')"
+echo "A0L_RUNNING=$(squeue -h -u account_a -t R -o '%j' | grep -c '^a0L-')"
+echo "TOTAL_RUNNING=$(squeue -h -u account_a -t R | wc -l)"

@@ -1,0 +1,64 @@
+#!/bin/bash
+# Cycle 26: THE FALSIFIABLE TEST of the sign-agreement mechanism, out of sample.
+#
+# MECHANISM (cycle 26, from the never-reduced mx/probe_sig_* probes):
+#   cross-coordinate sign agreement of the meta-gradient falls monotonically as the
+#   partition gets finer -- R18/C10/a0=1e-6/100ep, free adaptation, steady window:
+#     blocks(m=6) 70.87 +-0.80 %   layerwise(62) 53.26 +-0.19 %
+#     nodewise(14420) 51.03 +-0.12 %   weightwise(11.17M) 50.0053 +-0.0003 %
+#   and the M1 pooling gain runs OPPOSITE to it: blk6 +0.42, layerwise +2.40,
+#   weightwise +11.13 (via zpool, 25.5).  Claim: pooling buys the most where the
+#   partition's coordinates agree the least.
+#
+# WHY CIFAR-100 IS THE TEST.  24.3 measured NO interior pooling optimum on C100 at
+# LAYERWISE (best cell +0.004pp -- nothing), which looked like a flat contradiction of
+# the C10 result.  The mechanism explains it: C100 layerwise agreement is HIGH
+# (p4/p5scale: 54-76% vs C10's 53%).  But agreement must collapse toward 50% at
+# weightwise on ANY dataset -- 11.2M coordinates cannot agree.  So the mechanism makes
+# a sharp, pre-registered, out-of-sample prediction:
+#
+#   PREDICTED: on CIFAR-100, M1 pooling is USELESS at layerwise (already measured, 24.3)
+#              but produces a LARGE gain at weightwise, and an intermediate/small gain
+#              at nodewise.
+#   FALSIFIED IF: C100 weightwise shows no pooling gain.  Then agreement does not drive
+#              the gain and the whole cycle-26 mechanism dies.
+#
+# r=1 is the identity control and MUST reproduce the plain arm (c100f-w / c100f-node,
+# landing now).  r=0 is FULL pooling (CORRECTIONS 13) and MUST show sd(beta)=0 --
+# verified structurally on the p6mech probes this cycle.
+# Probes on the r=1 seed of each granularity give the agreement measurement IN THE SAME
+# RUNS as the gain, which no previous cycle has had.
+set -e
+cd /cluster/account_a/metaopt
+OUT=/cluster/account_a/metaopt/runs/cw
+mkdir -p "$OUT"
+COMMON="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 \
+--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 \
+--dataset CIFAR100 --batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 \
+--alpha0 1e-6 --num-epochs 100 --NN-name ResNet18_c100"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+n=0
+sub () {  # $1=tag $2=granularity $3=r $4=rtag
+  for S in 0 1 2; do
+    NAME=cw-$1-$4-s$S
+    EX="ALL,AUGMENT=1,BETA_CLIP=-15:-2.3026,HIER=additive,ETA_RATIO=$3"
+    # agreement probe on the r=1 (identity) seed 0 of each granularity: measures the
+    # partition's intrinsic agreement in the SAME run family as the gain.
+    if [ "$4" = "r1" ] && [ "$S" = "0" ]; then
+      EX="$EX,PROBE=25,PROBE_DIR=$OUT/probe_$1_r1_s0"
+    fi
+    sbatch --job-name=$NAME --partition=$PARTS --cpus-per-task=6 --mem=14G --time=03:50:00 \
+      --export=$EX \
+      jobs/run_cifar.sh $COMMON --stepsize-groups $2 --seed $S \
+      --save-directory "$OUT" --run-name $NAME >/dev/null
+    n=$((n+1))
+  done
+}
+for spec in 0:r0 0.03:r003 0.06:r006 0.1:r01 0.2:r02 1:r1; do
+  sub w weightwise ${spec%%:*} ${spec##*:}
+done
+for spec in 0:r0 0.03:r003 0.06:r006 0.1:r01 0.2:r02 1:r1; do
+  sub node nodewise ${spec%%:*} ${spec##*:}
+done
+echo "SUBMITTED cw: $n jobs"
+squeue -u $USER -h | wc -l

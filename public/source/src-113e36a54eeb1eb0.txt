@@ -1,0 +1,1584 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cK1_cpk1_score.py -- THE REGISTERED SCORER FOR `cpk1`, THE CUT-POSITION SWEEP
+#                      AT FIXED m = 2 ON CIFAR-100.
+#
+# STANDING RULE 21: this file is git-committed BEFORE any cpk1 run exists.
+# Every grid point, bar, gate, prediction, statistic and refusal below is
+# frozen here.  --selftest re-derives every archived constant from
+# results/all_runs.csv, re-derives cbl1's own five cut positions from the
+# corpus, re-derives every partition's size vector, balance and parameter
+# share from the frozen per-tensor parameter table, asserts that the corpus
+# contains ZERO cpk1 rows at registration time, and cross-checks each constant
+# against bin/cK1_cut_position_sweep.sh's OWN TEXT so registration and batch
+# cannot drift.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments (--runs, --manifest, --selftest) is NOT editing it.
+# Once a cpk1 run exists this file is frozen for good.
+#
+# =============================================================================
+# WHERE THIS COMES FROM
+# =============================================================================
+# `cbl1` (33 jobs, CIFAR-100, one submission, scored by its own registered
+# scorer UNEDITED) ran a count ladder and a balance ladder together.  Its
+# balance half returned R5 MIRROR-BREAK: two partitions with IDENTICAL
+# normalised entropy, [45,17] and [17,45], landed 16.5 pp apart.  The
+# registered balance statistic was DISQUALIFIED by its own mirror control and
+# was NOT replaced by a better-fitting one.  What survived is the bare
+# observation that at fixed m = 2 the POSITION of the cut decides.
+#
+# Re-derived here from results/all_runs.csv in --selftest, not quoted from
+# prose -- CAPTURE against cbl1's OWN in-batch anchors (scalar 22.7247,
+# layerwise 69.6693, gap 46.9447 pp):
+#
+#     k    spec       B          plateau5   CAPTURE
+#     17   [17,45]    0.84742     25.913    +0.06791
+#     31   [31,31]    1.00000     32.862    +0.21594
+#     45   [45,17]    0.84742     42.452    +0.42022
+#     55   [55,7]     0.50861     23.227    +0.01071
+#     60   [60,2]     0.20559     24.844    +0.04514
+#
+# FIVE POINTS ARE NOT A CURVE.  Between k = 45 and k = 55 -- ten of sixty-two
+# tensors -- CAPTURE falls by 0.409, and nobody has measured anything in
+# between.  Between k = 31 and k = 45 it rises by 0.204, and nobody has
+# measured anything in between either.  This batch maps that curve.
+#
+# =============================================================================
+# THE NETWORK, MEASURED NOT ASSUMED
+# =============================================================================
+# ResNet18_c100 as built by build_network() has exactly 62 parameter tensors
+# and 11,220,132 parameters.  named_parameters() order, read off the LIVE
+# model (the launcher re-proves this at submission time and writes
+# PARTITION-MANIFEST.txt, which G1 below REQUIRES):
+#
+#     1- 3   conv1.weight, bn1.weight, bn1.bias          (stem)
+#     4- 9   layer1.0            10-15  layer1.1
+#    16-24   layer2.0 (+shortcut)  25-30  layer2.1
+#    31-39   layer3.0 (+shortcut)  40-45  layer3.1
+#    46-54   layer4.0 (+shortcut)  55-60  layer4.1
+#    61-62   linear.weight, linear.bias
+#
+# STAGE boundaries therefore fall at k = 3, 15, 30, 45, 60 and BLOCK boundaries
+# at k = 3, 9, 15, 24, 30, 39, 45, 54, 60.  cbl1's maximum, k = 45, is EXACTLY
+# the layer3|layer4 stage boundary.  That is the observation this batch is
+# built to put at risk, and it is stated here before any cpk1 run exists.
+#
+# =============================================================================
+# THE DESIGN.  13 arms x 3 seeds = 39 jobs, ONE submission
+# =============================================================================
+#   ANCHORS, run IN BATCH so CAPTURE is a within-batch quantity:
+#     k01   scalar      m =  1
+#     k62   layerwise   m = 62
+#
+#   THE SWEEP, [k, 62-k] for eleven cut positions:
+#     k = 17, 24, 31, 38, 42, 45, 47, 49, 52, 55, 60
+#
+#   WHY THESE ELEVEN, stated before the data:
+#     * 17, 31, 45, 55, 60 are cbl1's five, re-run IN BATCH.  Without them the
+#       comparison with cbl1 would be cross-batch, and batch -- not seed -- is
+#       the unit of replication in this corpus (F(62,85) = 5.47, p 6.9e-13 for
+#       batch; F 1.21, p 0.213 for seed).  Re-running them costs 15 jobs and
+#       buys a within-batch replication test, G5a below.
+#     * spacing is 7 tensors on the left flank (17, 24, 31, 38), tightening to
+#       4, 3, 2, 2, 3, 3 across the claimed peak and the collapse
+#       (42, 45, 47, 49, 52, 55) and opening to 5 in the dead tail (60).
+#       Resolution is spent where cbl1 says the derivative is largest.
+#     * k = 45 and k = 17 are the SAME TWO SPECS as cbl1's mirror pair, so
+#       cbl1's decisive control is re-run inside this batch for free.
+#     * k = 24 and k = 38 are a SECOND mirror pair, [24,38] and [38,24], at
+#       identical B = 0.96290.  cbl1 had one mirror pair; a second, at a
+#       different balance and a different part of the network, is what turns
+#       "the entropy statistic failed once" into "it fails generally".
+#     * k = 49 is the grid point closest to a 50/50 split of the PARAMETERS
+#       (56.28% / 43.72%), which is the rival account named in advance below.
+#       It is 4 tensors from k = 45, so the two accounts predict different
+#       grid points and one submission can separate them.
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / meta-stepsize 1e-3 /
+#   alpha0 1e-6 / 100 epochs / batch 100 / gamma 1 / BETA_CLIP -15:-2.3026 /
+#   AUGMENT=1 / HIER unset / PROBE=0.  Matched cell-for-cell to cbl1 and hb1
+#   and to the archived CIFAR-100 rows, so the batches compose.
+#
+# =============================================================================
+# THE PRIMARY STATISTIC, FROZEN
+# =============================================================================
+#   plateau5 = mean of the LAST 5 test epochs.  The CSV `plateau` column
+#   (mean-of-last-20) is BANNED as primary and is never read by this file;
+#   `best_test` is not a plateau and is never read either.  train5 = mean of
+#   the last 5 TRAIN epochs, reported for EVERY arm: the coarse-partition
+#   failure has been train-side in every dataset measured so far, and a
+#   position effect that does not appear on FITTING would be a different
+#   phenomenon from the one cbl1 found.
+#
+#   CAPTURE(arm) = ( M(arm) - M(k01) ) / ( M(k62) - M(k01) )   on plateau5,
+#   both anchors measured IN BATCH.  CAPTURE(k01) = 0 and CAPTURE(k62) = 1 by
+#   construction; the science is entirely in the eleven m = 2 arms.
+#
+#   DISCLOSED CONFOUND, not discovered later: the two anchors use the `scalar`
+#   and `layerwise` code paths in HF.init_meta while every sweep arm uses the
+#   `blockwise` path.  [62] and [1]x62 are not run.  This is inherited from the
+#   archive, from hb1 and from cbl1 so that G3 can compare like with like.  It
+#   rescales CAPTURE by a constant and cannot reorder the eleven sweep arms,
+#   which all share one code path -- and every verdict below depends only on
+#   the ORDER and the SPACING of those eleven.
+#
+# =============================================================================
+# WHAT THIS BATCH DOES *NOT* REGISTER
+# =============================================================================
+# cbl1 disqualified normalised entropy B as the operative variable and
+# explicitly refused to replace it with whichever statistic then fit better.
+# Registering a fresh mechanistic statistic here, chosen with cbl1's five
+# points already in view, would be that same sin one level up.  So:
+#
+#   * THE PRIMARY IS A SHAPE CLAIM, NOT A MECHANISM.  Where is the argmax; is
+#     the curve single-peaked; how wide is the peak; is the position effect
+#     real at all.  Those are properties of the measured curve and need no
+#     theory to be well defined.
+#   * B is still PRINTED for every arm, labelled DISQUALIFIED-BY-cbl1-R5, and
+#     gates nothing.  It is shown so that the second mirror pair can be read.
+#   * ONE rival mechanism is named in advance -- PARAMETER BALANCE -- because
+#     it makes a DIFFERENT prediction about the argmax (k = 49, not k = 45),
+#     it can be stated without seeing cpk1 data, and it is already in trouble
+#     on cbl1's own numbers (k = 55 splits the parameters 78/22, a ratio of
+#     3.65, which is closer to even than k = 31's 10.6, yet k = 55 captured
+#     0.011 and k = 31 captured 0.216).  Recording that it is already losing
+#     is what makes an agreement a surprise rather than a confirmation.
+#   * No other functional form, statistic, window or scale may be introduced
+#     after the data exist.
+#
+# =============================================================================
+# PREDICTIONS, ON RECORD BEFORE SUBMISSION
+# =============================================================================
+#   P1  The argmax over the eleven grid points is k* = 45, the layer3|layer4
+#       stage boundary.  Weaker form actually tested: 45 lies in the PEAK SET.
+#   P2  The curve is SINGLE-PEAKED over the grid (no reversal larger than 0.05
+#       on the rise to k*, none on the fall away from it).
+#   P3  RIGHT-COLLAPSE: CAPTURE < 0.10 at every k >= 52.
+#   P4  The position effect is large: RANGE of CAPTURE over the eleven arms
+#       >= 0.30 (three times the bar that would refute it).
+#   P5  The parameter-balance rival LOSES: k* != 49.
+#   P6  Both mirror pairs BREAK: |CAP(45) - CAP(17)| > 0.10 and
+#       |CAP(38) - CAP(24)| > 0.10 at identical B within each pair.
+#
+#   I do not predict where the collapse between 45 and 55 begins.  That is the
+#   quantity this batch exists to measure and I decline to guess it.
+#
+# =============================================================================
+# REFUTATION CONDITIONS, FROZEN, CHECKED IN THIS ORDER
+# =============================================================================
+#   X1  NO-POSITION-EFFECT.  RANGE of CAPTURE over the eleven m = 2 arms
+#       < 0.10.  THIS IS THE REFUTATION OF THE HEADLINE CLAIM: if moving the
+#       cut across the whole network at fixed m = 2 buys less than a tenth of
+#       the scalar-to-layerwise gap, then cut position is NOT the operative
+#       variable and cbl1's 16.5 pp mirror break was batch-local.  0.10 in
+#       CAPTURE units is 4.67 pp, which is 8.4 SE of a 3-seed difference at
+#       this corpus's re-derived noise floor.  Verdict
+#       POSITION-REFUTED-FLAT, and nothing further is claimed.
+#   X2  MULTIMODAL.  With k* the argmax: some step BELOW k* falls by more than
+#       0.05, or some step ABOVE k* rises by more than 0.05.  Kills P2.
+#       Verdict POSITION-MULTIMODAL -- the curve has more than one hump and
+#       "the cut position" is not a one-dimensional story.
+#   X3  PEAK-OFF-BOUNDARY.  45 is NOT in the PEAK SET, where
+#       PEAK SET = { k : CAPTURE(k) >= CAPTURE(k*) - 0.05 }.  Kills P1.  This
+#       is a positive finding about where the peak actually is, not a batch
+#       failure: the BOUNDARY verdict becomes BOUNDARY-REFUTED and the
+#       measured k* is reported as the answer.
+#   X4  BROAD-PLATEAU.  The PEAK SET holds 5 or more of the eleven grid
+#       points.  Then what cbl1 read as a sharp peak is a plateau, position
+#       resolves only coarsely, and no argmax may be named.  Verdict
+#       POSITION-BROAD-PLATEAU.
+#   X5  CBL1-ORDER-BREAK.  Any of the SEVEN ordered pairs that cbl1 separated
+#       by more than 0.10 in CAPTURE reverses sign in this batch.  Those seven,
+#       re-derived from the corpus in --selftest, are
+#           45>17  45>31  45>55  45>60  31>17  31>55  31>60
+#       X5 does NOT void this batch: cpk1 is self-contained and its own shape
+#       verdict stands on its own anchors.  What X5 kills is the claim that
+#       this batch MAPS cbl1's curve; on X5 the two batches are reported as
+#       disagreeing and the cross-batch reading is withdrawn.
+#
+# WHAT DOES NOT COUNT AS REFUTATION, AND EQUALLY DOES NOT COUNT AS RESCUE
+#   * A step of <= 0.05 in the wrong direction anywhere.  Reported with its t,
+#     never promoted to a second mode.
+#   * CAPTURE > 1 at some k (an m = 2 partition beating layerwise).  Allowed,
+#     reported, changes no bar.
+#   * An in-batch k = 45 or k = 31 differing from cbl1's 0.4202 / 0.2159.
+#     cbl1 is ANOTHER BATCH.  Only the ORDER of the seven pairs is tested;
+#     the magnitudes are printed as description and gate nothing.
+#   * A pretty fit of some curve nobody named.  Neither the boundary account
+#     nor the parameter-balance account may be swapped for a third after the
+#     fact.
+#   * No post-hoc change of statistic, window, scale, grid or bar.
+#
+# =============================================================================
+# THE GATES, IN ORDER.  THE ORDER IS PART OF THE REGISTRATION
+# =============================================================================
+#   G0  PROVENANCE (RULE 20), ABSOLUTELY GATING.  Every arm is MEASURED from
+#       the run's OWN `ARGS:`/`ENV:` lines, never from its filename.  No
+#       repeated flag; dataset CIFAR100; NN-name ResNet18_c100; alpha0 1e-6;
+#       meta-stepsize 1e-3; num-epochs 100; batch-size 100; gamma 1;
+#       alg-base SGDm; alg-meta Lion; AUGMENT=1; BETA_CLIP=-15:-2.3026;
+#       HIER unset; and a --stepsize-groups value that is one of the thirteen
+#       registered arm strings.
+#   G1  THE PARTITION GATE.  PARTITION-MANIFEST.txt, written by the launcher
+#       from the LIVE model's named_parameters(), must show 62 tensors,
+#       11,220,132 parameters, and for every one of the eleven explicit specs
+#       exactly the registered size vector AND the registered per-group
+#       parameter counts.  Without it, "k = 49" is a claim about a string.
+#   G2  COMPLETENESS.  >= 95 of 100 epochs and all 5 tail epochs present.  Any
+#       registered arm with fewer than 2 usable seeds VOIDS the batch.
+#   G3  THE ARCHIVE GATE.  In-batch k01 and k62 must land within +/-2.00 pp of
+#       their archived cell means (22.7796 and 69.4756).  A miss is VOID-TREE.
+#   G4  THE MANIFOLD GATE.  In-batch (k62 - k01) must be >= 23.348 pp, half the
+#       archived gap.  Without the gap CAPTURE is a ratio of noise:
+#       VOID-NOMANIFOLD, and no verdict is issued.
+#   G5a REPLICATION.  The seven cbl1 pairs (X5).
+#   G5b THE PRIMARY.  X1 .. X4 -> the POSITION verdict; then the BOUNDARY
+#       verdict and the PARAMETER-BALANCE verdict, each with its own frozen
+#       tree.
+#   G6  DESCRIPTIVE, NEVER GATING.  Half-maximum span, mirror pairs, the
+#       disqualified B, parameter shares, the train ladder, the structural
+#       annotation, and the cross-batch cbl1 comparison.
+#
+# =============================================================================
+# WHAT THIS SCORER WILL NOT DO
+# =============================================================================
+#   * It will not read the CSV `plateau` (last-20) column, or `best_test`.
+#   * It will not pool cpk1 with cbl1 or with any archived batch to raise n.
+#     Archived rows enter only as G3's and G4's registered comparators, as the
+#     source of the noise floor, and as X5's frozen ordering.
+#   * It will not claim anything about CIFAR-10, Tiny-ImageNet, ImageNet-489,
+#     ResNet-50, alpha0 1e-3, any meta-stepsize but 1e-3, any optimiser pair
+#     but SGDm+Lion, any m other than 2 (the anchors are anchors, not rungs),
+#     or any hierarchical / shrinkage operator (HIER is unset in every arm).
+#   * It will not name a mechanism.  It locates a curve.  If the curve's shape
+#     is compatible with more than one story, it says so and stops.
+#   * It will not soften a bar after the fact.  If the answer lands in a gap,
+#     the deliverable is the word UNRESOLVED.
+#
+# =============================================================================
+# USAGE
+#   python3 analysis/cK1_cpk1_score.py --selftest
+#   python3 analysis/cK1_cpk1_score.py --runs /cluster/account_b/metaopt/runs
+#   python3 analysis/cK1_cpk1_score.py --runs <dir> --manifest <path>
+# =============================================================================
+
+from __future__ import print_function
+
+import argparse
+import collections
+import csv
+import glob
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cK1_cut_position_sweep.sh")
+
+# ---- FROZEN REGISTRATION ----------------------------------------------------
+PREFIX = "cpk1-"
+NET, DSET = "ResNet18_c100", "CIFAR100"
+MS, ALPHA0, CLIP, AUG = "1e-3", "1e-6", "-15:-2.3026", "1"
+EPOCHS, BATCH, GAMMA = 100, 100, "1"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+SEEDS = (0, 1, 2)
+N_TENSORS = 62
+N_PARAMS = 11220132
+
+# the eleven cut positions, in increasing k.  [k, 62-k].
+KGRID = (17, 24, 31, 38, 42, 45, 47, 49, 52, 55, 60)
+# cbl1's five, re-run in batch
+KGRID_FROM_CBL1 = (17, 31, 45, 55, 60)
+# the two mirror pairs: identical B, opposite cut position
+MIRROR_PAIRS = ((17, 45), (24, 38))
+# the layer3|layer4 STAGE boundary -- P1's prediction
+BOUNDARY_K = 45
+# the grid point nearest a 50/50 split of the PARAMETERS -- the named rival
+PARBAL_K = 49
+
+TAG_LO, TAG_HI = "k01", "k62"
+
+
+def ktag(k):
+    return "k%02d" % k
+
+
+def kspec(k):
+    return "[%d,%d]" % (k, N_TENSORS - k)
+
+
+ARMS = collections.OrderedDict()          # tag -> --stepsize-groups value
+ARMS[TAG_LO] = "scalar"
+for _k in KGRID:
+    ARMS[ktag(_k)] = kspec(_k)
+ARMS[TAG_HI] = "layerwise"
+
+# named_parameters() numel, in order, for ResNet18_c100.  Read off the LIVE
+# model at registration time; G1 re-checks it against the launcher's manifest,
+# which is itself written from the live model at submission time.
+TENSOR_NUMEL = (
+    [1728, 64, 64]                                                    # stem
+    + [36864, 64, 64, 36864, 64, 64] * 2                              # layer1
+    + [73728, 128, 128, 147456, 128, 128, 8192, 128, 128]             # layer2.0
+    + [147456, 128, 128, 147456, 128, 128]                            # layer2.1
+    + [294912, 256, 256, 589824, 256, 256, 32768, 256, 256]           # layer3.0
+    + [589824, 256, 256, 589824, 256, 256]                            # layer3.1
+    + [1179648, 512, 512, 2359296, 512, 512, 131072, 512, 512]        # layer4.0
+    + [2359296, 512, 512, 2359296, 512, 512]                          # layer4.1
+    + [51200, 100]                                                    # linear
+)
+
+# structure, in named_parameters() index (1-based, cut AFTER this index)
+STAGE_BOUNDARIES = (3, 15, 30, 45, 60)
+BLOCK_BOUNDARIES = (3, 9, 15, 24, 30, 39, 45, 54, 60)
+STRUCT = (   # (first_index, last_index, name)
+    (1, 3, "stem"), (4, 9, "layer1.0"), (10, 15, "layer1.1"),
+    (16, 24, "layer2.0"), (25, 30, "layer2.1"),
+    (31, 39, "layer3.0"), (40, 45, "layer3.1"),
+    (46, 54, "layer4.0"), (55, 60, "layer4.1"), (61, 62, "linear"),
+)
+
+# archived comparators, ALL re-derived by archived_arms() in --selftest
+ARCH_SCAL = 22.7796
+ARCH_LAY = 69.4756
+ARCH_GAP = 46.6959
+ARCH_TRAIN_SCAL = 22.9655
+ARCH_TRAIN_LAY = 98.9850
+SIGMA_W = 0.6836
+SIGMA_DF = 45
+
+# cbl1's own numbers, re-derived from the corpus in --selftest.  DESCRIPTIVE,
+# except that CBL1_ORDER is X5's frozen replication test.
+CBL1_PREFIX = "cbl1-"
+CBL1_N_ROWS = 33
+CBL1_LO, CBL1_HI = 22.724667, 69.669333
+CBL1_CAP = {17: 0.067910, 31: 0.215942, 45: 0.420225,
+            55: 0.010708, 60: 0.045145}
+CBL1_SEP = 0.10                # pairs separated by more than this are frozen
+CBL1_ORDER = ((31, 17), (31, 55), (31, 60),
+              (45, 17), (45, 31), (45, 55), (45, 60))   # (higher, lower)
+
+# bars
+RANGE_BAR = 0.10          # X1: below this, cut position is not operative
+WOBBLE_BAR = 0.05         # X2: a step this size against the hump is a mode
+PEAK_BAND = 0.05          # X3/X4: the PEAK SET is within this of the argmax
+PLATEAU_N = 5             # X4: this many arms in the PEAK SET is a plateau
+MIRROR_BAR = 0.10         # a mirror pair "breaks" above this
+TREE_BAND = 2.00          # G3
+MANIFOLD_BAR = 23.348     # G4: half of ARCH_GAP
+COLLAPSE_BAR = 0.10       # P3: "collapsed" means CAPTURE below this
+COLLAPSE_K = 52           # P3: at every k >= this
+BIG_RANGE = 0.30          # P4
+HALFMAX_NARROW = 8        # G6 descriptive: span in tensors at half maximum
+TRAIN_ARGMAX_SLACK = 2    # G6 descriptive: grid positions
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+
+
+# =============================================================================
+# the partition algebra.  Sizes, balance and parameter share come from the SPEC
+# STRING and the frozen tensor table, so the manifest and this file can be
+# compared without either quoting the other.
+# =============================================================================
+def spec_sizes(spec):
+    """The size vector a spec string denotes, or None if it is not a list."""
+    if not (spec.startswith("[") and spec.endswith("]")):
+        return None
+    return [int(x) for x in spec[1:-1].split(",")]
+
+
+def balance(sizes):
+    """B = H(p)/log(m), p_i = |g_i|/sum.  B := 1 for m = 1.
+
+    DISQUALIFIED as an explanation by cbl1's R5 MIRROR-BREAK.  Kept here only
+    so that this batch's two mirror pairs can be printed with the balance they
+    share.  It gates nothing."""
+    m = len(sizes)
+    if m <= 1:
+        return 1.0
+    tot = float(sum(sizes))
+    h = -sum((s / tot) * math.log(s / tot) for s in sizes)
+    return h / math.log(m)
+
+
+def group_params(sizes):
+    """Parameter count of each contiguous group, from the frozen tensor table."""
+    out, i = [], 0
+    for s in sizes:
+        out.append(sum(TENSOR_NUMEL[i:i + s]))
+        i += s
+    return out
+
+
+def param_share(k):
+    """Fraction of the network's parameters in the FIRST group of [k, 62-k]."""
+    return float(sum(TENSOR_NUMEL[:k])) / float(N_PARAMS)
+
+
+def struct_at(k):
+    """Where a cut after tensor k falls in the network, as text."""
+    tags = []
+    if k in STAGE_BOUNDARIES:
+        tags.append("STAGE boundary")
+    elif k in BLOCK_BOUNDARIES:
+        tags.append("block boundary")
+    for lo, hi, name in STRUCT:
+        if lo <= k <= hi:
+            tags.append("%s ends at %d" % (name, hi) if k == hi
+                        else "inside %s (%d..%d)" % (name, lo, hi))
+            break
+    return "; ".join(tags)
+
+
+def arm_sizes(tag):
+    spec = ARMS[tag]
+    if spec == "scalar":
+        return [N_TENSORS]
+    if spec == "layerwise":
+        return [1] * N_TENSORS
+    return spec_sizes(spec)
+
+
+def arm_m(tag):
+    return len(arm_sizes(tag))
+
+
+# =============================================================================
+# re-derivation from the corpus.  Nothing below is quoted from prose.
+# =============================================================================
+def _csv_rows(path=CSV):
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if (r.get("superseded") or "0") != "1"]
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_cell(r):
+    """True iff the archived row sits in the matched CIFAR-100 comparison cell."""
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["meta_stepsize"] == MS and r["alpha0"] == ALPHA0
+            and r["gamma"] == GAMMA and r["augment"] == AUG
+            and r["beta_clip"] == CLIP and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH) and r["epochs_done"] == str(EPOCHS)
+            and r["collapsed"] == "0")
+
+
+def _cell_p5(r):
+    if not _in_cell(r):
+        return None
+    try:
+        return float(r["plateau5"])
+    except (TypeError, ValueError):
+        return None
+
+
+def archived_arms(path=CSV):
+    """{granularity: (mean plateau5, n, distinct batches, mean final_train)}."""
+    acc = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is None:
+            continue
+        try:
+            tr = float(r["final_train"])
+        except (TypeError, ValueError):
+            tr = None
+        acc[r["granularity"]].append((p5, _batch_of(r["run"]), tr))
+    out = {}
+    for k, v in acc.items():
+        trs = [t for _, _, t in v if t is not None]
+        out[k] = (statistics.mean(x for x, _, _ in v), len(v),
+                  len(set(b for _, b, _ in v)),
+                  statistics.mean(trs) if trs else float("nan"))
+    return out
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN-CELL SD of plateau5 over (batch x granularity) cells."""
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        p5 = _cell_p5(r)
+        if p5 is not None:
+            cells[(_batch_of(r["run"]), r["granularity"])].append(p5)
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc
+
+
+def cbl1_from_csv(path=CSV):
+    """cbl1's own CAPTURE at its five cut positions, from ITS OWN anchors."""
+    g = collections.defaultdict(list)
+    n = 0
+    for r in _csv_rows(path):
+        if not str(r.get("run") or "").startswith(CBL1_PREFIX):
+            continue
+        n += 1
+        try:
+            g[r["granularity"]].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    if "scalar" not in g or "layerwise" not in g:
+        return None
+    lo, hi = statistics.mean(g["scalar"]), statistics.mean(g["layerwise"])
+    caps = {}
+    for k in KGRID_FROM_CBL1:
+        s = kspec(k)
+        if s in g:
+            caps[k] = (statistics.mean(g[s]) - lo) / (hi - lo)
+    return {"n_rows": n, "lo": lo, "hi": hi, "caps": caps}
+
+
+def ordered_pairs(caps, sep=CBL1_SEP):
+    """Every (higher, lower) pair separated by more than `sep` in CAPTURE."""
+    ks = sorted(caps)
+    out = []
+    for i in range(len(ks)):
+        for j in range(i + 1, len(ks)):
+            a, b = ks[i], ks[j]
+            d = caps[a] - caps[b]
+            if abs(d) > sep:
+                out.append((a, b) if d > 0 else (b, a))
+    return tuple(sorted(out))
+
+
+def premise_no_cpk1_rows(path=CSV):
+    """RULE 21: no run of this batch may exist in the corpus yet."""
+    return sum(1 for r in _csv_rows(path)
+               if str(r.get("run") or "").startswith(PREFIX))
+
+
+# =============================================================================
+# reading the runs.  The arm of a run is MEASURED from its own flags.
+# =============================================================================
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ, i, n = [], 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals, j = [], i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff, seen = collections.OrderedDict(), collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    return eff, dict((f, v) for f, v in seen.items() if len(v) > 1)
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    test, train = {}, {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    test[int(m.group(1))] = float(m.group(2))
+                m = EPTR_RE.search(line)
+                if m:
+                    train[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "test": test, "train": train,
+            "path": path}
+
+
+def tail5(series, budget=EPOCHS, w=5):
+    """PRIMARY window.  Mean of the LAST 5 epochs; train.py prints 0-indexed."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_of(a):
+    """The arm a run ACTUALLY ran, from its own flags.  None if it is not ours."""
+    if a.get("dataset") != DSET or a.get("NN-name") != NET:
+        return None
+    g = a.get("stepsize-groups")
+    for tag, spec in ARMS.items():
+        if g == spec:
+            return tag
+    return None
+
+
+# =============================================================================
+# G0 provenance
+# =============================================================================
+def gate0(recs):
+    kept, voided = [], []
+    for r in recs:
+        a, e = r["args"], r["env"]
+        why = []
+        if r["dup"]:
+            why.append("REPEATED FLAG %s" % sorted(r["dup"]))
+        tag = arm_of(a)
+        if tag is None:
+            why.append("arm not in the registered design (dataset=%s NN=%s groups=%s)"
+                       % (a.get("dataset"), a.get("NN-name"),
+                          a.get("stepsize-groups")))
+        for flag, want in (("meta-stepsize", MS), ("alpha0", ALPHA0),
+                           ("num-epochs", str(EPOCHS)), ("batch-size", str(BATCH)),
+                           ("gamma", GAMMA), ("alg-base", BASE_ALG),
+                           ("alg-meta", META_ALG)):
+            got = a.get(flag)
+            same = (norm_num(got) == norm_num(want)) if norm_num(want) is not None \
+                else (got == want)
+            if not same:
+                why.append("%s=%s (want %s)" % (flag, got, want))
+        if e.get("AUGMENT") != AUG:
+            why.append("AUGMENT=%s" % e.get("AUGMENT"))
+        if e.get("BETA_CLIP") != CLIP:
+            why.append("BETA_CLIP=%s" % e.get("BETA_CLIP"))
+        if (e.get("HIER") or "none") != "none":
+            why.append("HIER=%s (this is a PARTITION sweep; HIER must be unset)"
+                       % e.get("HIER"))
+        r["arm"] = tag
+        r["seed"] = a.get("seed")
+        (voided if why else kept).append((r, why))
+    return kept, voided
+
+
+# =============================================================================
+# G1 the partition gate -- every split must be a fact about the network
+# =============================================================================
+MAN_RE = re.compile(
+    r"^SPEC\s+(\S+)\s+M\s+(\d+)\s+SIZES\s+(\S+)\s+PARAMS\s+(\S+)\s+"
+    r"FIRSTGROUP\s+(.*?)\s+LASTGROUP\s+(.*?)\s*$")
+
+
+def read_manifest(path):
+    if not path or not os.path.exists(path):
+        return None
+    out, ntens, npar = {}, None, None
+    with open(path) as fh:
+        for line in fh:
+            s = line.strip()
+            m = re.match(r"^NUM_PARAM_TENSORS\s+(\d+)$", s)
+            if m:
+                ntens = int(m.group(1))
+                continue
+            m = re.match(r"^TOTAL_PARAMS\s+(\d+)$", s)
+            if m:
+                npar = int(m.group(1))
+                continue
+            m = MAN_RE.match(s)
+            if m:
+                out[m.group(1)] = {
+                    "m": int(m.group(2)),
+                    "sizes": [int(x) for x in m.group(3).split(",") if x != ""],
+                    "params": [int(x) for x in m.group(4).split(",") if x != ""],
+                    "first": m.group(5).split(),
+                    "last": m.group(6).split(),
+                }
+    return {"n_tensors": ntens, "n_params": npar, "specs": out}
+
+
+def gate1(man):
+    """[] if the manifest proves every registered partition; else the reasons."""
+    if man is None:
+        return ["PARTITION-MANIFEST.txt is missing"]
+    why = []
+    if man["n_tensors"] != N_TENSORS:
+        why.append("NUM_PARAM_TENSORS=%s (want %d)" % (man["n_tensors"], N_TENSORS))
+    if man["n_params"] != N_PARAMS:
+        why.append("TOTAL_PARAMS=%s (want %d)" % (man["n_params"], N_PARAMS))
+    for tag, spec in ARMS.items():
+        want = spec_sizes(spec)
+        if want is None:                 # scalar / layerwise: named, not listed
+            continue
+        got = man["specs"].get(spec)
+        if got is None:
+            why.append("no manifest line for %s (arm %s)" % (spec, tag))
+            continue
+        if got["sizes"] != want:
+            why.append("%s (arm %s) composed to sizes %s on the live model, "
+                       "registered %s" % (spec, tag, got["sizes"], want))
+        if got["m"] != len(want):
+            why.append("%s (arm %s) is m=%d, registered m=%d"
+                       % (spec, tag, got["m"], len(want)))
+        if sum(got["sizes"]) != N_TENSORS:
+            why.append("%s (arm %s) sizes sum to %d, not %d"
+                       % (spec, tag, sum(got["sizes"]), N_TENSORS))
+        wantp = group_params(want)
+        if got["params"] != wantp:
+            why.append("%s (arm %s) holds %s parameters per group on the live "
+                       "model, registered %s" % (spec, tag, got["params"], wantp))
+    return why
+
+
+# =============================================================================
+# statistics
+# =============================================================================
+def mean_se(v):
+    m = statistics.mean(v)
+    return (m, float("nan")) if len(v) < 2 else \
+        (m, statistics.stdev(v) / math.sqrt(len(v)))
+
+
+def contrast(a, b):
+    """(diff, se, t, df) for mean(a) - mean(b), independent 3-seed arms."""
+    ma, mb = statistics.mean(a), statistics.mean(b)
+    if len(a) < 2 or len(b) < 2:
+        return ma - mb, float("nan"), float("nan"), 0
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    t = (ma - mb) / se if se > 0 else float("inf")
+    return ma - mb, se, t, len(a) + len(b) - 2
+
+
+def capture(m_arm, m_lo, m_hi):
+    return (m_arm - m_lo) / (m_hi - m_lo)
+
+
+def rng(vals):
+    return (max(vals) - min(vals)) if vals else float("nan")
+
+
+def peak_set(caps):
+    """{ k : CAPTURE(k) >= CAPTURE(argmax) - PEAK_BAND }, and the argmax."""
+    kstar = max(caps, key=lambda k: (caps[k], -k))
+    return kstar, tuple(k for k in sorted(caps)
+                        if caps[k] >= caps[kstar] - PEAK_BAND)
+
+
+def modality(caps):
+    """(worst fall below the argmax, worst rise above it), on the k-ordered grid.
+
+    A single-peaked curve has both <= WOBBLE_BAR."""
+    ks = sorted(caps)
+    kstar = max(caps, key=lambda k: (caps[k], -k))
+    i_star = ks.index(kstar)
+    fall = 0.0
+    for i in range(i_star):
+        fall = max(fall, caps[ks[i]] - caps[ks[i + 1]])
+    rise = 0.0
+    for i in range(i_star, len(ks) - 1):
+        rise = max(rise, caps[ks[i + 1]] - caps[ks[i]])
+    return fall, rise
+
+
+def halfmax_span(caps):
+    """Span in TENSORS over the grid points at or above half the maximum."""
+    kstar = max(caps, key=lambda k: (caps[k], -k))
+    half = caps[kstar] / 2.0
+    inb = [k for k in sorted(caps) if caps[k] >= half]
+    return (max(inb) - min(inb)) if inb else float("nan")
+
+
+def position_verdict(caps):
+    """THE FROZEN SHAPE DECISION TREE.  Exhaustive and deterministic.
+
+    caps  {k: CAPTURE} over the eleven m = 2 arms."""
+    r = rng(list(caps.values()))
+    if r < RANGE_BAR:
+        return "POSITION-REFUTED-FLAT"                       # X1
+    fall, rise = modality(caps)
+    if max(fall, rise) > WOBBLE_BAR:
+        return "POSITION-MULTIMODAL"                         # X2
+    _, ps = peak_set(caps)
+    if len(ps) >= PLATEAU_N:
+        return "POSITION-BROAD-PLATEAU"                      # X4
+    return "POSITION-SINGLE-PEAKED"
+
+
+def boundary_verdict(caps):
+    """P1's tree: is the argmax at the layer3|layer4 STAGE boundary?"""
+    kstar, ps = peak_set(caps)
+    if kstar == BOUNDARY_K:
+        return "BOUNDARY-CONFIRMED-ARGMAX"
+    if BOUNDARY_K in ps:
+        return "BOUNDARY-CONSISTENT-NOT-ARGMAX"
+    return "BOUNDARY-REFUTED"                                # X3
+
+
+def parbal_verdict(caps):
+    """The named rival's tree: is the argmax at the parameter-balanced cut?"""
+    kstar, ps = peak_set(caps)
+    if kstar == PARBAL_K:
+        return "PARAM-BALANCE-FAVOURED"
+    if PARBAL_K in ps:
+        return "PARAM-BALANCE-CONSISTENT-NOT-ARGMAX"
+    return "PARAM-BALANCE-REFUTED"
+
+
+def replication_verdict(caps):
+    """X5: do cbl1's seven separated pairs keep their sign in this batch?"""
+    broken = []
+    for hi, lo in CBL1_ORDER:
+        if hi not in caps or lo not in caps:
+            return "CBL1-ORDER-UNTESTABLE", [("missing", hi, lo, float("nan"))]
+        d = caps[hi] - caps[lo]
+        if d <= 0:
+            broken.append(("reversed", hi, lo, d))
+    return ("CBL1-ORDER-BREAK" if broken else "CBL1-ORDER-REPLICATES"), broken
+
+
+# =============================================================================
+# selftest
+# =============================================================================
+def selftest():
+    fails = []
+
+    def ok(label, cond, extra=""):
+        print("  %-68s %s %s" % (label, "PASS" if cond else "**FAIL**", extra))
+        if not cond:
+            fails.append(label)
+
+    print("cK1_cpk1_score selftest -- every constant re-derived, none quoted")
+
+    print("-- the archived CIFAR-100 cell -------------------------------------")
+    g = archived_arms()
+    for k in ("scalar", "layerwise"):
+        ok("archived %s arm present" % k, k in g,
+           ("mean %.4f n=%d batches=%d train %.3f" % g[k]) if k in g else "")
+    if all(k in g for k in ("scalar", "layerwise")):
+        gap = g["layerwise"][0] - g["scalar"][0]
+        ok("ARCH_SCAL matches the CSV", abs(g["scalar"][0] - ARCH_SCAL) < 0.005,
+           "%.4f" % g["scalar"][0])
+        ok("ARCH_LAY matches the CSV", abs(g["layerwise"][0] - ARCH_LAY) < 0.005,
+           "%.4f" % g["layerwise"][0])
+        ok("ARCH_GAP matches the CSV", abs(gap - ARCH_GAP) < 0.005, "%.4f pp" % gap)
+        ok("MANIFOLD_BAR is exactly half the archived gap",
+           abs(MANIFOLD_BAR - gap / 2.0) < 0.005, "%.4f" % (gap / 2.0))
+        ok("archived scalar UNDERFITS (the failure is train-side)",
+           abs(g["scalar"][3] - ARCH_TRAIN_SCAL) < 0.05
+           and abs(g["scalar"][3] - g["scalar"][0]) < 2.0,
+           "train %.3f vs test %.4f" % (g["scalar"][3], g["scalar"][0]))
+        ok("archived layerwise FITS", abs(g["layerwise"][3] - ARCH_TRAIN_LAY) < 0.05,
+           "train %.3f" % g["layerwise"][3])
+    sd, df, nc = noise_floor_from_csv()
+    ok("SIGMA_W matches the CSV", abs(sd - SIGMA_W) < 0.005,
+       "re-derived %.4f df=%d cells=%d" % (sd, df, nc))
+    ok("SIGMA_DF matches the CSV", df == SIGMA_DF, "%d" % df)
+
+    print("-- RULE 21 premise: nothing of this batch may exist yet ------------")
+    n = premise_no_cpk1_rows()
+    ok("corpus holds ZERO %s rows" % PREFIX, n == 0, "found %d" % n)
+
+    print("-- cbl1, re-derived from the corpus (this batch's starting point) --")
+    c = cbl1_from_csv()
+    ok("cbl1 is in the corpus", c is not None)
+    if c:
+        ok("cbl1 contributed %d rows" % CBL1_N_ROWS, c["n_rows"] == CBL1_N_ROWS,
+           "found %d" % c["n_rows"])
+        ok("cbl1's in-batch anchors re-derive",
+           abs(c["lo"] - CBL1_LO) < 5e-4 and abs(c["hi"] - CBL1_HI) < 5e-4,
+           "scalar %.4f layerwise %.4f gap %.4f" % (c["lo"], c["hi"],
+                                                    c["hi"] - c["lo"]))
+        ok("all five cbl1 cut positions are present",
+           set(c["caps"]) == set(KGRID_FROM_CBL1), str(sorted(c["caps"])))
+        for k in KGRID_FROM_CBL1:
+            if k in c["caps"]:
+                ok("cbl1 CAPTURE at k=%d re-derives to %.5f" % (k, CBL1_CAP[k]),
+                   abs(c["caps"][k] - CBL1_CAP[k]) < 5e-5, "%.6f" % c["caps"][k])
+        derived = ordered_pairs(c["caps"])
+        ok("CBL1_ORDER is exactly the pairs the corpus separates by > %.2f"
+           % CBL1_SEP, derived == CBL1_ORDER,
+           " ".join("%d>%d" % p for p in derived))
+        ok("CBL1_ORDER holds %d pairs" % len(CBL1_ORDER), len(derived) == 7,
+           "%d" % len(derived))
+        ok("cbl1's argmax over its own five k is %d" % BOUNDARY_K,
+           max(c["caps"], key=lambda k: c["caps"][k]) == BOUNDARY_K)
+        ok("the cbl1 MIRROR BREAK that motivates this batch is in the corpus",
+           abs(c["caps"][45] - c["caps"][17]) > MIRROR_BAR,
+           "|CAP(45)-CAP(17)| = %.4f at identical B = %.5f"
+           % (abs(c["caps"][45] - c["caps"][17]), balance([45, 17])))
+
+    print("-- the network, and the partition algebra over it ------------------")
+    ok("the frozen tensor table has %d entries" % N_TENSORS,
+       len(TENSOR_NUMEL) == N_TENSORS, "%d" % len(TENSOR_NUMEL))
+    ok("the frozen tensor table sums to %d parameters" % N_PARAMS,
+       sum(TENSOR_NUMEL) == N_PARAMS, "%d" % sum(TENSOR_NUMEL))
+    ok("STRUCT tiles 1..%d exactly once" % N_TENSORS,
+       [i for lo, hi, _ in STRUCT for i in range(lo, hi + 1)]
+       == list(range(1, N_TENSORS + 1)))
+    ok("STAGE_BOUNDARIES are the last index of a stage",
+       all(any(hi == b for _, hi, _ in STRUCT) for b in STAGE_BOUNDARIES))
+    ok("BLOCK_BOUNDARIES contain every STAGE boundary",
+       set(STAGE_BOUNDARIES) <= set(BLOCK_BOUNDARIES))
+    ok("BOUNDARY_K = %d is the layer3|layer4 STAGE boundary" % BOUNDARY_K,
+       BOUNDARY_K in STAGE_BOUNDARIES
+       and [n for lo, hi, n in STRUCT if hi == BOUNDARY_K] == ["layer3.1"],
+       struct_at(BOUNDARY_K))
+    ok("13 registered arms", len(ARMS) == 13, str(list(ARMS)))
+    ok("the grid holds %d cut positions" % len(KGRID), len(KGRID) == 11)
+    ok("the grid is strictly increasing and inside 1..%d" % (N_TENSORS - 1),
+       list(KGRID) == sorted(set(KGRID)) and KGRID[0] >= 1
+       and KGRID[-1] <= N_TENSORS - 1)
+    ok("every sweep arm has m = 2",
+       all(arm_m(ktag(k)) == 2 for k in KGRID))
+    ok("every sweep spec covers the model",
+       all(sum(arm_sizes(ktag(k))) == N_TENSORS for k in KGRID))
+    ok("the anchors bracket every sweep arm in m",
+       arm_m(TAG_LO) == 1 and arm_m(TAG_HI) == N_TENSORS)
+    ok("cbl1's five cut positions are all on this grid",
+       set(KGRID_FROM_CBL1) <= set(KGRID))
+    print("      %-4s %-9s %-10s %-9s %-9s  %s"
+          % ("k", "spec", "B", "params_g1", "share", "structure"))
+    for k in KGRID:
+        gp = group_params(arm_sizes(ktag(k)))
+        print("      %-4d %-9s %-10.5f %-9d %-9.5f  %s"
+              % (k, kspec(k), balance(arm_sizes(ktag(k))), gp[0],
+                 param_share(k), struct_at(k)))
+    for a, b in MIRROR_PAIRS:
+        ok("mirror pair k=%d / k=%d has IDENTICAL balance" % (a, b),
+           abs(balance([a, N_TENSORS - a]) - balance([b, N_TENSORS - b])) < 1e-12,
+           "B = %.5f" % balance([a, N_TENSORS - a]))
+        ok("mirror pair k=%d / k=%d is genuinely mirrored" % (a, b),
+           [a, N_TENSORS - a] == list(reversed([b, N_TENSORS - b])))
+        ok("mirror pair k=%d / k=%d has DIFFERENT parameter shares" % (a, b),
+           abs(param_share(a) - param_share(b)) > 0.05,
+           "%.5f vs %.5f" % (param_share(a), param_share(b)))
+    ok("cbl1's mirror pair is re-run in batch", MIRROR_PAIRS[0] == (17, 45))
+    ok("the second mirror pair is new to this batch",
+       set(MIRROR_PAIRS[1]).isdisjoint(set(KGRID_FROM_CBL1)))
+    ok("param_share is strictly increasing in k",
+       all(param_share(KGRID[i]) < param_share(KGRID[i + 1])
+           for i in range(len(KGRID) - 1)))
+    ok("PARBAL_K = %d is the grid point nearest a 50/50 PARAMETER split" % PARBAL_K,
+       min(KGRID, key=lambda k: abs(param_share(k) - 0.5)) == PARBAL_K,
+       "share %.5f" % param_share(PARBAL_K))
+    ok("PARBAL_K and BOUNDARY_K are DIFFERENT grid points",
+       PARBAL_K != BOUNDARY_K and abs(PARBAL_K - BOUNDARY_K) >= 3,
+       "%d vs %d" % (PARBAL_K, BOUNDARY_K))
+    ok("group_params agrees with param_share at every grid point",
+       all(abs(group_params(arm_sizes(ktag(k)))[0] / float(N_PARAMS)
+               - param_share(k)) < 1e-12 for k in KGRID))
+    ok("group_params of every sweep arm sums to the whole network",
+       all(sum(group_params(arm_sizes(ktag(k)))) == N_PARAMS for k in KGRID))
+    ok("the grid resolves the cbl1 cliff (45->55) at 2..3 tensor spacing",
+       [k for k in KGRID if 45 <= k <= 55] == [45, 47, 49, 52, 55])
+    ok("the grid is coarser on the left flank than across the peak",
+       min(KGRID[i + 1] - KGRID[i] for i in range(3))
+       > max(KGRID[i + 1] - KGRID[i] for i in range(4, 8)))
+    ok("B is DIRECTION-BLIND, which is why cbl1 R5 disqualified it",
+       abs(balance([45, 17]) - balance([17, 45])) < 1e-12,
+       "%.5f" % balance([45, 17]))
+
+    print("-- the power arithmetic the bars rest on ---------------------------")
+    se_mean = SIGMA_W / math.sqrt(3.0)
+    se_diff = SIGMA_W * math.sqrt(2.0 / 3.0)
+    se_cap = se_diff / ARCH_GAP
+    ok("SE of a 3-seed mean", abs(se_mean - 0.3947) < 0.002, "%.4f pp" % se_mean)
+    ok("SE of a difference of two 3-seed means", abs(se_diff - 0.5582) < 0.002,
+       "%.4f pp" % se_diff)
+    ok("SE(CAPTURE difference) at this gap", abs(se_cap - 0.011954) < 0.0005,
+       "%.5f" % se_cap)
+    ok("RANGE_BAR is >= 8 SE", RANGE_BAR / se_cap >= 8,
+       "%.1f SE = %.2f pp" % (RANGE_BAR / se_cap, RANGE_BAR * ARCH_GAP))
+    ok("WOBBLE_BAR is >= 4 SE (a mode, not a wobble)", WOBBLE_BAR / se_cap >= 4,
+       "%.1f SE = %.2f pp" % (WOBBLE_BAR / se_cap, WOBBLE_BAR * ARCH_GAP))
+    ok("PEAK_BAND is >= 4 SE", PEAK_BAND / se_cap >= 4,
+       "%.1f SE" % (PEAK_BAND / se_cap))
+    ok("MIRROR_BAR is >= 8 SE", MIRROR_BAR / se_cap >= 8,
+       "%.1f SE" % (MIRROR_BAR / se_cap))
+
+    print("-- the shape decision tree, exercised in EVERY direction -----------")
+    ks = list(KGRID)
+    peaked = dict(zip(ks, [0.05, 0.10, 0.20, 0.30, 0.38, 0.45,
+                           0.30, 0.18, 0.09, 0.03, 0.02]))
+    ok("POSITION-SINGLE-PEAKED on a clean single hump",
+       position_verdict(peaked) == "POSITION-SINGLE-PEAKED")
+    ok("its argmax and PEAK SET are the hump",
+       peak_set(peaked) == (45, (45,)), str(peak_set(peaked)))
+    ok("BOUNDARY-CONFIRMED-ARGMAX when the hump sits on the boundary",
+       boundary_verdict(peaked) == "BOUNDARY-CONFIRMED-ARGMAX")
+    ok("PARAM-BALANCE-REFUTED when the hump sits on the boundary",
+       parbal_verdict(peaked) == "PARAM-BALANCE-REFUTED")
+    flat = dict(zip(ks, [0.20, 0.21, 0.22, 0.23, 0.24, 0.25,
+                         0.24, 0.23, 0.22, 0.21, 0.20]))
+    ok("POSITION-REFUTED-FLAT when nothing depends on the cut",
+       position_verdict(flat) == "POSITION-REFUTED-FLAT",
+       "range %.3f vs bar %.2f" % (rng(list(flat.values())), RANGE_BAR))
+    ok("FLAT outranks every other clause",
+       position_verdict(dict(zip(ks, [0.0, 0.09, 0.0, 0.09, 0.0, 0.09,
+                                      0.0, 0.09, 0.0, 0.09, 0.0])))
+       == "POSITION-REFUTED-FLAT")
+    bimodal = dict(zip(ks, [0.05, 0.40, 0.10, 0.05, 0.20, 0.50,
+                            0.20, 0.10, 0.05, 0.03, 0.02]))
+    ok("POSITION-MULTIMODAL on two humps with a real valley",
+       position_verdict(bimodal) == "POSITION-MULTIMODAL")
+    latehump = dict(zip(ks, [0.05, 0.10, 0.20, 0.30, 0.38, 0.45,
+                             0.20, 0.10, 0.05, 0.30, 0.02]))
+    ok("POSITION-MULTIMODAL catches a SECOND hump after the argmax",
+       position_verdict(latehump) == "POSITION-MULTIMODAL")
+    # WOBBLE_BAR probed either side with exactly-representable values
+    wob = dict(zip(ks, [0.0, 0.25, 0.21875, 0.30, 0.38, 0.45,
+                        0.30, 0.18, 0.09, 0.03, 0.02]))
+    ok("a dip of 0.03125, just under WOBBLE_BAR, is NOT a second mode",
+       position_verdict(wob) != "POSITION-MULTIMODAL",
+       "dip %.5f vs bar %.2f" % (0.25 - 0.21875, WOBBLE_BAR))
+    wob2 = dict(zip(ks, [0.0, 0.25, 0.1875, 0.30, 0.38, 0.45,
+                         0.30, 0.18, 0.09, 0.03, 0.02]))
+    ok("a dip of 0.0625, just over WOBBLE_BAR, IS a second mode",
+       position_verdict(wob2) == "POSITION-MULTIMODAL",
+       "dip %.5f vs bar %.2f" % (0.25 - 0.1875, WOBBLE_BAR))
+    broad = dict(zip(ks, [0.05, 0.10, 0.42, 0.43, 0.44, 0.45,
+                          0.44, 0.43, 0.09, 0.03, 0.02]))
+    ok("POSITION-BROAD-PLATEAU when %d arms sit inside the peak band" % PLATEAU_N,
+       position_verdict(broad) == "POSITION-BROAD-PLATEAU",
+       "peak set %s" % str(peak_set(broad)[1]))
+    ok("MULTIMODAL outranks BROAD-PLATEAU",
+       position_verdict(dict(zip(ks, [0.45, 0.10, 0.42, 0.43, 0.44, 0.45,
+                                      0.44, 0.43, 0.09, 0.03, 0.02])))
+       == "POSITION-MULTIMODAL")
+    offb = dict(zip(ks, [0.05, 0.10, 0.20, 0.30, 0.35, 0.38,
+                         0.42, 0.50, 0.20, 0.05, 0.02]))
+    ok("BOUNDARY-REFUTED when the argmax moves to the parameter-balanced cut",
+       boundary_verdict(offb) == "BOUNDARY-REFUTED"
+       and parbal_verdict(offb) == "PARAM-BALANCE-FAVOURED",
+       "argmax k=%d" % peak_set(offb)[0])
+    near = dict(zip(ks, [0.05, 0.10, 0.20, 0.30, 0.35, 0.44,
+                         0.42, 0.46, 0.20, 0.05, 0.02]))
+    ok("BOUNDARY-CONSISTENT-NOT-ARGMAX when 45 is inside the band but not top",
+       boundary_verdict(near) == "BOUNDARY-CONSISTENT-NOT-ARGMAX",
+       "argmax k=%d, peak set %s" % peak_set(near))
+    ok("the argmax tie-break prefers the SMALLER k",
+       peak_set(dict(zip(ks, [0.5, 0.5, 0.1, 0.1, 0.1, 0.1,
+                              0.1, 0.1, 0.1, 0.1, 0.1])))[0] == 17)
+    ok("halfmax_span measures the width of the hump in tensors",
+       halfmax_span(peaked) == 47 - 38, "%.0f tensors" % halfmax_span(peaked))
+    ok("halfmax_span is 0 on a curve with a single point above half maximum",
+       halfmax_span(dict(zip(ks, [0.0, 0.0, 0.0, 0.0, 0.0, 0.90,
+                                  0.0, 0.0, 0.0, 0.0, 0.0]))) == 0)
+    ok("modality reports (fall below argmax, rise above argmax)",
+       modality(peaked) == (0.0, 0.0))
+
+    print("-- the replication tree (X5), exercised both ways ------------------")
+    good = dict(zip(ks, [0.05, 0.10, 0.20, 0.30, 0.38, 0.45,
+                         0.30, 0.18, 0.09, 0.03, 0.02]))
+    ok("CBL1-ORDER-REPLICATES when every separated pair keeps its sign",
+       replication_verdict(good)[0] == "CBL1-ORDER-REPLICATES")
+    bad = dict(good)
+    bad[55] = 0.99
+    ok("CBL1-ORDER-BREAK when a separated pair reverses",
+       replication_verdict(bad)[0] == "CBL1-ORDER-BREAK",
+       str(replication_verdict(bad)[1]))
+    ok("CBL1-ORDER-UNTESTABLE when a pair member is missing",
+       replication_verdict(dict((k, v) for k, v in good.items() if k != 60))[0]
+       == "CBL1-ORDER-UNTESTABLE")
+    ok("every CBL1_ORDER pair is on this grid",
+       all(a in KGRID and b in KGRID for a, b in CBL1_ORDER))
+    ok("CBL1_ORDER never contradicts itself",
+       all((b, a) not in CBL1_ORDER for a, b in CBL1_ORDER))
+
+    print("-- the parsers, on adversarial input -------------------------------")
+    eff, dup = parse_args_line("--alg-meta Lion --dataset CIFAR100 --alg-meta RMSProp")
+    ok("a repeated flag is DETECTED", "alg-meta" in dup, str(dup))
+    ok("argparse's last-wins is reproduced", eff["alg-meta"] == "RMSProp")
+    line = ("--dataset CIFAR100 --NN-name ResNet18_c100 --stepsize-groups %s "
+            "--seed 0" % kspec(49))
+    eff2, dup2 = parse_args_line(line)
+    ok("no false positive on a clean line", not dup2)
+    ok("the bracket spec survives tokenisation",
+       eff2.get("stepsize-groups") == kspec(49), eff2.get("stepsize-groups"))
+    ok("arm_of reads k=49 from the flags", arm_of(eff2) == "k49")
+    for tag, spec in ARMS.items():
+        ok("arm_of round-trips %s" % tag,
+           arm_of({"dataset": DSET, "NN-name": NET,
+                   "stepsize-groups": spec}) == tag)
+    ok("arm_of rejects the CIFAR-10 network",
+       arm_of({"dataset": "CIFAR10", "NN-name": "ResNet18",
+               "stepsize-groups": "layerwise"}) is None)
+    ok("arm_of rejects an off-grid cut position",
+       arm_of({"dataset": DSET, "NN-name": NET,
+               "stepsize-groups": "[46,16]"}) is None)
+    ok("arm_of rejects cbl1's count-ladder arms (they are NOT cpk1 arms)",
+       arm_of({"dataset": DSET, "NN-name": NET,
+               "stepsize-groups": "[16,16,15,15]"}) is None
+       and arm_of({"dataset": DSET, "NN-name": NET,
+                   "stepsize-groups": "[8,8,8,8,8,8,7,7]"}) is None)
+    ok("arm_of rejects hb1's stem arm [2,60]",
+       arm_of({"dataset": DSET, "NN-name": NET,
+               "stepsize-groups": "[2,60]"}) is None)
+    ok("tail5 needs all 5 tail epochs",
+       tail5({e: 50.0 for e in range(95, 100)}) == 50.0
+       and tail5({e: 50.0 for e in range(96, 100)}) is None)
+    ok("tail5 ignores everything but the tail",
+       abs(tail5(dict([(e, 1.0) for e in range(95)]
+                      + [(e, 7.0) for e in range(95, 100)])) - 7.0) < 1e-9)
+
+    print("-- the partition gate, on a good and three bad manifests -----------")
+    lines = ["NUM_PARAM_TENSORS %d" % N_TENSORS, "TOTAL_PARAMS %d" % N_PARAMS]
+    for spec in ARMS.values():
+        s = spec_sizes(spec)
+        if s is None:
+            continue
+        lines.append("SPEC %s M %d SIZES %s PARAMS %s FIRSTGROUP conv1.weight a "
+                     "LASTGROUP b linear.bias"
+                     % (spec, len(s), ",".join(str(x) for x in s),
+                        ",".join(str(x) for x in group_params(s))))
+    tmp = os.path.join(os.environ.get("TMPDIR", "/tmp"), "cpk1_selftest_manifest.txt")
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    ok("a correct manifest passes G1", gate1(read_manifest(tmp)) == [],
+       str(gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines).replace("SIZES 49,13", "SIZES 48,14") + "\n")
+    ok("a manifest whose k=49 arm composed to [48,14] FAILS G1",
+       any("registered" in w for w in gate1(read_manifest(tmp))),
+       str(gate1(read_manifest(tmp))[:1]))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines).replace(
+            "PARAMS %s" % ",".join(str(x) for x in group_params([45, 17])),
+            "PARAMS 1,%d" % (N_PARAMS - 1)) + "\n")
+    ok("a manifest with the wrong PARAMETER counts FAILS G1",
+       any("parameters per group" in w for w in gate1(read_manifest(tmp))),
+       str(gate1(read_manifest(tmp))[:1]))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(l for l in lines if "[45,17]" not in l) + "\n")
+    ok("a manifest missing an arm FAILS G1",
+       any("no manifest line" in w for w in gate1(read_manifest(tmp))))
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines).replace("NUM_PARAM_TENSORS 62",
+                                          "NUM_PARAM_TENSORS 60") + "\n")
+    ok("a manifest with the wrong tensor count FAILS G1",
+       any("NUM_PARAM_TENSORS" in w for w in gate1(read_manifest(tmp))))
+    ok("a missing manifest FAILS G1", gate1(read_manifest(tmp + ".nope")) != [])
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+    print("-- the batch script's own text must match this registration --------")
+    if not os.path.exists(BATCH_SH):
+        ok("bin/cK1_cut_position_sweep.sh exists", False, BATCH_SH)
+    else:
+        txt = open(BATCH_SH).read()
+        for label, needle in (
+                ("run-name prefix cpk1-", "cpk1-"),
+                ("dataset CIFAR100", "DSET=CIFAR100"),
+                ("network ResNet18_c100", "NET=ResNet18_c100"),
+                ("meta-stepsize 1e-3", "MST=1e-3"),
+                ("alpha0 1e-6", "ALPHA0=1e-6"),
+                ("100 epochs", "EPOCHS=100"),
+                ("batch 100", "BATCH=100"),
+                ("box -15:-2.3026", 'CLIP="-15:-2.3026"'),
+                ("AUGMENT=1", "AUG=1"),
+                ("SGDm base", "--alg-base SGDm"),
+                ("Lion meta", "--alg-meta Lion"),
+                ("HIER=none", "HIER=none"),
+                ("seeds 0 1 2", 'SEEDS="0 1 2"'),
+                ("the m=1 anchor", "G=scalar"),
+                ("the m=62 anchor", "G=layerwise"),
+                ("it writes the partition manifest", "PARTITION-MANIFEST.txt"),
+                ("it records PARAMS in the manifest", "PARAMS"),
+                ("it protects its prefix", "PROTECTED.txt"),
+                ("it names this scorer", "cK1_cpk1_score.py"),
+                ("it exports METAOPT_WS for the cluster_b workspace",
+                 "export METAOPT_WS"),
+        ):
+            ok("batch script declares %s" % label, needle in txt)
+        for k in KGRID:
+            ok("batch script composes the k=%d arm as %s" % (k, kspec(k)),
+               ("'%s'" % kspec(k)) in txt)
+        ok("batch script names every grid point in KGRID order",
+           "K_LIST=\"%s\"" % " ".join(str(k) for k in KGRID) in txt,
+           "K_LIST=\"%s\"" % " ".join(str(k) for k in KGRID))
+
+    print("=" * 74)
+    if fails:
+        print("SELFTEST FAIL -- %d checks failed" % len(fails))
+        for f in fails:
+            print("   %s" % f)
+        return 1
+    print("SELFTEST PASS")
+    return 0
+
+
+# =============================================================================
+# the score
+# =============================================================================
+def score(runs_dir, manifest):
+    paths = sorted(glob.glob(os.path.join(runs_dir, "**", PREFIX + "*.out"),
+                             recursive=True))
+    print("cK1_cpk1_score -- `cpk1`, the CIFAR-100 CUT-POSITION sweep at m = 2")
+    print("runs dir: %s" % runs_dir)
+    print("%d .out files match %s*" % (len(paths), PREFIX))
+    if not paths:
+        print("VERDICT: NO DATA -- the batch has not produced any output yet.")
+        return 3
+    recs = [r for r in (read_out(p) for p in paths) if r]
+    print("%d carry an ARGS line" % len(recs))
+
+    print("\n-- REGISTERED PREDICTIONS, restated before the numbers --------------")
+    print("   P1 argmax k* = %d (the layer3|layer4 STAGE boundary); tested as "
+          "'45 in the PEAK SET'" % BOUNDARY_K)
+    print("   P2 the curve is SINGLE-PEAKED over the grid")
+    print("   P3 RIGHT-COLLAPSE: CAPTURE < %.2f at every k >= %d"
+          % (COLLAPSE_BAR, COLLAPSE_K))
+    print("   P4 RANGE of CAPTURE >= %.2f" % BIG_RANGE)
+    print("   P5 the parameter-balance rival loses: k* != %d" % PARBAL_K)
+    print("   P6 both mirror pairs break: %s"
+          % ", ".join("|CAP(%d)-CAP(%d)| > %.2f" % (b, a, MIRROR_BAR)
+                      for a, b in MIRROR_PAIRS))
+
+    print("\n-- G0 PROVENANCE (RULE 20): the arm is read from each run's own flags --")
+    kept, voided = gate0(recs)
+    for r, why in voided:
+        print("   VOID %-32s %s" % (os.path.basename(r["path"]), "; ".join(why)))
+    print("   %d runs pass provenance, %d VOID" % (len(kept), len(voided)))
+    if not kept:
+        print("VERDICT: VOID -- no run survived provenance.")
+        return 2
+
+    print("\n-- G1 PARTITION GATE: every split must be a fact about the network --")
+    if manifest is None:
+        for c in (os.path.join(runs_dir, "cpk1", "PARTITION-MANIFEST.txt"),
+                  os.path.join(runs_dir, "PARTITION-MANIFEST.txt")):
+            if os.path.exists(c):
+                manifest = c
+                break
+    man = read_manifest(manifest)
+    why1 = gate1(man)
+    print("   manifest: %s" % (manifest or "<not found>"))
+    if man:
+        for k in KGRID:
+            d = man["specs"].get(kspec(k))
+            if d:
+                print("      k=%-3d %-9s sizes %s  params %s  B=%.5f  share %.5f"
+                      % (k, kspec(k), ",".join(str(x) for x in d["sizes"]),
+                         ",".join(str(x) for x in d["params"]),
+                         balance(d["sizes"]),
+                         d["params"][0] / float(man["n_params"] or N_PARAMS)))
+    for w in why1:
+        print("   FAIL %s" % w)
+    if why1:
+        print("VERDICT: VOID-PARTITION -- without the manifest, 'k = 49' is a "
+              "claim about a string, not about a network.")
+        return 2
+    print("   PASS -- %d parameter tensors, %d parameters; all 11 sweep specs "
+          "compose exactly as registered, in sizes AND in parameter counts"
+          % (man["n_tensors"], man["n_params"]))
+
+    print("\n-- G2 COMPLETENESS: >= 95/100 epochs and all 5 tail epochs present --")
+    cells = collections.defaultdict(list)
+    incomplete = []
+    for r, _ in kept:
+        done = (max(r["test"]) + 1) if r["test"] else 0
+        p5 = tail5(r["test"])
+        t5 = tail5(r["train"])
+        if p5 is None or done < 0.95 * EPOCHS:
+            incomplete.append((os.path.basename(r["path"]), done))
+            continue
+        cells[r["arm"]].append((p5, t5, r["seed"], os.path.basename(r["path"])))
+    for n, d in incomplete:
+        print("   DROPPED %-34s %d epochs" % (n, d))
+    print("   %d complete runs in %d arms" % (sum(len(v) for v in cells.values()),
+                                              len(cells)))
+    thin = [a for a in ARMS if len(cells.get(a, [])) < 2]
+    if thin:
+        print("   arms with fewer than 2 usable seeds: %s" % ", ".join(thin))
+        print("VERDICT: VOID -- a registered arm has fewer than 2 usable seeds.")
+        return 2
+
+    print("\n-- the arms ---------------------------------------------------------")
+    print("   %-4s %-9s %-3s %-9s %-8s %-9s %-9s  %s"
+          % ("arm", "spec", "n", "plateau5", "se", "train5", "share", "seeds"))
+    p5s, t5s = {}, {}
+    for arm in ARMS:
+        v = cells.get(arm, [])
+        if not v:
+            continue
+        a = [x for x, _, _, _ in v]
+        b = [y for _, y, _, _ in v if y is not None]
+        p5s[arm] = a
+        if b:
+            t5s[arm] = b
+        m, se = mean_se(a)
+        k = int(arm[1:]) if arm not in (TAG_LO, TAG_HI) else None
+        print("   %-4s %-9s %-3d %-9.3f %-8.3f %-9s %-9s  %s"
+              % (arm, ARMS[arm][:9], len(v), m, se,
+                 ("%.3f" % statistics.mean(b)) if b else "--",
+                 ("%.5f" % param_share(k)) if k else "--",
+                 " ".join("s%s=%.2f" % (s, x) for x, _, s, _ in
+                          sorted(v, key=lambda z: str(z[2])))))
+
+    print("\n-- G3 ARCHIVE GATE: does this batch reproduce the archived cell? ----")
+    g = archived_arms()
+    bad = []
+    for arm, key, want in ((TAG_LO, "scalar", ARCH_SCAL),
+                           (TAG_HI, "layerwise", ARCH_LAY)):
+        got = statistics.mean(p5s[arm])
+        ref = g[key][0] if key in g else float("nan")
+        d = got - ref
+        print("   %-4s in-batch %.3f   archived %.3f (n=%d, %d batches)   %+.3f pp"
+              % (arm, got, ref, g[key][1], g[key][2], d))
+        if not (abs(d) <= TREE_BAND):
+            bad.append("%s off by %+.3f pp (band +/-%.2f)" % (arm, d, TREE_BAND))
+    if bad:
+        for b in bad:
+            print("   FAIL %s" % b)
+        print("VERDICT: VOID-TREE -- the batch does not reproduce the archived "
+              "CIFAR-100 cell; nothing here is comparable.")
+        return 2
+    print("   PASS -- both anchors inside +/-%.2f pp" % TREE_BAND)
+
+    print("\n-- G4 MANIFOLD GATE: there must be a gap to capture ------------------")
+    m_lo, m_hi = statistics.mean(p5s[TAG_LO]), statistics.mean(p5s[TAG_HI])
+    gap = m_hi - m_lo
+    print("   in-batch GAP = M(%s) - M(%s) = %+.3f pp   (archived %+.3f, bar %.3f)"
+          % (TAG_HI, TAG_LO, gap, ARCH_GAP, MANIFOLD_BAR))
+    if gap < MANIFOLD_BAR:
+        print("VERDICT: VOID-NOMANIFOLD -- the granularity gap did not appear in "
+              "this batch, so CAPTURE is a ratio of noise and no verdict is issued.")
+        return 2
+    print("   PASS")
+
+    caps_by_k = {}
+    for k in KGRID:
+        t = ktag(k)
+        if t in p5s:
+            caps_by_k[k] = capture(statistics.mean(p5s[t]), m_lo, m_hi)
+    if len(caps_by_k) != len(KGRID):
+        print("VERDICT: VOID -- the sweep is incomplete (%d of %d cut positions)."
+              % (len(caps_by_k), len(KGRID)))
+        return 2
+
+    t_lo = statistics.mean(t5s[TAG_LO]) if TAG_LO in t5s else None
+    t_hi = statistics.mean(t5s[TAG_HI]) if TAG_HI in t5s else None
+    tcaps_by_k = {}
+    if t_lo is not None and t_hi is not None and t_hi != t_lo:
+        for k in KGRID:
+            t = ktag(k)
+            if t in t5s:
+                tcaps_by_k[k] = capture(statistics.mean(t5s[t]), t_lo, t_hi)
+
+    print("\n-- G5a REPLICATION (X5): cbl1's seven separated pairs ----------------")
+    rv, broken = replication_verdict(caps_by_k)
+    for hi_k, lo_k in CBL1_ORDER:
+        d = caps_by_k[hi_k] - caps_by_k[lo_k]
+        dd, se_d, t_d, df_d = contrast(p5s[ktag(hi_k)], p5s[ktag(lo_k)])
+        print("   cbl1 said k=%-2d > k=%-2d (by %.4f); here %+.4f  [%+.3f pp, "
+              "se %.3f, t %+.2f]  %s"
+              % (hi_k, lo_k, CBL1_CAP[hi_k] - CBL1_CAP[lo_k], d, dd, se_d, t_d,
+                 "OK" if d > 0 else "REVERSED"))
+    print("   VERDICT (replication): %s" % rv)
+    if rv == "CBL1-ORDER-BREAK":
+        print("   X5 fires.  This batch's own shape verdict below still stands -- "
+              "cpk1 is self-contained and normalised on its own anchors -- but the "
+              "claim that it MAPS cbl1's curve is WITHDRAWN, and the two batches "
+              "are reported as disagreeing.")
+
+    print("\n-- G5b THE PRIMARY: THE CUT-POSITION CURVE AT FIXED m = 2 ------------")
+    print("   %-4s %-9s %-9s %-9s %-9s %-8s  %s"
+          % ("k", "spec", "plateau5", "CAPTURE", "TRAINCAP", "share", "structure"))
+    for k in KGRID:
+        print("   %-4d %-9s %-9.3f %+9.4f %9s %-8.5f  %s"
+              % (k, kspec(k), statistics.mean(p5s[ktag(k)]), caps_by_k[k],
+                 ("%+.4f" % tcaps_by_k[k]) if k in tcaps_by_k else "--",
+                 param_share(k), struct_at(k)))
+
+    r = rng(list(caps_by_k.values()))
+    kstar, ps = peak_set(caps_by_k)
+    fall, rise = modality(caps_by_k)
+    hspan = halfmax_span(caps_by_k)
+    print("\n   RANGE of CAPTURE over the %d cut positions = %.4f   (X1 fires "
+          "below %.2f)" % (len(KGRID), r, RANGE_BAR))
+    print("   ARGMAX k* = %d   CAPTURE %+.4f   %s"
+          % (kstar, caps_by_k[kstar], struct_at(kstar)))
+    print("   PEAK SET (within %.2f of the argmax): %s   (X4 fires at %d or more)"
+          % (PEAK_BAND, ", ".join("k=%d" % k for k in ps), PLATEAU_N))
+    print("   worst fall BELOW the argmax %.4f | worst rise ABOVE it %.4f   "
+          "(X2 fires above %.2f)" % (fall, rise, WOBBLE_BAR))
+    print("   step-by-step CAPTURE increments:")
+    for i in range(len(KGRID) - 1):
+        a, b = KGRID[i], KGRID[i + 1]
+        dd, se_d, t_d, df_d = contrast(p5s[ktag(b)], p5s[ktag(a)])
+        print("      k=%-2d -> k=%-2d (%+d tensors)  dCAPTURE %+.4f   %+.3f pp  "
+              "se %.3f  t %+.2f (df %d)"
+              % (a, b, b - a, caps_by_k[b] - caps_by_k[a], dd, se_d, t_d, df_d))
+
+    pv = position_verdict(caps_by_k)
+    bv = boundary_verdict(caps_by_k)
+    pbv = parbal_verdict(caps_by_k)
+    print("\n   frozen bars: X1 FLAT range<%.2f | X2 MULTIMODAL a step >%.2f "
+          "against the hump | X3 PEAK-OFF-BOUNDARY k=%d not in the PEAK SET | "
+          "X4 BROAD-PLATEAU >=%d arms in the PEAK SET | X5 CBL1-ORDER-BREAK"
+          % (RANGE_BAR, WOBBLE_BAR, BOUNDARY_K, PLATEAU_N))
+    print("   VERDICT (the SHAPE):            %s" % pv)
+    print("   VERDICT (the BOUNDARY account): %s" % bv)
+    print("   VERDICT (the PARAM-BAL rival):  %s" % pbv)
+
+    print("\n   the registered predictions, scored:")
+    print("      P1 k* = %d in the PEAK SET .......... %s"
+          % (BOUNDARY_K, "HELD" if BOUNDARY_K in ps else "REFUTED (X3)"))
+    print("      P2 single-peaked .................... %s"
+          % ("HELD" if max(fall, rise) <= WOBBLE_BAR else "REFUTED (X2)"))
+    late = [k for k in KGRID if k >= COLLAPSE_K]
+    p3 = all(caps_by_k[k] < COLLAPSE_BAR for k in late)
+    print("      P3 CAPTURE < %.2f at every k >= %d ... %s  (%s)"
+          % (COLLAPSE_BAR, COLLAPSE_K, "HELD" if p3 else "REFUTED",
+             ", ".join("k=%d %+.4f" % (k, caps_by_k[k]) for k in late)))
+    print("      P4 RANGE >= %.2f .................... %s  (%.4f)"
+          % (BIG_RANGE, "HELD" if r >= BIG_RANGE else "REFUTED", r))
+    print("      P5 k* != %d ......................... %s  (k* = %d)"
+          % (PARBAL_K, "HELD" if kstar != PARBAL_K else "REFUTED", kstar))
+    mb = []
+    for a, b in MIRROR_PAIRS:
+        d = abs(caps_by_k[b] - caps_by_k[a])
+        dd, se_d, t_d, df_d = contrast(p5s[ktag(b)], p5s[ktag(a)])
+        mb.append((a, b, d, dd, se_d, t_d, d > MIRROR_BAR))
+    print("      P6 both mirror pairs break .......... %s"
+          % ("HELD" if all(x[6] for x in mb) else "REFUTED"))
+    for a, b, d, dd, se_d, t_d, brk in mb:
+        print("         k=%-2d vs k=%-2d at IDENTICAL B=%.5f: CAPTURE %+.4f vs "
+              "%+.4f, |diff| %.4f  [%+.3f pp, se %.3f, t %+.2f]  %s"
+              % (a, b, balance([a, N_TENSORS - a]), caps_by_k[a], caps_by_k[b],
+                 d, dd, se_d, t_d, "BREAKS" if brk else "agrees"))
+
+    print("\n-- G6 DESCRIPTIVE, NEVER GATING --------------------------------------")
+    print("   half-maximum span %.0f tensors (narrow at <= %d): the hump covers "
+          "k in [%d, %d]"
+          % (hspan, HALFMAX_NARROW,
+             min(k for k in KGRID if caps_by_k[k] >= caps_by_k[kstar] / 2.0),
+             max(k for k in KGRID if caps_by_k[k] >= caps_by_k[kstar] / 2.0)))
+    print("   the DISQUALIFIED statistic, printed only so the mirror pairs can be "
+          "read (cbl1 R5 ruled normalised entropy out and it is NOT rehabilitated "
+          "here, whichever way it falls):")
+    for k in KGRID:
+        print("      k=%-3d B=%.5f  CAPTURE %+.4f" % (k, balance([k, N_TENSORS - k]),
+                                                      caps_by_k[k]))
+    onb = [k for k in KGRID if k in STAGE_BOUNDARIES]
+    offb = [k for k in KGRID if k not in BLOCK_BOUNDARIES]
+    print("   grid points ON a STAGE boundary: %s  (mean CAPTURE %+.4f)"
+          % (onb, statistics.mean([caps_by_k[k] for k in onb]) if onb else float("nan")))
+    print("   grid points inside a block:      %s  (mean CAPTURE %+.4f)"
+          % (offb, statistics.mean([caps_by_k[k] for k in offb]) if offb
+             else float("nan")))
+    print("   NOTE: that contrast is DESCRIPTIVE.  It was not registered as a "
+          "test, the two sets are not matched on anything, and it may not be "
+          "promoted to a finding.")
+
+    if tcaps_by_k and len(tcaps_by_k) == len(KGRID):
+        tstar = max(tcaps_by_k, key=lambda k: (tcaps_by_k[k], -k))
+        print("   TRAIN curve TRAINCAP: %s"
+              % "  ".join("k=%d %+.3f" % (k, tcaps_by_k[k]) for k in KGRID))
+        print("   train5 anchors: %s %.3f -> %s %.3f (span %.3f pp)"
+              % (TAG_LO, t_lo, TAG_HI, t_hi, t_hi - t_lo))
+        print("   TRAIN argmax k=%d vs TEST argmax k=%d" % (tstar, kstar))
+        di = abs(KGRID.index(tstar) - KGRID.index(kstar))
+        if di > TRAIN_ARGMAX_SLACK:
+            print("   FLAG T1 TRAIN-TEST-DIVERGENCE: the fitting curve peaks %d "
+                  "grid positions away from the generalisation curve.  The coarse-"
+                  "partition failure has been train-side in every dataset measured "
+                  "so far, so a position effect that peaks elsewhere on TRAIN is a "
+                  "different phenomenon.  Non-overriding." % di)
+        else:
+            print("   T1 not triggered (argmax agrees to within %d grid positions)"
+                  % TRAIN_ARGMAX_SLACK)
+    else:
+        print("   train5 unavailable in at least one arm; T1 not evaluated")
+
+    if any(caps_by_k[k] > 1.0 for k in KGRID):
+        print("   NOTE: some m=2 arm has CAPTURE > 1, i.e. it beat layerwise. "
+              "Reported; it changes no bar.")
+
+    print("\n   CROSS-BATCH, DESCRIPTIVE ONLY (cbl1 is ANOTHER BATCH and batch is")
+    print("   the unit of replication; only the ORDER of the seven pairs above is")
+    print("   a test.  These magnitudes gate nothing):")
+    c = cbl1_from_csv()
+    if c:
+        print("      cbl1 anchors scalar %.3f layerwise %.3f (gap %.3f); "
+              "cpk1 %.3f / %.3f (gap %.3f)"
+              % (c["lo"], c["hi"], c["hi"] - c["lo"], m_lo, m_hi, gap))
+        for k in KGRID_FROM_CBL1:
+            if k in c["caps"]:
+                print("      k=%-3d cpk1 CAPTURE %+.4f   cbl1 CAPTURE %+.4f   %+.4f"
+                      % (k, caps_by_k[k], c["caps"][k], caps_by_k[k] - c["caps"][k]))
+    else:
+        print("      cbl1 rows not found in the corpus; nothing printed.")
+
+    print("\n-- SCOPE -------------------------------------------------------------")
+    print("   CIFAR-100 / ResNet18_c100 / SGDm+Lion / ms 1e-3 / alpha0 1e-6 / 100 ep.")
+    print("   EVERY sweep arm has m = 2; the anchors are anchors, not rungs, so this")
+    print("   batch says NOTHING about the group COUNT, about resnet18_blocks, about")
+    print("   CIFAR-10, Tiny-ImageNet, ImageNet-489 or ResNet-50, about any other")
+    print("   meta-stepsize or optimiser pair, or about any hierarchical/shrinkage")
+    print("   operator (HIER is unset in every arm).  It locates a curve in the cut")
+    print("   position k for ONE architecture in ONE named_parameters() order; a")
+    print("   different ordering of the same network is a different experiment.")
+    print("   No mechanism is named: normalised entropy stays DISQUALIFIED, and the")
+    print("   boundary and parameter-balance accounts are the only two rivals that")
+    print("   were on record before the data existed.")
+    print("")
+    print("   FINAL: SHAPE %s | BOUNDARY %s | PARAM-BAL %s | REPLICATION %s"
+          % (pv, bv, pbv, rv))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    sys.exit(selftest() if a.selftest else score(a.runs, a.manifest))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,49 @@
+#!/bin/bash
+# safe_trim.sh -- the ONLY sanctioned way to reduce queue depth.
+#
+# WHY THIS EXISTS.  On 2026-08-20T08:33:15 an ad-hoc scancel sweep cancelled 177 pending
+# jobs on cluster_a.  It hit the 36 `kb-*` and 14 `p8-*` (submitted as `p7-*-blk6-s{3..9}`)
+# jobs that cycle 29 had submitted 39 minutes earlier and had named, in writing, as
+# "the two things this cycle turns on".  Zero of the 50 had started.  A full cycle of
+# decisive work was destroyed by our own cleanup, and the loss was invisible for a day
+# because the trim reported only a count.
+#
+# Root cause: the sweep selected by RECENCY (newest job IDs first).  Decisive experiments
+# are, by construction, always the newest jobs in the queue.  Recency-ordered trimming
+# therefore cancels exactly the jobs it must never touch.
+#
+# RULES ENFORCED HERE
+#   1. Never cancel a job whose name matches a prefix in bin/PROTECTED.txt.
+#   2. Never cancel a job at Nice < 1000.  Decisive work is put at the front on purpose;
+#      the front of the queue is not the trim's business.
+#   3. Never cancel a RUNNING job.
+#   4. Trim from the BACK (highest Nice first) -- the opposite of what killed cycle 29.
+#   5. Print every name it is about to cancel.  Counts hide disasters.
+#
+# Usage: bash bin/safe_trim.sh <n_to_cancel> [--commit]
+#        Without --commit it is a dry run.
+set -u
+N=${1:?usage: safe_trim.sh <n> [--commit]}
+COMMIT=${2:-}
+BIN="$(cd "$(dirname "$0")" && pwd)"
+PROT="$BIN/PROTECTED.txt"
+U=$(whoami)
+
+pat=$(grep -vE '^\s*(#|$)' "$PROT" | sed 's/[[:space:]]*$//' | paste -sd'|' -)
+echo "protected prefixes: $pat"
+
+# Highest Nice first == least important first.  Rule 4.
+cand=$(squeue -u "$U" -h -t PENDING -O "JobID:12,Name:34,Nice:9" \
+       | awk -v p="^($pat)" '$3+0 >= 1000 && $2 !~ p {print $3" "$1" "$2}' \
+       | sort -rn | head -n "$N")
+
+n=$(printf '%s\n' "$cand" | grep -c . )
+echo "would cancel $n job(s):"
+printf '%s\n' "$cand" | awk '{print "  nice="$1"  "$3"  ("$2")"}'
+
+if [ "$COMMIT" = "--commit" ] && [ "$n" -gt 0 ]; then
+  printf '%s\n' "$cand" | awk '{print $2}' | xargs -r scancel
+  echo "CANCELLED $n"
+else
+  echo "(dry run -- pass --commit to act)"
+fi

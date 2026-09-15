@@ -1,0 +1,1188 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cO1_cfr1_score.py -- THE REGISTERED SCORER FOR BATCH `cfr1`.
+#
+# COMMITTED BEFORE ANY cfr1 RUN EXISTS (STANDING RULE 21).  Run it UNEDITED
+# (STANDING RULE 16).  Documented command-line arguments are not edits;
+# nothing below this line may be changed once a cfr1 run exists on disk.  If
+# this file turns out to be broken it is FROZEN and a NEW file is registered
+# (precedent: cN1 -> cN2 at CORRECTIONS 149).
+#
+# -----------------------------------------------------------------------------
+# THE THREAT THIS BATCH EXISTS TO DISCHARGE
+# -----------------------------------------------------------------------------
+# MASTER-TABLE row 24 reads, verbatim:
+#
+#     "Falloff above the peak: scalar 5.871 vs blk6 1.060, layerwise 1.801,
+#      nodewise 2.593 pp/decade."
+#     THE CORRECT SENTENCE: partitioning buys TOLERANCE to an over-large
+#     meta-stepsize, not peak accuracy.  The granularity claim is a robustness
+#     claim.                                          (verdict CONFIRMED)
+#
+# Every number in that row lives in the response surface ABOVE each arm's
+# meta-stepsize optimum.  The corpus-wide clamp census (CORRECTIONS 148)
+# measured that region to be, for these two arms:
+#
+#     ms = 1e-4 (the shared optimum)  scalar 0/33 bind, layerwise 0/6 bind
+#     ms = 1e-3 (one decade above)    scalar 0/33 bind, layerwise 100% bind
+#
+# so "the fine arm degrades more slowly above its optimum" and "the fine arm's
+# runaway groups hit a wall the scalar arm never reaches" are, in the corpus as
+# it stands, the SAME OBSERVATION.  The BETA_CLIP floor of -15 is a stabiliser
+# that catches exactly the groups an over-large meta-stepsize sends running,
+# and row 24 has no clamp-free replicate: of the 24 non-canonical-box cells in
+# the corpus only `tc1` and `ub9` contain a scalar arm at all, `tc1` was
+# measured NOT clamp-free (CORRECTIONS 149), and `ub9` gave a cross-batch,
+# cross-account, two-wall-ambiguous null at 0.22 SE.
+#
+# This batch supplies the missing replicate with the instrument `cts2`
+# validated at CORRECTIONS 150: MOVE THE FLOOR ONLY, keep the ceiling, and put
+# all four cells IN ONE BATCH so the cross-batch floor cancels outright.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  2 granularities x 2 boxes x 3 seeds = 12 jobs, ONE submission.
+#
+#   factor A  granularity   sc  = scalar     (m = 1  coordinate)
+#                           lay = layerwise  (m = 62 coordinates)
+#   factor B  box           C = CLAMPED  BETA_CLIP=-15:-2.3026 (campaign std)
+#                           R = RELEASED BETA_CLIP=-80:-2.3026 (floor released,
+#                                                               SAME ceiling)
+#
+#   ResNet18 / CIFAR-10 / SGDm base / Lion meta / meta-stepsize 1e-3 /
+#   alpha0 1e-3 / 100 epochs / batch 100 / gamma 1 / AUGMENT=1 / HIER unset /
+#   SCHED none / PROBE=100 with a per-run PROBE_DIR.
+#
+#   ESTIMAND, the primary and the only one:
+#       G_C  = mean(lay, C) - mean(sc, C)        the clamped granularity gap
+#       G_R  = mean(lay, R) - mean(sc, R)        the released granularity gap
+#       DID  = G_R - G_C                         the difference in differences
+#
+#   ONLY ms = 1e-3 IS RUN, and that is an ARITHMETIC decision, not a saving.
+#   With --weight-decay-meta 0 the Lion meta-update is
+#       beta <- beta - ms*sign(.),      sign(.) in {-1, 0, +1},
+#   so |dbeta| <= ms EXACTLY per meta-step and over T meta-steps beta is
+#   confined to [ln a0 - ms*T, ln a0 + ms*T].  At alpha0 = 1e-3 and T = 50000
+#   (100 epochs x 500 iterations of CIFAR-10 at batch 100):
+#       ms = 1e-4  ->  beta >= -11.914545 (float32)  = 3.085455 nats ABOVE the
+#                      -15 floor.  THE FLOOR IS UNREACHABLE AT THE TUNED
+#                      META-STEPSIZE, so releasing it there is a null BY
+#                      CONSTRUCTION -- provably, not merely by measurement.
+#       ms = 1e-3  ->  beta >= -56.888439 (float32).  The floor is reachable
+#                      with 8092 meta-steps to spare, and 100% of layerwise
+#                      runs in the corpus reach it.
+#   The whole box-dependence of row 24's falloff therefore lives at ms = 1e-3,
+#   and the four cells run here capture all of it.
+#
+#   NO blk6 ARM, and that is a REFUSAL WITH A REASON, re-derived from the CSV
+#   by --selftest.  Row 24's blk6 (1.060) and nodewise (2.593) falloffs come
+#   from the c40 `rs-` response surface, and MASTER-TABLE row 106 measured that
+#   surface's truncation to be GRANULARITY-ASYMMETRIC: in the 67 `rs-` rows,
+#   scalar 0/22 and layerwise 0/22 are truncated while resnet18_blocks is 6/13
+#   and nodewise 6/10.  A blk6 arm here would audit a falloff number that row
+#   106 has already REFUTED, at +50% cost and with a second, uncorrected
+#   estimand.  scalar and layerwise are exactly the two arms of row 24 whose
+#   numbers survive that audit.  If the verdict below comes back WALL-DRIVEN,
+#   the blk6 rung (censused at 68.8% binding, between scalar's 0% and
+#   layerwise's 100%) is the registered dose-response follow-up.
+#
+# -----------------------------------------------------------------------------
+# WHY THE RELEASED FLOOR IS -80, BY ARITHMETIC ON THE LIVE SOURCE
+# -----------------------------------------------------------------------------
+# HF.Lion_meta_update is
+#     beta <- (1 - ms*wd_meta)*beta - ms*sign( b2*mom + (1-b2)*HtT_gradft )
+# and this batch passes --weight-decay-meta 0, so the multiplicative term is
+# exactly 1 and |dbeta| <= ms = 1e-3 per meta-step.  The launcher's guard 4e
+# re-derives all three of those facts from the LIVE Optimizers/HF.py on the
+# account that runs the jobs -- that BETA_CLIP is parsed out of the environment
+# into (_beta_lo, _beta_hi), that it is applied as beta.clamp(_beta_lo,
+# _beta_hi) AFTER the meta update, and that the meta update is the sign-bounded
+# one -- and submits nothing if any of them is false.
+#
+# beta starts at float32 log(1e-3) = -6.907755.  Simulating the WORST CASE,
+# 50000 consecutive downward steps in float32, lands at -56.888439.  That is
+# the lowest beta this configuration can reach, by arithmetic, in any run,
+# ever.  -80.0 is 23.111561 nats below it -- 23111 meta-steps that do not
+# exist.  alpha = exp(-56.888439) = 1.96e-25 is a normal float32 (smallest
+# normal 1.18e-38), so releasing the floor introduces no underflow.
+#
+# THE CEILING IS HELD AT -2.3026 IN BOTH BOXES, so the manipulation is
+# ONE-FACTOR.  This is the defect that made CORRECTIONS 149's `ub9`/`tc1` null
+# ambiguous ({-30:6.0} and {-60:6.0} move BOTH walls) and it is not inherited.
+# The price is a DECLARED SCOPE LIMIT: a SURVIVES verdict below discharges the
+# FLOOR half of the threat only.  The ceiling half is MEASURED HERE FOR FREE
+# and reported as a pre-specified diagnostic -- if the clamped layerwise arm
+# never puts a coordinate on the ceiling (n_at_hi = 0 at every record of every
+# record of every run), then the floor is the only wall at this cell and the
+# audit is complete; if it does, the verdict is scoped to the floor and the
+# ceiling release is the next experiment.  Releasing the ceiling here as a
+# third level was considered and refused: FINDINGS 6190-6215 measured 2/2
+# FATAL COLLAPSES on releasing the ceiling to +6.0, and a diverged arm is
+# UNRESOLVED-DIVERGED by R2 below, i.e. it would cost 6 GPU-hours and could
+# not answer anything.
+#
+# -----------------------------------------------------------------------------
+# PROBE=100, AND WHY THAT INTERVAL IS EXACT AND NOT A SAMPLE
+# -----------------------------------------------------------------------------
+# The manipulation check must be at the COORDINATE denominator (FINDINGS 51.1:
+# per-tensor beta[] readings are the wrong resolution) and over the FULL
+# trajectory (CORRECTIONS 149.7: terminal and sampled occupancy rates are LOWER
+# BOUNDS, because cells bounce off the wall and drift back).  Neither is
+# available from TensorBoard here: HF.py emits beta scalars only for
+# stepsize_type in {scalar, blockwise}, and `layerwise` EMITS NONE.  The
+# layerwise arm is unauditable without the probe, so PROBE is not optional.
+#
+# PROBE is an INTERVAL, not a flag (_probe_every = int(PROBE)); PROBE=1 writes
+# a JSONL record on EVERY one of the 50000 meta-steps, and each record does
+# ~62 device-to-host syncs (h_absmax loops over all of h_condenced).  PROBE=100
+# writes 499 records per run at ~2 MB, for ~3 s of syncs against a ~45 min run,
+# and it is set IDENTICALLY on all 12 runs so it cannot enter the contrast.
+#
+# THE INTERVAL COSTS NOTHING IN RESOLUTION, and this is the point:
+#   |dbeta| <= ms per meta-step, so over a stride of PROBE meta-steps beta
+#   cannot move by more than ms*PROBE = 0.1 nats.  If a coordinate touches the
+#   wall at ANY meta-step, then at the NEXT sampled record that coordinate is
+#   still within 0.1 nats of the wall.  So the detector
+#       REACHED(wall) := min over records of beta_true_min <= wall + 0.1004
+#   has NO FALSE NEGATIVES: it is EXACT for the event "some coordinate reached
+#   the wall at some meta-step", not a lower bound.  That is the direct answer
+#   to CORRECTIONS 149.7, and it is why a coarse interval is sufficient.
+#   The complementary exact-equality count n_at_lo (PATCH_CLIPCOUNT, tolerance
+#   1e-6) has no FALSE POSITIVES and is reported alongside as the lower bound.
+#   Both are printed for every run; a gap between them is itself information.
+#
+# The probe fields this scorer reads, all written by PATCH_CLIP /
+# PATCH_CLIPCOUNT in HF._probe and none of them derived here:
+#   beta_true_min / beta_true_max   min and max over ALL beta COORDINATES
+#   n_at_lo / n_at_hi / n_beta      per-COORDINATE clip occupancy and the
+#                                   coordinate count (1 for scalar, 62 for
+#                                   layerwise -- checked, so a per-tensor-mean
+#                                   reading cannot be mistaken for this one)
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTRATION.  Gates fire IN ORDER; the first failure decides.
+#
+#   G0 PROVENANCE  12 runs, 4 cells x 3 seeds, 12 distinct job ids, 100/100
+#      epochs, no repeated flag on any ARGS line, and every run's NAME agreeing
+#      with its OWN ARGS line and its OWN ENV line.  BETA_CLIP and PROBE are
+#      environment variables and cannot ride the ARGS line, so they are audited
+#      from the ENV line (STANDING RULE 20's known blind spot).
+#
+#   R1 MANIPULATION, at the coordinate denominator, over the full trajectory.
+#      (a) every RELEASED run must stay strictly clear of -80: min over records
+#          of beta_true_min > -80 + 0.1004, and n_at_lo = 0 at every record.
+#      (b) every run must carry >= 400 records and the registered coordinate
+#          count (1 for sc, 62 for lay).
+#      (c) an unreadable or missing probe fails CLOSED to
+#          UNRESOLVED-MANIPULATION-UNCHECKED.
+#      A released run that touches its floor means the manipulation FAILED and
+#      this batch is UNRESOLVED, NOT evidence.
+#
+#   R2 DIVERGENCE  any run with < 100 epochs, a non-finite metric, or
+#      plateau5 <= 15.00 pp (CIFAR-10 chance is 10.0 pp) is DEAD ->
+#      UNRESOLVED-DIVERGED.  Registered in advance precisely so that "the
+#      released arms failed to train" can NEVER be scored as "the tolerance
+#      collapsed".  COLLAPSED-BY-FREEZING is its own label: it fires when a
+#      released cell's terminal beta_true_max <= -20, i.e. EVERY coordinate's
+#      stepsize is below 2.1e-9 and the arm has stopped learning -- a statement
+#      about the floor AS A FLOOR, not about tolerance.
+#
+#   R3 NOISE  any of the four cell SDs above 3*sigma_w = 0.6480 pp ->
+#      UNRESOLVED-NOISY: the registered noise floor did not transfer and the
+#      bars below do not apply.
+#
+#   R4 PREMISE, both halves.
+#      (i)  G_C >= 1.6792 pp, half the corpus's own clamped gap at this cell
+#           (layerwise 91.1936 n=17 minus scalar 87.8352 n=17 = 3.3585 pp).
+#      (ii) THE WALL MUST EXIST: at least 2 of the 3 CLAMPED LAYERWISE runs
+#           must have reached the -15 floor.  If the clamped fine arm never
+#           binds, there is no wall to release and a null DID is null BY
+#           CONSTRUCTION -- it would NOT vindicate row 24 and may not be
+#           reported as if it did.  -> UNRESOLVED-PREMISE-NOWALL.
+#
+#   VERDICT on DID = G_R - G_C, at the registered bar 2*SE_DID = 0.4988 pp:
+#      |DID| <= 0.4988                       ROW24-SURVIVES
+#           the tolerance is a property of the PARTITION.  Row 24 stands.
+#      DID <= -0.4988 and G_R >= 1.6792      ROW24-ATTENUATED
+#           the wall carries part of the tolerance; row 24's MAGNITUDE must be
+#           restated with the released number beside it.
+#      DID <= -0.4988 and G_R <  1.6792      ROW24-WALL-DRIVEN
+#           the tolerance WAS the wall.  Row 24 must be REWRITTEN.
+#      DID >= +0.4988                        ROW24-BOX-SUPPRESSED
+#           the tolerance is real and the box was suppressing it.
+#
+#   DISCLOSED, PRE-SPECIFIED, NON-GATING diagnostics, reported every run:
+#      * NEGATIVE CONTROL.  The census measures scalar 0/33 bound at ms = 1e-3,
+#        so the scalar arm should not move when the floor is released:
+#        |mean(sc,R) - mean(sc,C)| against 2*SE_GAP = 0.3527 pp.  This is
+#        cts2's k50-coarse-block control (+0.03 nats) transposed to an
+#        accuracy.  A scalar arm that moves is reported, loudly; it does not
+#        void the DID, which is a difference in differences either way.
+#      * CEILING SCOPE.  max n_at_hi over the clamped layerwise runs, deciding
+#        whether the floor was the only wall at this cell.
+#      * the floor-occupancy RATE per run, both as the exact lower bound
+#        (n_at_lo >= 1) and as the no-false-negative detector above.
+#
+# MAY NOT CLAIM: anything about any other meta-stepsize, alpha0, dataset,
+# architecture, base/meta optimiser pair, granularity other than scalar and
+# layerwise, or box other than the two run here; anything about the CEILING as
+# a wall beyond the diagnostic above; any splice with `rs-`, `ms-`, `mx-`,
+# `tc1`, `ub9` or any other batch's arms (batch is the unit of replication:
+# F(62,85) = 5.47, p 6.9e-13 for batch, F(11,1976) = 0.152 for seed); and any
+# statement about row 24's FITTED SLOPE in pp/decade, which is a multi-rung
+# object this batch does not measure -- what is measured is the GAP at one
+# decade above the shared optimum, under two boxes.
+#
+# PRIMARY IS plateau5.  The CSV `plateau` column is BANNED as primary and
+# best_test is not a plateau.  TRAIN is reported alongside TEST at every arm.
+#
+# USAGE
+#   python3 analysis/cO1_cfr1_score.py --selftest
+#   python3 analysis/cO1_cfr1_score.py --runs /cluster/account_b/metaopt/runs \
+#                                      --probes /cluster/account_b/metaopt/runs/cfr1
+#   python3 analysis/cO1_cfr1_score.py --dump-probe cfr1_probe.json \
+#                                      --probes /cluster/account_b/metaopt/runs/cfr1
+#   python3 analysis/cO1_cfr1_score.py --runs ../runs_cluster_b \
+#                                      --probe-json cfr1_probe.json
+# =============================================================================
+
+import argparse
+import collections
+import csv
+import glob
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cO1_floor_release_row24.sh")
+
+# ---- FROZEN REGISTRATION ----------------------------------------------------
+PREFIX = "cfr1-"
+NET, DSET = "ResNet18", "CIFAR10"
+MS, ALPHA0, AUG = "1e-3", "1e-3", "1"
+EPOCHS, BATCH, GAMMA = 100, 100, "1"
+BASE_ALG, META_ALG = "SGDm", "Lion"
+SEEDS = (0, 1, 2)
+N_TENSORS = 62
+TOTAL_PARAMS = 11173962
+
+CLIP_C = "-15:-2.3026"          # the campaign standard
+CLIP_R = "-80:-2.3026"          # the released floor, IDENTICAL ceiling
+BOXES = ("C", "R")
+ARMS = ("sc", "lay")
+ARM_SPEC = {"sc": "scalar", "lay": "layerwise"}
+ARM_COORDS = {"sc": 1, "lay": N_TENSORS}
+CELLS = tuple((a, b) for b in BOXES for a in ARMS)
+N_RUNS = len(CELLS) * len(SEEDS)          # 12
+
+# ---- the arithmetic of the released floor, re-derived by --selftest ----------
+BETA_INIT = -6.907755           # float32 log(1e-3)
+FLOOR_C = -15.0
+FLOOR_R = -80.0
+CEIL = -2.3026
+META_STEPS = 50000              # 100 epochs x 500 iterations of CIFAR-10 @ 100
+PROBE_EVERY = 100               # the registered PROBE interval
+STEP_BOUND = 0.1004             # ms * PROBE_EVERY + float32 slack
+REACHABLE_MIN = -56.888439      # exact float32, 50000 monotone -1e-3 steps
+REACHABLE_MIN_1E4 = -11.914545  # the same at ms = 1e-4: ABOVE the -15 floor
+FLOOR_MARGIN = 23.111561        # REACHABLE_MIN - FLOOR_R
+FROZEN_BETA = -20.0
+MIN_RECORDS = 400               # 499 are written; allow for a truncated tail
+
+# ---- the noise floor, re-derived from the corpus by --selftest ---------------
+# Pooled WITHIN (batch family x granularity x meta-stepsize) SD of plateau5
+# over the canonical-box ResNet18/CIFAR-10/SGDm+Lion/alpha0=1e-3/AUGMENT=1
+# stratum, granularity in {scalar, layerwise}, 100/100 epochs, collapsed = 0,
+# EXCLUDING this batch's own rows so the selftest stays green after landing.
+SIGMA_W = 0.2160
+SIGMA_DF = 76
+SIGMA_CELLS = 30
+
+# ---- the corpus's own clamped gap at this cell.  DESCRIPTIVE: it enters only
+# ---- through PREMISE_BAR, never as a comparator and never spliced in.
+CORPUS_LAY = 91.193647          # n = 17
+CORPUS_SC = 87.835176           # n = 17
+CORPUS_GAP = 3.358471           # the clamped granularity gap at ms = 1e-3
+CORPUS_GAP_TUNED = 0.624145     # the same gap at ms = 1e-4, for context only
+
+# ---- BARS.  --selftest quotes every one in SE units. ------------------------
+PREMISE_BAR = 1.6792      # R4(i): half the corpus's own clamped gap
+DID_BAR = 0.4988          # verdict: 2 * SE_DID
+CONTROL_BAR = 0.3527      # negative control: 2 * SE_GAP
+NOISY_BAR = 0.6480        # R3: 3 * SIGMA_W
+DEAD_BAR = 15.00          # R2: plateau5 at or below this = did not train
+MIN_WALL_SEEDS = 2        # R4(ii): clamped layerwise runs that must bind
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+EPTR_RE = re.compile(r"Epoch\s+(\d+).*?Train Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+NAME_RE = re.compile(r"^cfr1-(sc|lay)-([CR])-s([012])-(\d+)\.out$")
+
+
+def clip_of(box):
+    return CLIP_C if box == "C" else CLIP_R
+
+
+def floor_of(box):
+    return FLOOR_C if box == "C" else FLOOR_R
+
+
+# =============================================================================
+# the corpus
+# =============================================================================
+def _csv_rows(path=CSV):
+    with open(path) as fh:
+        return [r for r in csv.DictReader(fh) if (r.get("superseded") or "0") != "1"]
+
+
+def _batch_of(run):
+    return re.split(r"[-_]", str(run))[0]
+
+
+def _in_stratum(r):
+    """The canonical-box cell row 24's clamped numbers were measured in."""
+    return (r["network"] == NET and r["dataset"] == DSET
+            and r["base"] == BASE_ALG and r["meta"] == META_ALG
+            and r["alpha0"] == ALPHA0 and r["gamma"] == GAMMA
+            and r["augment"] == AUG and r["beta_clip"] == CLIP_C
+            and not (r.get("hier") or "").strip()
+            and r["batch_size"] == str(BATCH)
+            and r["epochs_requested"] == str(EPOCHS)
+            and r["epochs_done"] == str(EPOCHS)
+            and r["collapsed"] == "0"
+            and r["granularity"] in ("scalar", "layerwise")
+            and not str(r.get("run") or "").startswith(PREFIX))
+
+
+def noise_floor_from_csv(path=CSV):
+    """Pooled WITHIN (family x granularity x meta-stepsize) SD of plateau5."""
+    cells = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if not _in_stratum(r):
+            continue
+        try:
+            cells[(_batch_of(r["run"]), r["granularity"],
+                   r["meta_stepsize"])].append(float(r["plateau5"]))
+        except (TypeError, ValueError):
+            pass
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) >= 2:
+            m = statistics.mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+            nc += 1
+    return (math.sqrt(ss / df) if df else float("nan")), df, nc
+
+
+def corpus_gap_from_csv(ms=MS, path=CSV):
+    """The corpus's own clamped layerwise - scalar gap at one meta-stepsize."""
+    g = collections.defaultdict(list)
+    for r in _csv_rows(path):
+        if _in_stratum(r) and r["meta_stepsize"] == ms:
+            try:
+                g[r["granularity"]].append(float(r["plateau5"]))
+            except (TypeError, ValueError):
+                pass
+    if "layerwise" not in g or "scalar" not in g:
+        return None
+    lay, sc = statistics.mean(g["layerwise"]), statistics.mean(g["scalar"])
+    return lay, sc, lay - sc, len(g["layerwise"]), len(g["scalar"])
+
+
+def rs_truncation_from_csv(path=CSV):
+    """MASTER-TABLE row 106's asymmetry, re-derived: {granularity: (trunc, n)}."""
+    out = collections.defaultdict(lambda: [0, 0])
+    for r in _csv_rows(path):
+        if not str(r.get("run") or "").startswith("rs-"):
+            continue
+        try:
+            trunc = int(r["epochs_done"]) < int(r["epochs_requested"])
+        except (TypeError, ValueError):
+            continue
+        out[r["granularity"]][1] += 1
+        if trunc:
+            out[r["granularity"]][0] += 1
+    return dict((k, tuple(v)) for k, v in out.items())
+
+
+def premise_no_cfr1_rows(path=CSV):
+    return sum(1 for r in _csv_rows(path)
+               if str(r.get("run") or "").startswith(PREFIX))
+
+
+# =============================================================================
+# the SE arithmetic.  Each contrast gets the SE of ITS OWN linear combination.
+# =============================================================================
+def se_of_combo(coefs, sigma=SIGMA_W, n=3):
+    """SE, in PERCENTAGE POINTS, of sum_i coefs[i]*mean(cell_i), n seeds each."""
+    return sigma * math.sqrt(sum(c * c for c in coefs) / float(n))
+
+
+SE_ARM = se_of_combo((1,))                # one cell mean
+SE_GAP = se_of_combo((1, -1))             # G_C, G_R, and the scalar control
+SE_DID = se_of_combo((1, -1, -1, 1))      # DID = G_R - G_C
+
+
+# =============================================================================
+# reading the runs.  Nothing is taken from the launcher's header.
+# =============================================================================
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    eff, seen = {}, collections.Counter()
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("--"):
+            key = t[2:]
+            val = "1"
+            if i + 1 < len(toks) and not toks[i + 1].startswith("--"):
+                val = toks[i + 1]
+                i += 1
+            seen[key] += 1
+            eff[key] = val
+        i += 1
+    return eff, sorted(k for k, c in seen.items() if c > 1)
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    test, train = {}, {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EP_RE.search(line)
+                if m:
+                    test[int(m.group(1))] = float(m.group(2))
+                m = EPTR_RE.search(line)
+                if m:
+                    train[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args,
+            "env": parse_env_line(env or ""), "envline": env or "",
+            "test": test, "train": train, "path": path}
+
+
+def tail5(series, budget=EPOCHS, w=5):
+    """PRIMARY window.  Mean of the LAST 5 epochs; train.py prints 0-indexed."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def collect(runsdir):
+    """Every cfr1 .out file, with its cell MEASURED from its own ARGS and ENV."""
+    recs = []
+    for p in sorted(glob.glob(os.path.join(runsdir, PREFIX + "*.out"))):
+        base = os.path.basename(p)
+        m = NAME_RE.match(base)
+        r = read_out(p)
+        if r is None:
+            recs.append({"path": p, "base": base, "bad": "no ARGS line"})
+            continue
+        r["base"] = base
+        r["run"] = base.rsplit("-", 1)[0] if m else base[:-4]
+        r["job_id"] = m.group(4) if m else None
+        r["name_arm"] = m.group(1) if m else None
+        r["name_box"] = m.group(2) if m else None
+        r["name_seed"] = int(m.group(3)) if m else None
+        spec = r["args"].get("stepsize-groups")
+        r["meas_arm"] = None
+        for a in ARMS:
+            if spec == ARM_SPEC[a]:
+                r["meas_arm"] = a
+        clip = r["env"].get("BETA_CLIP")
+        r["meas_box"] = {CLIP_C: "C", CLIP_R: "R"}.get(clip)
+        r["clip"] = clip
+        try:
+            r["seed"] = int(r["args"].get("seed"))
+        except (TypeError, ValueError):
+            r["seed"] = None
+        r["p5"] = tail5(r["test"])
+        r["t5"] = tail5(r["train"])
+        r["n_ep"] = len(r["test"])
+        recs.append(r)
+    return recs
+
+
+# =============================================================================
+# the manipulation check, read from the runs' OWN probe.jsonl.
+# COORDINATE denominator (beta_true_min/max, n_at_lo/n_at_hi over ALL beta
+# coordinates), FULL trajectory (every record, not the terminal one).
+# =============================================================================
+PROBE_FIELDS = ("step", "beta_true_min", "beta_true_max",
+                "n_at_lo", "n_at_hi", "n_beta")
+
+
+def probe_summary_one(path):
+    """Reduce one probe.jsonl to the registered scalars.  None if unreadable."""
+    n = 0
+    bmin = float("inf")
+    bmax = float("-inf")
+    nlo_max = 0
+    nhi_max = 0
+    nlo_hits = 0
+    nhi_hits = 0
+    nbeta = None
+    last = None
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    tmin = float(rec["beta_true_min"])
+                    tmax = float(rec["beta_true_max"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if tmin != tmin or tmax != tmax:      # NaN
+                    continue
+                n += 1
+                bmin = min(bmin, tmin)
+                bmax = max(bmax, tmax)
+                lo = int(rec.get("n_at_lo") or 0)
+                hi = int(rec.get("n_at_hi") or 0)
+                nlo_max = max(nlo_max, lo)
+                nhi_max = max(nhi_max, hi)
+                nlo_hits += 1 if lo >= 1 else 0
+                nhi_hits += 1 if hi >= 1 else 0
+                if rec.get("n_beta") is not None:
+                    nbeta = int(rec["n_beta"])
+                last = (tmin, tmax)
+    except IOError:
+        return None
+    if n == 0:
+        return None
+    return {"n": n, "bmin": bmin, "bmax": bmax, "n_at_lo_max": nlo_max,
+            "n_at_hi_max": nhi_max, "lo_rate": nlo_hits / float(n),
+            "hi_rate": nhi_hits / float(n), "n_beta": nbeta,
+            "last_min": last[0], "last_max": last[1]}
+
+
+def probes_from_dir(probedir):
+    """{run_name: summary} over <probedir>/probe_<run>/probe.jsonl."""
+    out = {}
+    for d in sorted(glob.glob(os.path.join(probedir, "probe_" + PREFIX + "*"))):
+        if not os.path.isdir(d):
+            continue
+        run = os.path.basename(d)[len("probe_"):]
+        s = probe_summary_one(os.path.join(d, "probe.jsonl"))
+        if s is not None:
+            out[run] = s
+    return out or None
+
+
+def probes_from_json(path):
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except (IOError, ValueError):
+        return None
+    out = dict((k, v) for k, v in raw.items() if str(k).startswith(PREFIX))
+    return out or None
+
+
+def reached(value, wall):
+    """EXACT detector: |dbeta| <= ms per step bounds one stride by STEP_BOUND."""
+    if wall < 0 and value <= wall + STEP_BOUND:
+        return True
+    return False
+
+
+def reached_ceiling(value, ceil=CEIL):
+    return value >= ceil - STEP_BOUND
+
+
+# =============================================================================
+# reporting helpers
+# =============================================================================
+class Report(object):
+    def __init__(self):
+        self.fail = 0
+
+    def ok(self, label, cond, extra=""):
+        tag = "PASS" if cond else "FAIL"
+        if not cond:
+            self.fail += 1
+        print("  [%s] %-62s %s" % (tag, label, extra))
+        return bool(cond)
+
+    def note(self, s):
+        print("       %s" % s)
+
+
+def fmt(x, w=9, p=4):
+    return ("%*.*f" % (w, p, x)) if x is not None and x == x else " " * (w - 2) + "--"
+
+
+# =============================================================================
+# THE FROZEN DECISION RULE
+# =============================================================================
+def verdict(gc, gr, wall_seeds):
+    """Premise first (both halves), then the four branches on DID."""
+    if gc is None or gr is None:
+        return "UNRESOLVED-INCOMPLETE", "a cell mean is missing"
+    if wall_seeds is not None and wall_seeds < MIN_WALL_SEEDS:
+        return ("UNRESOLVED-PREMISE-NOWALL",
+                "only %d of %d CLAMPED LAYERWISE runs reached the -15 floor, "
+                "below the registered %d.  There is no wall to release at this "
+                "cell, so a null DID is null BY CONSTRUCTION and does NOT "
+                "vindicate row 24" % (wall_seeds, len(SEEDS), MIN_WALL_SEEDS))
+    if gc < PREMISE_BAR:
+        return ("UNRESOLVED-PREMISE",
+                "the in-batch CLAMPED granularity gap G_C = %.4f pp is below "
+                "the premise bar %.4f pp (half the corpus's own %.4f pp); row "
+                "24's regime did not reproduce in this batch and no other "
+                "batch's arms may be spliced in" % (gc, PREMISE_BAR, CORPUS_GAP))
+    did = gr - gc
+    if abs(did) <= DID_BAR:
+        return ("ROW24-SURVIVES",
+                "DID = %.4f pp, within the registered bar %.4f pp (2 SE_DID): "
+                "releasing the floor does not move the granularity gap, so the "
+                "tolerance row 24 reports is a property of the PARTITION and "
+                "not of the wall" % (did, DID_BAR))
+    if did >= DID_BAR:
+        return ("ROW24-BOX-SUPPRESSED",
+                "DID = %+.4f pp >= %.4f pp: the released box GROWS the gap, so "
+                "the tolerance is real and the standard box was suppressing it; "
+                "row 24 understates its own effect" % (did, DID_BAR))
+    if gr >= PREMISE_BAR:
+        return ("ROW24-ATTENUATED",
+                "DID = %+.4f pp <= %.4f pp but the released gap G_R = %.4f pp "
+                "still clears the premise bar %.4f pp: the wall carries PART of "
+                "the tolerance and row 24's MAGNITUDE must be restated with the "
+                "released number beside it" % (did, -DID_BAR, gr, PREMISE_BAR))
+    return ("ROW24-WALL-DRIVEN",
+            "DID = %+.4f pp <= %.4f pp and the released gap G_R = %.4f pp falls "
+            "below the premise bar %.4f pp: the tolerance WAS the wall, and "
+            "MASTER-TABLE row 24 must be REWRITTEN"
+            % (did, -DID_BAR, gr, PREMISE_BAR))
+
+
+# =============================================================================
+# SELFTEST -- must pass BEFORE any cfr1 run exists
+# =============================================================================
+def selftest():
+    import numpy as _np
+    R = Report()
+    print("=" * 78)
+    print("cO1_cfr1_score.py --selftest")
+    print("=" * 78)
+
+    print("\n-- RULE 21 premise ---------------------------------------------")
+    n = premise_no_cfr1_rows()
+    R.ok("no cfr1- row exists in the corpus yet", n == 0, "%d found" % n)
+
+    print("\n-- the released floor, re-derived by arithmetic -----------------")
+    b0 = float(_np.float32(_np.log(_np.float32(1e-3))))
+    R.ok("beta init = float32 log(1e-3)", abs(b0 - BETA_INIT) < 5e-6, "%.6f" % b0)
+    R.ok("the standard floor is %.6f nats below init" % (b0 - FLOOR_C),
+         abs((b0 - FLOOR_C) - 8.092245) < 1e-4, "%.6f" % (b0 - FLOOR_C))
+    R.ok("the ceiling is %.6f nats above init" % (CEIL - b0),
+         abs((CEIL - b0) - 4.605155) < 1e-4, "%.6f" % (CEIL - b0))
+    b = _np.float32(b0)
+    ms = _np.float32(1e-3)
+    for _ in range(META_STEPS):
+        b = _np.float32(b - ms)
+    R.ok("float32 worst case after %d monotone -1e-3 steps" % META_STEPS,
+         abs(float(b) - REACHABLE_MIN) < 5e-5, "%.6f" % float(b))
+    R.ok("the released floor is strictly unreachable",
+         FLOOR_R < REACHABLE_MIN, "%.1f < %.6f" % (FLOOR_R, REACHABLE_MIN))
+    R.ok("margin REACHABLE_MIN - FLOOR_R",
+         abs((REACHABLE_MIN - FLOOR_R) - FLOOR_MARGIN) < 1e-5,
+         "%.6f nats = %d meta-steps that do not exist"
+         % (REACHABLE_MIN - FLOOR_R, int((REACHABLE_MIN - FLOOR_R) / 1e-3)))
+    R.ok("the CLAMPED floor IS reachable at ms = 1e-3",
+         REACHABLE_MIN < FLOOR_C, "%.6f < %.1f, with %d meta-steps to spare"
+         % (REACHABLE_MIN, FLOOR_C, int((FLOOR_C - REACHABLE_MIN) / 1e-3)))
+    b4 = _np.float32(b0)
+    ms4 = _np.float32(1e-4)
+    for _ in range(META_STEPS):
+        b4 = _np.float32(b4 - ms4)
+    R.ok("at ms = 1e-4 the -15 floor is UNREACHABLE, so no arm is needed there",
+         float(b4) > FLOOR_C and abs(float(b4) - REACHABLE_MIN_1E4) < 5e-5,
+         "%.6f > %.1f by %.6f nats" % (float(b4), FLOOR_C, float(b4) - FLOOR_C))
+    R.ok("alpha at the reachable minimum is a normal float32",
+         math.exp(REACHABLE_MIN) > 1.18e-38,
+         "exp(%.3f) = %.3e" % (REACHABLE_MIN, math.exp(REACHABLE_MIN)))
+    R.ok("FROZEN_BETA is unreachable under the CLAMPED floor",
+         FROZEN_BETA < FLOOR_C, "%.1f < %.1f" % (FROZEN_BETA, FLOOR_C))
+
+    print("\n-- the PROBE interval makes the wall detector EXACT --------------")
+    R.ok("one PROBE stride cannot move beta by more than STEP_BOUND",
+         STEP_BOUND > PROBE_EVERY * 1e-3,
+         "%.4f > %.4f = ms * PROBE" % (STEP_BOUND, PROBE_EVERY * 1e-3))
+    R.ok("a wall touch at ANY meta-step is visible at the next record",
+         reached(FLOOR_C + PROBE_EVERY * 1e-3, FLOOR_C),
+         "beta = %.4f one stride above the floor still detects"
+         % (FLOOR_C + PROBE_EVERY * 1e-3))
+    R.ok("a coordinate a full nat clear of the wall does NOT detect",
+         not reached(FLOOR_C + 1.0, FLOOR_C), "%.4f" % (FLOOR_C + 1.0))
+    R.ok("the released floor detector fires only near -80",
+         reached(FLOOR_R + 0.05, FLOOR_R) and not reached(REACHABLE_MIN, FLOOR_R),
+         "reachable min %.4f is %.4f nats clear" % (REACHABLE_MIN,
+                                                    REACHABLE_MIN - FLOOR_R))
+    R.ok("MIN_RECORDS is below the %d records PROBE=%d writes"
+         % (META_STEPS // PROBE_EVERY - 1, PROBE_EVERY),
+         MIN_RECORDS < META_STEPS // PROBE_EVERY, "%d" % MIN_RECORDS)
+
+    print("\n-- the noise floor, re-derived from the corpus ------------------")
+    sd, df, nc = noise_floor_from_csv()
+    R.ok("SIGMA_W matches the CSV", abs(sd - SIGMA_W) < 0.005,
+         "%.4f pp over df %d, %d cells" % (sd, df, nc))
+    R.ok("SIGMA_DF matches the CSV", df == SIGMA_DF, "%d" % df)
+    R.ok("SIGMA_CELLS matches the CSV", nc == SIGMA_CELLS, "%d" % nc)
+    R.note("SE(one cell mean, 3 seeds)   = sigma/sqrt(3)    = %.4f pp" % SE_ARM)
+    R.note("SE(a gap, 2 cells)           = sigma*sqrt(2/3)  = %.4f pp" % SE_GAP)
+    R.note("SE(the DID, 4 cells)         = sigma*sqrt(4/3)  = %.4f pp" % SE_DID)
+
+    print("\n-- the corpus's own clamped gap, re-derived ---------------------")
+    g = corpus_gap_from_csv()
+    R.ok("the ms = 1e-3 clamped cell is present", g is not None and g[3] >= 5
+         and g[4] >= 5, "n = %s/%s" % ((g[3], g[4]) if g else ("-", "-")))
+    if g:
+        R.ok("CORPUS_LAY matches the CSV", abs(g[0] - CORPUS_LAY) < 0.005,
+             "%.4f pp" % g[0])
+        R.ok("CORPUS_SC matches the CSV", abs(g[1] - CORPUS_SC) < 0.005,
+             "%.4f pp" % g[1])
+        R.ok("CORPUS_GAP matches the CSV", abs(g[2] - CORPUS_GAP) < 0.005,
+             "%.4f pp = %.2f SE_GAP" % (g[2], g[2] / SE_GAP))
+    g4 = corpus_gap_from_csv("1e-4")
+    R.ok("the tuned gap at ms = 1e-4 is much smaller, as row 23 records",
+         g4 is not None and abs(g4[2] - CORPUS_GAP_TUNED) < 0.005
+         and g4[2] < CORPUS_GAP,
+         "%.4f pp vs %.4f pp -- the object row 24 is about is the %.4f pp "
+         "difference" % (g4[2] if g4 else float("nan"), CORPUS_GAP,
+                         CORPUS_GAP - (g4[2] if g4 else float("nan"))))
+
+    print("\n-- row 106's truncation asymmetry, the reason there is no blk6 ---")
+    tr = rs_truncation_from_csv()
+    R.ok("scalar is 0/22 truncated in the rs- surface",
+         tr.get("scalar") == (0, 22), str(tr.get("scalar")))
+    R.ok("layerwise is 0/22 truncated in the rs- surface",
+         tr.get("layerwise") == (0, 22), str(tr.get("layerwise")))
+    R.ok("resnet18_blocks IS truncation-contaminated",
+         tr.get("resnet18_blocks", (0, 0))[0] > 0,
+         "%s -- row 24's blk6 falloff rests on this" % str(tr.get("resnet18_blocks")))
+    R.ok("nodewise IS truncation-contaminated",
+         tr.get("nodewise", (0, 0))[0] > 0, str(tr.get("nodewise")))
+
+    print("\n-- every bar, quoted in SE units --------------------------------")
+    R.ok("PREMISE_BAR is half the corpus's own clamped gap",
+         abs(PREMISE_BAR - CORPUS_GAP / 2.0) < 0.005,
+         "%.4f pp = %.2f SE_GAP" % (PREMISE_BAR, PREMISE_BAR / SE_GAP))
+    R.ok("DID_BAR is 2 SE of the difference in differences",
+         abs(DID_BAR - 2 * SE_DID) < 0.005,
+         "%.4f pp = %.2f SE_DID" % (DID_BAR, DID_BAR / SE_DID))
+    R.ok("CONTROL_BAR is 2 SE of a two-cell difference",
+         abs(CONTROL_BAR - 2 * SE_GAP) < 0.005,
+         "%.4f pp = %.2f SE_GAP" % (CONTROL_BAR, CONTROL_BAR / SE_GAP))
+    R.ok("NOISY_BAR is 3 sigma_w", abs(NOISY_BAR - 3 * SIGMA_W) < 0.005,
+         "%.4f pp" % NOISY_BAR)
+    R.ok("DID_BAR is far below the effect row 24 would have to lose",
+         DID_BAR < CORPUS_GAP - CORPUS_GAP_TUNED,
+         "%.4f pp vs the %.4f pp of falloff differential at stake"
+         % (DID_BAR, CORPUS_GAP - CORPUS_GAP_TUNED))
+    R.ok("DEAD_BAR is above CIFAR-10 chance and far below this cell",
+         10.0 < DEAD_BAR < CORPUS_SC,
+         "%.2f pp (chance 10.00, the clamped scalar arm sits at %.2f)"
+         % (DEAD_BAR, CORPUS_SC))
+
+    print("\n-- the design ---------------------------------------------------")
+    R.ok("2 granularities x 2 boxes x 3 seeds", N_RUNS == 12, "%d runs" % N_RUNS)
+    R.ok("the two boxes share a ceiling and differ only in the floor",
+         CLIP_C.split(":")[1] == CLIP_R.split(":")[1]
+         and CLIP_C.split(":")[0] != CLIP_R.split(":")[0],
+         "%s vs %s" % (CLIP_C, CLIP_R))
+    R.ok("the registered coordinate counts",
+         ARM_COORDS["sc"] == 1 and ARM_COORDS["lay"] == N_TENSORS,
+         "scalar %d, layerwise %d" % (ARM_COORDS["sc"], ARM_COORDS["lay"]))
+    try:
+        sh = open(BATCH_SH).read()
+    except IOError:
+        sh = ""
+    R.ok("the launcher script is on disk", bool(sh), BATCH_SH)
+    if sh:
+        for lit in ('CLIP_C="%s"' % CLIP_C, 'CLIP_R="%s"' % CLIP_R,
+                    'ARMS="sc lay"', 'BOXES="C R"', 'SEEDS="0 1 2"',
+                    "PROBE=$PROBE_EVERY", "PROBE_EVERY=%d" % PROBE_EVERY,
+                    "MST=%s" % MS, "ALPHA0=%s" % ALPHA0,
+                    "EPOCHS=%d" % EPOCHS, "BATCH=%d" % BATCH,
+                    "GAMMA=%s" % GAMMA, "AUG=%s" % AUG,
+                    "DSET=%s" % DSET, "NET=%s" % NET,
+                    "NTENS=%d" % N_TENSORS, "G_SC=scalar", "G_LAY=layerwise"):
+            R.ok("launcher contains  %s" % lit, lit in sh)
+        R.ok("the launcher names THIS scorer", os.path.basename(__file__) in sh)
+        R.ok("the launcher names ONLY this account's workspace",
+             "/data1" not in sh and "/cluster/account_b/metaopt" in sh)
+        R.ok("every guard and scancel line is filtered on the cfr1- prefix",
+             "cfr1-" in sh and "cts2-" not in sh and "cpk1-" not in sh)
+        R.ok("the launcher declares the two box levels and nothing else",
+             sh.count("BETA_CLIP=$CLIP") == 1)
+
+    print("\n-- argparse last-wins, on a synthetic line ----------------------")
+    eff, dup = parse_args_line("--alg-meta RMSProp --seed 0 --alg-meta Lion")
+    R.ok("last occurrence wins", eff["alg-meta"] == "Lion", eff["alg-meta"])
+    R.ok("the repeat is reported", dup == ["alg-meta"], str(dup))
+
+    print("\n-- the probe reducer, on a synthetic trace ----------------------")
+    import tempfile
+    fd, tmp = tempfile.mkstemp(suffix=".jsonl")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"step": 0, "beta_true_min": -6.9,
+                             "beta_true_max": -6.9, "n_at_lo": 0,
+                             "n_at_hi": 0, "n_beta": 62}) + "\n")
+        fh.write(json.dumps({"step": 100, "beta_true_min": -15.0,
+                             "beta_true_max": -3.0, "n_at_lo": 7,
+                             "n_at_hi": 0, "n_beta": 62}) + "\n")
+        fh.write(json.dumps({"step": 200, "beta_true_min": -12.0,
+                             "beta_true_max": -2.3026, "n_at_lo": 0,
+                             "n_at_hi": 1, "n_beta": 62}) + "\n")
+    s = probe_summary_one(tmp)
+    os.unlink(tmp)
+    R.ok("the reducer takes the MIN over the whole trajectory",
+         s is not None and abs(s["bmin"] + 15.0) < 1e-9, fmt(s["bmin"]))
+    R.ok("it takes the MAX over the whole trajectory",
+         abs(s["bmax"] + 2.3026) < 1e-9, fmt(s["bmax"]))
+    R.ok("a wall touch at an interior record is NOT lost to the terminal one",
+         s["last_min"] == -12.0 and s["bmin"] == -15.0,
+         "terminal %.4f, trajectory %.4f -- CORRECTIONS 149.7"
+         % (s["last_min"], s["bmin"]))
+    R.ok("the exact per-coordinate counter is carried",
+         s["n_at_lo_max"] == 7 and s["n_at_hi_max"] == 1,
+         "n_at_lo %d, n_at_hi %d" % (s["n_at_lo_max"], s["n_at_hi_max"]))
+    R.ok("occupancy is a RATE over records, not a terminal flag",
+         abs(s["lo_rate"] - 1 / 3.0) < 1e-9, "%.4f" % s["lo_rate"])
+    R.ok("the coordinate count is read from the probe, not assumed",
+         s["n_beta"] == 62, "%d" % s["n_beta"])
+
+    print("\n-- the verdict machine, on synthetic cells ----------------------")
+    def _v(gc, gr, w=3):
+        return verdict(gc, gr, w)[0]
+    R.ok("an unmoved gap scores ROW24-SURVIVES",
+         _v(3.36, 3.30) == "ROW24-SURVIVES")
+    R.ok("a gap that vanishes when the floor is released scores WALL-DRIVEN",
+         _v(3.36, 0.40) == "ROW24-WALL-DRIVEN")
+    R.ok("a gap that halves but survives scores ATTENUATED",
+         _v(3.36, 2.00) == "ROW24-ATTENUATED")
+    R.ok("a gap that grows scores BOX-SUPPRESSED",
+         _v(3.36, 4.50) == "ROW24-BOX-SUPPRESSED")
+    R.ok("a clamped gap that did not reproduce scores UNRESOLVED-PREMISE",
+         _v(1.00, 0.10) == "UNRESOLVED-PREMISE")
+    R.ok("the premise gate fires BEFORE the wall-driven branch",
+         _v(1.00, 0.00) != "ROW24-WALL-DRIVEN")
+    R.ok("no wall in the clamped fine arm scores UNRESOLVED-PREMISE-NOWALL",
+         _v(3.36, 3.30, 1) == "UNRESOLVED-PREMISE-NOWALL")
+    R.ok("the no-wall gate fires BEFORE the survives branch",
+         _v(3.36, 3.30, 0) != "ROW24-SURVIVES")
+    R.ok("the survives band is symmetric about zero",
+         _v(3.36, 3.36 - DID_BAR + 1e-6) == "ROW24-SURVIVES"
+         and _v(3.36, 3.36 + DID_BAR - 1e-6) == "ROW24-SURVIVES")
+
+    print("\n" + "=" * 78)
+    print("SELFTEST %s   (%d failures)" % ("PASSED" if R.fail == 0 else "FAILED",
+                                           R.fail))
+    print("=" * 78)
+    return 0 if R.fail == 0 else 1
+
+
+# =============================================================================
+# SCORE
+# =============================================================================
+def score(runsdir, probedir, probejson):
+    R = Report()
+    print("=" * 78)
+    print("cfr1 -- RELEASE THE FLOOR ON MASTER-TABLE ROW 24.")
+    print("        registered scorer, run unedited (RULES 16 and 21).")
+    print("  runs    %s" % runsdir)
+    print("  probes  %s" % (probejson or probedir))
+    print("=" * 78)
+
+    recs = collect(runsdir)
+    print("\n-- G0 PROVENANCE ------------------------------------------------")
+    R.ok("%d cfr1 .out files" % N_RUNS, len(recs) == N_RUNS, "%d found" % len(recs))
+    bad = [r for r in recs if r.get("bad")]
+    R.ok("every .out has an ARGS line", not bad,
+         ", ".join(r["base"] for r in bad) if bad else "")
+    good = [r for r in recs if not r.get("bad")]
+    dups = [r["base"] for r in good if r["dup"]]
+    R.ok("no repeated flag on any ARGS line (RULE 20)", not dups, ", ".join(dups))
+    jids = set(r["job_id"] for r in good if r["job_id"])
+    R.ok("%d distinct job ids" % N_RUNS, len(jids) == N_RUNS, "%d" % len(jids))
+    mism = [r["base"] for r in good
+            if r["meas_arm"] != r["name_arm"] or r["meas_box"] != r["name_box"]
+            or r["seed"] != r["name_seed"]]
+    R.ok("run NAME agrees with its own ARGS and ENV", not mism, ", ".join(mism))
+    wrongcfg = []
+    for r in good:
+        a = r["args"]
+        for k, want in (("dataset", DSET), ("NN-name", NET),
+                        ("alg-base", BASE_ALG), ("alg-meta", META_ALG),
+                        ("gamma", GAMMA)):
+            if a.get(k) != want:
+                wrongcfg.append("%s %s=%s" % (r["base"], k, a.get(k)))
+        for k, want in (("meta-stepsize", MS), ("alpha0", ALPHA0),
+                        ("num-epochs", str(EPOCHS)), ("batch-size", str(BATCH)),
+                        ("weight-decay-meta", "0")):
+            if norm_num(a.get(k)) != norm_num(want):
+                wrongcfg.append("%s %s=%s" % (r["base"], k, a.get(k)))
+        if r["env"].get("AUGMENT") != AUG:
+            wrongcfg.append("%s AUGMENT=%s" % (r["base"], r["env"].get("AUGMENT")))
+        if r["env"].get("PROBE") != str(PROBE_EVERY):
+            wrongcfg.append("%s PROBE=%s" % (r["base"], r["env"].get("PROBE")))
+        if (r["env"].get("HIER") or "none") != "none":
+            wrongcfg.append("%s HIER=%s" % (r["base"], r["env"].get("HIER")))
+        if (r["env"].get("SCHED") or "none") != "none":
+            wrongcfg.append("%s SCHED=%s" % (r["base"], r["env"].get("SCHED")))
+    R.ok("every run's own ARGS/ENV matches the registered cell", not wrongcfg,
+         "; ".join(wrongcfg[:4]))
+    got = collections.Counter((r["meas_arm"], r["meas_box"]) for r in good)
+    R.ok("all four cells have 3 seeds",
+         all(got.get(c) == len(SEEDS) for c in CELLS), str(dict(got)))
+    if R.fail:
+        print("\nVOID -- G0 failed.  No number below may be reported.")
+        return 2
+
+    print("\n-- R1 MANIPULATION CHECK ----------------------------------------")
+    print("       coordinate denominator, FULL trajectory, PROBE=%d."
+          % PROBE_EVERY)
+    pr = probes_from_json(probejson) if probejson else probes_from_dir(probedir)
+    if pr is None:
+        print("  [FAIL] no probe trace could be read from %s"
+              % (probejson or probedir))
+        print("\nUNRESOLVED-MANIPULATION-UNCHECKED -- the scorer fails closed.")
+        return 3
+    R.ok("a probe trace for every run", len(pr) >= N_RUNS
+         or all(r["run"] in pr for r in good), "%d traces" % len(pr))
+    manip_fail, frozen = [], []
+    wall_lay_C = 0
+    ceil_lay_C = 0
+    print("       %-18s %-3s %-4s %9s %9s %7s %7s %7s %6s"
+          % ("run", "box", "arm", "min beta", "max beta", "n_lo", "n_hi",
+             "lo_rate", "recs"))
+    for r in sorted(good, key=lambda x: (x["meas_box"], x["meas_arm"], x["seed"])):
+        s = pr.get(r["run"])
+        if not s:
+            manip_fail.append("%s: no probe" % r["run"])
+            continue
+        print("       %-18s %-3s %-4s %9.4f %9.4f %7d %7d %7.4f %6d"
+              % (r["run"], r["meas_box"], r["meas_arm"], s["bmin"], s["bmax"],
+                 s["n_at_lo_max"], s["n_at_hi_max"], s["lo_rate"], s["n"]))
+        if s["n"] < MIN_RECORDS:
+            manip_fail.append("%s: only %d probe records" % (r["run"], s["n"]))
+        want_coords = ARM_COORDS[r["meas_arm"]]
+        if s["n_beta"] is not None and s["n_beta"] != want_coords:
+            manip_fail.append("%s: n_beta = %s, registered %d -- the reading is "
+                              "not at the coordinate denominator"
+                              % (r["run"], s["n_beta"], want_coords))
+        fl = floor_of(r["meas_box"])
+        if r["meas_box"] == "R":
+            if reached(s["bmin"], fl):
+                manip_fail.append("%s: beta reached %.4f, within %.4f of the "
+                                  "RELEASED floor %.1f"
+                                  % (r["run"], s["bmin"], STEP_BOUND, fl))
+            if s["n_at_lo_max"] > 0:
+                manip_fail.append("%s: n_at_lo = %d at the released floor"
+                                  % (r["run"], s["n_at_lo_max"]))
+            if s["last_max"] <= FROZEN_BETA:
+                frozen.append(r["run"])
+        else:
+            if r["meas_arm"] == "lay" and reached(s["bmin"], fl):
+                wall_lay_C += 1
+            if r["meas_arm"] == "lay" and s["n_at_hi_max"] > 0:
+                ceil_lay_C += 1
+    R.ok("no RELEASED run came within %.4f nats of -80" % STEP_BOUND,
+         not manip_fail, "; ".join(manip_fail[:3]))
+    if manip_fail:
+        print("\nUNRESOLVED-MANIPULATION -- the manipulation did not happen as "
+              "registered.\nThis batch is NOT evidence about row 24, and no "
+              "verdict may be reported.")
+        return 3
+
+    print("\n-- R2 TRAINING FAILURE ------------------------------------------")
+    dead = []
+    for r in good:
+        if r["n_ep"] < EPOCHS:
+            dead.append("%s: %d/%d epochs" % (r["base"], r["n_ep"], EPOCHS))
+        elif r["p5"] is None or r["p5"] != r["p5"]:
+            dead.append("%s: no plateau5" % r["base"])
+        elif r["p5"] <= DEAD_BAR:
+            dead.append("%s: plateau5 %.4f <= %.2f" % (r["base"], r["p5"], DEAD_BAR))
+    R.ok("no run failed to train", not dead, "; ".join(dead[:3]))
+    if dead:
+        print("\nUNRESOLVED-DIVERGED -- at least one run did not train.  This is "
+              "a REGISTERED\noutcome and is NOT scored as 'the tolerance "
+              "collapsed'.")
+        return 4
+    if frozen:
+        print("       FROZEN (terminal beta_true_max <= %.1f, every coordinate "
+              "below alpha = %.1e): %s"
+              % (FROZEN_BETA, math.exp(FROZEN_BETA), ", ".join(sorted(frozen))))
+
+    cell = collections.defaultdict(list)
+    tcell = collections.defaultdict(list)
+    for r in good:
+        cell[(r["meas_arm"], r["meas_box"])].append(r["p5"])
+        if r["t5"] is not None:
+            tcell[(r["meas_arm"], r["meas_box"])].append(r["t5"])
+
+    print("\n-- THE ARMS (plateau5 PRIMARY; train5 reported alongside) --------")
+    print("       %-4s %-10s %-9s %10s %8s %10s %8s"
+          % ("arm", "spec", "box", "plateau5", "sd", "train5", "sd"))
+    for c in CELLS:
+        v, t = cell[c], tcell[c]
+        print("       %-4s %-10s %-9s %10.4f %8.4f %10s %8s"
+              % (c[0], ARM_SPEC[c[0]], "CLAMPED" if c[1] == "C" else "RELEASED",
+                 statistics.mean(v), statistics.stdev(v) if len(v) > 1 else 0.0,
+                 "%10.4f" % statistics.mean(t) if t else "        --",
+                 "%8.4f" % (statistics.stdev(t) if len(t) > 1 else 0.0)
+                 if t else "      --"))
+
+    print("\n-- R3 NOISE BLOW-UP ---------------------------------------------")
+    noisy = ["%s-%s sd %.4f" % (c[0], c[1], statistics.stdev(cell[c]))
+             for c in CELLS if statistics.stdev(cell[c]) > NOISY_BAR]
+    R.ok("no cell's SD exceeds 3 sigma_w = %.4f pp" % NOISY_BAR, not noisy,
+         "; ".join(noisy))
+    if noisy:
+        print("\nUNRESOLVED-NOISY -- the registered noise floor does not "
+              "transfer to this batch,\nso the bars do not apply.")
+        return 5
+
+    gc = statistics.mean(cell[("lay", "C")]) - statistics.mean(cell[("sc", "C")])
+    gr = statistics.mean(cell[("lay", "R")]) - statistics.mean(cell[("sc", "R")])
+    did = gr - gc
+    tgc = (statistics.mean(tcell[("lay", "C")]) - statistics.mean(tcell[("sc", "C")])
+           if tcell[("lay", "C")] and tcell[("sc", "C")] else None)
+    tgr = (statistics.mean(tcell[("lay", "R")]) - statistics.mean(tcell[("sc", "R")])
+           if tcell[("lay", "R")] and tcell[("sc", "R")] else None)
+    ctl = statistics.mean(cell[("sc", "R")]) - statistics.mean(cell[("sc", "C")])
+    lmv = statistics.mean(cell[("lay", "R")]) - statistics.mean(cell[("lay", "C")])
+
+    print("\n-- THE CONTRASTS ------------------------------------------------")
+    print("       G_C  (lay - sc, CLAMPED )   %9.4f pp  %7.2f SE_GAP  train %s"
+          % (gc, gc / SE_GAP, fmt(tgc)))
+    print("       G_R  (lay - sc, RELEASED)   %9.4f pp  %7.2f SE_GAP  train %s"
+          % (gr, gr / SE_GAP, fmt(tgr)))
+    print("       DID  (G_R - G_C)            %9.4f pp  %7.2f SE_DID"
+          % (did, did / SE_DID))
+    print("       corpus clamped gap, ms 1e-3 %9.4f pp  (DESCRIPTIVE, "
+          "cross-batch, never spliced)" % CORPUS_GAP)
+
+    print("\n-- DISCLOSED DIAGNOSTICS (pre-specified, non-gating) -------------")
+    print("       NEGATIVE CONTROL  scalar R - scalar C  %+9.4f pp   bar "
+          "+/-%.4f  %s" % (ctl, CONTROL_BAR,
+                           "moved" if abs(ctl) > CONTROL_BAR else "unmoved"))
+    print("       layerwise R - layerwise C              %+9.4f pp" % lmv)
+    print("       CLAMPED layerwise runs that reached the -15 floor: %d of %d"
+          % (wall_lay_C, len(SEEDS)))
+    if ceil_lay_C == 0:
+        print("       CEILING SCOPE: no CLAMPED layerwise run put a coordinate "
+              "on the -2.3026\n         ceiling at any record, so the FLOOR is "
+              "the only wall at this cell and\n         a one-factor floor "
+              "release is a COMPLETE box audit here.")
+    else:
+        print("       CEILING SCOPE: %d of %d CLAMPED layerwise runs reached the "
+              "CEILING.  The\n         ceiling is held in both boxes, so this "
+              "verdict is SCOPED TO THE FLOOR;\n         the ceiling remains an "
+              "untested wall and is the next experiment."
+              % (ceil_lay_C, len(SEEDS)))
+
+    print("\n-- R4 PREMISE, THEN THE VERDICT ---------------------------------")
+    v, why = verdict(gc, gr, wall_lay_C)
+    if v == "ROW24-WALL-DRIVEN" and len(frozen) >= len(SEEDS):
+        v = "COLLAPSED-BY-FREEZING"
+        why += ("; and at least one released CELL is FROZEN, so the gap moved "
+                "because releasing the floor drove every coordinate's stepsize "
+                "to zero -- a statement about the floor AS A FLOOR, not about "
+                "tolerance, and it must be written that way")
+    print("       VERDICT  %s" % v)
+    print("       %s" % why)
+    print("\n       OUT OF SCOPE by registration: any other meta-stepsize, "
+          "alpha0, dataset,\n       architecture, optimiser pair, granularity "
+          "or box; the CEILING as a wall\n       beyond the diagnostic above; "
+          "any splice with rs-, ms-, mx-, tc1, ub9 or\n       any other batch; "
+          "and row 24's FITTED pp/decade slope, which is a multi-rung\n       "
+          "object this batch does not measure.")
+    print("=" * 78)
+    return 0
+
+
+def dump_probe(probedir, out):
+    pr = probes_from_dir(probedir)
+    if pr is None:
+        print("could not read any probe under %s" % probedir)
+        return 1
+    with open(out, "w") as fh:
+        json.dump(pr, fh, indent=1, sort_keys=True)
+    print("wrote %d probe summaries to %s" % (len(pr), out))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--probes", default="/cluster/account_b/metaopt/runs/cfr1")
+    ap.add_argument("--probe-json", default=None,
+                    help="read probe summaries from a JSON written by --dump-probe")
+    ap.add_argument("--dump-probe", default=None,
+                    help="write the probe summaries to this JSON and exit")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if a.dump_probe:
+        return dump_probe(a.probes, a.dump_probe)
+    return score(a.runs, a.probes, a.probe_json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

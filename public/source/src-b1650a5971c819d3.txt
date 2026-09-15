@@ -1,0 +1,96 @@
+"""Patch B: instrumentation probe for HF.py.
+
+Records, per step-size group b:
+  - beta_b (log step size)            -> H3 runaway test
+  - running mean/std of the meta-gradient z_b -> H1: SNR = |mean|/std ~ sqrt(n_b)
+  - n_b (group size)                  -> the x-axis of the H1 regression
+
+INERTNESS: pure accumulation inside the existing `torch.no_grad()` block, after
+meta_update. It never mutates z, beta, or any optimizer state. Disabled unless
+the PROBE env var is set, so default behaviour is byte-identical.
+"""
+import sys
+
+P = "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py"
+src = open(P).read()
+orig = src
+if "PATCH_PROBE" in src:
+    print("ALREADY_PATCHED"); sys.exit(0)
+
+anchor = "            self.meta_update(HtT_gradft)"
+assert src.count(anchor) == 1, f"anchor count={src.count(anchor)}"
+src = src.replace(anchor, anchor + "\n            self._probe(HtT_gradft)  # PATCH_PROBE", 1)
+
+# append probe methods to the class (before the first module-level update section marker)
+tail_anchor = "###################################################\n###################################################\n    # Updates"
+assert src.count(tail_anchor) == 1, f"tail anchor count={src.count(tail_anchor)}"
+
+probe_code = '''
+    # ----------------------------------------------------------- PATCH_PROBE
+    def _probe_init(self):
+        import os
+        self._probe_every = int(os.environ.get('PROBE', '0'))
+        self._probe_dir = os.environ.get('PROBE_DIR', '')
+        self._z_n = 0
+        self._z_sum = None
+        self._z_sqsum = None
+        if self._probe_every and self._probe_dir:
+            os.makedirs(self._probe_dir, exist_ok=True)
+            # group sizes n_b: the x-axis of the H1 SNR regression
+            if self.stepsize_type == 'layerwise':
+                nb = self.param_numels
+            elif self.stepsize_type == 'scalar':
+                nb = [sum(self.param_numels)]
+            elif self.stepsize_type == 'blockwise':
+                nb = [sum(self.param_numels[i] for i in gi) for gi in self.param_groups_indices]
+            else:
+                nb = self.param_numels
+            with open(os.path.join(self._probe_dir, 'block_sizes.json'), 'w') as fh:
+                import json; json.dump({'stepsize_type': self.stepsize_type, 'n_b': nb}, fh)
+
+    def _probe(self, z):
+        if not hasattr(self, '_probe_every'):
+            self._probe_init()
+        if not self._probe_every:
+            return
+        # flatten z to one vector of per-group scalars (weightwise/nodewise: per-tensor means)
+        if self.stepsize_type in ('scalar', 'layerwise', 'blockwise'):
+            zv = z[0].detach().reshape(-1).float()
+        else:
+            zv = torch.stack([zi.detach().float().mean() for zi in z])
+        if self._z_sum is None:
+            self._z_sum = torch.zeros_like(zv)
+            self._z_sqsum = torch.zeros_like(zv)
+        self._z_sum += zv
+        self._z_sqsum += zv * zv
+        self._z_n += 1
+        if self.counter % self._probe_every:
+            return
+        import json, os
+        mean = self._z_sum / max(self._z_n, 1)
+        var = (self._z_sqsum / max(self._z_n, 1)) - mean * mean
+        std = var.clamp_min(0).sqrt()
+        snr = (mean.abs() / (std + 1e-12))
+        if self.stepsize_type in ('scalar', 'layerwise', 'blockwise'):
+            bv = self.beta[0].detach().reshape(-1).float()
+        else:
+            bv = torch.stack([b.detach().float().mean() for b in self.beta])
+        rec = {'step': int(self.counter),
+               'beta': bv.cpu().tolist(),
+               'z_mean': mean.cpu().tolist(),
+               'z_std': std.cpu().tolist(),
+               'snr': snr.cpu().tolist()}
+        with open(os.path.join(self._probe_dir, 'probe.jsonl'), 'a') as fh:
+            fh.write(json.dumps(rec) + chr(10))
+        if self.writer is not None:
+            self.writer.add_scalar('Probe/beta_mean', bv.mean().item(), self.counter)
+            self.writer.add_scalar('Probe/beta_max', bv.max().item(), self.counter)
+            self.writer.add_scalar('Probe/beta_min', bv.min().item(), self.counter)
+            self.writer.add_scalar('Probe/snr_median', snr.median().item(), self.counter)
+
+'''
+src = src.replace(tail_anchor, probe_code + tail_anchor, 1)
+
+open(P + ".bak_probe", "w").write(orig)
+open(P, "w").write(src)
+print("PATCH_B_OK (backup HF.py.bak_probe); +%d lines" % (src.count("\n") - orig.count("\n")))

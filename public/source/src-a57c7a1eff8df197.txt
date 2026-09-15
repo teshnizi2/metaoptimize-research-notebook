@@ -1,0 +1,135 @@
+#!/bin/bash
+# =============================================================================
+# c90_awbase.sh -- `r50`, DOES THE PARTITION RESULT SURVIVE A DIFFERENT BASE
+# OPTIMISER?  ONE variable changes: SGDm -> AdamW.  Everything else is
+# byte-identical to `cc1` (the batch that produced D=+0.727 and G=+0.011).
+#
+# WHY.  Re-derived at write time: every count-matched partition row in the
+# corpus is SGDm.  112/112.  Zero under any other base.  That is the single
+# largest external-validity hole and the referee objection ranked MAJOR.
+#
+# THE CONTRASTS, both WITHIN this batch:
+#   D = chunk777  - nodewise     count-matched, m 14,421 vs 14,420  (+1 group)
+#   G = chunk2325 - nodewise1d   count-matched EXACTLY, m 4,851
+#   D - G is the mechanism contrast and carries no cross-batch floor.
+#
+# PRE-REGISTERED, and it can come out either way:
+#   D >= +0.30 with t >= 2      -> TRANSFERS.  The partition result is not an
+#                                  SGDm artefact and the paper may say so.
+#   D in [-0.15, +0.15]         -> DOES NOT TRANSFER at this cell.  That is a
+#                                  scope limit, reported as one, NOT buried.
+#   anything else               -> UNDECIDED at this n.
+#   G is expected NULL as on SGDm; a RESOLVED non-null G would say the tail
+#   story is base-dependent and must be re-scoped.
+#
+# MAY NOT CLAIM: any pooling with cc1 (different base); RULE 11 (no AdamW
+# ladder exists); anything about ResNet34 or CIFAR-100.
+#
+# USAGE   bash bin/c90_awbase.sh            # dry run
+#         bash bin/c90_awbase.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/r50
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP="-15:-2.3026"; MST=1e-4; ALPHA0=1e-3; EPOCHS=100; BATCH=100
+NET=ResNet50; DSET=CIFAR10; GAMMA=1; AUG=1
+SEEDS="0 1 2"
+PARTS=gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=07:00:00   # R50 is ~2.8x R18 per epoch
+
+echo "=============================================================="
+echo " r50 -- cc1's four arms under an AdamW base.  ONE variable changes."
+echo " box $CLIP  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  4 arms x 3 seeds = 12 jobs"
+echo "=============================================================="
+
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+grep -q PATCH_CHUNKWISE "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && grep -q PATCH_NODEBN "$CIF/Optimizers/HF.py" 2>/dev/null \
+  && echo "guard 1: PATCH_CHUNKWISE and PATCH_NODEBN present" \
+  || guard_fail "guard 1: chunk/nodebn patches missing -- this batch cannot run here"
+
+# guard 2 -- THE PREMISE.  Confirm the base-optimiser hole is real, from the CSV.
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2: premise"
+import csv, sys, collections
+rows=[r for r in csv.DictReader(open(sys.argv[1]))
+      if r["granularity"].startswith("chunk") or r["granularity"]=="nodewise1d"]
+c=collections.Counter(r["base"] for r in rows)
+print("guard 2: %d count-matched partition rows in the corpus, by base: %s" % (len(rows), dict(c)))
+assert len(c)==1 and "SGDm" in c, "the hole has already been filled; re-check whether r50 is still needed"
+print("guard 2: the AdamW hole is REAL -- 0 rows under any base but SGDm")
+PYEOF
+
+# guard 3 -- beta allocation MEASURED on the live tree, AdamW args
+python3 - "$CIF" "$NET" "$ALPHA0" "$MST" <<'PYEOF' || guard_fail "guard 3: beta allocation"
+import sys, os
+cif, net, a0, mst = sys.argv[1:5]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s) -- run on the cluster inside the venv." % ex)
+class NW:
+    def add_scalar(self, *a, **k): pass
+# AdamW base needs normalizer_param/momentum_param/weight_decay; Lion meta needs
+# meta_stepsize/momentum_param/Lion_beta2/weight_decay.
+B = {"alg": "SGDm", "momentum_param": 0.99, "weight_decay": 0.1}
+M = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+     "Lion_beta2": 0.9, "weight_decay": 0}
+want = {"nodewise": 79700, "chunk295": 79796, "nodewise1d": 26677, "chunk884": 26715}
+for g, w in want.items():
+    torch.manual_seed(0)
+    opt = HF(build_network(net, "cpu"), stepsize_groups=g, alpha0=float(a0),
+             args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+    m = sum(int(b.numel()) for b in opt.beta)
+    assert m == w, "m(%s) is %d, expected %d" % (g, m, w)
+    print("guard 3: %-12s ALLOCATED beta m=%-6d (registered %d)" % (g, m, w))
+print("guard 3: D pair is 1 group apart; G pair is EXACT")
+PYEOF
+
+grep -q '^r50-' "$CSVP" && guard_fail "guard 4: r50-* already in the CSV" || echo "guard 4: no r50-* name collision"
+
+NCC=$(grep -c '^cc1-' "$CSVP" 2>/dev/null)
+echo "guard 5: $NCC cc1 rows on disk as the SGDm comparator"
+[ "${NCC:-0}" -ge 9 ] || guard_fail "guard 5: cc1 comparator missing"
+
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: ${FREE:-?} GB free; pending=$PEND, adding 12"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 6: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+mkdir -p "$SAVE"; N=0; REJ=0
+for S in $SEEDS; do
+  for G in nodewise chunk295 nodewise1d chunk884; do
+    case $G in nodewise) SH=node ;; chunk295) SH=ch ;; nodewise1d) SH=n1d ;; chunk884) SH=c88 ;; esac
+    CMD="sbatch --job-name=r50-$SH-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=20G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$SAVE/probe_${SH}_r50_s${S} \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name r50-$SH-s$S"
+    if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else echo "$CMD"; N=$((N+1)); fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+echo "---- ONE variable changes vs cc1: base SGDm -> AdamW.  D and G are both WITHIN this batch. ----"

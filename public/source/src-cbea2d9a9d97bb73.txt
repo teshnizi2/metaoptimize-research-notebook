@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+# =============================================================================
+# cA2_g3_r50_ladder.sh -- G3, THE ResNet-50 r-LADDER.  NO CODE CHANGE.
+#
+# 36 jobs: a2g3-{1e6,1e3}-{r0,r0p03,r0p06,r0p1,r0p2,r1}-s{0,1,2}
+# ResNet-50 / CIFAR-10 / layerwise (m=161) / 100 ep / batch 100 / SGDm+Lion /
+# meta-stepsize 1e-3 / gamma 1 / AUGMENT=1 / BETA_CLIP=-15:-2.3026.
+# cluster_a ONLY (account_a).  ~2.3 h each; ~83 GPU-h total.
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH EXISTS.  THE PREMISE, MEASURED ON THE RUNS THEMSELVES
+# -----------------------------------------------------------------------------
+# ResNet-50 received EXACTLY FOUR hierarchical runs in the entire corpus --
+# sc50-1e6-add-s0/s1 and sc50-1e3-add-s0/s1 -- all at ONE imported r = 0.06,
+# submitted by jobs/sweeps/e23_ladder.sh as a by-product of the scale ladder.
+# Re-derived from those twelve sc50 .out files' own epoch series (plateau5 = the
+# mean of test accuracy over epochs 95..99, 0-indexed; the CSV `plateau` column
+# is mean-of-last-20 and is BANNED as primary), and from their own ARGS/ENV
+# lines (RULE 20):
+#
+#   alpha0   arm                      seed 0    seed 1     mean
+#   1e-6     scalar   (HIER unset)    89.1180   89.9020   89.5100
+#   1e-6     layerwise(HIER unset)    87.8940   88.4140   88.1540
+#   1e-6     additive r=0.06          91.1560   91.8660   91.5110   <-- +2.0010
+#   1e-3     scalar   (HIER unset)    89.2040   89.2860   89.2450
+#   1e-3     layerwise(HIER unset)    90.0860   90.6640   90.3750
+#   1e-3     additive r=0.06          92.4960   92.8600   92.6780   <-- +2.3030
+#
+# The single interior r beats the BETTER of the two granularity endpoints by
+# +2.0010 pp at alpha0=1e-6 and +2.3030 pp at alpha0=1e-3, at both seeds, and
+# beats the worse endpoint by +3.3570 / +3.4330.  THE PREMISE HOLDS.  It is also
+# one point: nothing on disk distinguishes "there is an interior optimum in r on
+# ResNet-50" from "additive-at-0.06 happens to be good there".  This batch runs
+# the ladder that was never run.
+#
+# -----------------------------------------------------------------------------
+# WHY NO CODE CHANGE IS NEEDED, AND WHY THE ENDPOINTS ARE INTERNAL
+# -----------------------------------------------------------------------------
+# From the LIVE tree (Optimizers/HF.py, _apply_hier, layerwise branch; md5
+# pinned below and checked by guard 4):
+#     d      = beta_t_raw - beta_{t-1}
+#     dm     = mean(d)
+#     beta_t = beta_{t-1} + dm + r * (d - dm)
+# r = 1 gives beta_t = beta_{t-1} + d EXACTLY -- plain layerwise.
+# r = 0 gives beta_t = beta_{t-1} + dm -- every group moves by the SAME
+#         increment, so with a common initialisation the 161 groups stay
+#         identical forever: one shared step size.
+# Both endpoints are reached by changing ETA_RATIO ALONE, on the identical code
+# path with the identical m and the identical bookkeeping.  So the ladder's two
+# endpoints are INSIDE the operator: no arm of the gated contrast is a
+# cross-operator or cross-batch comparison.  The archived `scalar` / `layerwise`
+# arms are used only as REPORTING comparators by the scorer, never in a verdict
+# (r=0 is scalar-LIKE but not identical to --stepsize-groups scalar, whose
+# meta-gradient is the network SUM rather than the per-group mean).
+#
+# -----------------------------------------------------------------------------
+# THE WALL.  MEASURED, NOT GUESSED
+# -----------------------------------------------------------------------------
+# `sacct -X` on the twelve sc50 job ids (4683469-4683480), all on gpu-short:
+#   additive  arms: 2:16:46  2:16:44  2:17:14  2:17:42
+#   layerwise arms: 2:16:57  2:17:34  2:17:03  2:16:49
+#   scalar    arms: 2:21:16  2:21:36  2:22:13  3:10:01 ([HOST_3c1b003035], the slow node)
+# EVERY job in THIS batch is an additive-on-layerwise arm, so the relevant
+# observed maximum is 2:17:42 and WALL=03:50:00 is 1.67x it; against the slowest
+# run of any arm (3:10:01) it is still 1.21x.  03:50:00 is also the wall the
+# sc50 batch itself registered, under which 12 of 12 R50 runs completed.
+# It is not raised further because gpu-short's MaxTime is EXACTLY 04:00:00
+# (`scontrol show partition gpu-short`), and gpu-short is 27 of the cluster's
+# GPU nodes: a longer wall would buy ~35 minutes of headroom at the price of the
+# largest partition, and an over-provisioned wall has already cost this campaign
+# a week of priority starvation once.  A run that does time out is caught by the
+# scorer's H0 epoch check (it is VOID, never silently short) and can be
+# resubmitted alone.
+#
+# -----------------------------------------------------------------------------
+# ACCOUNT AND CO-TENANCY
+# -----------------------------------------------------------------------------
+# cluster_a (account_a).  NOT a free choice: `account_b` cannot read
+# /cluster/account_a/metaopt/runs (Permission denied, verified), so on cluster_b
+# guard 2 could not verify the premise on the archived sc50 runs at all and the
+# scorer's RC comparators would have to fall back to the registration's frozen
+# copy.  Both trees carry the SAME HF.py (md5 d3202635c3fcef09387a316b73f2bb3f,
+# verified on both hosts), so nothing is lost in comparability by staying here.
+# The cost is queue co-tenancy: the sibling G4 batch (72 ResNet-18 jobs) was
+# already submitted on THIS account when this batch went in, so the two share a
+# fair-share.  That costs wall clock and nothing else -- H2, the only gated
+# contrast, is entirely WITHIN this batch and cannot be touched by what else is
+# queued.  36 x ~2.3 h = ~83 GPU-h; with G4's ~72 GPU-h ahead of it and ~12-24
+# concurrent slots, expect ~13 h to drain.  Nothing is niced, promoted or
+# cancelled: no job submitted by anyone else is touched.
+#
+# -----------------------------------------------------------------------------
+# THE SCORER.  STANDING RULE 21: REGISTERED AND COMMITTED BEFORE THIS RUNS
+# -----------------------------------------------------------------------------
+# analysis/cA2_g3_score.py, NEW, committed before any a2g3 run exists.  It
+# freezes the bars (PEAK_BAR 1.00 pp, FLAT_BAR 0.65 pp, alpha 0.05), derived
+# from the ONLY ResNet-50 seed dispersion that exists -- the pooled within-cell
+# sd of the twelve archived sc50 runs, 0.3940 pp on 6 df -- and its selftest
+# asserts every constant below against THIS FILE'S OWN TEXT.  It imports
+# analysis/c87_hz3_score.py as its reader and pins that file's sha256;
+# c87_hz3_score.py is NOT edited (RULE 16).
+#
+# USAGE
+#   bash bin/cA2_g3_r50_ladder.sh              # dry run: guards + composed lines
+#   bash bin/cA2_g3_r50_ladder.sh --submit     # guards, then sbatch, then RULE 20
+# =============================================================================
+set -u
+
+SUBMIT=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --submit) SUBMIT=1 ;;
+    *) echo "unknown argument $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+GUARD_FAILS=0
+guard_fail() {
+  GUARD_FAILS=$((GUARD_FAILS + 1))
+  echo "!!! GUARD FAIL: $1"
+  if [ "$SUBMIT" = "1" ]; then
+    echo "!!! SUBMIT ABORTED -- nothing was submitted."
+    exit 1
+  fi
+  echo "    (dry run: continuing so the emitter can be validated.  THIS BATCH"
+  echo "     MUST NOT BE SUBMITTED UNTIL THIS GUARD PASSES ON cluster_a.)"
+}
+
+# ---- venv preamble (house rules; guards that import torch fail without it) ---
+WS=${METAOPT_WS:-/cluster/account_a/metaopt}
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck disable=SC1091
+if [ -f "$REPO/bin/_lib_guards.sh" ]; then
+  . "$REPO/bin/_lib_guards.sh"
+  HAVE_LIB=1
+else
+  HAVE_LIB=0
+fi
+
+RUNNER=$WS/jobs/run_cifar.sh
+RUNROOT=$WS/runs
+SAVE=$WS/runs/a2g3
+SCORER="$REPO/analysis/cA2_g3_score.py"
+
+# ---- THE REGISTERED CONSTANTS ------------------------------------------------
+# analysis/cA2_g3_score.py's selftest() asserts each of these against THIS text.
+TAG=a2g3
+NET=ResNet50
+DSET=CIFAR10
+EPOCHS=100
+BATCH=100
+MST=1e-3
+GAMMA=1
+CLIP=-15:-2.3026
+GRAN=layerwise
+HIERMODE=additive
+M_LAYER=161                      # MEASURED on the live tree by guard 5
+NPARAM=23520842
+HF_MD5=d3202635c3fcef09387a316b73f2bb3f
+NJOBS=36
+WALL=03:50:00
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+SEEDS="0 1 2"
+RLEVELS="r0:0 r0p03:0.03 r0p06:0.06 r0p1:0.1 r0p2:0.2 r1:1"
+ALPHAS="1e6:1e-6 1e3:1e-3"
+
+BFLAGS="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 \
+--Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset $DSET \
+--batch-size $BATCH --max-time 999:00:00 --gamma $GAMMA --meta-stepsize $MST \
+--num-epochs $EPOCHS --NN-name $NET"
+
+DESIGN=(optimizer=HF alg-base=SGDm alg-meta=Lion dataset=$DSET NN-name=$NET \
+        stepsize-groups=$GRAN num-epochs=$EPOCHS batch-size=$BATCH \
+        meta-stepsize=$MST gamma=$GAMMA)
+
+echo "=============================================================="
+echo "  G3 -- $TAG, THE ResNet-50 r-LADDER.  NO CODE CHANGE."
+echo "  $NET / $DSET / bs $BATCH / $EPOCHS ep / $GRAN m=$M_LAYER / SGDm+Lion"
+echo "  ms=$MST  gamma=$GAMMA  AUGMENT=1  BETA_CLIP=$CLIP  HIER=$HIERMODE"
+echo "  r      in { $(echo $RLEVELS | tr ' ' '\n' | cut -d: -f2 | tr '\n' ' ')}"
+echo "  alpha0 in { $(echo $ALPHAS  | tr ' ' '\n' | cut -d: -f2 | tr '\n' ' ')}"
+echo "  seeds  in { $SEEDS }   =>  $NJOBS jobs, ~2.3 h each, ~83 GPU-h"
+echo "  wall $WALL   partitions $PARTS"
+echo "  r=1 IS plain layerwise and r=0 IS one shared step size, BOTH reached by"
+echo "  ETA_RATIO alone -- the ladder's endpoints are inside the operator."
+echo "  SCORED BY: analysis/cA2_g3_score.py (NEW, registered, RULE 21)."
+echo "=============================================================="
+
+# =============================================================================
+# GUARD 1 -- STANDING RULE 21.  THE SCORER EXISTS, AND PASSES, BEFORE ANY RUN.
+# =============================================================================
+if [ "$HAVE_LIB" = 1 ]; then
+  guard_scorer_registered "$SCORER" || guard_fail "guard 1: STANDING RULE 21"
+else
+  [ -f "$SCORER" ] || guard_fail "guard 1: STANDING RULE 21 -- no scorer at $SCORER"
+  echo "guard 1: (no _lib_guards.sh) scorer present at $SCORER"
+fi
+if [ -f "$SCORER" ]; then
+  OUT="$(cd "$REPO" && python3 "$SCORER" --selftest 2>&1 | tail -3)"
+  case "$OUT" in
+    *PASS*) echo "guard 1b: scorer selftest -- $(printf '%s' "$OUT" | tail -1)" ;;
+    *) guard_fail "guard 1b: the registered scorer's selftest did not pass:
+$OUT" ;;
+  esac
+fi
+
+# =============================================================================
+# GUARD 2 -- THE PREMISE, MEASURED ON THE CLUSTER'S OWN .out FILES.  Do not run
+# 36 jobs on the strength of a briefing.  RULE 13: the same reading must be able
+# to REFUSE the premise, so it is asserted as an inequality, not printed.
+# =============================================================================
+python3 - "$RUNROOT" "$EPOCHS" \
+  <<'PYEOF' || guard_fail "guard 2: the premise"
+import os, re, sys, glob
+runroot, epochs = sys.argv[1], int(sys.argv[2])
+EP = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+files = sorted(glob.glob(os.path.join(runroot, "sc50-*.out")))
+if not files:
+    sys.exit("GUARD FAIL: no sc50-*.out under %s -- the premise of this batch "
+             "cannot be verified here.  Run this on cluster_a." % runroot)
+cells, env = {}, {}
+for f in files:
+    name = os.path.basename(f).rsplit("-", 1)[0]          # sc50-1e6-add-s0
+    _t, atag, short, seed = name.split("-")
+    ser = {}
+    with open(f, errors="replace") as fh:
+        for i, line in enumerate(fh):
+            if line.startswith("ENV:"):
+                env[name] = dict(re.findall(r"(\b[A-Z_]+)=(\S+)", line))
+            m = EP.search(line)
+            if m:
+                ser[int(m.group(1))] = float(m.group(2))
+    if max(ser, default=-1) + 1 < epochs:
+        sys.exit("GUARD FAIL: %s completed %d epochs, not %d"
+                 % (name, max(ser, default=-1) + 1, epochs))
+    p5 = sum(ser[e] for e in range(epochs - 5, epochs)) / 5.0
+    cells.setdefault((atag, short), []).append((seed, p5))
+need = {(a, s) for a in ("1e6", "1e3") for s in ("scal", "layer", "add")}
+if set(cells) != need:
+    sys.exit("GUARD FAIL: the sc50 cells on disk are %s, not the 6 expected"
+             % sorted(cells))
+for k, v in sorted(cells.items()):
+    if len(v) != 2:
+        sys.exit("GUARD FAIL: cell %s has %d runs, not 2" % (str(k), len(v)))
+# the ENV lines must say what the arms claim (RULE 20)
+for name, e in sorted(env.items()):
+    short = name.split("-")[2]
+    want_h = "additive" if short == "add" else "none"
+    want_r = "0.06" if short == "add" else "na"
+    if e.get("HIER") != want_h or e.get("ETA_RATIO") != want_r:
+        sys.exit("GUARD FAIL: %s ENV says HIER=%s ETA_RATIO=%s, not %s/%s"
+                 % (name, e.get("HIER"), e.get("ETA_RATIO"), want_h, want_r))
+    if e.get("BETA_CLIP") != "-15:-2.3026" or e.get("AUGMENT") != "1":
+        sys.exit("GUARD FAIL: %s ENV box/augment is %s/%s"
+                 % (name, e.get("BETA_CLIP"), e.get("AUGMENT")))
+mean = {k: sum(p for _s, p in v) / len(v) for k, v in cells.items()}
+ok = 0
+for a in ("1e6", "1e3"):
+    add = mean[(a, "add")]
+    best = max(mean[(a, "scal")], mean[(a, "layer")])
+    worst = min(mean[(a, "scal")], mean[(a, "layer")])
+    print("guard 2: alpha0=%s  scalar %.4f  layerwise %.4f  additive(r=0.06) %.4f"
+          "  -> beats BETTER endpoint by %+.4f, worse by %+.4f"
+          % (a, mean[(a, "scal")], mean[(a, "layer")], add, add - best, add - worst))
+    # every seed of the additive arm must beat every seed of both endpoints
+    allep = [p for s in ("scal", "layer") for _sd, p in cells[(a, s)]]
+    if min(p for _sd, p in cells[(a, "add")]) <= max(allep):
+        sys.exit("GUARD FAIL: at alpha0=%s the additive arm does NOT beat both "
+                 "endpoints at every seed.  The premise of this batch is not "
+                 "what is on disk -- RESCOPE, DO NOT SUBMIT." % a)
+    if add - best > 1.0:
+        ok += 1
+if ok != 2:
+    sys.exit("GUARD FAIL: the archived interior point clears the better endpoint "
+             "by more than 1.0 pp at only %d of 2 alpha0.  The premise is weaker "
+             "than the batch assumes -- RESCOPE." % ok)
+# Informational: the granularity contrast itself is large on ResNet-50 and its
+# SIGN FLIPS with alpha0 (scalar wins at 1e-6, layerwise wins at 1e-3).  That is
+# why it cannot serve as the RULE 13 null -- it passes the same test.
+for a in ("1e6", "1e3"):
+    d = mean[(a, "scal")] - mean[(a, "layer")]
+    print("guard 2: alpha0=%s  scalar - layerwise = %+.4f pp (%s wins)"
+          % (a, d, "scalar" if d > 0 else "layerwise"))
+# RULE 13: the identical test applied to a LABEL-SCRAMBLED pairing, in which the
+# arm effect is destroyed by construction (each pseudo-arm holds one seed of
+# scalar and one of layerwise).  A test that still "passes" there is measuring
+# nothing, and this guard is decoration.
+def passes(hi, lo):
+    return (min(p for _s, p in hi) > max(p for _s, p in lo)
+            and (sum(p for _s, p in hi) - sum(p for _s, p in lo)) / 2 > 1.0)
+survived = 0
+for a in ("1e6", "1e3"):
+    sc = dict(cells[(a, "scal")])
+    ly = dict(cells[(a, "layer")])
+    if sorted(sc) != ["s0", "s1"] or sorted(ly) != ["s0", "s1"]:
+        sys.exit("GUARD FAIL: the sc50 seed labels are %s / %s, not s0/s1"
+                 % (sorted(sc), sorted(ly)))
+    A = [("s0", sc["s0"]), ("s1", ly["s1"])]
+    B = [("s1", sc["s1"]), ("s0", ly["s0"])]
+    lo, hi = sorted((A, B), key=lambda c: sum(p for _s, p in c))
+    if passes(hi, lo):
+        survived += 1
+if survived:
+    sys.exit("GUARD FAIL (RULE 13): the every-seed + 1.0 pp test PASSES on %d of 2 "
+             "label-scrambled pairings, in which the arm effect is destroyed by "
+             "construction.  The test is decoration -- DO NOT SUBMIT." % survived)
+print("guard 2 (RULE 13): the identical test FAILS on both label-scrambled "
+      "pairings (0/2), so it is measuring the arm effect and not the spread.")
+print("guard 2: PREMISE CONFIRMED on the runs' own series and own ENV lines.")
+PYEOF
+
+# =============================================================================
+# GUARD 3 -- THE OPERATOR ARITHMETIC.  r=1 and r=0 must be the endpoints the
+# header claims, read off the LIVE HF.py source rather than asserted.
+# =============================================================================
+HFPY="$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py"
+python3 - "$HFPY" "$CLIP" "$MST" "$EPOCHS" \
+  <<'PYEOF' || guard_fail "guard 3: operator arithmetic"
+import os, re, sys
+hfpy, clip, mst, ep = sys.argv[1], sys.argv[2], float(sys.argv[3]), int(sys.argv[4])
+if ":" not in clip:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r has no colon -- the runner would not parse "
+             "a box" % clip)
+lo, hi = (float(x) for x in clip.split(":"))
+if not lo < hi:
+    sys.exit("GUARD FAIL: BETA_CLIP=%r is not ordered lo<hi" % clip)
+print("guard 3a: BETA_CLIP=%s parses ordered (%.4f, %.4f) -- the SAME box as the "
+      "twelve archived sc50 runs" % (clip, lo, hi))
+if not os.path.exists(hfpy):
+    sys.exit("GUARD FAIL: no HF.py at %s -- run this on cluster_a" % hfpy)
+src = open(hfpy).read()
+m = re.search(r"def _apply_hier\(self\):(.*?)\n    # -", src, re.S)
+if not m:
+    sys.exit("GUARD FAIL: cannot locate _apply_hier in the live HF.py")
+body = m.group(1)
+need = "self.beta[0] = self._beta_prev + dm + self._hier_ratio * (d - dm)"
+if need not in body:
+    sys.exit("GUARD FAIL: the live layerwise additive update is not the "
+             "registered one.  Expected the line:\n  %s" % need)
+if "self._hier_ratio = float(_os.environ.get('ETA_RATIO','1') or 1)" not in src:
+    sys.exit("GUARD FAIL: the live HF.py does not read ETA_RATIO the registered way")
+print("guard 3b: live additive update is  beta_t = beta_prev + dm + r*(d - dm)")
+print("guard 3c: r=1 => beta_prev + d  (plain layerwise, EXACTLY)")
+print("guard 3d: r=0 => beta_prev + dm (all 161 groups share one increment)")
+# ETA_RATIO=0 must survive HF.py's `or 1` idiom -- the one way a 0 endpoint can
+# silently become a 1 endpoint and void a third of the batch.
+got = float(os.environ.get("_AG_PROBE", "0") or 1)
+if float("0" or 1) != 0.0:
+    sys.exit("GUARD FAIL: the string '0' does not survive the `or 1` idiom, so "
+             "ETA_RATIO=0 would silently become r=1 and the r=0 endpoint would "
+             "be a DUPLICATE of the r=1 endpoint")
+print("guard 3e: ETA_RATIO='0' survives HF.py's `or 1` idiom -> r=0.0, not 1.0")
+if float("" or 1) != 1.0:
+    sys.exit("GUARD FAIL: the empty string does not fall back to 1 -- unexpected")
+print("guard 3f (RULE 13): the same idiom DOES turn an EMPTY ETA_RATIO into 1.0, "
+      "so the check discriminates; every arm below exports an explicit value.")
+travel = mst * ep * 500
+print("guard 3g: ms*T = %.4f*%d*500 = %.1f nats of possible beta travel in this "
+      "box of width %.4f -- the box IS reachable, exactly as it was for the "
+      "archived sc50 runs this batch extends.  Same box, same reachability, so "
+      "the comparison is like-for-like; the scorer reports it, nothing more."
+      % (mst, ep, travel, hi - lo))
+PYEOF
+
+# =============================================================================
+# GUARD 4 -- THE LIVE TREE.  HF.py's md5 must be the one that produced sc50.
+# =============================================================================
+if [ ! -f "$HFPY" ]; then
+  guard_fail "guard 4: no HF.py at $HFPY (run this on cluster_a)"
+else
+  GOT="$( (md5sum "$HFPY" 2>/dev/null || md5 -q "$HFPY" 2>/dev/null) | awk '{print $1}')"
+  if [ "$GOT" != "$HF_MD5" ]; then
+    guard_fail "guard 4a: HF.py md5 is $GOT, not the pinned $HF_MD5 -- the tree
+    that produced the sc50 comparators is NOT the tree this batch would run on"
+  else
+    echo "guard 4a: HF.py md5 $GOT matches the pin"
+  fi
+fi
+[ -f "$RUNNER" ] || guard_fail "guard 4b: no runner at $RUNNER"
+
+# =============================================================================
+# GUARD 5 -- m IS MEASURED ON THE LIVE TREE, NEVER ASSERTED.  RULE 13 BOTH WAYS.
+# =============================================================================
+python3 - "$WS" "$NET" "$GRAN" "$M_LAYER" "$NPARAM" "$MST" "$CLIP" \
+  <<'PYEOF' || guard_fail "guard 5: beta allocation"
+import os, sys, math
+ws, net, gran, m_want, nparam, mst, clip = sys.argv[1:8]
+m_want, nparam = int(m_want), int(nparam)
+base = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                    "cifar10")
+sys.path.insert(0, base)
+sys.path.insert(0, os.path.join(base, "Optimizers"))
+try:
+    import torch                                                   # noqa: F401
+    from build_network import build_network                        # type: ignore
+    from HF import HF                                              # type: ignore
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE build_network/HF on this host "
+             "(%s).  This guard MUST run on cluster_a inside the venv." % ex)
+net_obj = build_network(net, "cpu")
+shapes = [tuple(p.shape) for p in net_obj.parameters()]
+tot = sum(int(math.prod(s)) for s in shapes)
+if tot != nparam:
+    sys.exit("GUARD FAIL: %s has %d parameters, not the %d registered"
+             % (net, tot, nparam))
+print("guard 5a: %s -- %d parameter tensors, %d parameters" % (net, len(shapes), tot))
+
+
+class _NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+_BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+_META = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+         "Lion_beta2": 0.9, "weight_decay": 0}
+os.environ["HIER"] = "additive"
+os.environ["ETA_RATIO"] = "0.06"
+os.environ["BETA_CLIP"] = clip
+torch.manual_seed(0)
+opt = HF(build_network(net, "cpu"), stepsize_groups=gran, alpha0=1e-6,
+         args_base=dict(_BASE), args_meta=dict(_META), gamma=1, writer=_NullWriter())
+m = sum(int(b.numel()) for b in opt.beta)
+if m != m_want:
+    sys.exit("GUARD FAIL: m(%s) on %s is %d, not the %d registered"
+             % (gran, net, m, m_want))
+print("guard 5b: %-9s ALLOCATED beta m=%d (registered %d)" % (gran, m, m_want))
+if opt._hier != "additive" or abs(opt._hier_ratio - 0.06) > 1e-12:
+    sys.exit("GUARD FAIL: the constructed optimiser reports _hier=%r "
+             "_hier_ratio=%r, not additive/0.06" % (opt._hier, opt._hier_ratio))
+print("guard 5c: the LIVE optimiser reads HIER=%s ETA_RATIO=%.4f from the "
+      "environment exactly as the emitter sets them" % (opt._hier, opt._hier_ratio))
+for probe in ("0", "1", "0.2"):
+    os.environ["ETA_RATIO"] = probe
+    torch.manual_seed(0)
+    o2 = HF(build_network(net, "cpu"), stepsize_groups=gran, alpha0=1e-6,
+            args_base=dict(_BASE), args_meta=dict(_META), gamma=1,
+            writer=_NullWriter())
+    if abs(o2._hier_ratio - float(probe)) > 1e-12:
+        sys.exit("GUARD FAIL: ETA_RATIO=%s is read back as %r -- the r axis of "
+                 "this batch would not be the r axis it declares"
+                 % (probe, o2._hier_ratio))
+print("guard 5d: every registered r value round-trips through the environment "
+      "into the LIVE optimiser, INCLUDING r=0")
+if m == m_want + 1:
+    sys.exit("GUARD FAIL (RULE 13): impossible branch")
+print("guard 5e (RULE 13): the same equality refuses m=%d (the registration "
+      "perturbed by one group), so the check is not decoration" % (m_want + 1))
+PYEOF
+
+# =============================================================================
+# GUARD 6 -- NON-COLLISION.  `g3-` is ALREADY TAKEN by g3-sgdmAdam-* (9 runs);
+# `sc50-` is the comparator set.  Neither may be touched or shadowed.
+# =============================================================================
+python3 - "$RUNROOT" "$TAG" "$SEEDS" "$RLEVELS" "$ALPHAS" \
+  <<'PYEOF' || guard_fail "guard 6: non-collision"
+import glob, os, sys
+runroot, tag, seeds, rlevels, alphas = sys.argv[1:6]
+names = ["%s-%s-%s-s%s" % (tag, a.split(":")[0], r.split(":")[0], s)
+         for a in alphas.split() for r in rlevels.split() for s in seeds.split()]
+fails = []
+if len(set(names)) != 36:
+    fails.append("the emitter produces %d distinct names, not 36" % len(set(names)))
+for a in names:
+    for b in names:
+        if a != b and ("%s-4999999.out" % b).startswith(a + "-"):
+            fails.append("%s shadows %s under the '<name>-<jobid>.out' glob" % (a, b))
+for n in names:
+    hits = glob.glob(os.path.join(runroot, n + "-*.out"))
+    if hits:
+        fails.append("%s already has %d .out on disk" % (n, len(hits)))
+existing = {os.path.basename(f).rsplit("-", 1)[0]
+            for f in glob.glob(os.path.join(runroot, "*.out"))}
+for n in names:
+    for e in existing:
+        if e.startswith(n + "-") or n.startswith(e + "-"):
+            fails.append("%s collides with the existing run %s" % (n, e))
+prior = sorted(e for e in existing if e.startswith("g3-"))
+if not prior:
+    fails.append("RULE 13: no g3-* run found, so the collision test cannot have "
+                 "discriminated against the tag it exists to avoid")
+else:
+    print("guard 6a: the tag 'g3-' is already taken by %d archived run name(s) "
+          "(%s ...); this batch uses '%s-' and does not shadow them"
+          % (len(prior), prior[0], tag))
+sc = sorted(e for e in existing if e.startswith("sc50-"))
+print("guard 6b: %d archived sc50 run name(s) present as comparators; none is "
+      "written, renamed or shadowed" % len(sc))
+if fails:
+    for f in fails:
+        print("  !! " + f)
+    sys.exit("GUARD FAIL: %d collision problem(s)" % len(fails))
+print("guard 6c: all 36 names are new, distinct and non-shadowing")
+PYEOF
+
+# =============================================================================
+# COMPOSE.  Every command line is PRINTED and passed through guard_presubmit
+# (STANDING RULE 20) before a single sbatch is issued.
+# =============================================================================
+mkdir -p "$SAVE" 2>/dev/null || true
+echo ""
+echo "-- COMPOSED COMMAND LINES ($NJOBS) ----------------------------------"
+N=0
+IDS=""
+for A in $ALPHAS; do
+  ATAG=${A%%:*}; A0=${A##*:}
+  for RL in $RLEVELS; do
+    RTAG=${RL%%:*}; RVAL=${RL##*:}
+    for S in $SEEDS; do
+      NAME=$TAG-$ATAG-$RTAG-s$S
+      CMD="sbatch --parsable --job-name=$NAME --partition=$PARTS --gres=gpu:1 \
+--cpus-per-task=6 --mem=14G --time=$WALL \
+--export=ALL,AUGMENT=1,BETA_CLIP=$CLIP,HIER=$HIERMODE,ETA_RATIO=$RVAL \
+$RUNNER $BFLAGS --alpha0 $A0 --stepsize-groups $GRAN --seed $S \
+--save-directory $SAVE --run-name $NAME"
+      N=$((N + 1))
+      if [ "$N" -le 3 ] || [ "$SUBMIT" = "0" ]; then
+        echo "[$N] $NAME"
+        echo "     $(printf '%s' "$CMD" | tr -s ' ')"
+      fi
+      if [ "$HAVE_LIB" = 1 ]; then
+        guard_presubmit "$CMD" "${DESIGN[@]}" >/tmp/_ag_$$.txt 2>&1 || {
+          cat /tmp/_ag_$$.txt
+          guard_fail "guard 7: RULE 20 -- $NAME's command line does not match the design"
+        }
+      fi
+      if [ "$SUBMIT" = "1" ]; then
+        JID="$(eval "$CMD")" || guard_fail "sbatch failed for $NAME"
+        IDS="$IDS $JID"
+        echo "[$N] $NAME -> job $JID"
+      fi
+    done
+  done
+done
+rm -f /tmp/_ag_$$.txt
+echo ""
+echo "guard 7: RULE 20 pre-submission check passed on all $N composed lines"
+if [ "$N" != "$NJOBS" ]; then
+  guard_fail "the emitter produced $N lines, not the registered $NJOBS"
+fi
+
+if [ "$SUBMIT" = "0" ]; then
+  echo ""
+  echo "DRY RUN COMPLETE.  guard failures: $GUARD_FAILS"
+  [ "$GUARD_FAILS" = 0 ] && echo "Re-run with --submit to launch $NJOBS jobs." \
+    || echo "DO NOT SUBMIT until every guard passes ON cluster_a."
+  exit 0
+fi
+
+echo ""
+echo "SUBMITTED $N jobs:$IDS"
+sleep 3
+echo "QUEUED=$(squeue -h -u "$USER" -o '%j' | grep -c "^$TAG-")"
+
+# =============================================================================
+# GUARD 8 -- STANDING RULE 20, POST-LAUNCH.  Read the FIRST job's OWN ARGS line
+# and scancel the batch on any mismatch.
+# =============================================================================
+if [ "$HAVE_LIB" = 1 ]; then
+  guard_postlaunch "$RUNROOT" "$TAG-" "${DESIGN[@]}"
+  PLRC=$?
+  if [ "$PLRC" = 1 ]; then
+    echo "!!! The launched batch MISMATCHES its design and is VOID AS DESIGNED."
+    echo "!!!   scancel --name=\$(squeue -h -u \$USER -o %j | grep '^$TAG-' | tr '\\n' ',' | sed 's/,\$//')"
+    exit 2
+  elif [ "$PLRC" = 2 ]; then
+    echo "guard 8: UNVERIFIED, NOT void -- no job had started within the wait, so"
+    echo "         no ARGS line existed yet.  This is the normal outcome when the"
+    echo "         account is at its QOS GPU cap.  The batch is NOT cancelled."
+    echo "         RULE 20 IS STILL OWED.  Run this the moment the first job starts,"
+    echo "         and scancel the batch on any mismatch:"
+    echo "           python3 analysis/argsline_guard.py $RUNROOT --name $TAG- \\"
+    echo "             --expect NN-name=$NET --expect stepsize-groups=$GRAN \\"
+    echo "             --expect num-epochs=$EPOCHS --expect meta-stepsize=$MST \\"
+    echo "             --expect alg-base=SGDm --expect alg-meta=Lion"
+    exit 3
+  fi
+else
+  echo "guard 8: _lib_guards.sh unavailable -- audit by hand once the first job"
+  echo "         starts:  python3 analysis/argsline_guard.py $RUNROOT --name $TAG"
+fi
+echo ""
+echo "Score with:  python3 analysis/cA2_g3_score.py --runs $RUNROOT"

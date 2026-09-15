@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cG16_eb_score.py -- THE REGISTERED SCORER FOR `eb1`, THE DIAL-FREE
+#                     EMPIRICAL-BAYES / JAMES-STEIN SHRINKAGE BATCH (G16).
+#
+# STANDING RULE 21: this file is git-committed BEFORE any eb1 run exists.  Every
+# bar, band edge and refusal below is frozen here.  selftest() RE-DERIVES each
+# one from results/all_runs.csv (never quotes prose) and asserts the literals
+# against bin/cG16_eb_batch.sh's OWN TEXT, so registration and batch cannot
+# drift apart.
+#
+# STANDING RULE 16: run this file UNEDITED and quote its verdict.  Passing its
+# documented arguments is not editing it.  Once an eb1 run exists it is frozen.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# Every hierarchical operator in this tree carries a hand-set strength.  The
+# best-measured one is `additive` (HF.py, PATCH_HIER, `_apply_hier`, layerwise):
+#
+#     d      = beta_t - beta_{t-1}          the realised meta-update
+#     dm     = mean(d)                      its shared component
+#     beta_t := beta_{t-1} + dm + r*(d - dm)
+#
+# r = 1 is the arithmetic identity (plain layerwise).  Its archived ten-rung
+# r-curve at THIS cell (re-derived by prior_curve_from_csv(), never quoted) has
+# an interior optimum at r = 0.06, worth +2.314 pp over r = 1.  That optimum had
+# to be FOUND by sweeping.  A shrinkage strength that must be tuned per setting
+# is a hyperparameter, not a method.
+#
+# G16 removes the dial.  PATCH_EBJS estimates the retained-deviation fraction at
+# every meta-step from the data:
+#
+#     SS   = sum_b (x_b - xbar)^2                      x = the beta increment d
+#     s2   = pooled EWMA temporal variance of x about its own EWMA mean
+#     c    = min(1, (m-3) * s2 / SS)                   positive-part James-Stein
+#     rhat = 1 - c                                     the RETAINED fraction
+#
+# and applies beta_t := beta_{t-1} + dm + rhat*(d - dm).  That is EXACTLY the
+# additive operator with r replaced by rhat, so the archived r-curve is its
+# reference and rhat is directly comparable to the measured argmax 0.06.
+# rho, the EWMA constant, DEFAULTS to the meta-optimiser's own momentum_param
+# (0.99 here), so the method introduces no new hyperparameter; the `ebjr` arm
+# perturbs it to 0.9 to test the one assumption that could break it (A1: that
+# fluctuation about the EWMA mean is noise, not drift).
+#
+# THE PREDICTION, AND IT CAN COME OUT EITHER WAY.  The estimator has no dial, so
+# it either lands in the band the sweep already showed to be good, or it does
+# not.  rhat could plausibly sit at ~0.9 (barely pooling, no gain) or at ~0
+# (collapsed onto the scalar arm, -2.4 pp).  Both are live outcomes.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  18 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85)=5.47, p 6.9e-13) -- is held constant and every contrast is WITHIN
+# this batch.  Six arms x three seeds, all at
+#   ResNet18 / CIFAR-10 / layerwise (m=62) / SGDm + Lion / alpha0 1e-6 /
+#   meta-stepsize 1e-3 / 100 epochs / batch 100 / gamma 1 /
+#   BETA_CLIP -15:-2.3026 / AUGMENT=1 / PROBE=0.
+#
+#   lay   HIER unset                  THE NO-OP CONTROL.  Patched HF.py with the
+#                                     patch OFF must reproduce the 17 archived
+#                                     plain-layerwise runs.
+#   a1    HIER=additive ETA_RATIO=1   THE IDENTITY CONTROL.  A pre-existing mode
+#                                     must be unchanged by the patch.
+#   a06   HIER=additive ETA_RATIO=.06 THE MANIFOLD.  The archived argmax,
+#                                     re-measured in this batch.
+#   ebjs  HIER=ebjs                   PRIMARY.  Dial-free, rho = 0.99 inherited.
+#   ebjr  HIER=ebjs EB_RHO=0.9        ROBUSTNESS of the noise estimator.
+#   ebjz  HIER=ebjz                   SECONDARY.  The same rhat applied to the
+#                                     meta-gradient instead (= zmpool with rhat).
+#                                     Descriptive only: the z-space r-curve is
+#                                     NOT measured in the corpus (4 zmpool rows
+#                                     in total, none at this cell), so there is
+#                                     no reference against which to score it.
+#
+# -----------------------------------------------------------------------------
+# PRE-REGISTERED METRIC.  plateau5 = mean of the LAST 5 test epochs, PRIMARY.
+# The CSV `plateau` column (last 20) is BANNED as primary and `best_test` is not
+# a plateau at all.
+#
+# PRE-REGISTERED QUANTITIES
+#   LIFT = mean plateau5(ebjs) - mean plateau5(a1)
+#   GAP  = mean plateau5(a06)  - mean plateau5(ebjs)
+#   RHAT = median over the arm's runs of each run's final reported rbar
+#          (the EBJS: telemetry line the optimiser prints every EB_LOG steps)
+#
+# PRE-REGISTERED BARS, all DERIVED from the archived curve, not chosen:
+#   TUNED = archived mean(r=0.06) - archived mean(r=1) = 2.314 pp
+#   SUCCESS_LIFT_BAR = 0.50 * TUNED = 1.16 pp     (recover half the tuned lift)
+#   SUCCESS_GAP_BAR  = 0.25 * TUNED = 0.58 pp     (land within a quarter of it)
+#   FAILURE_BAR      = 0.30 pp                    (2.6 SE of a 3-seed difference)
+#   GOOD_BAND        = the archived r-rungs within 0.70 pp of the argmax
+#                    = [0.03, 0.10]               (excludes r=0 at 92.288)
+#
+#   SUCCESS  LIFT >= 1.16 AND GAP <= 0.58
+#   FAILURE  LIFT <= 0.30
+#   PARTIAL  anything strictly between
+#
+# WHERE 0.30 COMES FROM.  SIGMA_W = 0.1438 pp is the pooled WITHIN-CELL SD of
+# plateau5 over the ten archived additive r-cells (df 47), re-derived by
+# noise_floor_from_csv().  SE of a 3-seed mean = 0.0830; SE of a difference of
+# two = 0.1174.  0.30 pp is 2.56 SE, so a FAILURE verdict carries about a 1%
+# chance of being produced by noise from a truly-null effect.  1.16 pp is 9.9 SE.
+#
+# -----------------------------------------------------------------------------
+# THE GATES, IN ORDER
+#   G0 PROVENANCE, absolutely gating.  Read from each run's OWN ARGS/ENV line
+#      (RULE 20).  A repeated flag, a wrong HIER, a short run, or a filename
+#      that disagrees with --run-name drops that run.  Fewer than MIN_SEEDS
+#      surviving in any REQUIRED arm -> VOID.
+#   G1 THE NO-OP CONTROL, absolutely gating.  `lay` must reproduce the archived
+#      plain-layerwise mean and `a1` the archived additive r=1 mean, each within
+#      G1_BAND = 0.45 pp.  A miss means PATCH_EBJS changed behaviour when off,
+#      which would retroactively invalidate the archive -> VOID-PATCHBROKE.
+#      (The PRIMARY no-op proof is offline and bitwise:
+#       analysis/cG16_noop_equiv.py.  G1 is its in-vivo confirmation.)
+#   G2 THE MANIFOLD GATE.  a06 - a1 in THIS batch must be >= MANIFOLD_BAR = 0.50
+#      pp.  If the tuned effect is absent here, a dial-free estimator failing to
+#      find it says nothing -> UNRESOLVED-NOMANIFOLD.
+#   G3 THE ESTIMATOR'S OWN OUTPUT.  RHAT against GOOD_BAND.  Reported for every
+#      EB arm.  DESCRIPTIVE: it explains the primary, it cannot overturn it.
+#      Absent telemetry is reported as NA and does not void anything.
+#   G4 THE PRIMARY.  LIFT and GAP against the registered bars.
+#
+# MAY NOT CLAIM: anything about ResNet50, CIFAR-100, Tiny-ImageNet, alpha0 other
+# than 1e-6, a meta-stepsize other than 1e-3, a granularity other than layerwise,
+# a budget other than 100 epochs, or the z-space mode's accuracy relative to a
+# tuned z-space optimum (which does not exist in the corpus).
+#
+# USAGE
+#   python3 analysis/cG16_eb_score.py --selftest
+#   python3 analysis/cG16_eb_score.py --runs /cluster/account_b/metaopt/runs
+#                                     [--csv results/all_runs.csv]
+# =============================================================================
+import argparse
+import collections
+import csv
+import glob
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+CSV = os.path.join(REPO, "results", "all_runs.csv")
+BATCH_SH = os.path.join(REPO, "bin", "cG16_eb_batch.sh")
+
+# ---- the cell, frozen -------------------------------------------------------
+PREFIX = "eb1"
+NET = "ResNet18"
+DSET = "CIFAR10"
+GRAN = "layerwise"
+ALPHA0 = "1e-6"
+MS = "1e-3"
+EPOCHS = 100
+BATCH = 100
+GAMMA = 1
+CLIP = "-15:-2.3026"
+AUG = "1"
+PROBE = "0"
+SEEDS = ["0", "1", "2"]
+M_LAYERWISE = 62
+
+# ---- the arms, frozen.  tag -> (HIER, ETA_RATIO, EB_RHO, required?) ----------
+# ETA_RATIO/EB_RHO of None means "the run must NOT declare a meaningful value";
+# run_cifar.sh prints `na` for an unset ETA_RATIO and `na` for an unset EB_RHO.
+ARMS = collections.OrderedDict([
+    ("lay",  {"HIER": "none",     "ETA_RATIO": "na", "EB_RHO": "na",  "req": True}),
+    ("a1",   {"HIER": "additive", "ETA_RATIO": "1",  "EB_RHO": "na",  "req": True}),
+    ("a06",  {"HIER": "additive", "ETA_RATIO": "0.06", "EB_RHO": "na", "req": True}),
+    ("ebjs", {"HIER": "ebjs",     "ETA_RATIO": "na", "EB_RHO": "na",  "req": True}),
+    ("ebjr", {"HIER": "ebjs",     "ETA_RATIO": "na", "EB_RHO": "0.9", "req": False}),
+    ("ebjz", {"HIER": "ebjz",     "ETA_RATIO": "na", "EB_RHO": "na",  "req": False}),
+])
+NJOBS = 18
+
+# ---- the registered bars and priors.  Every one is RE-DERIVED from the CSV by
+# ---- the functions below; the literals are the registration and selftest()
+# ---- fails if a re-derivation drifts away from them.
+SIGMA_W = 0.1438            # pooled within-cell SD of plateau5, df 47
+SIGMA_TOL = 0.005
+PRIOR_PLAIN = 90.893        # archived plain layerwise HIER=none, n=17
+PRIOR_A1 = 90.971           # archived additive r=1, n=3
+PRIOR_A06 = 93.285          # archived additive r=0.06, n=8  (the argmax)
+PRIOR_TOL = 0.02
+TUNED = 2.314               # PRIOR_A06 - PRIOR_A1
+SUCCESS_LIFT_BAR = 1.16     # 0.50 * TUNED
+SUCCESS_GAP_BAR = 0.58      # 0.25 * TUNED
+FAILURE_BAR = 0.30
+MANIFOLD_BAR = 0.50
+G1_BAND = 0.45
+GOOD_BAND = (0.03, 0.10)    # archived rungs within PEAK_TOL of the argmax
+PEAK_TOL = 0.70
+MIN_SEEDS = 2
+
+VOID = "VOID"
+VOID_PATCH = "VOID-PATCHBROKE"
+UNRES_NOMAN = "UNRESOLVED-NOMANIFOLD"
+SUCCESS = "SUCCESS"
+PARTIAL = "PARTIAL"
+FAILURE = "FAILURE"
+
+EP_RE = re.compile(r"Epoch\s+(\d+).*?Test Accuracy:\s*([0-9.]+)", re.I)
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+ENV_RE = re.compile(r"^\s*ENV:\s*(.*)$")
+EBJS_RE = re.compile(r"^EBJS:\s+t=(\d+)\s+m=(\d+)\s+rho=(\S+)\s+s2=(\S+)\s+"
+                     r"ss=(\S+)\s+r=(\S+)\s+rbar=(\S+)\s*$")
+
+
+# ---------------------------------------------------------------------------
+# re-derivation from the corpus.  NOTHING here is quoted from prose.
+# ---------------------------------------------------------------------------
+def _cell_rows(path=None):
+    path = path or CSV
+    """Archived rows at EXACTLY the eb1 configuration, any hier."""
+    out = []
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if (r["network"] != NET or r["dataset"] != DSET
+                    or r["granularity"] != GRAN or r["alpha0"] != ALPHA0
+                    or r["meta_stepsize"] != MS or r["base"] != "SGDm"
+                    or r["meta"] != "Lion" or r["beta_clip"] != CLIP
+                    or r["augment"] != AUG
+                    or r["epochs_requested"] != str(EPOCHS)
+                    or r["collapsed"] != "0" or r["complete"] != "1"
+                    or r["window_ok"] != "1" or not r["plateau5"]):
+                continue
+            out.append(r)
+    return out
+
+
+def prior_curve_from_csv(path=None):
+    path = path or CSV
+    """Archived additive r-curve at this cell.  {r_string: (mean, n)}."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path):
+        if r["hier"] == "additive":
+            by["%g" % float(r["eta_ratio"])].append(float(r["plateau5"]))
+    return dict((k, (statistics.mean(v), len(v))) for k, v in by.items())
+
+
+def plain_prior_from_csv(path=None):
+    path = path or CSV
+    """Archived plain layerwise (HIER empty) at this cell.  (mean, n)."""
+    v = [float(r["plateau5"]) for r in _cell_rows(path) if (r["hier"] or "") == ""]
+    return (statistics.mean(v), len(v)) if v else (None, 0)
+
+
+def noise_floor_from_csv(path=None):
+    path = path or CSV
+    """Pooled WITHIN-CELL SD of plateau5 over the archived additive r-cells.
+    Returns (sigma, df, n_runs, n_cells)."""
+    by = collections.defaultdict(list)
+    for r in _cell_rows(path):
+        if r["hier"] == "additive":
+            by["%g" % float(r["eta_ratio"])].append(float(r["plateau5"]))
+    num = den = 0.0
+    n = 0
+    for v in by.values():
+        n += len(v)
+        if len(v) > 1:
+            s = statistics.stdev(v)
+            num += s * s * (len(v) - 1)
+            den += len(v) - 1
+    if den <= 0:
+        return None, 0, n, len(by)
+    return math.sqrt(num / den), int(den), n, len(by)
+
+
+def good_band_from_csv(path=None, tol=PEAK_TOL):
+    path = path or CSV
+    """The archived r-rungs whose mean is within `tol` pp of the argmax.
+    Returns (lo, hi, [rungs])."""
+    cur = prior_curve_from_csv(path)
+    if not cur:
+        return None, None, []
+    peak = max(m for m, _n in cur.values())
+    rr = sorted(float(k) for k, (m, _n) in cur.items() if m >= peak - tol)
+    return (min(rr), max(rr), rr) if rr else (None, None, [])
+
+
+def zmpool_census(path=None):
+    path = path or CSV
+    """How many zmpool rows exist ANYWHERE, and how many at this cell.  This is
+    why the ebjz arm is descriptive-only."""
+    tot = at = 0
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r["hier"] == "zmpool":
+                tot += 1
+    for r in _cell_rows(path):
+        if r["hier"] == "zmpool":
+            at += 1
+    return tot, at
+
+
+# ---------------------------------------------------------------------------
+# parsing.  Every fact about a run comes from that run's OWN .out.
+# ---------------------------------------------------------------------------
+def _tokens(line):
+    import shlex
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_args_line(line):
+    """(effective_flags, repeated_flags).  argparse keeps the LAST occurrence."""
+    toks = _tokens(line)
+    occ = []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t.startswith("--") and len(t) > 2:
+            if "=" in t:
+                f, v = t.split("=", 1)
+                occ.append((f.lstrip("-"), v))
+                i += 1
+                continue
+            vals = []
+            j = i + 1
+            while j < n and not (toks[j].startswith("--") and len(toks[j]) > 2):
+                vals.append(toks[j])
+                j += 1
+            occ.append((t.lstrip("-"), " ".join(vals)))
+            i = j
+            continue
+        i += 1
+    eff = collections.OrderedDict()
+    seen = collections.OrderedDict()
+    for f, v in occ:
+        eff[f] = v
+        seen.setdefault(f, []).append(v)
+    dup = dict((f, v) for f, v in seen.items() if len(v) > 1)
+    return eff, dup
+
+
+def parse_env_line(line):
+    out = {}
+    for tok in line.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
+def read_out(path):
+    args = env = None
+    ser = {}
+    rbars = []
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                if args is None:
+                    m = ARGS_RE.match(line)
+                    if m:
+                        args = m.group(1).strip()
+                        continue
+                if env is None:
+                    m = ENV_RE.match(line)
+                    if m:
+                        env = m.group(1).strip()
+                        continue
+                m = EBJS_RE.match(line.rstrip("\n"))
+                if m:
+                    rbars.append((int(m.group(1)), int(m.group(2)),
+                                  float(m.group(6)), float(m.group(7))))
+                    continue
+                m = EP_RE.search(line)
+                if m:
+                    ser[int(m.group(1))] = float(m.group(2))
+    except IOError:
+        return None
+    if args is None:
+        return None
+    eff, dup = parse_args_line(args)
+    return {"args": eff, "dup": dup, "argsline": args, "envline": env or "",
+            "env": parse_env_line(env or ""), "series": ser, "ebjs": rbars,
+            "path": path}
+
+
+def plateau5(series, budget=EPOCHS, w=5):
+    """Mean of the last 5 test epochs.  Epochs are 0-indexed in the .out."""
+    v = [series[e] for e in range(budget - w, budget) if e in series]
+    return sum(v) / len(v) if len(v) == w else None
+
+
+def norm_num(s):
+    try:
+        return "%g" % float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_of(runname):
+    """eb1-<arm>-s<seed>  ->  (arm, seed) or (None, None)."""
+    m = re.match(r"^%s-([a-z0-9]+)-s(\d+)$" % re.escape(PREFIX), runname or "")
+    if not m or m.group(1) not in ARMS:
+        return None, None
+    return m.group(1), m.group(2)
+
+
+# ---------------------------------------------------------------------------
+# G0 -- PROVENANCE
+# ---------------------------------------------------------------------------
+def gate0(recs):
+    """Returns (cells, dropped).  cells[(arm, seed)] = plateau5."""
+    want_args = {"NN-name": NET, "dataset": DSET, "stepsize-groups": GRAN,
+                 "alpha0": ALPHA0, "num-epochs": str(EPOCHS),
+                 "batch-size": str(BATCH), "gamma": str(GAMMA),
+                 "meta-stepsize": MS, "alg-base": "SGDm", "alg-meta": "Lion"}
+    cells, dropped = {}, []
+    for rec in recs:
+        why = []
+        rn = rec["args"].get("run-name", "")
+        arm, seed = arm_of(rn)
+        if arm is None:
+            dropped.append((os.path.basename(rec["path"]),
+                            ["--run-name=%s is not a registered eb1 arm" % rn]))
+            continue
+        spec = ARMS[arm]
+        if rec["dup"]:
+            why.append("REPEATED FLAG %s (RULE 20)" % ",".join(sorted(rec["dup"])))
+        for f, w in want_args.items():
+            got = rec["args"].get(f)
+            if got is None:
+                why.append("--%s absent" % f)
+            elif norm_num(w) is not None and norm_num(got) is not None:
+                if norm_num(got) != norm_num(w):
+                    why.append("--%s=%s want %s" % (f, got, w))
+            elif got != w:
+                why.append("--%s=%s want %s" % (f, got, w))
+        for k, w in (("AUGMENT", AUG), ("BETA_CLIP", CLIP), ("PROBE", PROBE),
+                     ("SCHED", "none")):
+            got = rec["env"].get(k)
+            if got != w:
+                why.append("ENV %s=%s want %s" % (k, got, w))
+        if rec["env"].get("HIER") != spec["HIER"]:
+            why.append("ENV HIER=%s want %s for arm %s"
+                       % (rec["env"].get("HIER"), spec["HIER"], arm))
+        for k in ("ETA_RATIO", "EB_RHO"):
+            got, w = rec["env"].get(k), spec[k]
+            if w == "na":
+                if got not in (None, "na"):
+                    why.append("ENV %s=%s want unset for arm %s" % (k, got, arm))
+            elif norm_num(got) != norm_num(w):
+                why.append("ENV %s=%s want %s for arm %s" % (k, got, w, arm))
+        if seed not in SEEDS:
+            why.append("--seed=%s not a registered seed" % seed)
+        if rec["args"].get("seed") != seed:
+            why.append("--seed=%s disagrees with run-name %s"
+                       % (rec["args"].get("seed"), rn))
+        p5 = plateau5(rec["series"])
+        if p5 is None:
+            why.append("fewer than %d completed epochs (max ep %s)"
+                       % (EPOCHS, max(rec["series"]) if rec["series"] else "none"))
+        if not os.path.basename(rec["path"]).startswith(rn + "-"):
+            why.append("filename disagrees with --run-name %s" % rn)
+        if why:
+            dropped.append((os.path.basename(rec["path"]), why))
+            continue
+        cells[(arm, seed)] = p5
+    return cells, dropped
+
+
+def arm_means(cells):
+    by = collections.defaultdict(list)
+    for (arm, _s), v in cells.items():
+        by[arm].append(v)
+    return dict((k, (statistics.mean(v), len(v), sorted(v)))
+                for k, v in by.items())
+
+
+def arm_rhat(recs):
+    """{arm: (median final rbar, n runs with telemetry, [values])}."""
+    by = collections.defaultdict(list)
+    for rec in recs:
+        arm, _s = arm_of(rec["args"].get("run-name", ""))
+        if arm is None or not rec["ebjs"]:
+            continue
+        by[arm].append(rec["ebjs"][-1][3])       # last line's rbar
+    return dict((k, (statistics.median(v), len(v), sorted(v)))
+                for k, v in by.items())
+
+
+# ---------------------------------------------------------------------------
+# the verdict
+# ---------------------------------------------------------------------------
+def verdict(lift, gap, manifold_ok):
+    if not manifold_ok:
+        return UNRES_NOMAN
+    if lift >= SUCCESS_LIFT_BAR and gap <= SUCCESS_GAP_BAR:
+        return SUCCESS
+    if lift <= FAILURE_BAR:
+        return FAILURE
+    return PARTIAL
+
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+def selftest():
+    n = p = 0
+
+    def ok(label, cond):
+        nonlocal n, p
+        n += 1
+        p += 1 if cond else 0
+        print("  [%s] %s" % ("ok" if cond else "FAIL", label))
+
+    print("cG16_eb_score selftest")
+    print("-- constants re-derived from %s --" % CSV)
+    sig, df, nrun, ncell = noise_floor_from_csv()
+    print("   pooled within-cell SD = %.4f (df %d, %d runs, %d cells)"
+          % (sig, df, nrun, ncell))
+    ok("SIGMA_W literal %.4f matches re-derivation %.4f" % (SIGMA_W, sig),
+       abs(sig - SIGMA_W) <= SIGMA_TOL)
+
+    pm, pn = plain_prior_from_csv()
+    print("   archived plain layerwise = %.3f (n=%d)" % (pm, pn))
+    ok("PRIOR_PLAIN %.3f" % PRIOR_PLAIN, abs(pm - PRIOR_PLAIN) <= PRIOR_TOL)
+    ok("plain prior has n >= 10 (%d)" % pn, pn >= 10)
+
+    cur = prior_curve_from_csv()
+    for k in sorted(cur, key=float):
+        print("   archived additive r=%-5s %.3f (n=%d)" % (k, cur[k][0], cur[k][1]))
+    ok("PRIOR_A1 %.3f" % PRIOR_A1, abs(cur["1"][0] - PRIOR_A1) <= PRIOR_TOL)
+    ok("PRIOR_A06 %.3f" % PRIOR_A06, abs(cur["0.06"][0] - PRIOR_A06) <= PRIOR_TOL)
+    peak = max(m for m, _ in cur.values())
+    ok("r=0.06 IS the archived argmax", abs(cur["0.06"][0] - peak) < 1e-9)
+    tuned = cur["0.06"][0] - cur["1"][0]
+    print("   TUNED lift (argmax - identity) = %.3f pp" % tuned)
+    ok("TUNED literal %.3f" % TUNED, abs(tuned - TUNED) <= PRIOR_TOL)
+    ok("SUCCESS_LIFT_BAR == 0.50*TUNED (%.4f)" % (0.5 * tuned),
+       abs(SUCCESS_LIFT_BAR - 0.5 * tuned) <= 0.01)
+    ok("SUCCESS_GAP_BAR  == 0.25*TUNED (%.4f)" % (0.25 * tuned),
+       abs(SUCCESS_GAP_BAR - 0.25 * tuned) <= 0.01)
+
+    lo, hi, rr = good_band_from_csv()
+    print("   GOOD_BAND (within %.2f pp of argmax) = [%g, %g] over %s"
+          % (PEAK_TOL, lo, hi, rr))
+    ok("GOOD_BAND literal (%g, %g)" % GOOD_BAND,
+       abs(lo - GOOD_BAND[0]) < 1e-9 and abs(hi - GOOD_BAND[1]) < 1e-9)
+    ok("GOOD_BAND EXCLUDES r=0, so landing in it is not automatic",
+       0.0 not in rr)
+    ok("GOOD_BAND EXCLUDES r=1, so landing in it is not automatic",
+       1.0 not in rr)
+
+    se3 = SIGMA_W / math.sqrt(3.0)
+    sed = se3 * math.sqrt(2.0)
+    print("   SE(3-seed mean) = %.4f pp;  SE(difference) = %.4f pp" % (se3, sed))
+    ok("FAILURE_BAR is >= 2.5 SE of a difference (%.2f SE)" % (FAILURE_BAR / sed),
+       FAILURE_BAR / sed >= 2.5)
+    ok("SUCCESS_LIFT_BAR is >= 8 SE of a difference (%.2f SE)"
+       % (SUCCESS_LIFT_BAR / sed), SUCCESS_LIFT_BAR / sed >= 8.0)
+    ok("FAILURE_BAR < SUCCESS_LIFT_BAR so the verdicts cannot both fire",
+       FAILURE_BAR < SUCCESS_LIFT_BAR)
+
+    zt, za = zmpool_census()
+    print("   zmpool rows: %d in the whole corpus, %d at this cell" % (zt, za))
+    ok("ebjz is DESCRIPTIVE-ONLY because no z-space r-curve exists here",
+       za == 0 and not ARMS["ebjz"]["req"])
+
+    print("-- the batch script and this file agree --")
+    if os.path.exists(BATCH_SH):
+        t = open(BATCH_SH).read()
+        for lit, name in [("%.4f" % SIGMA_W, "SIGMA_W"),
+                          ("%.2f" % SUCCESS_LIFT_BAR, "SUCCESS_LIFT_BAR"),
+                          ("%.2f" % SUCCESS_GAP_BAR, "SUCCESS_GAP_BAR"),
+                          ("%.2f" % FAILURE_BAR, "FAILURE_BAR"),
+                          ("%.2f" % MANIFOLD_BAR, "MANIFOLD_BAR"),
+                          ("%.2f" % G1_BAND, "G1_BAND"),
+                          (CLIP, "BETA_CLIP"), (ALPHA0, "alpha0"),
+                          (MS, "meta-stepsize"), (str(M_LAYERWISE), "m")]:
+            ok("bin/cG16_eb_batch.sh carries %s=%s" % (name, lit), lit in t)
+        for arm in ARMS:
+            ok("bin/cG16_eb_batch.sh mentions arm %s" % arm,
+               re.search(r"\b%s\b" % re.escape(arm), t) is not None)
+        ok("bin/cG16_eb_batch.sh declares %d jobs" % NJOBS, str(NJOBS) in t)
+    else:
+        ok("bin/cG16_eb_batch.sh exists", False)
+
+    print("-- parsing --")
+    a, d = parse_args_line("--alg-meta Lion --seed 0 --alg-meta Lion")
+    ok("a repeated flag is detected", "alg-meta" in d)
+    e = parse_env_line("HIER=ebjs EB_RHO=na PROBE=0")
+    ok("ENV parses", e.get("HIER") == "ebjs" and e.get("EB_RHO") == "na")
+    m = EBJS_RE.match("EBJS: t=500 m=62 rho=0.99 s2=1.234e-08 ss=5.678e-06 "
+                      "r=0.061234 rbar=0.058000")
+    ok("the EBJS telemetry line parses", m is not None
+       and abs(float(m.group(7)) - 0.058) < 1e-9)
+    ok("arm_of maps eb1-ebjs-s1", arm_of("eb1-ebjs-s1") == ("ebjs", "1"))
+    ok("arm_of rejects a foreign name", arm_of("g4m-r006-m1e3-s0") == (None, None))
+    ser = dict((i, 90.0 + 0.001 * i) for i in range(EPOCHS))
+    ok("plateau5 uses the LAST 5 epochs",
+       abs(plateau5(ser) - statistics.mean([ser[i] for i in range(95, 100)])) < 1e-9)
+    ok("plateau5 refuses a short run", plateau5({0: 90.0}) is None)
+
+    print("-- the verdict function --")
+    ok("SUCCESS needs BOTH bars", verdict(1.20, 0.50, True) == SUCCESS)
+    ok("a big lift that still trails the peak is PARTIAL",
+       verdict(1.20, 0.90, True) == PARTIAL)
+    ok("a null lift is FAILURE", verdict(0.05, 2.30, True) == FAILURE)
+    ok("a middling lift is PARTIAL", verdict(0.80, 1.50, True) == PARTIAL)
+    ok("no manifold overrides everything", verdict(3.00, 0.00, False) == UNRES_NOMAN)
+
+    print("selftest: %d/%d %s" % (p, n, "PASS" if p == n else "FAIL"))
+    return 0 if p == n else 1
+
+
+# ---------------------------------------------------------------------------
+# score
+# ---------------------------------------------------------------------------
+def score(runs_dir):
+    print("=" * 78)
+    print("cG16_eb_score -- eb1, DIAL-FREE EMPIRICAL-BAYES / JAMES-STEIN (G16)")
+    print("runs_dir = %s" % runs_dir)
+    print("=" * 78)
+
+    paths = sorted(glob.glob(os.path.join(runs_dir, "%s-*.out" % PREFIX)))
+    recs = [r for r in (read_out(p) for p in paths) if r]
+    print("\nfound %d %s-*.out files, %d parsed" % (len(paths), PREFIX, len(recs)))
+    if not recs:
+        print("\nVERDICT: %s -- no runs" % VOID)
+        return 2
+
+    cells, dropped = gate0(recs)
+    print("\n-- G0 PROVENANCE (each run's OWN ARGS/ENV) --")
+    print("   %d run(s) admitted, %d dropped" % (len(cells), len(dropped)))
+    for name, why in dropped:
+        print("   DROP %s" % name)
+        for w in why:
+            print("        %s" % w)
+
+    means = arm_means(cells)
+    print("\n-- arm means (plateau5 = mean of the LAST 5 test epochs) --")
+    print("   %-6s %-9s %-9s %-3s  %s" % ("arm", "HIER", "extra", "n", "plateau5"))
+    for arm, spec in ARMS.items():
+        extra = ""
+        if spec["ETA_RATIO"] != "na":
+            extra = "r=%s" % spec["ETA_RATIO"]
+        if spec["EB_RHO"] != "na":
+            extra = "rho=%s" % spec["EB_RHO"]
+        if arm in means:
+            m, k, v = means[arm]
+            print("   %-6s %-9s %-9s %-3d  %8.3f   %s"
+                  % (arm, spec["HIER"], extra or "-", k, m,
+                     " ".join("%.3f" % x for x in v)))
+        else:
+            print("   %-6s %-9s %-9s %-3s  %8s" % (arm, spec["HIER"], extra or "-",
+                                                   0, "MISSING"))
+
+    missing = [a for a, s in ARMS.items()
+               if s["req"] and means.get(a, (0, 0, []))[1] < MIN_SEEDS]
+    if missing:
+        print("\nVERDICT: %s -- required arm(s) %s below MIN_SEEDS=%d"
+              % (VOID, ",".join(missing), MIN_SEEDS))
+        return 2
+
+    # ---- G1 -----------------------------------------------------------------
+    pm, pn = plain_prior_from_csv()
+    cur = prior_curve_from_csv()
+    d_lay = means["lay"][0] - pm
+    d_a1 = means["a1"][0] - cur["1"][0]
+    print("\n-- G1 THE NO-OP CONTROL (band +-%.2f pp) --" % G1_BAND)
+    print("   lay  %8.3f  vs archived plain layerwise %8.3f (n=%d)  diff %+7.3f"
+          % (means["lay"][0], pm, pn, d_lay))
+    print("   a1   %8.3f  vs archived additive r=1    %8.3f (n=%d)  diff %+7.3f"
+          % (means["a1"][0], cur["1"][0], cur["1"][1], d_a1))
+    g1 = abs(d_lay) <= G1_BAND and abs(d_a1) <= G1_BAND
+    print("   G1 %s" % ("PASS -- PATCH_EBJS is inert when off, in vivo"
+                        if g1 else "FAIL"))
+    if not g1:
+        print("\nVERDICT: %s -- the patched tree does not reproduce the archive "
+              "with the patch OFF.  Every eb1 number is void and the patch must "
+              "be reverted before anything else runs." % VOID_PATCH)
+        return 2
+
+    # ---- G2 -----------------------------------------------------------------
+    inbatch = means["a06"][0] - means["a1"][0]
+    manifold_ok = inbatch >= MANIFOLD_BAR
+    print("\n-- G2 THE MANIFOLD GATE (bar %.2f pp) --" % MANIFOLD_BAR)
+    print("   in-batch tuned lift  a06 - a1 = %+7.3f pp   (archived %+7.3f)"
+          % (inbatch, cur["0.06"][0] - cur["1"][0]))
+    print("   G2 %s" % ("PASS" if manifold_ok else
+                        "FAIL -- the tuned effect is absent from THIS batch"))
+
+    # ---- G3 -----------------------------------------------------------------
+    lo, hi, rr = good_band_from_csv()
+    rh = arm_rhat(recs)
+    print("\n-- G3 THE ESTIMATOR'S OWN OUTPUT (descriptive) --")
+    print("   GOOD_BAND = [%g, %g], the archived rungs within %.2f pp of the "
+          "argmax %s" % (lo, hi, PEAK_TOL, rr))
+    for arm in ("ebjs", "ebjr", "ebjz"):
+        if arm in rh:
+            med, k, v = rh[arm]
+            where = "IN BAND" if lo <= med <= hi else (
+                "BELOW -- over-pooled" if med < lo else "ABOVE -- under-pooled")
+            print("   %-5s rhat median %.5f over %d run(s)  %-22s  %s"
+                  % (arm, med, k, where, " ".join("%.5f" % x for x in v)))
+        else:
+            print("   %-5s rhat NA (no EBJS telemetry in the .out)" % arm)
+
+    # ---- G4 -----------------------------------------------------------------
+    lift = means["ebjs"][0] - means["a1"][0]
+    gap = means["a06"][0] - means["ebjs"][0]
+    v_plain = means["ebjs"][0] - means["lay"][0]
+    sig, df, _nr, _nc = noise_floor_from_csv()
+    sed = sig * math.sqrt(1.0 / means["ebjs"][1] + 1.0 / means["a1"][1])
+    print("\n-- G4 THE PRIMARY --")
+    print("   LIFT = ebjs - a1  = %+7.3f pp   (bar SUCCESS >= %.2f, FAILURE <= %.2f)"
+          % (lift, SUCCESS_LIFT_BAR, FAILURE_BAR))
+    print("   GAP  = a06 - ebjs = %+7.3f pp   (bar SUCCESS <= %.2f)"
+          % (gap, SUCCESS_GAP_BAR))
+    print("   ebjs - lay        = %+7.3f pp   (informational)" % v_plain)
+    print("   pooled SE of the LIFT difference = %.4f pp  ->  %.2f SE"
+          % (sed, lift / sed if sed else float("nan")))
+
+    if "ebjr" in means:
+        print("   robustness: ebjr (rho=0.9) %+7.3f pp vs ebjs, so the noise"
+              % (means["ebjr"][0] - means["ebjs"][0]))
+        print("               estimator's EWMA horizon %s the result"
+              % ("MATTERS for" if abs(means["ebjr"][0] - means["ebjs"][0]) > 2 * sed
+                 else "does not move"))
+    if "ebjz" in means:
+        print("   secondary:  ebjz (z-space) %8.3f, %+7.3f pp vs a1.  DESCRIPTIVE:"
+              % (means["ebjz"][0], means["ebjz"][0] - means["a1"][0]))
+        print("               no tuned z-space r-curve exists at this cell.")
+
+    vd = verdict(lift, gap, manifold_ok)
+    print("\n" + "=" * 78)
+    print("VERDICT: %s" % vd)
+    if vd == SUCCESS:
+        print("  A dial-free James-Stein estimate of the shrinkage recovers at")
+        print("  least half the lift of the SWEPT optimum and lands within a")
+        print("  quarter of it, at this cell only.")
+    elif vd == FAILURE:
+        print("  The dial-free estimator does not reproduce the tuned effect at")
+        print("  this cell.  The tuned optimum is real here (G2 passed), so the")
+        print("  James-Stein noise model is what fails, not the manifold.")
+    elif vd == PARTIAL:
+        print("  The estimator moves the result in the right direction but does")
+        print("  not clear the registered bar.  Reportable as PARTIAL only.")
+    else:
+        print("  The tuned effect is not present in this batch, so nothing can")
+        print("  be concluded about an estimator that tries to find it.")
+    print("=" * 78)
+    return 0
+
+
+def main():
+    global CSV
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--runs", default="/cluster/account_b/metaopt/runs")
+    ap.add_argument("--csv", default=CSV)
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    CSV = a.csv
+    if a.selftest:
+        return selftest()
+    return score(a.runs)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

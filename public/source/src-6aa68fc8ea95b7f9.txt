@@ -1,0 +1,91 @@
+#!/bin/bash
+set -u
+cd /cluster/account_a/metaopt
+R=/cluster/account_a/metaopt/runs
+P="gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g"
+C="BETA_CLIP=-15:-2.3026"
+SGDM="--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0"
+mkdir -p $R/rs
+# ===========================================================================
+# c40 `rs-*` -- THE GRANULARITY x META-STEP RESPONSE SURFACE.  a0=1e-3 throughout.
+#
+# OPEN QUESTION.  FINDINGS 39.1 measured the granularity gain at ONE arbitrary
+# meta-step (ms=1e-4): +0.617pp, Welch t=4.00, n=3.  That is a pairwise number at
+# a cell neither arm chose.  The paper's claim -- "the granularity axis is largely
+# a reparameterisation of the meta-step axis" -- requires each arm at ITS OWN
+# optimum, and it makes a strong falsifiable prediction this surface tests:
+#
+#   PRE-REGISTRATION.  If granularity is a reparameterised meta-step, then every
+#   granularity's ms-response curve is the SAME curve shifted along log(ms), and
+#   the peak heights are equal to within seed noise.  Falsified if peak heights
+#   differ systematically with m, or if the curve shapes differ.
+#
+# GRID CHOICE IS PRINCIPLED, NOT UNIFORM.  33.1 established that under Lion the
+# realised increment is |2p-1|*ms, and 34.2 verified |2p-1| FALLS with m.  A finer
+# partition therefore has a SMALLER effective step at the same nominal ms, so its
+# optimum nominal ms must sit HIGHER.  The grid is shifted up for finer arms; a
+# common grid would spend most of its cells below every fine arm's optimum.
+#
+# FROZEN-BETA ANCHOR.  ms=1e-8 (not 0, to avoid a positivity assert) freezes beta:
+# log-space travel over 50k steps is 5e-4, negligible.  This is the ms->0 limit =
+# constant-LR SGDm at alpha0=1e-3.  It is granularity-INDEPENDENT by construction,
+# so scal and lay MUST agree there to within seed noise -- a structural check in
+# the sense of Rule 4, not a fifth data point.
+#
+# METRIC: plateau (mean of last 5 epochs).  Rule 3: report the CURVE, never the
+# peak cell alone.  Rule 5 is why every cell is a0=1e-3 and none is a0=1e-6.
+#
+# EXCEEDS the standing 40-pending cap, on the operator's explicit instruction to
+# choose what the paper needs over what is cheapest.  Mitigation: this is ONE
+# coherent experiment with nothing speculative behind it, internally ordered by
+# --nice so the headline curves finish first; cluster_b's decisive fz-* batch is
+# untouched on the other account.
+# ===========================================================================
+sub(){ # $1 name  $2 gran  $3 ms  $4 seed  $5 nice
+  sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --nice=$5 --export="ALL,AUGMENT=1,$C" jobs/run_cifar.sh $SGDM \
+  --dataset CIFAR10 --NN-name ResNet18 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize $3 --alpha0 1e-3 --num-epochs 100 --stepsize-groups $2 --seed $4 \
+  --save-directory $R/rs --run-name $1 >/dev/null; }
+
+# --- TIER 0 (nice 0): the two headline curves, fully bracketed on the left ------
+# ms-scalA-1e4/1e3 and ms-layA-1e4/1e3 already exist at n=3 -> top up seeds 3,4.
+for s in 0 1 2 3 4; do
+  sub rs-scal-1e5-s$s scalar    1e-5 $s 0
+  sub rs-scal-3e5-s$s scalar    3e-5 $s 0
+  sub rs-scal-3e4-s$s scalar    3e-4 $s 0
+  sub rs-lay-1e5-s$s  layerwise 1e-5 $s 0
+  sub rs-lay-3e5-s$s  layerwise 3e-5 $s 0
+  sub rs-lay-3e4-s$s  layerwise 3e-4 $s 0
+done
+for s in 3 4; do                      # top-ups to n=5 on the 39.1 diagonal
+  sub rs-scal-1e4-s$s scalar    1e-4 $s 0
+  sub rs-scal-1e3-s$s scalar    1e-3 $s 0
+  sub rs-lay-1e4-s$s  layerwise 1e-4 $s 0
+  sub rs-lay-1e3-s$s  layerwise 1e-3 $s 0
+done
+for s in 0 1 2; do                    # frozen-beta anchor (structural check)
+  sub rs-scal-frz-s$s scalar    1e-8 $s 0
+  sub rs-lay-frz-s$s  layerwise 1e-8 $s 0
+done
+
+# --- TIER 1 (nice 50): the collapse test -- intermediate granularities ----------
+for s in 0 1 2 3 4; do
+  for g in 3e-5:3e5 1e-4:1e4 3e-4:3e4 1e-3:1e3 3e-3:3e3; do
+    sub rs-blk6-${g#*:}-s$s resnet18_blocks ${g%:*} $s 50
+  done
+  for g in 1e-4:1e4 3e-4:3e4 1e-3:1e3 3e-3:3e3 1e-2:1e2; do
+    sub rs-node-${g#*:}-s$s nodewise ${g%:*} $s 50
+  done
+done
+
+# --- TIER 2 (nice 100): boundary case -- does weightwise recover at ANY ms? -----
+for s in 0 1 2; do
+  for g in 3e-4:3e4 1e-3:1e3 3e-3:3e3 1e-2:1e2; do
+    sub rs-w-${g#*:}-s$s weightwise ${g%:*} $s 100
+  done
+done
+
+sleep 3
+echo "MARKER rs- submitted: $(squeue -h -u account_a -o %j | grep -c '^rs-')"
+echo "cluster_a1 pending: $(squeue -h -u account_a -t PENDING | wc -l) running: $(squeue -h -u account_a -t RUNNING | wc -l)"

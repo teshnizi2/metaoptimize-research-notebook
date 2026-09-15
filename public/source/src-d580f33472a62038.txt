@@ -1,0 +1,36 @@
+import json, os, re, sys
+R = sys.argv[1] if len(sys.argv) > 1 else "/cluster/account_b/metaopt/runs"
+man = open(R + "/cvg1-PARTITION-MANIFEST.txt").read()
+names = {int(i): n for i, n, s in re.findall(r"^TENSOR (\d+) (\S+) (\d+)$", man, re.M)}
+sizes = {int(i): int(s) for i, n, s in re.findall(r"^TENSOR (\d+) (\S+) (\d+)$", man, re.M)}
+
+print("=== SCALAR ARM: single beta, pin timing (500 steps/epoch, probe every 100 steps) ===")
+for s in ("s31", "s32", "s33"):
+    recs = [json.loads(l) for l in open("%s/cvg1/probe_cvg1-k01-%s/probe.jsonl" % (R, s))]
+    b = [r["beta"][0] for r in recs]
+    first = next((i for i, x in enumerate(b) if x <= -14.999), None)
+    npin = sum(1 for x in b if x <= -14.999)
+    st = recs[first]["step"] if first is not None else None
+    print("  k01-%s: beta[0] start %.4f min %.4f max %.4f terminal %.4f" % (s, b[0], min(b), max(b), b[-1]))
+    print("          first at -15: record %s step %s epoch %.1f | pinned %d/500 = %.4f"
+          % (first, st, (st / 500.0 if st else -1), npin, npin / 500.0))
+
+print("\n=== LAYERWISE ARM: which groups stay OFF the floor at the end ===")
+for s in ("s31", "s32", "s33"):
+    recs = [json.loads(l) for l in open("%s/cvg1/probe_cvg1-kL-%s/probe.jsonl" % (R, s))]
+    b = recs[-1]["beta"]
+    free = [(i + 1, names[i + 1], sizes[i + 1], round(b[i], 3)) for i in range(26) if b[i] > -14.999]
+    pin = [i + 1 for i in range(26) if b[i] <= -14.999]
+    print("  kL-%s: %d FREE %s" % (s, len(free), free))
+    print("         %d PINNED at indices %s = %s" % (len(pin), pin, [names[i] for i in pin]))
+
+print("\n=== TEST-ACCURACY TRAJECTORY (every 10 epochs) ===")
+import glob
+EP = re.compile(r"^Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,\s*Test Accuracy:\s*([0-9.]+)\s*%")
+for f in sorted(glob.glob(R + "/cvg1-*.out")):
+    te = {}
+    for ln in open(f, errors="replace"):
+        m = EP.match(ln)
+        if m: te[int(m.group(1))] = float(m.group(3))
+    b = os.path.basename(f).split("-4929")[0].replace("cvg1-", "")
+    print("  %-9s" % b, " ".join("e%d=%.1f" % (e, te[e]) for e in range(0, 100, 10)), "e99=%.2f" % te[99])

@@ -1,0 +1,96 @@
+import os as _os_sgd
+import numpy as np
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim
+from torch.optim.lr_scheduler import StepLR
+import copy
+
+
+
+def build_optimizer(net, args, writer):
+
+    
+    if args.optimizer == 'AdamW':
+        return AdamW_optimizer(net, lr=args.alpha0, writer=writer)
+    if args.optimizer == 'SGD':
+        return SGD_optimizer(net, lr=args.alpha0, writer=writer)
+    if args.optimizer == 'HF': 
+        from Optimizers.HF import HF
+        args_base = {name:getattr(args, name+'_base') for name in ['alg', 'normalizer_param', 'momentum_param', 'weight_decay', 'Lion_beta2'] if getattr(args, name+'_base') is not None}
+        args_meta = {name:getattr(args, name+'_meta') for name in ['alg', 'normalizer_param', 'momentum_param', 'weight_decay', 'Lion_beta2'] if getattr(args, name+'_meta') is not None}
+        args_meta['meta_stepsize'] = args.meta_stepsize
+        return HF(net, stepsize_groups=args.stepsize_groups, alpha0=args.alpha0, args_base=args_base, args_meta=args_meta, gamma=args.gamma, writer=writer)
+    
+    print('Error: optimizer ', args.optimizer, '  is not supported')
+    0/0
+
+
+class CosineDecayWithWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, min_lr=0.0, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        self.finished_warmup = False
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * (self.last_epoch / self.warmup_steps) for base_lr in self.base_lrs]
+        else:
+            self.finished_warmup = True
+            return [self.min_lr + (base_lr - self.min_lr) * 
+                    (1 + math.cos(math.pi * (self.last_epoch - self.warmup_steps) / (self.total_steps - self.warmup_steps))) / 2 
+                    for base_lr in self.base_lrs]
+
+
+
+class AdamW_optimizer():
+    def __init__(self, net, lr, data=None, writer=None):
+        self.lr = lr
+        self.optimizer = torch.optim.AdamW(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=0.1)
+        total_steps = 422000 # Define total training steps
+        warmup_steps = 10000  # Define warmup steps
+        self.scheduler = CosineDecayWithWarmupScheduler(self.optimizer, warmup_steps, total_steps)
+
+
+    def step(self, net, loss):
+        
+        net.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+
+
+
+
+class SGD_optimizer():
+    """Standard SGD+momentum reference arm (added cycle 35).
+
+    The campaign had NO non-meta SGD path at all, so the standard
+    ResNet18/CIFAR-10 recipe (lr 0.1, momentum 0.9, wd 5e-4, cosine to 0)
+    -- which reaches ~94.5-95.5% -- had never been reproduced in this harness.
+    Every published baseline was AdamW, and every one inherited the
+    422000/10000 cosine defaults, i.e. a 20-epoch warmup and no decay.
+
+    Uses the SAME COS_TOTAL/COS_WARMUP env overrides as AdamW_optimizer, so a
+    correctly-scaled 100-epoch run is COS_TOTAL=50000 COS_WARMUP=1000.
+    Does not touch any existing code path.
+    """
+    def __init__(self, net, lr, data=None, writer=None):
+        self.lr = lr
+        wd = float(_os_sgd.environ.get('SGD_WD', 5e-4))
+        mom = float(_os_sgd.environ.get('SGD_MOM', 0.9))
+        self.optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=mom,
+                                         weight_decay=wd, nesterov=False)
+        total_steps = int(_os_sgd.environ.get('COS_TOTAL', 422000))
+        warmup_steps = int(_os_sgd.environ.get('COS_WARMUP', 10000))
+        self.scheduler = CosineDecayWithWarmupScheduler(self.optimizer, warmup_steps, total_steps)
+
+    def step(self, net, loss):
+        net.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()

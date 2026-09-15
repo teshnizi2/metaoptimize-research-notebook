@@ -1,0 +1,480 @@
+#!/bin/bash
+# =============================================================================
+# cM1_clamp_release.sh -- `cts2`, RELEASING THE BETA_CLIP FLOOR ON THE
+#                         k = 49 -> k = 50 CLIFF, SUBMITTED AS ONE BATCH.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.
+# Nothing here touches the other account and nothing is submitted to cluster_a.
+# Every guard and every scancel line below is filtered on the `cts2-` prefix
+# alone, so no job this script did not submit can be affected.
+#
+# REGISTERED SCORER: analysis/cM1_cts2_score.py, git-committed BEFORE this
+# batch is submitted (STANDING RULE 21).  Every bar is frozen there and its
+# --selftest re-derives the noise floor, cts1's own cliff and the released
+# floor's arithmetic from the corpus and from float32, and asserts each
+# constant against THIS FILE'S own text.
+#
+# NO CODE PATCH.  BETA_CLIP is already an environment variable read by
+# Optimizers/HF.py (line ~43: `_bc = os.environ.get('BETA_CLIP','')`, split on
+# ':' into self._beta_lo / self._beta_hi) and applied at line ~116-118 as
+# `self.beta[i].clamp(self._beta_lo, self._beta_hi)` after every meta-update.
+# Changing the floor needs no edit to the shared tree, and this batch makes
+# none.
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# cts1 (CORRECTIONS 147) measured, IN BATCH, on plateau5:
+#     k49 = [49,13]  55.1687 pp     k50 = [50,12]  30.3347 pp    step 24.8340 pp
+# and that step is the departure of ONE tensor, layer4.0.bn2.weight.
+#
+# cts1's own TensorBoard traces -- which its registered scorer never opens --
+# say that the winning arm is the arm whose BOTH stepsize groups end pinned
+# against the BETA_CLIP floor:
+#
+#   beta init = log(1e-6) = -13.815511; the floor -15 is 1.184489 nats below it.
+#   block1 (the 13-tensor tail group) reaches -15.0000 at meta-step 17700-18400
+#          of 50000 in 12/12 cut runs and stays there for 63-65 % of the run.
+#   block0 at k = 49 also reaches it: -15.0000 / -15.0000 / -14.2897.
+#   block0 at k = 50 never comes within 1.18 nats of it: -9.8279 / -9.8819 /
+#          -9.6998 at the end, ~200x the terminal stepsize of the k = 49 arm.
+#
+# The cliff and the clamp's turnover are perfectly confounded in cts1.
+# docs/FINDINGS.md 36.3 records the confound; nobody has measured it.
+# This batch releases the floor and changes nothing else.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  2 x 2 x 3 seeds = 12 jobs, ONE submission.
+#
+#   factor A  cut     k49 = [49,13]  |  k50 = [50,12]
+#   factor B  clamp   C = CLAMPED  BETA_CLIP=-15:-2.3026  (campaign standard)
+#                     R = RELEASED BETA_CLIP=-80:-2.3026  (floor non-binding)
+#
+#   BOTH CLAMPED CELLS ARE RUN IN BATCH.  cts1's arms are NOT spliced in:
+#   batch is the unit of replication (F(62,85) = 5.47, p 6.9e-13 for batch;
+#   F(11,1976) = 0.152 for seed), and the estimand is a WITHIN-BATCH
+#   clamp x cut interaction.  Splicing would put one level of factor B in
+#   another batch and make the interaction a batch effect.
+#
+#   NO ANCHORS, AND NO CAPTURE.  The primary is a difference of two arm means
+#   in PERCENTAGE POINTS and needs no anchors.  Anchors would actively harm:
+#     (i) cts1's scalar anchor sits ON the -15 floor for 62.8-63.0 % of its
+#         trajectory, so a RELEASED scalar anchor moves too and CAPTURE's
+#         denominator would be as clamp-sensitive as its numerator -- the
+#         ratio would confound exactly the factor under test;
+#     (ii) HF.py's TensorBoard block emits beta scalars only for stepsize_type
+#         in {scalar, blockwise}; `layerwise` emits NONE, so a RELEASED
+#         layerwise anchor could not be audited for the manipulation check and
+#         the batch's own R1 gate could not be evaluated on it.
+#   6 jobs saved, and an uninterpretable ratio avoided.  The scorer computes
+#   no CAPTURE and forbids one being computed afterwards.
+#
+#   CIFAR-100 / ResNet18_c100 / SGDm base / Lion meta / ms 1e-3 / alpha0 1e-6 /
+#   100 ep / batch 100 / gamma 1 / AUGMENT=1 / HIER unset / SCHED none /
+#   PROBE=0.  Read out of bin/cL1_cliff_tensor_split.sh, cell for cell, rather
+#   than reconstructed.  The ONLY thing that differs between the C and R cells
+#   is the FLOOR of BETA_CLIP; the CEILING is identical, so the manipulation is
+#   one-factor.
+#
+# -----------------------------------------------------------------------------
+# WHY -80, CHOSEN BY MEASUREMENT AND NOT BY GUESS
+# -----------------------------------------------------------------------------
+# HF.Lion_meta_update is
+#     beta <- (1 - ms*wd_meta)*beta - ms*sign( b2*mom + (1-b2)*HtT_gradft )
+# and this batch passes --weight-decay-meta 0, so it is
+#     beta <- beta - ms*sign(.)          with sign(.) in {-1, 0, +1}
+# i.e. |dbeta| <= ms = 1e-3 per meta-step, exactly.  One meta-step per training
+# iteration; 100 epochs x 500 iterations at batch 100 = 50000 meta-steps, which
+# is exactly the span of cts1's TensorBoard step axis (0..49900, stride 100).
+#
+# MEASURED on cts1's own event files, all 27 traces, 13473 intervals:
+#   * the largest |dbeta| across one 100-meta-step logging interval is
+#     0.10004044 -- and float32 reproduces it to the bit (subtracting
+#     float32(1e-3) one hundred times from float32(-8.0831937789917) gives
+#     exactly the logged float32(-8.183234214782715)).  The 4.04e-5 excess over
+#     0.1 is float32 rounding, not a bigger step.
+#   * the lowest beta anywhere in cts1 is -15.000000, the CLAMPED floor itself.
+#   * the highest beta anywhere in cts1 is -4.823390, 2.52 nats clear of the
+#     ceiling -2.3026, which is never touched by any run.  Keeping the ceiling
+#     therefore costs nothing.
+#   * simulating the WORST CASE -- 50000 consecutive downward steps in float32
+#     from the init -13.815511 -- lands at -63.790127.  That is the lowest beta
+#     this configuration can reach by arithmetic, in any run, ever.
+#
+# -80.0 is 16.209873 nats below that -- 16209 meta-steps that do not exist.
+# It is non-binding BY CONSTRUCTION, and the scorer's R1 still checks it
+# EMPIRICALLY on every released run's own trace, treating any trace that comes
+# within 0.1004 of -80 as a FAILED MANIPULATION and the batch as UNRESOLVED.
+# alpha = exp(-63.79) = 2.2e-28 is a normal float32 (min normal 1.18e-38), so
+# releasing the floor introduces no underflow.
+#
+# -----------------------------------------------------------------------------
+# PROBE STAYS 0 -- a considered refusal, not an omission.
+#   (a) It does not do what was hoped.  HF.block_product reduces <h,g> to ONE
+#       scalar PER GROUP before _probe() ever sees it, so for a blockwise arm
+#       z is a single length-2 tensor.  There is NO per-tensor <h,g> at m = 2;
+#       that path exists only for stepsize_type layerwise/weightwise/nodewise,
+#       which this batch has none of.
+#   (b) PROBE is an INTERVAL, not a flag (_probe_every = int(PROBE)), so
+#       PROBE=1 writes a JSONL record on EVERY meta-step -- 50000 per run --
+#       and each record does ~62 device-to-host syncs (h_absmax loops over all
+#       of h_condenced).  That changes wall-clock and breaks the byte-for-byte
+#       match with cts1 that makes the CLAMPED cells comparable.
+#   (c) With PROBE_DIR unset, _probe appends probe.jsonl to the CWD, which is
+#       the SHARED source tree, from 12 concurrent jobs.
+#   (d) The one quantity this batch needs -- clip occupancy -- is already fully
+#       observable at m = 2 from the two TensorBoard beta_block scalars, at
+#       zero cost and zero deviation.  That is what the scorer's R1 reads.
+#
+# -----------------------------------------------------------------------------
+# THE PRE-REGISTRATION lives in analysis/cM1_cts2_score.py and is summarised
+# here.  Gates fire IN ORDER; the first failure decides.
+#   G0 provenance: 12 runs, 4 cells x 3 seeds, 12 job ids, 100/100 epochs, no
+#      repeated flag, and every run's NAME agreeing with its own ARGS and ENV.
+#   R1 MANIPULATION: every RELEASED trace must stay strictly above
+#      -80 + 0.1004, and every CLAMPED run must reach its own floor.  A
+#      released trace that touches -80 means the manipulation FAILED and the
+#      batch is UNRESOLVED-MANIPULATION, not evidence.  Unreadable traces fail
+#      CLOSED to UNRESOLVED-MANIPULATION-UNCHECKED.
+#   R2 DIVERGENCE: any run with < 100 epochs, non-finite metrics, or
+#      plateau5 <= 5.00 pp is DEAD -> UNRESOLVED-DIVERGED.  Registered in
+#      advance precisely so that "the released arms failed to train" can NEVER
+#      be scored as "the cliff collapsed".
+#   R3 NOISE: any cell SD above 3*sigma_w = 2.6757 pp -> UNRESOLVED-NOISY.
+#   R4 PREMISE: D_C = M(k49,C) - M(k50,C) must be >= 12.4170 pp, HALF of cts1's
+#      own 24.8340 pp (17.05 SE).  Otherwise UNRESOLVED-PREMISE and cts1's arms
+#      may NOT be spliced in to rescue it.
+#   VERDICT on D_R = M(k49,R) - M(k50,R):
+#      SURVIVED   D_R >= 12.4170 pp  -> the finding is about STEPSIZE ALLOCATION
+#      COLLAPSED  D_R <=  1.4564 pp  -> it was CLAMP-TURNOVER TIMING, and
+#                 CORRECTIONS 147's surviving claim must be RESTATED as holding
+#                 in the CLAMPED REGIME ONLY
+#      PARTIAL    in between -> attenuated, neither branch claimed
+#      and COLLAPSED-BY-FREEZING if both released cells end with beta <= -20 in
+#      both blocks, which is a statement about the floor AS A FLOOR.
+#   NOISE FLOOR re-derived from results/all_runs.csv, not quoted: pooled within
+#   (batch x granularity) SD of plateau5 over the cts1 cell restricted to the
+#   m = 2 "[k,62-k]" arms = 0.8919 pp, df 46, 23 cells.  SE of an arm
+#   difference at 3 seeds = 0.7282 pp; SE of the interaction = 1.0299 pp.
+#
+# MAY NOT CLAIM: anything about m, about any cut but 49/50, about CAPTURE or
+# either anchor (none were run), about any other dataset/architecture/alpha0/
+# meta-stepsize/optimiser pair, about which TENSOR carries the step (cts1 owns
+# that; cts2 re-scopes it), or about any clamp setting but the two run here.
+#
+# WALLTIME, MEASURED not guessed.  cts1 ran this exact cell on this account,
+# 18 jobs, 0 TIMEOUT and 0 FAILED; cpk1 measured 42.0 min mean per run over 39
+# jobs of the same cell.  02:30:00 is cts1's own request, ~3.6x that mean, and
+# stays inside gpu-short's 4 h ceiling so no partition in the list is excluded.
+# Total cost: 12 jobs x ~45 min ~= 9 GPU-hours.
+#
+# USAGE   bash bin/cM1_clamp_release.sh            # dry run, submits nothing
+#         bash bin/cM1_clamp_release.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+# NOTE: bin/_lib_guards.sh re-assigns WS at source time from METAOPT_WS with a
+# default that points at the OTHER account, which would clobber this value and
+# aim guard_postlaunch at the wrong directory (it did exactly that to tn1 and
+# to hb1).  Exporting METAOPT_WS here is the documented work-around; the
+# library is NOT patched while jobs are queued.
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cts2
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# ---- the two clamps.  SAME CEILING, DIFFERENT FLOOR: one factor. ------------
+CLIP_C="-15:-2.3026"
+CLIP_R="-80:-2.3026"
+MST=1e-3; ALPHA0=1e-6; EPOCHS=100; BATCH=100
+GAMMA=1; AUG=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="0 1 2"
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=02:30:00
+NTENS=62
+
+# ---- the registered grid and the registered specs, written out LITERALLY ----
+K_LIST="49 50"
+G_K49='[49,13]'
+G_K50='[50,12]'
+ARMS="k49 k50"
+CLAMPS="C R"
+
+echo "=============================================================="
+echo " cts2 -- CIFAR-100 CLAMP RELEASE on the k=49 -> k=50 cliff"
+echo " $DSET / $NET  ms $MST  alpha0 $ALPHA0  AUGMENT=$AUG  PROBE=0"
+echo " clamp C = $CLIP_C (standard)   clamp R = $CLIP_R (floor released)"
+echo " cuts k = $K_LIST ; 2 cuts x 2 clamps x 3 seeds = 12 jobs, one submission"
+echo " scorer: analysis/cM1_cts2_score.py (registered before any run exists)"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests ------
+SC="$REPO/analysis/cM1_cts2_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: scorer missing"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cM1_cts2_score.py bin/cM1_clamp_release.sh 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires the scorer committed BEFORE any run exists: $DIRTY"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 was verified"
+  echo "          on the host that committed the scorer.  Not a pass, not a fail."
+fi
+python3 "$SC" --selftest >/tmp/cts2_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -30 /tmp/cts2_selftest.$$; }
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^cts2-' "$CSVP" && guard_fail "guard 2: cts2-* already in the CSV" \
+                         || echo "guard 2: no cts2-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/cts2-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cts2-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT cts2-*.out files already exist"
+fi
+
+# ---- guard 3: the CIFAR-100 data is actually staged on THIS account ---------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4: BOTH PARTITIONS PROVEN ON THE LIVE MODEL, AND WRITTEN DOWN ----
+# Same live-model proof cts1 used, reduced to the two cuts this batch runs, and
+# extended with guard 4e: BETA_CLIP is parsed and applied by the OPTIMISER
+# SOURCE ON THIS ACCOUNT the way the released floor assumes, and the meta
+# update's per-step |dbeta| bound is re-derived from that source rather than
+# asserted.  If either is not true on the live tree, nothing is submitted.
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+
+SPECS=""
+for K in $K_LIST; do
+  eval "LIT=\${G_K$K:-}"
+  WANT="[$K,$((NTENS-K))]"
+  if [ "$LIT" != "$WANT" ]; then
+    guard_fail "guard 4c: G_K$K is '$LIT', but the grid says '$WANT'"
+  fi
+  SPECS="$SPECS $LIT"
+done
+NK=$(echo $K_LIST | wc -w | tr -d ' ')
+NA=$(echo $ARMS | wc -w | tr -d ' ')
+NC=$(echo $CLAMPS | wc -w | tr -d ' ')
+[ "$NA" = "$NK" ] || guard_fail "guard 4c: $NA arms for $NK cut positions and no anchors"
+[ "$NC" = 2 ] || guard_fail "guard 4c: $NC clamp levels, expected 2"
+PREV=""
+for K in $K_LIST; do
+  if [ -n "$PREV" ] && [ "$K" != "$((PREV+1))" ]; then
+    guard_fail "guard 4c: the grid is not consecutive ($PREV -> $K); the step would not be single-tensor"
+  fi
+  PREV=$K
+done
+# the two clamps must share a ceiling and differ only in the floor
+[ "${CLIP_C#*:}" = "${CLIP_R#*:}" ] \
+  && echo "guard 4c: both clamps share the ceiling ${CLIP_C#*:}" \
+  || guard_fail "guard 4c: the two clamps differ in the CEILING as well as the floor"
+[ "${CLIP_C%%:*}" != "${CLIP_R%%:*}" ] \
+  || guard_fail "guard 4c: the two clamps have the SAME floor; there is no manipulation"
+echo "guard 4c: $NK literal specs agree with the grid; $NA arms x $NC clamps"
+
+# shellcheck disable=SC2086
+python3 - "$CIF" "$MANIFEST" "$NTENS" "$CLIP_C" "$CLIP_R" $SPECS <<'PYEOF' \
+  || guard_fail "guard 4: live partition / clamp check FAILED"
+import sys, os
+cif, out, ntens = sys.argv[1], sys.argv[2], int(sys.argv[3])
+clip_c, clip_r = sys.argv[4], sys.argv[5]
+specs = sys.argv[6:]
+sys.path.insert(0, cif)
+os.chdir(cif)
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network("ResNet18_c100", "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in net.named_parameters()]
+numel = [int(p.numel()) for _, p in net.named_parameters()]
+tot = sum(numel)
+T = len(nps)
+lines = ["NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "CLIP_C %s" % clip_c, "CLIP_R %s" % clip_r]
+print("guard 4: live ResNet18_c100 has %d parameter tensors, %d parameters"
+      % (T, tot))
+if T != ntens:
+    print("!!! guard 4: the live model has %d tensors, the batch assumes %d"
+          % (T, ntens))
+    raise SystemExit(1)
+
+print("guard 4: the layer4.0 block, tensor by tensor -- this is where the cut sits:")
+for i in range(45, 54):
+    print("         %2d  %-32s %9d" % (i + 1, names[i], numel[i]))
+
+bad = 0
+seen = {}
+for spec in specs:
+    g = HF.polish_the_stepsize_groups(None, spec, nps)
+    sizes = [len(x) for x in g]
+    if sum(sizes) != T:
+        print("!!! guard 4: %s does not cover the model (%d of %d)"
+              % (spec, sum(sizes), T)); bad += 1; continue
+    if len(g) != 2:
+        print("!!! guard 4: %s composed to m=%d, but every arm must be m=2"
+              % (spec, len(g))); bad += 1; continue
+    want = [int(x) for x in spec[1:-1].split(",")]
+    if sizes != want:
+        print("!!! guard 4: %s composed to sizes %s on the live model" % (spec, sizes))
+        bad += 1; continue
+    k = sizes[0]
+    if list(g[0]) != names[:k] or list(g[-1]) != names[k:]:
+        print("!!! guard 4: %s does not split named_parameters() at %d BY NAME"
+              % (spec, k)); bad += 1; continue
+    pc, i = [], 0
+    for s in sizes:
+        pc.append(sum(numel[i:i + s])); i += s
+    lines.append("SPEC %s M %d SIZES %s PARAMS %s FIRSTGROUP %s LASTGROUP %s"
+                 % (spec, len(g), ",".join(str(s) for s in sizes),
+                    ",".join(str(s) for s in pc), " ".join(g[0]), " ".join(g[-1])))
+    print("guard 4: %-9s m=2  sizes %-8s  params %9d / %-9d  share %.6f"
+          % (spec, str(sizes), pc[0], pc[1], pc[0] / float(tot)))
+    print("         FULL first  = %s" % " ".join(g[0]))
+    print("         FULL second = %s" % " ".join(g[1]))
+    seen[k] = (set(g[-1]), pc[0])
+
+ks = sorted(seen)
+print("guard 4d: the single-tensor step, MEASURED on the live model:")
+for a, b in zip(ks, ks[1:]):
+    moved = [n for n in names if n in seen[a][0] and n not in seen[b][0]]
+    dp = seen[b][1] - seen[a][1]
+    flag = "" if len(moved) == 1 else "   <<< NOT A SINGLE TENSOR"
+    print("         k=%d -> k=%d moves %-30s %8d params%s"
+          % (a, b, " ".join(moved), dp, flag))
+    if len(moved) != 1:
+        bad += 1
+    lines.append("STEP %d %d MOVED %s PARAMS %d" % (a, b, " ".join(moved), dp))
+
+# guard 4e: the CLAMP, on the live source.  Three things, none assumed:
+#   (1) BETA_CLIP is read from the environment and split on ':' into a floor
+#       and a ceiling;
+#   (2) it is applied as a clamp on beta after the meta update;
+#   (3) the meta update's per-step |dbeta| is bounded by meta_stepsize, which
+#       is what makes -80 unreachable.
+import inspect, re as _re
+src_init = inspect.getsource(HF.__init__)
+if "BETA_CLIP" in src_init and "_beta_lo" in src_init and "split(':')" in src_init.replace('"', "'"):
+    print("guard 4e: BETA_CLIP is parsed from the environment into "
+          "(_beta_lo, _beta_hi) on the live source")
+else:
+    print("!!! guard 4e: the live HF.__init__ does not parse BETA_CLIP as assumed")
+    bad += 1
+src_step = ""
+for _m in ("step", "update", "__call__"):
+    if hasattr(HF, _m):
+        _s = inspect.getsource(getattr(HF, _m))
+        if "_beta_lo" in _s:
+            src_step = _s
+            break
+_flat = "".join(src_step.split())
+if "clamp(self._beta_lo,self._beta_hi)" in _flat:
+    print("guard 4e: the clamp is applied to beta AFTER the meta update, in "
+          "HF.%s" % _m)
+else:
+    print("!!! guard 4e: could not find beta.clamp(_beta_lo, _beta_hi) in the "
+          "live update path")
+    bad += 1
+src_lion = inspect.getsource(HF.Lion_meta_update)
+if "torch.sign" in src_lion and "meta_stepsize" in src_lion:
+    print("guard 4e: Lion_meta_update moves beta by meta_stepsize * sign(.), so")
+    print("          |dbeta| <= 1e-3 per meta-step and 50000 meta-steps cannot")
+    print("          take beta from -13.815511 below -63.790127 (float32).")
+    print("          The released floor -80.0 is 16.209873 nats below that.")
+else:
+    print("!!! guard 4e: Lion_meta_update is not the sign-bounded update the "
+          "released floor's justification assumes")
+    bad += 1
+
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: %d cut specs verified; PARTITION-MANIFEST.txt written to %s"
+      % (len(specs), out))
+PYEOF
+[ -s "$MANIFEST" ] && echo "guard 4b: manifest is non-empty" || guard_fail "guard 4b: no manifest"
+
+# ---- guard 5: capacity ------------------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 12"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=$MST alpha0=$ALPHA0 \
+        num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for CL in $CLAMPS; do
+    case $CL in
+      C) CLIP=$CLIP_C ;;
+      R) CLIP=$CLIP_R ;;
+      *) echo "!!! unknown clamp $CL"; exit 2 ;;
+    esac
+    for ARM in $ARMS; do
+      case $ARM in
+        k49) G=$G_K49 ;;
+        k50) G=$G_K50 ;;
+        *)   echo "!!! unknown arm $ARM"; exit 2 ;;
+      esac
+      # NOTE the single quotes around $G below: "[50,12]" is a bash bracket GLOB.
+      # Unquoted, inside the eval, it would expand against the CWD if a file
+      # named 5 or 0 or , ever existed there.  Quoted, argv reaches train.py
+      # literally and the runner's `echo "ARGS: $@"` prints it unchanged for
+      # RULE 20.
+      CMD="sbatch --job-name=cts2-$ARM-$CL-s$S --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $ALPHA0 --num-epochs $EPOCHS \
+--stepsize-groups '$G' --seed $S --save-directory $SAVE --run-name cts2-$ARM-$CL-s$S"
+      if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+        echo "!!! RULE 20 PRE-CHECK FAILED for cts2-$ARM-$CL-s$S"
+        guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+      fi
+      if [ "$SUBMIT" = 1 ]; then eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+      else echo "$CMD"; echo; N=$((N+1)); fi
+    done
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cts2-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cts2-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cts2- present in bin/PROTECTED.txt ----"
+  # jobs/run_cifar.sh hard-codes #SBATCH --output=$WS/runs/%x-%j.out, so the .out
+  # files land in $WS/runs, NOT in --save-directory.
+  guard_postlaunch "$WS/runs" "cts2-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cts2 job started inside the window.  This is NOT"
+       echo "         a mismatch.  Re-check once one starts with:"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name cts2-" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cts2-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+fi

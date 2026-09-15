@@ -1,0 +1,701 @@
+# MAIN-IDEA-GAPS — what was never tried on the hierarchical/shrinkage idea, and why
+
+**Scope.** This document is the accounting for **Arsalan's November-2025 proposal only** — learn a
+scalar and a layerwise step size jointly and shrink the layerwise ones toward the scalar with a
+tunable strength, in order to diagnose why the strictly more expressive parameterisation loses on
+ImageNet. It is **not** about the paper that exists instead (the count-matched partition audit).
+It answers one question: *what did we not run, and was that a decision or an oversight.*
+
+**Metric rule, applied throughout.** `plateau5` (mean of the last 5 test epochs) is primary. The
+CSV `plateau` column is mean-of-last-20 and is not used. `best_test` is used only where it is
+named explicitly, and where a recorded headline was a `best_test` number that is said so.
+
+**Replication rule, applied throughout.** BATCH is the unit of replication in this corpus; SEED is
+null. Every contrast below is **within one batch** unless it says otherwise, and where a contrast
+is cross-batch that is flagged as a defect, not a result. `batch` is the run-name prefix up to the
+first `-` or `_`. The 4 duplicate groups that touch hierarchical rows (8 rows) are collapsed before
+any `n` is quoted.
+
+**Every number below was re-derived at this HEAD from `results/all_runs.csv` (2,177 rows, 2,174
+after dropping the 3 `superseded=1` rows) and, for the code and dataset claims, from the live tree
+on cluster_a. Nothing is quoted from prose, including from the briefing that commissioned this
+document — where my re-derivation disagrees with the record, §3.4 and §2.6 say so.** No Slurm job
+was submitted; both queues were confirmed empty (`squeue -u account_a` returns a header only).
+
+Reproduction preamble for every table in this file:
+
+```python
+import pandas as pd, re
+d = pd.read_csv('results/all_runs.csv'); d = d[d.superseded != 1]
+d['batch'] = d.run.map(lambda r: re.split(r'[-_]', str(r))[0])
+h = d[d['hier'].fillna('') != '']          # 637 rows — the main idea's own runs
+```
+
+**Cost model** (median `wallclock_min` over completed 100-epoch runs in the corpus, one GPU):
+ResNet-10 21 min (0.35 GPU-h) · ResNet-18 42 min (0.70) · ResNet-18/CIFAR-100 42 min (0.70) ·
+ResNet-34 64 min (1.07) · ResNet-50 136.5 min (2.28) · ResNet-18 at 300 ep 130 min (2.17).
+The whole hierarchical programme to date is **637 runs / 492.8 GPU-h**, out of a 2,174-run /
+1,641.6 GPU-h corpus. That is the yardstick for "cheap" below.
+
+---
+
+## 0. The gap list in one table
+
+Ordered by what I judge a supervisor will care about, not by cost.
+
+| # | gap | why not done | still worth doing | rough cost |
+|---|---|---|---|---|
+| **G1** | **The proposal as literally written — a genuinely tunable shrinkage — was never measured.** The implemented M0 applies the projection every step, so λ is a *time constant*, not a strength, and every rung with λ ≥ 1e-3 is fully pooled long before the run ends | **OVERLOOKED**, then partially recognised. FINDINGS records the half-life arithmetic for the *weightwise* ladder (cycle 4) but the *layerwise* ladder was never re-designed on the same insight, and the ladder was reported as "flat over three decades = robust" rather than "saturated" until CORRECTIONS 3 | **Yes — this is the single thing that must be run before the idea can be called dead** | patch + equivalence suite (0 GPU); 60 runs ≈ **42 GPU-h**, one batch |
+| **G2** | The **two-level parameterisation** β_g = β_scalar + δ_g with its own meta-step-size for δ — arguably what the proposal actually describes — was **never implemented at all**. No patch for it exists in `patches/` | **OVERLOOKED.** M0 (projection) and M1 (increment mixing) were both built as post-hoc operators on β; the joint-estimation form was never coded | Yes. It is the only variant where "pooling strength" is not confounded with a meta-step-size rescaling by construction | patch ≈ 40 lines + verification; 66 runs ≈ **46 GPU-h** |
+| **G3** | **The one architecture where the motivating anomaly reproduces (ResNet-50) got 4 hierarchical runs at a single r, transplanted from another cell** — and those 4 runs beat *both* endpoints by 2.0–3.4 pp | **OVERLOOKED / superseded.** `sc50` was launched to test the *premise*, not the fix; by the time it landed the campaign had pivoted to the partition audit and nobody read the additive rows against the scalar rows in the same batch | **Yes. This is the strongest un-chased positive result in the corpus** | r-ladder 9 rungs × 3 seeds × 2 α₀ + in-batch scalar = 60 runs ≈ **137 GPU-h**; ×2 for a second batch |
+| **G4** | The **r × meta-step-size two-way ladder** that would settle the record's own mechanism claim ("the r-dial is a meta-LR dial in a pooling costume") was never run. **All 637 hierarchical runs are at `meta_stepsize = 1e-3`, without exception** | **OVERLOOKED.** The pre-registered kill test (`ms-*`, 52 jobs) swept meta-step-size on *plain* arms only. It fires at α₀=1e-3 and, as re-derived in §3.5, **fails to fire at α₀=1e-6** — which nobody noticed | **Yes, and it is the cheapest decisive experiment on the list** | 45 runs ≈ **32 GPU-h**, one batch |
+| **G5** | **The anomaly cell under the parent paper's own optimiser pair (AdamW + Adam, α₀=1e-3) has one r value and no λ ladder.** Layerwise loses to scalar by 1.889 pp there; the fix was never swept there | **OVERLOOKED.** `dc` ran r=0.06 only, imported from the SGDm+Lion optimum | Yes | 33 runs ≈ **23 GPU-h** |
+| **G6** | **84 % of hierarchical design cells (182 of 217) rest on a single batch** — 425 of the 637 runs. Under this corpus's own F-test that is n=1 for inference | **COST**, and partly overlooked: seeds were added instead of batches because seeds are cheaper and the batch effect was established late (cycle ~62) | Yes, for whichever cells survive G1–G5 | ~1 replicate batch per surviving headline, ≈ 20–30 GPU-h each |
+| **G7** | **The main idea was never crossed with the partition instrument the replacement paper is built on.** Hierarchical runs use 4 of the corpus's 27 real granularities: `layerwise`, `nodewise`, `weightwise`, `resnet18_blocks`. **Zero** on `chunk*` (15 variants), `nodewise1d`, `permnode*` | **SUPERSEDED**, and a genuine loss. The chunk family was built after the hierarchy work closed, and nobody went back | Yes — pooling on a count-matched partition is the only design that separates "pooling" from "coarsening" | additive+zpool × 3 chunk sizes × 5 r × 3 seeds ≈ 90 runs ≈ **63 GPU-h** |
+| **G8** | **True pooling (`zpool`) was never run on a good partition.** 83 zpool runs, all on `layerwise` or `weightwise`, all ResNet-18/CIFAR-10, and only 4 of them at α₀=1e-3 (all 20-epoch). The claim "pooling never improves a good partition" is an extrapolation from the layerwise ceiling, not a measurement | **OVERLOOKED.** zpool was built to fix the additive confound and was retired once it showed full pooling loses (−3.157 pp re-derived here; the record says −3.044) | Yes, and cheaply — it is the honest version of the headline null | blk6 + chunk777 × 6 r × 3 seeds ≈ 36 runs ≈ **25 GPU-h** |
+| **G9** | **`zmpool` — the magnitude-invariant operator, built specifically because zpool's interior was confounded — has 4 runs, all 20-epoch endpoint gates, and no sweep at all** | **COST / abandonment.** It was patched at cycle 12 and the campaign pivoted before the ladder was launched | Yes if G4 is not run; it answers a subset of the same question | 9 r × 3 seeds × 2 granularities ≈ 54 runs ≈ **38 GPU-h** |
+| **G10** | **The motivating phenomenon was never reproduced on ImageNet, and cannot be with the code and data on disk.** The authors' `imagenet/Optimizers/HF.py` accepts **`scalar` only** into `stepsize_type` — `layerwise` is not in its list, not even as a dead branch | **INFEASIBLE** on the local copy (489/1000 train classes; 50,000 flat, unlabelled val JPEGs; no devkit anywhere), and **infeasible on cost** even with a complete copy | The premise deserves *a* scale test; ImageNet-1k is not the affordable one | see §4 — ImageNet-1k ≈ **3,000–5,000 GPU-h** for a ladder; **Tiny-ImageNet ≈ 200 GPU-h** is the credential-free substitute and was never considered |
+| **G11** | **Everything is CIFAR-resolution ResNets.** No transformer, no VGG/DenseNet/ViT, no GroupNorm net (17 `ResNet18_gn` runs exist, none hierarchical), no ResNet-101 (1 run, not hierarchical) | **COST + deliberate scoping.** The ResNet ladder R10→R18→R34→R50 was the chosen scale axis | Partly — the architecture axis matters less than G3/G4. A GroupNorm arm is nearly free and would test whether the effect is a BatchNorm artefact | GN arm: 18 runs ≈ **13 GPU-h** |
+| **G12** | **TinyStories: assessed, cut, and the assessment holds — I re-verified it on the tree.** Zero training runs have ever executed there; the optimizer copy carries **0 patches** and cannot execute `layerwise` at all | **COST**, correctly declined | Not before G1–G5. It is a third independent optimizer port for a modality the abstract already scopes out | see §5 — **≥ 3 weeks and ≥ 300 GPU-h** before a first contrast, and I concur |
+| **G13** | **`batch_size = 100` in every one of the 2,174 runs in the corpus.** Batch size sets steps-per-epoch, which sets how many meta-updates a run gets, which is exactly the quantity the shrink saturation argument turns on | **OVERLOOKED.** It was inherited from the parent config and never questioned | Yes as a robustness check on G1 — a 4× larger batch quarters the meta-steps and moves every half-life | 12 runs ≈ **8 GPU-h** |
+| **G14** | **All 637 hierarchical runs use one β-clip box, `-15:-2.3026`**, while the corpus uses 13. The box demonstrably matters: the anomaly's size changes from −1.889 pp to −1.561 pp between `a0` (`-15:-2.3026`) and `tc1` (`-30:6.0`) | **OVERLOOKED.** The box was frozen for the hierarchy work before its influence was measured | Yes, one box-free replicate of the surviving headline | 12 runs ≈ **8 GPU-h** |
+| **G15** | **No hierarchical run uses a non-normalised meta-optimizer.** Every meta in the corpus is `Lion`, `Adam`, `RMSProp` or `fixed`. The whole "pooling ≡ meta-LR division by \|2p−1\|" confound exists *because* Lion's increment has constant magnitude — a plain-SGD meta would not have it | **OVERLOOKED.** Nobody asked whether the confound was a property of the operator or of the meta-optimizer | Yes — it is the conceptually cleanest way to break the confound, cleaner than G4 | needs a plain-SGD meta arm in `build_optimizer` (may already exist as `fixed`); ~24 runs ≈ **17 GPU-h** |
+| **G16** | **A learned or empirical-Bayes pooling strength was never tried.** The textbook hierarchical answer — James–Stein / empirical Bayes, λ estimated on-line from the between-group variance — needs no ladder and no tuning, which is precisely the objection the proposal was written to answer | **OVERLOOKED.** Never proposed in any cycle | Yes. It is cheap and it is the version a referee will ask about | patch ≈ 30 lines; 18 runs ≈ **13 GPU-h** |
+| **G17** | **Only three r values and one λ value were ever run past 100 epochs**, all in one batch, at α₀=1e-6 only, with no scalar reference in that batch | **COST.** 300-epoch runs are 3× the price and the budget axis was spent on the partition question | Yes for whichever operator survives G1 | 8 rungs × 2 seeds at 300 ep ≈ **35 GPU-h** |
+| **G18** | **The hierarchical arms were never benchmarked against a tuned fixed-hyper-parameter baseline.** Every contrast in the 637 runs is MetaOptimize-vs-MetaOptimize. The best hierarchical run in the corpus is **94.092** (ResNet-34, additive r=0.02); plain SGD at lr=0.1 reaches **95.282** on ResNet-18 in the same corpus | **DELIBERATE** for the internal comparison, but never stated as a scope limit *for the hierarchy claim* | Yes — one line in any write-up, no new compute; the runs already exist | **0 GPU-h** |
+| **G19** | **No three-level hierarchy.** Every operator is two-level (group vs. global). scalar → block → layer, the natural nesting for a ResNet, was never built | **OVERLOOKED** | Low priority until G1 settles the two-level case | patch + 27 runs ≈ **19 GPU-h** |
+
+---
+
+## 1. G1 — the proposal as literally written was never run
+
+### 1.1 What the code does
+
+`patches/HF_patched.py`, `_apply_hier`, reached from `step()` on **every minibatch**:
+
+```python
+if self._hier == 'shrink':
+    self.beta[0] = b - self._hier_lam * (b - b.mean())
+```
+
+So the deviation of each group's log step size from the group mean is multiplied by (1−λ) once per
+optimizer step. Over T steps the surviving deviation is (1−λ)^T. CIFAR-10 has 50,000 training
+images and `batch_size = 100` in every run in the corpus, so a 100-epoch run is **50,000 meta
+steps**.
+
+### 1.2 The ladder, re-derived, within one batch
+
+The only λ ladder that exists is ResNet-18 / CIFAR-10 / SGDm+Lion / layerwise / α₀=1e-6 / 100 ep.
+Rungs λ ≥ 1e-3 are batch `h2`, which also carries its own plain-layerwise control (`h2-base_*`,
+n=5, plateau5 **90.802**). Duplicate group `h2-layer-shrink0.1-s2` collapsed.
+
+| λ | n | plateau5 | Δ vs `h2` plain | half-life (steps) | half-lives in 50,000 steps |
+|---|---|---|---|---|---|
+| 0.01 | 3 | 92.575 | +1.773 | 69.0 | 725 |
+| 0.001 | 3 | 92.426 | +1.624 | 692.8 | 72.2 |
+| 0.1 | 3 | 92.336 | +1.534 | 6.6 | 7,600 |
+| 0.3 | 3 | 92.274 | +1.472 | 1.9 | 25,729 |
+| **1.0** | 3 | 92.257 | +1.455 | 0 | ∞ |
+| 0.5 | 3 | 92.255 | +1.453 | 1.0 | 50,000 |
+| 0.03 | 3 | 92.229 | +1.427 | 22.8 | 2,197 |
+
+Three points, all re-derived:
+
+1. **The ladder is flat.** Over three decades of λ the spread is **0.346 pp** (92.229 → 92.575),
+   against a within-cell seed SD of ≈0.20. There is no dose–response.
+2. **Every rung is saturated.** The least aggressive rung on this ladder, λ=1e-3, still runs
+   **72 half-lives**. By the end of *epoch 2* it is at full pooling. The sweep measured full
+   pooling seven times.
+3. **λ=1.0 ranks 5th of 7 on plateau5** — not 6th. The "sixth of seven" in the record is a
+   `best_test` ranking. Either way the ordering is noise; the point is that it is noise, so
+   "the optimum is at full pooling" was correctly struck and nothing replaces it.
+
+### 1.3 The three genuinely partial rungs exist — in a different batch, with no control
+
+λ ∈ {1e-5, 3e-5, 1e-4} exist **only** in batch `lp`, which contains **6 runs and nothing else** —
+no plain arm, no scalar arm, no λ=1 arm.
+
+| λ | batch | n | plateau5 | half-lives in 50,000 | deviation surviving at end |
+|---|---|---|---|---|---|
+| 1e-5 | `lp` | 2 | 90.914 | 0.72 | 61 % |
+| 3e-5 | `lp` | 2 | 90.958 | 2.16 | 22 % |
+| 1e-4 | `lp` | 2 | 90.761 | 7.21 | 0.7 % |
+
+So the *only* three measurements of partial pooling on layerwise sit in an isolated 6-run batch,
+and the 1.4-pp step between λ=1e-4 (`lp`, 90.761) and λ=1e-3 (`h2`, 92.426) is **perfectly
+confounded with the `lp` → `h2` batch change**, which in this corpus is the established unit of
+replication. That comparison cannot be made. It was made anyway.
+
+Note also that even λ=1e-4 is effectively saturated (0.7 % deviation left). Genuinely partial
+pooling at the end of a 100-epoch run needs λ ≲ 3e-5, i.e. **two rungs of one ladder in one batch
+with no control**. That is the entire evidence base for the proposal's actual claim.
+
+### 1.4 What the correct experiment would have been
+
+The briefing asks precisely this. Four candidate repairs, and only two of them work:
+
+* **(a) Prox / penalty form — the right one.** Add a quadratic penalty λ‖β − β̄‖² to the *meta*
+  objective, so the meta-gradient carries a −2λ(β − β̄) term and the shrink is balanced against
+  the meta-gradient's drive instead of applied unconditionally. The stationary deviation is then
+  set by the ratio of the meta-gradient's between-group spread to λ — a genuine strength dial with
+  **no time constant and no saturation**, and λ=0 is exactly plain by construction. This is what
+  "partial pooling with a tunable coefficient" means in the statistics literature the proposal
+  borrows from, and it is a ~15-line change inside `_apply_hier` (add to `HtT_gradft` before
+  `meta_update`, not to `beta` after it).
+  **Cost:** patch + a λ=0 byte-equivalence test (0 GPU) · 8 rungs × 3 seeds × 2 α₀ = 48 runs,
+  plus in-batch plain and scalar controls at both α₀ (12 runs) = **60 runs ≈ 42 GPU-h, one batch.**
+
+* **(b) Two-level parameterisation — the most faithful one.** Carry β_scalar and δ_g explicitly,
+  β_g = β_scalar + δ_g, and give δ its own meta-step-size η_δ = ρ·η. ρ is the pooling strength;
+  ρ=0 is *exactly* scalar and ρ=1 is per-group with the shared level still learned. No projection,
+  no time constant. This is arguably what the proposal literally describes ("learn a scalar and
+  layerwise step sizes **jointly**") and **no patch for it was ever written**.
+  **Cost:** ~40 lines + an equivalence suite at both endpoints · 9 rungs × 3 seeds × 2 α₀ +
+  controls = **66 runs ≈ 46 GPU-h.** This is G2.
+
+* **(c) Periodic *full* shrink (λ=1 every k steps) — also valid.** Deviation is zeroed every k
+  steps and rebuilt over the next k. This is a stationary process; k is a genuine, non-saturating
+  strength dial (large k → nearly plain, k=1 → fully pooled). Cheapest of the three: one counter
+  and an env var.
+  **Cost:** k ∈ {1, 10, 100, 1000, 10000, ∞} × 3 seeds × 2 α₀ = **36 runs ≈ 25 GPU-h.**
+
+* **(d) Periodic *partial* shrink (λ<1 every k steps) — does NOT work, and it is the obvious
+  wrong answer.** It only reparameterises the per-step coefficient (λ_eff ≈ λ/k); the deviation
+  still decays geometrically and still saturates, just later. Same for a per-epoch shrink with
+  λ<1 (that is (d) with k=500). I flag this explicitly because it is the fix that will be
+  proposed first, and it would waste a batch.
+
+**Judgement.** This is the gap that matters. Until (a) or (b) is run, "hierarchical shrinkage
+toward the scalar does not help" is **not a measured statement** — what was measured is "full
+pooling of β, applied as a projection, gives +1.5 pp over plain layerwise at α₀=1e-6 on
+ResNet-18, and is insensitive to how fast you get there."
+
+---
+
+## 2. G6–G9, G13–G14, G17, G19 — coverage holes, from the CSV
+
+### 2.1 The design grid, in full
+
+637 hierarchical runs across 50 batches. Every one of them is at:
+
+| axis | hierarchical runs use | corpus contains |
+|---|---|---|
+| `meta_stepsize` | **1e-3 only** | 15 distinct values |
+| `beta_clip` | **`-15:-2.3026` only** | 13 distinct boxes |
+| `batch_size` | **100 only** | 100 only (all 2,174 runs) |
+| `gamma` | **1.0 only** | 1.0, 0.999 |
+| `granularity` | layerwise, nodewise, weightwise, resnet18_blocks (**4**) | 27 real partitions |
+| `base` | SGDm (615), AdamW (16), Lion (6) | SGDm, AdamW, SGD, RMSProp, Lion, HF |
+| `meta` | Lion (605), Adam (32) | Lion, Adam, RMSProp, fixed |
+| `network` | R10, R18, R34, R50, and the three `_c100` variants | + `ResNet18_gn`, `ResNet101` |
+| `epochs` | 100 (571), 20 (43), 300 (13), 4 (7), 600 (3) | + 200-epoch windows |
+| `dataset` | CIFAR-10 (575), CIFAR-100 (62) | same |
+
+The granularities **never touched by any hierarchical run**: `chunk1`, `chunk2`, `chunk16`,
+`chunk128`, `chunk295`, `chunk771`, `chunk777`, `chunk835`, `chunk884`, `chunk1024`, `chunk2293`,
+`chunk2325`, `chunk2500`, `chunk8192`, `chunk65536` (15 chunk variants), `nodewise1d`,
+`permnode0/1/2/101/202/303`, and `scalar` itself — 23 of the corpus's 27 real partitions.
+
+### 2.2 Batch replication — the biggest quiet hole (G6)
+
+Grouping the 637 runs by (operator × network × dataset × base × meta × α₀ × granularity × epochs ×
+knob) gives **217 design cells**:
+
+* **182 cells (83.9 %) rest on a single batch**, holding **425 of the 637 runs**.
+* **52 cells are n=1 outright.**
+
+Under this corpus's own variance decomposition — batch is the replication unit, seed is null — a
+five-seed cell inside one batch is n=1 for inference. So most of the hierarchical evidence is
+unreplicated in the sense the project itself insists on everywhere else. This is partly cost and
+partly sequencing: the batch effect was only established around cycle 62, after most of the
+hierarchy work was done, and nobody went back to add replicate batches.
+
+### 2.3 Empty and thin cells, named
+
+| what is missing | detail |
+|---|---|
+| ResNet-34 at α₀=1e-3 | **no r-curve at all** — one point, r=0.06, n=3, batch `sa3`. The α₀=1e-6 curve has 14 rungs |
+| ResNet-50, any α₀ | **one point, r=0.06, n=2** — see §3.3, this is the important one |
+| ResNet-10, ResNet-34, CIFAR-100 under `shrink` | **20-epoch, n=1, λ=1.0 only** (batches `p4`/`p5`). No λ ladder anywhere but ResNet-18 |
+| `shrink` under AdamW base | **zero runs.** All 113 `shrink` runs are SGDm |
+| `shrink` on ResNet-50 | **zero runs** |
+| `zpool` off ResNet-18 | **zero runs.** No ResNet-10/34/50, no CIFAR-100 |
+| `zpool` at α₀=1e-3 at a real budget | **zero.** The 4 rows at α₀=1e-3 are 20-epoch endpoint gates |
+| `zpool` on `nodewise` or `resnet18_blocks` | **zero** — see §2.4 |
+| `zmpool` | **4 runs, 20 epochs, endpoints only.** No sweep, ever |
+| `additive` on nodewise/blocks/weightwise off ResNet-18 | **zero** (only `resnet18_blocks` on `ResNet18_c100`) |
+| any operator × any `chunk*` / `nodewise1d` / `permnode*` | **zero** (G7) |
+| any operator at meta_stepsize ≠ 1e-3 | **zero** (G4) |
+| any operator at a second β-clip box | **zero** (G14) |
+| any operator at a second batch size | **zero** (G13) |
+| any operator on `ResNet18_gn` (GroupNorm) | **zero** (G11) |
+| a 3-level hierarchy | **never built** (G19) |
+| long budget | 300 ep: `shrink` λ=0.1 only (2 batches, n=2 each) and `additive` r ∈ {0, 0.05, 0.1} (batch `e3a`, n=2). 600 ep: `additive` r=0.06 under AdamW only (n=3). **No r-ladder beyond 100 ep covers the optimum region 0.02–0.07 on any network** (G17) |
+
+### 2.4 G8 in detail — pooling was never tested on a good partition
+
+All 83 `zpool` runs are ResNet-18 / CIFAR-10 / `layerwise` or `weightwise`. Re-derived from the
+100-epoch cells (batches `zsw`, `zsx`, `zrn`):
+
+| r | layerwise plateau5 | n | weightwise plateau5 | n |
+|---|---|---|---|---|
+| 0 (full pooling) | 87.880 | 5 | 87.943 | 5 |
+| 0.1 | 89.728 | 5 | 87.986 | 5 |
+| 0.3 | 89.677 | 5 | 88.094 | 5 |
+| 0.5 | 89.361 | 4 | 88.004 | 4 |
+| 0.7 | 89.235 | 6 | 88.256 | 6 |
+| 0.9 | 90.335 | 2 | 88.614 | 2 |
+| 0.95 | 90.454 | 2 | 88.905 | 2 |
+| 0.99 | 91.112 | 1 | 89.272 | 2 |
+| 1 (plain) | 91.037 | 5 | 79.235 | 5 |
+
+The operator behaves exactly as designed at r=0: **87.880 (layerwise) vs 87.943 (weightwise) vs
+87.955 plain scalar in batch `sc`** — granularity-invariant to 0.075 pp across a factor of 180,000
+in group count, which is the identity the operator was built to satisfy and which `additive` fails
+by 47 pp. Full pooling is **−3.157 pp** against plain layerwise here. It rescues weightwise by
+**+8.7 pp**. Both re-derive.
+
+But the partitions tested are the *worst* one (weightwise) and a *fine* one (layerwise, m=62). The
+corpus's best partition is `resnet18_blocks` (m=6), which reaches **91.341–91.594** plain across
+seven batches in the same regime — above every zpool cell in the table. **zpool was never run on it, nor on any
+`chunk*` partition.** So "pooling never improves a good partition" is an inference from the
+layerwise ceiling, not an observation. The inference is plausible (zpool interpolates toward
+scalar, which is worse) but the interesting case — pooling a partition *finer* than blk6 down
+toward blk6-like coarseness, where an interior optimum is at least conceivable — is exactly the
+`chunk*` family, and it is empty.
+
+### 2.5 A defect in what was collapsed
+
+4 duplicate groups touch hierarchical rows (8 rows), all in batch `h2`. Two of them collapse
+`h2-blk6_s{0,1,2}` with `h2-b-L0p1_s{0,1,2}`, so the blocks λ=0.1 cell that reads n=6 in the raw
+CSV is **n=3** (plateau5 91.760). Any table quoting n=6 there is wrong.
+
+### 2.6 One correction to the record, found while re-deriving
+
+The record and the briefing say the M1 interior optimum "transfers nowhere — no interior optimum
+on ResNet10, ResNet34, or CIFAR-100 at either α₀." **On plateau5, within batch, at α₀=1e-6, that is
+too strong.** Re-derived (r=1 is the exact plain-layerwise identity; r=0 is the fully-pooled
+increment, *not* scalar):
+
+| cell | r=0 | peak | at r= | r=1 (plain) | peak − r=0 | peak − r=1 | interior optimum? |
+|---|---|---|---|---|---|---|---|
+| R18 layerwise, α₀=1e-6 | 92.288 | **93.286** | 0.06 | 90.971 | +0.998 | +2.314 | **yes** |
+| R18 nodewise, α₀=1e-6 | 92.359 | **93.225** | 0.06 | 91.766 | +0.866 | +1.459 | **yes** |
+| R34 layerwise, α₀=1e-6 | 93.073 | **93.967** | 0.025 | 90.421 | +0.894 | +3.546 | **yes** |
+| R10 layerwise, α₀=1e-6 | 82.180 | **91.605** | 0.1 | 90.743 | +9.425 | +0.862 | **yes** |
+| R18_c100, α₀=1e-6 | 11.087 | 70.106 | 0.2 | 69.718 | +59.019 | +0.388 | below the 0.5-pp bar |
+| R18 blocks, α₀=1e-6 † | 91.859 | 91.927 | 0.03 | 91.459 | +0.068 | +0.468 | no |
+| R18 weightwise, α₀=1e-6 | 47.955 | 79.064 | 1.0 | 79.064 | — | 0 | no (monotone to plain) |
+| R18 layerwise, α₀=1e-3 | 92.217 | 92.403 | 0.1 | 91.216 | +0.186 | +1.187 | no (below bar vs r=0) |
+| R10 layerwise, α₀=1e-3 | 82.237 | 91.241 | 1.0 | 91.241 | — | 0 | no |
+| R18_c100, α₀=1e-3 | 8.917 | 70.107 | 1.0 | 70.107 | — | 0 | no |
+| R18 blocks, α₀=1e-3 | 92.161 | 92.161 | 0 | — | 0 | — | no (monotone down) |
+| R18 layerwise, **Lion base**, α₀=1e-6 | **93.925** | 93.925 | 0 | 91.281 | 0 | +2.644 | no — optimum at **full** pooling |
+
+† the only row in this table that mixes batches (`gp` supplies r ∈ {0, 0.06, 0.2, 1}, `adg` supplies
+r ∈ {0.03, 0.1}). Within `gp` alone, r=0 is the maximum, so the verdict "no interior optimum" holds
+single-batch. Every other row is either single-batch or, where two batches supply it, holds
+single-batch as well: within `zad` alone the R18-layerwise curve is 92.326 (r=0) → **93.201** (r=0.07)
+→ 90.971 (r=1); within `r34r` alone the R34 curve is 93.073 (r=0) → **93.912** (r=0.02) → 90.421 (r=1);
+the R18-nodewise, R10 and CIFAR-100 curves are each one batch throughout.
+
+The ResNet-34 curve is the cleanest in the corpus: 14 rungs, unimodal, n=3 each, and the two
+batches supplying it (`r34f`, `r34r`) **interleave** across the rungs, so the shape is not
+batch-confounded. Its r=1 endpoint (90.421) also lands on the independent plain-layerwise measurement
+in batch `sc` (90.178), which is the identity check the operator must pass.
+
+**The honest statement is therefore narrower and more specific than "transfers nowhere":** the
+interior optimum replicates on **4 of 7** tested (network × granularity) cells at α₀=1e-6, fails on
+all of them at α₀=1e-3, fails on `weightwise` and `resnet18_blocks` at either α₀, and **inverts**
+under a Lion base (where the optimum is at **full** pooling, r=0, giving the highest hierarchical
+cell mean on ResNet-18 anywhere in the corpus, 93.925 at n=2 — the highest single hierarchical run
+in the corpus is 94.092, `r34r-r002-s2` on ResNet-34). What does not transfer is (i) the *value* of r —
+0.025 on R34, 0.06 on R18, 0.1 on R10 — and (ii) the whole phenomenon out of the α₀=1e-6 regime.
+The record's α₀ argument still lands; its phrasing does not. Someone should fix the phrasing before
+Saber checks it, because he will.
+
+---
+
+## 3. G3, G5, G10 — the motivating phenomenon
+
+### 3.1 Was the anomaly ever reproduced? Yes — on CIFAR-10, in three batches
+
+The idea exists to explain why layerwise loses to scalar on ImageNet. **ImageNet was never run**
+(§3.6). But the anomaly itself — layerwise materially below scalar — **does reproduce at
+CIFAR resolution**, and this appears not to have been read off the corpus in one place before.
+
+Batch-matched Δ = plateau5(layerwise) − plateau5(scalar), 100 epochs, over all 45 cells in the
+corpus that contain both arms in the same batch (43 such cells). The negative tail:
+
+| batch | network | base+meta | α₀ | layerwise | scalar | Δ | n/arm |
+|---|---|---|---|---|---|---|---|
+| `a0` | ResNet-18 | AdamW + Adam | 1e-3 | 90.818 | 92.707 | **−1.889** | 3 |
+| `tc1` | ResNet-18 | AdamW + Adam | 1e-3 | 91.190 | 92.751 | **−1.561** | 2 |
+| `sc50` | **ResNet-50** | SGDm + Lion | 1e-6 | 88.154 | 89.510 | **−1.356** | 2 |
+| `pp` | ResNet-18 | AdamW + Adam | 1e-6 | 73.400 | 73.849 | −0.449 | 3 |
+| `PP` | ResNet-18 | AdamW + Adam | 1e-6 | 73.498 | 73.811 | −0.313 | 3 |
+| `bo` | ResNet-18 | Lion + Lion | 1e-6 | 91.281 | 91.452 | −0.171 | 3 |
+| `g1` | ResNet-18 | AdamW + Lion | 1e-6 | 91.511 | 91.616 | −0.105 | 3 |
+
+The other 36 cells are positive, up to +55.6 pp on ResNet-10/CIFAR-100. So the anomaly is **real,
+reproducible, and conditional** — it needs either the parent paper's own AdamW+Adam pair at
+α₀=1e-3, or ResNet-50. It is *not* a property of scale alone: in the same `sc50` batch at α₀=1e-3
+the sign flips (layerwise 90.375 vs scalar 89.245, **+1.130**). And `I1`, nominally the same
+AdamW+Adam/α₀=1e-3 cell as `a0`, gives **+0.136** — so even within one configuration the anomaly is
+batch-conditional and that discrepancy was never chased either.
+
+**This is the most useful thing in this document for the project's own sake.** The premise is
+testable at CIFAR cost. Nobody had to wait for ImageNet.
+
+### 3.2 And the fix was almost never run where the anomaly lives
+
+| anomaly cell | hierarchical runs in it | what exists |
+|---|---|---|
+| `a0` / `tc1`, R18, AdamW+Adam, α₀=1e-3 | **5** (batch `dc`) | `additive` r=0.06 **only**, imported from the SGDm+Lion optimum. No ladder, no `shrink`, and **no scalar arm in `dc`** — see §3.2a |
+| `sc50`, R50, SGDm+Lion, α₀=1e-6 | **2** | `additive` r=0.06 **only**. No ladder. No `shrink`. No `zpool` |
+
+The r-optimum of 0.06 was located in a cell (ResNet-18, SGDm+Lion, α₀=1e-6) where layerwise **beats**
+scalar by roughly +3 pp — i.e. in a cell with no anomaly to fix. It was then transplanted, once, at
+n=2–5, into the cells that do have one. That is the design error at the centre of the whole
+programme, and it is an **oversight**, not a decision: no cycle records a reason for not laddering
+the anomaly cells.
+
+### 3.2a The one shot that was taken at the AdamW anomaly cell moved it 0.5 pp
+
+Batch `dc` does contain a plain-layerwise reference at α₀=1e-3 (`dc-awscal-a1e3-s0..s4`, n=5,
+plateau5 **90.909**), so an in-batch contrast is available after all:
+
+| batch `dc`, R18, AdamW+Adam, α₀=1e-3 | plateau5 | n |
+|---|---|---|
+| plain layerwise (`dc-awscal-a1e3-*`) | 90.909 | 5 |
+| `additive` r=0.06 (`dc-aw-a1e3-*`) | **91.409** | 5 |
+| Δ | **+0.500** | — |
+| scalar, in the comparable batch `a0` (**cross-batch**) | 92.707 | 3 |
+
+So the single hierarchical point tried in the anomaly cell buys **+0.500 pp** — exactly on the
+project's materiality bar — and leaves layerwise roughly **1.3 pp short of scalar**. The fix does
+not close the anomaly there. But it is one r value, chosen in a different cell, with no ladder
+around it, so this is a weak null and not a refutation. It is the whole of the evidence that the
+idea fails where the phenomenon lives, and it is not enough to carry that conclusion.
+
+**RULE 20 flag, unresolved.** Those reference runs are named `dc-awscal-*` — "AdamW **scal**ar" —
+but the CSV records their granularity as `layerwise`, and their scores (90.66–91.16) sit on top of
+`a0-layer-1e3` (90.818) and 1.8 pp below `a0-scal-1e3` (92.707), which says the CSV column is right
+and the name is misleading. **I did not read the `ARGS` line and cannot close this.** If those runs
+really were scalar, the Δ above is meaningless and the cell has no plain reference at all. One
+`grep ARGS` over five `.out` files settles it, and it should be done before §3.2a is quoted.
+
+### 3.3 What those 4 ResNet-50 runs actually say (G3)
+
+Batch `sc50` in full, plateau5, all arms in one batch, 100 epochs:
+
+| α₀ | scalar (n=2) | layerwise (n=2) | additive r=0.06 (n=2) | add − layerwise | add − scalar |
+|---|---|---|---|---|---|
+| 1e-6 | 89.510 | 88.154 | **91.511** | **+3.357** | **+2.001** |
+| 1e-3 | 89.245 | 90.375 | **92.678** | **+2.303** | **+3.433** |
+
+Individual runs: `sc50-1e6-add-s0/s1` = 91.156 / 91.866; `sc50-1e3-add-s0/s1` = 92.496 / 92.860.
+
+Read plainly: **in the one architecture where the motivating anomaly reproduces, a single
+untuned hierarchical point beats both endpoints by 2.0–3.4 pp, at both initialisations.** That is
+the shape the proposal predicted. It rests on **n=2 in one batch with no r-ladder**, so it is a
+lead and not a result — but a lead of that size, in exactly the cell the project was commissioned
+to explain, sitting unexamined in the CSV, is the thing a supervisor is entitled to be annoyed
+about. It should be the first job if anything is run at all.
+
+Caveat, stated so it is not oversold: `additive`'s r-dial is confounded with an effective
+meta-step-size division (§3.5), so the R50 gain could be "ResNet-50 wants a smaller meta-step-size"
+rather than "pooling helps ResNet-50". **There is no meta-step-size ladder on ResNet-50 at all**, so
+that alternative is untested. G4 and G3 should be run as one design.
+
+### 3.4 The α₀ correction re-derived (so the size of the M1 claim is honest)
+
+At the *proper* initialisation the interior optimum largely goes away. ResNet-18 / CIFAR-10 /
+SGDm+Lion / layerwise / 100 ep, `additive`:
+
+| r | α₀=1e-6 (n) | α₀=1e-3 (n) |
+|---|---|---|
+| 0 | 92.288 (6) | 92.217 (7) |
+| 0.03 | 92.620 (5) | 92.096 (7) |
+| 0.05 | 93.053 (10) | 92.100 (5) |
+| **0.06** | **93.286 (8)** | 92.106 (12) |
+| 0.07 | 93.222 (9) | 92.152 (5) |
+| 0.1 | 92.598 (5) | **92.403 (7)** |
+| 0.2 | 91.519 (3) | 92.017 (5) |
+| 1 | 90.971 (3) | 91.216 (5) |
+
+Optimum − r=0 is **+0.998 pp** at α₀=1e-6 and **+0.186 pp** at α₀=1e-3 — an 81 % reduction, and the
+survivor is below the project's own 0.5-pp materiality bar. The record's "76 %" is the same
+statement computed on a different sub-selection; the direction and the verdict are identical.
+
+### 3.5 The mechanism test fires at one α₀ and fails at the other — and nobody noticed (G4)
+
+CORRECTIONS 21 pre-registered the kill: *"if `scalar` at ms=1e-4 reaches 92.2–92.6, the whole M0/M1
+family is meta-LR tuning."* Re-derived from the `ms` and `rs` batches, plain arms, ResNet-18 /
+CIFAR-10 / SGDm+Lion / 100 ep:
+
+**α₀ = 1e-3 — the test fires.**
+
+| meta_stepsize | scalar | layerwise | batch |
+|---|---|---|---|
+| 1e-4 | **92.305** (n=3) | 92.960 (n=3) | `ms` |
+| 1e-4 | 92.198 (n=2) | 92.824 (n=2) | `rs` |
+| 1e-3 | 87.967 (n=3) | 91.259 (n=3) | `ms` |
+
+Plain **scalar** at a tuned meta-step-size reaches 92.305, inside the pre-registered band; plain
+**layerwise** reaches 92.960, above the entire `additive` r-ladder at that α₀ (best 92.403). The
+hierarchical family buys nothing a meta-step-size sweep does not buy more of. Verdict stands.
+
+**α₀ = 1e-6 — the test does not fire, and cannot, because the ladder runs the wrong way.**
+
+| meta_stepsize | scalar | layerwise | n/arm | batch |
+|---|---|---|---|---|
+| 1e-5 | 19.566 | 19.570 | 5 | `ms` |
+| 3e-5 | 22.739 | 22.766 | 5 | `ms` |
+| 1e-4 | 45.594 | 46.362 | 5 | `ms` |
+| 3e-4 | 87.649 | 90.228 | 5 | `ms` |
+| 1e-3 | 87.887 | 90.921 | 18 / 24 | **cross-batch** (9 batches; batch `ms` has no 1e-3 rung) |
+
+The `additive` optimum in this cell is **93.286**. **No rung of the meta-step-size ladder comes
+within 2.3 pp of it.** Two further defects in that ladder: it has **no rung above 1e-3** on either
+`scalar` or `layerwise` at either α₀ (the only ms=3e-3 runs in the corpus are 4 rows on `nodewise`
+and `resnet18_blocks` at α₀=1e-3, batch `rs`), and **batch `ms` itself contains no ms=1e-3 arm at
+α₀=1e-6**, so its own top rung has to be borrowed from nine other batches. The direction that could
+exonerate the operator was never sampled, and the anchor of the ladder that was sampled is
+cross-batch. Since pooling *divides* the effective meta-step
+(the `|2p−1|` ≈ 0.097 → 10.3× factor), the matching rung is 1e-4, which scores 46.4 — i.e. the
+naive equivalence is off by 47 pp in the wrong direction. Whatever `additive` is doing at α₀=1e-6,
+the corpus does not currently show it to be meta-LR tuning.
+
+**This is a live hole, not a rhetorical one.** The cheapest fix is the two-way ladder in G4:
+r ∈ {0, 0.06, 1} × ms ∈ {1e-4, 3e-4, 1e-3, 3e-3, 1e-2} × 3 seeds at α₀=1e-6, **45 runs ≈ 32 GPU-h,
+one batch.** If the r-axis flattens once ms is free, the operator is a meta-LR dial and the idea is
+closed properly. If it does not, the idea is not dead and §3.3 becomes urgent.
+
+### 3.6 ImageNet — the honest position (G10)
+
+**Never run. Not runnable here. Verified on the tree today, not quoted.**
+
+Data, at `/cluster/account_a/imagenet_data/ILSVRC/Data/CLS-LOC`:
+
+* **489 of 1000 train class directories**, 68 GB (of ~148 GB). The classes present are complete —
+  it is a partial download, not a corrupt one.
+* **50,000 validation JPEGs in one flat directory, no class subdirectories.** A search of the whole
+  tree for `*devkit*`, `*ground_truth*` and `*.mat` returns **nothing**. **The validation set is
+  unlabelled**, so `plateau5` cannot be computed at *any* number of classes. This blocks ImageNet
+  independently of the missing 511 classes, and it is the decisive blocker.
+
+Code, which is worse and is the sharper point:
+
+* `imagenet/Optimizers/HF.py` line 153:
+  `self.stepsize_type = stepsize_groups if stepsize_groups in ['scalar'] else 'blockwise'`
+  — the ImageNet copy of the optimizer accepts **`scalar` only**; `layerwise`, `nodewise` and
+  `weightwise` are not in its list and not in its docstring. It can do `scalar` and `blockwise`
+  (`resnet18_blocks` = [3,12,15,15,15,2], `resnet50_blocks` = [3,30,39,57,30,2]) and nothing else.
+  It carries **0** of our patches (260 lines against the CIFAR copy's 710).
+* `imagenet/load_data.py` reads validation with `datasets.ImageFolder(root='ILSVRC2012/validation')`
+  — which requires class subdirectories the on-disk copy does not have.
+
+So: **the parent paper's blockwise-on-ImageNet claim has an executable path in the released code;
+the layerwise-on-ImageNet claim does not.** That is worth putting to Arsalan directly. (FINDINGS
+also records that the authors' own launcher on scratch, `cedar_arg_iterator_HF.sh`, sweeps
+`scalar` only with `resnet18_blocks` commented out — I did not re-open that directory, which is
+the PI's and off-limits without permission.)
+
+Cost, if the data were complete and labelled. A ResNet-50 / ImageNet-1k 90-epoch run is
+≈90 × 1.28M × 3 × 4.1 GFLOP ≈ **1.4 × 10¹⁸ FLOP**; an L4 at a realistic 30–50 % MFU delivers
+≈10–15 TFLOP/s, so **≈30–40 GPU-h per run at best, 60–100 in practice** with this codebase's
+Python-side meta overhead. A 9-rung r-ladder × 3 seeds × 2 arms is 54 runs = **3,000–5,000 GPU-h**.
+That is 2–3× the *entire* corpus to date. **Infeasible on cost alone**, before the credentials
+question.
+
+**The substitute that was never considered.** The record's substitutes were CIFAR-100 and a budget
+sweep — both same-resolution, so neither moves the *scale/resolution* axis the premise is about.
+The credential-free option is **Tiny-ImageNet** (200 classes, 100k train images at 64×64, ~240 MB,
+free download from cs231n, labelled val): ≈8× CIFAR-10 per epoch, so **≈5.6 GPU-h per 100-epoch
+ResNet-18 run**, and a 9-rung r-ladder × 3 seeds plus scalar/layerwise controls ≈ 36 runs ≈
+**200 GPU-h.** Downsampled ImageNet-1k at 64×64 (Chrabaszcz et al.) would be better still but needs
+the same ImageNet account, and costs ≈71 GPU-h per run (≈850 GPU-h for a thin ladder).
+**Tiny-ImageNet is affordable, needs no credentials, and was never proposed. That is an oversight.**
+
+**What the absence does to the enterprise.** The proposal's premise is a claim about a regime the
+project never entered. The mitigation is that the *phenomenon* — layerwise below scalar — was
+reproduced three times at CIFAR cost (§3.1) without anyone noticing, so the diagnosis could have
+been attempted on reproducible ground. It was not, because the fix was only ever laddered in cells
+where the phenomenon is absent. That, and not the missing ImageNet, is what stopped the diagnosis.
+
+---
+
+## 4. G11 — scale
+
+Everything is 32×32 ResNets. Re-derived from the corpus: ResNet-18 (1,668 runs), ResNet-18/C100
+(188), ResNet-34 (141), ResNet-10 (110), ResNet-50 (31), ResNet-18-GroupNorm (17), ResNet-10/C100
+and ResNet-34/C100 (9 each), ResNet-101 (1). **Hierarchical runs exist only on the ResNet ladder
+and only at CIFAR resolution.**
+
+Never tried, in ascending cost:
+
+| axis | cost | verdict |
+|---|---|---|
+| **GroupNorm** (`ResNet18_gn` exists, 17 non-hierarchical runs) — tests whether the effect is a BatchNorm interaction | 18 runs ≈ **13 GPU-h** | worth doing; nearly free |
+| **ResNet-101** (1 run exists, so the builder works) | 27 runs ≈ **80 GPU-h** (extrapolating R50's 2.28 GPU-h by depth) | only after G3 |
+| **Non-ResNet architecture** (VGG, DenseNet, a small ViT) — `build_network.py` would need a new branch, and every partition definition (`resnet18_blocks`, `nodewise1d`, the chunk family) would need re-deriving for it | 1–2 days of work + ≈50 GPU-h | the honest answer to "is this a ResNet fact?" but not the bottleneck |
+| **Higher input resolution** (Tiny-ImageNet at 64×64) | ≈**200 GPU-h** | **the one that actually addresses the premise** — see §3.6 |
+| **ImageNet-1k** | ≈**3,000–5,000 GPU-h** + credentials + a full optimizer port | infeasible |
+
+The genuine scale gap is **resolution**, not depth. The project moved along the depth axis
+(R10→R18→R34→R50) because it was free, and the depth axis is the one the premise is *least* about.
+Note that ResNet-50 at α₀=1e-6 is where the anomaly does reproduce (§3.1), so depth was not useless
+— it just was not followed up (§3.3).
+
+---
+
+## 5. G12 — TinyStories: the assessment was correct, verified against the tree
+
+I re-checked every claim in the CUT decision on `cluster_a` today.
+
+| claim in the record | verified? | evidence |
+|---|---|---|
+| data staged, 50 pretokenised shards, ~10 GB | **yes** | 50 `.bin` + 50 `.json` in `data/tinystories/TinyStories_all_data/`; `du -sh` = **10G** |
+| `train.py` exposes `--stepsize-groups` | **yes** | `train.py:88` `parser.add_argument("--stepsize-groups", type=str, default="scalar")`, and `:89` `--meta-stepsize` |
+| that tree's `HF.py` supports only scalar/layerwise/nodewise/weightwise/blocks | **yes, and it is worse than that** | `HF.py:156` puts `layerwise`/`nodewise`/`weightwise` in the accept list but `self.beta` is assigned **only** on the `scalar` (`:159`) and `blockwise` (`:161`) branches, so `len(self.beta)` on the next line raises `AttributeError`. **The three fine granularities are dead on arrival.** Only `scalar` and blockwise (`resnet18_blocks`, `resnet50_blocks`, `transformer_blocks_15m` = [1,9,9,9,9,9,10]) actually run |
+| no chunkwise, nodewise1d, permnode, probe5 | **yes** | none present |
+| zero patches | **yes** | `grep -c "PATCH_"` = **0**. 267 lines against the CIFAR copy's 710 (and against the CIFAR copy's own pre-patch 264) |
+| zero training runs ever executed | **yes** | `runs/` contains exactly one TinyStories artefact, `ts-pretok-4680828.out` |
+
+**So there are three independent copies of the optimizer in the released code** — `cifar10/` (264
+lines originally, 710 now with our patches), `tinystories/` (267, 0 patches), `imagenet/` (260, 0
+patches, `scalar`-only) — and the dead-granularity defect is present in two of them independently.
+
+**What it would take to run THE MAIN IDEA (not the partition work) on TinyStories:**
+
+1. **Port the granularity fix** (`patch_hf2.py` re-derived against a 232-diff-line-different file)
+   so `layerwise` executes at all. Without this there is no layerwise arm and therefore no
+   scalar-vs-layerwise contrast to hierarchicalise. **Prerequisite, not optional.**
+2. **Port the β-clip guard.** An unguarded run is a different experiment — the guard is a
+   first-order intervention in this corpus (CORRECTIONS 39 measures +10.3 pp for it, at n=2, and
+   calls that cell undecidable) — and the CIFAR results are not comparable without it.
+3. **Port `PATCH_HIER`** (`additive` + `shrink`) and, if G1 is taken seriously, the new prox/two-level
+   operator as well.
+4. **Re-verify the equivalence suite** on the transformer: r=1 ≡ plain, r=0 granularity-invariant,
+   λ=0 ≡ plain — byte-level, as was done on CIFAR.
+5. **Calibrate α₀ and the meta-step-size from scratch.** Zero runs have executed there, so the CIFAR
+   values (α₀ ∈ {1e-6, 1e-3}, ms=1e-3) carry no information. This is itself a ladder: ≥2 arms × 5
+   rungs × 2 seeds before any hierarchical contrast is meaningful.
+6. **Only then** a primary contrast: scalar vs layerwise vs hierarchical at 100k iters ×
+   131,072 tokens/iter (`train.py`: `batch_size=64`, `gradient_accumulation_steps=8`,
+   `max_seq_len=256`; `dim=288`, `n_layers=6` — the 15M model).
+
+**I concur with the CUT: ≥3 weeks of work and ≥300 GPU-h before a first contrast**, and the
+calibration ladder alone (step 5) is roughly the cost of G1+G3+G4 combined, which answer the actual
+question. Note one detail in TinyStories' favour if it is ever revived: the meta-update runs once
+per *iteration*, so a 100k-iter run gives 100,000 meta-steps — a shrink at λ=1e-3 would run 144
+half-lives there, i.e. **the saturation problem of §1 is twice as bad on TinyStories**, and porting
+`shrink` as-is would repeat the same mistake in a new modality.
+
+---
+
+## 6. G13–G19 and the rest — what else a supervisor will ask
+
+**"Did you vary the batch size?"** No. `batch_size = 100` in **all 2,174 rows** of the corpus. This
+is not a minor axis for this idea: batch size sets steps-per-epoch, which sets the number of meta
+updates, which is the exact quantity the shrink saturation turns on. A 4× larger batch quarters the
+meta-steps and multiplies every half-life-in-run by 4. **12 runs ≈ 8 GPU-h** would tell you whether
+the M0 "flat ladder" is a property of the operator or of 50,000 steps. **Overlooked.**
+
+**"Did you check it outside the one β-clip box?"** No — all 637 at `-15:-2.3026`, while the corpus
+uses 13 boxes, and the anomaly's size co-varies with the box across batches (`a0`, box
+`-15:-2.3026`, −1.889 pp; `tc1`, box `-30:6.0`, −1.561 pp, same nominal cell). Batch and box are
+confounded in that pair, which is precisely why a within-batch box contrast is needed and does not
+exist. **12 runs ≈ 8 GPU-h. Overlooked.**
+
+**"Is the confound a property of the operator or of Lion?"** Untested. The `|2p−1|` argument works
+*because* Lion's meta-increment has constant magnitude ±ms; with a non-normalised meta-optimizer
+(plain SGD on β) it would not apply. Every meta in the corpus is `Lion`, `Adam`, `RMSProp` or
+`fixed` — **no non-normalised meta anywhere**. This is arguably a cleaner confound-breaker than G4.
+**~24 runs ≈ 17 GPU-h. Overlooked.**
+
+**"Did you try letting the model choose the pooling strength?"** No. Empirical-Bayes / James–Stein
+shrinkage — λ_t = 1 − (m−2)σ̂²/‖β_t − β̄_t‖², estimated on-line from the between-group spread — is
+the textbook hierarchical answer, needs **no ladder and no tuning**, and directly answers the
+obvious referee objection ("you added a hyper-parameter to a method whose selling point is having
+none"). **Never proposed in any cycle. Patch ≈30 lines + 18 runs ≈ 13 GPU-h. Overlooked, and it is
+the one I would be most embarrassed about.**
+
+**"Is the hierarchy nested properly?"** No. Every operator is two-level: group vs. global. The
+natural structure for a ResNet is three-level — scalar → block → layer — with a strength at each
+level. Never built. **Overlooked**, though low priority until the two-level case is settled.
+
+**"How does any of this compare to just tuning the learning rate?"** It does not, and it was never
+asked. Every hierarchical contrast in the 637 runs is MetaOptimize-vs-MetaOptimize. In the same
+corpus, at ResNet-18/CIFAR-10/100 epochs, plain SGD at lr=0.1 reaches **95.282 / 95.180 / 95.082 /
+95.040 / 95.038** (batch `bl`, plateau5, n=5) and tuned AdamW reaches **94.962**, while the best
+hierarchical run anywhere in the corpus is **94.092** (`r34r-r002-s2`, ResNet-34) and the best on
+ResNet-18 is **94.040** (`bo-lion-r0-s0`). At 300/600 epochs the cosine AdamW baseline gives
+**95.02–95.26** against the hierarchical arms' 93.0–93.6. **The entire hierarchical family sits
+1–2 pp below a tuned fixed-hyper-parameter baseline on the same architecture and budget.** This
+costs **0 GPU-h** to state and should be stated. It does not invalidate the internal comparison —
+MetaOptimize's claim is about tuning-free adaptation, not about beating a tuned baseline — but
+omitting it would be the kind of omission that gets found.
+
+**"Did the budget ever erase the effect?"** Partly, and the two operators behave differently. Within
+batch `e3a` (α₀=1e-6, 300 epochs, ResNet-18): plain layerwise 91.764, `shrink` λ=0.1 **91.826**
+(+0.062, against +1.534 for the same λ at 100 epochs in `h2`) — **`shrink`'s advantage collapses
+with budget**; `additive` r=0 92.056, r=0.05 93.016, r=0.1 **93.313** (+1.549 over plain, against
+the batch-matched +2.530 for r=0.06 at 100 epochs in batch `sc`, where plain layerwise is 90.772
+and additive r=0.06 is 93.302) — **`additive`'s does not.** That divergence is unexplained and
+rests on n=2 in one batch with no scalar arm. **G17.**
+
+**"Did you look at the trajectories, not just the endpoint?"** Partly — `PATCH_PROBE` records
+per-step β and meta-gradient statistics and `probe.jsonl` files exist for the `zb`/`zsw` batches.
+But **no probe was ever collected on the ResNet-50 anomaly cell, on the AdamW anomaly cell, or on
+any `shrink` λ ladder rung**, so the one thing that would say *why* the interior optimum exists at
+α₀=1e-6 — the β trajectory's spread over training — was never measured where it matters. Probes are
+nearly free (they run inside the training job). **Overlooked.**
+
+**"Why is `I1` +0.136 and `a0` −1.889 in the same nominal cell?"** Unresolved. Same network, same
+optimiser pair, same α₀, same β-clip box, same augmentation, n=3 each. Whatever distinguishes them
+is not in the CSV's columns, which under RULE 20 means somebody has to read the two batches' own
+`ARGS` lines. **I did not do this** — the `.out` files are not in this repo (they live at `../runs`
+and `../runs_cluster_b`) and this task did not extend to opening them. **UNSURE, and worth one hour.**
+
+---
+
+## 7. If only three things are ever run
+
+1. **G4 — the r × meta-step-size ladder at α₀=1e-6.** 45 runs, ≈32 GPU-h, one batch. It closes the
+   idea honestly or reopens it. Cheapest decisive item on the list.
+2. **G1 — the prox-form shrink.** 60 runs, ≈42 GPU-h, one batch, plus a patch. Without it the
+   proposal's own claim has never been measured, and that is the sentence that must not appear in a
+   final report unaddressed.
+3. **G3 — the ResNet-50 r-ladder in the anomaly cell.** 60 runs, ≈137 GPU-h. The only place where
+   the fix and the phenomenon are in the same room.
+
+Total ≈**211 GPU-h**, against 1,641.6 already spent. If those three come back null, the idea is
+dead on evidence rather than on a saturated operator and a transplanted hyper-parameter.
+
+---
+
+## 8. What I could not check, and what I am not sure about
+
+* **The `.out` and `probe.jsonl` series are not in this repository** (`runs/` is gitignored; they
+  live at `../runs` and `../runs_cluster_b`). Everything above is derived from `all_runs.csv` plus
+  live reads of the code and data trees on cluster_a. Any claim that needs a per-epoch curve or an
+  `ARGS` line — the `I1` vs `a0` discrepancy above, in particular — is **UNSURE** and marked so.
+* **RULE 20 is not satisfied for the batches I lean on.** I did not read the `ARGS` line of `sc50`,
+  `h2`, `lp`, `dc`, `r34f`/`r34r`, `bo`, `ms` or `rs`. The CSV's derived columns are what I used,
+  and the `dc-awscal` naming conflict in §3.2a is exactly the failure mode RULE 20 exists for.
+  Before any of §3.1, §3.3 or §3.5 is quoted to Arsalan, those eight `ARGS` lines should be read —
+  it is an hour's work and the campaign has been burned twice by skipping it.
+* **The ImageNet GPU-hour figure is my own FLOP arithmetic**, not a measurement, and the record's
+  own estimate (≈165 L4-h for a 90-epoch ResNet-50 run) is roughly 3× lower than mine. Either
+  bound makes a ladder infeasible, so the discrepancy does not change the verdict, but neither
+  number should be quoted as measured.
+* **The Tiny-ImageNet cost is extrapolated** from CIFAR-10 wallclock by pixel and image count. This
+  codebase's CIFAR runs are partly overhead-bound rather than FLOP-bound, so the extrapolation is
+  likely an over-estimate — i.e. Tiny-ImageNet is probably cheaper than the 200 GPU-h quoted.
+* **I did not open the authors' Jan-2024 run outputs on scratch**, which remain off-limits without
+  Saber's permission.
+* **The record's "transfers nowhere" phrasing is wrong as written** (§2.6). I have not traced which
+  document first said it or whether the manuscript repeats it; that check is outstanding and the
+  manuscript was not touched by this task.

@@ -1,0 +1,384 @@
+#!/bin/bash
+# =============================================================================
+# cVG1_vggbn_smoke.sh -- `cvg1`, THE CAMPAIGN'S FIRST NON-ResNet BATCH.
+#   ONE SUBMISSION, 6 JOBS (2 arms x 3 seeds), 100 EPOCHS, SEEDS {31,32,33},
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here
+# touches the other account, nothing is submitted to `cluster_a`, and every guard
+# and scancel line below is filtered on the `cvg1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cVG1_vggbn_gap_score.py, git-committed BEFORE
+# this batch is submitted (STANDING RULE 21; the proof is the commit time
+# against the earliest sacct Submit, stated in CORRECTIONS with the margin in
+# seconds).  The hypothesis, the two accounts, every bar (in pp AND in SE from
+# a noise floor re-derived at registration with cvg1's own rows excluded from
+# every reader), the gates, and the floor/ceiling proof for BOTH accounts are
+# frozen there; --selftest re-derives every corpus premise digit for digit.
+#
+# THE DOCUMENTED SCORER INVOCATION -- no second argument to forget:
+#     python3 analysis/cVG1_vggbn_gap_score.py <runsdir>
+#
+# -----------------------------------------------------------------------------
+# WHY THIS BATCH.  All 2,761 corpus rows are ResNet (eleven distinct `network`
+# values, ZERO not matching ^[Rr]es[Nn]et).  That is the campaign's single
+# largest scope limit.  cvg1 asks the precondition question -- does the
+# scalar-to-layerwise plateau5 gap EXIST AT ALL on a plain BatchNorm conv stack
+# with no residual addition anywhere -- on VGG11_bn_c100 (PATCH_VGGBN).
+#
+# WHY THAT ARCHITECTURE.  Re-derived on the live ResNet18_c100: the five
+# 512-wide BN scales are at 47/50/53/56/59; CORRECTIONS 187's three carriers
+# (50, 53, 59) are EXACTLY those whose output is a summand of a residual
+# addition, and the two non-carriers (47, 56) are EXACTLY the mid-branch bn1
+# scales.  ResNet cannot separate "feeds a residual add" from "deepest and
+# widest".  VGG11_bn keeps BatchNorm, convolutions and a 512-wide deepest stage
+# -- so the finding stays STATABLE -- and has no residual addition at all.
+#
+# THE ARMS.  Deliberately only two: this batch measures LEVELS on an
+# architecture whose levels have never been measured.  Registering isolation
+# arms here would mean predicting arm levels on an unmeasured net, which the
+# standing floor prohibition forbids.  PROBE_TENSOR=1 rides along at ~zero GPU
+# cost so the follow-on isolation batch can nominate VGG's candidate carriers
+# from THIS batch's records, exactly as ctd1's records fed ciso1.
+#   k01  scalar        m = 1,  the in-batch floor anchor
+#   kL   layerwise     m = 26, the in-batch ceiling anchor
+#
+# COST.  6 jobs x 100 epochs.  ResNet18_c100/CIFAR100 at 100 epochs has a
+# median wallclock of 42 min over 394 corpus rows; VGG11_bn is ~9.27M params
+# against ResNet18_c100's 11.22M and far cheaper in FLOPs at 32x32, so 6 runs
+# is budgeted at <= 5 GPU-hours and bounded by WALL x 6 = 18 GPU-hours.
+#
+# RULE 20.  Every value below is ONE shell token of [A-Za-z0-9_.,:/-].
+# analysis/argsline_guard.py IS NOT EDITED.  BETA_CLIP and PROBE are
+# ENVIRONMENT variables audited from the runner's ENV line; PROBE_TENSOR is
+# audited from the `PROBE_TENSOR: on` line the patch itself prints.
+#
+# PARTITIONS: composed by bin/_lib_guards.sh's slurm_parts_for_wall
+# (CORRECTIONS 178); gpu-short must be included at WALL within its MaxTime or
+# the source-time hook aborts with exit 2.
+#
+# USAGE   bash bin/cVG1_vggbn_smoke.sh            # dry run, submits nothing
+#         bash bin/cVG1_vggbn_smoke.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cvg1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+BNLIVE="$CIF/build_network.py"
+BNPRE="$CIF/build_network.py.pre_vggbn"
+HFLIVE="$CIF/Optimizers/HF.py"
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=VGG11_bn_c100
+SEEDS="31 32 33"
+MST=1e-3
+A0=1e-6
+NTENS=26
+TOTPAR=9274532
+# ---- the registered specs, LITERAL.  The scorer holds the same two strings;
+# ---- guard 4c' proves the two agree so neither can drift.
+G_K01='scalar'
+G_KL='layerwise'
+ARMS="k01 kL"
+WALL=03:00:00
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+echo "=============================================================="
+echo " cvg1 -- FIRST NON-ResNet BATCH: does the granularity gap exist"
+echo "         on a PLAIN (non-residual) BatchNorm conv stack?"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C"
+echo " ms=$MST alpha0=$A0  horizon $EPOCHS epochs; seeds $SEEDS"
+echo "   k01  $G_K01      (m=1, in-batch floor anchor)"
+echo "   kL   $G_KL   (m=$NTENS, in-batch ceiling anchor)"
+echo " 2 arms x 3 seeds = 6 jobs, ONE submission"
+echo " partitions $PARTS   walltime $WALL"
+echo " scorer: analysis/cVG1_vggbn_gap_score.py (registered before any run exists)"
+echo " DOCUMENTED INVOCATION: python3 analysis/cVG1_vggbn_gap_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests -----
+SC="$REPO/analysis/cVG1_vggbn_gap_score.py"
+PATCHV="$REPO/patches/patch_vggbn.py"
+TESTV="$REPO/tests/test_vggbn.py"
+for f in "$SC" "$PATCHV" "$TESTV"; do
+  [ -f "$f" ] || guard_fail "guard 1a: missing $f"
+done
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- \
+      analysis/cVG1_vggbn_gap_score.py bin/cVG1_vggbn_smoke.sh \
+      patches/patch_vggbn.py tests/test_vggbn.py 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer, patch, test AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires them committed BEFORE any run exists: $DIRTY"
+  DEL=$(git -C "$REPO" diff HEAD --numstat -- analysis/ 2>/dev/null | awk '$2+0>0{print}')
+  [ -z "$DEL" ] && echo "guard 1b2: no uncommitted DELETIONS under analysis/ (RULE 16)" \
+               || guard_fail "guard 1b2: analysis/ has uncommitted deletions: $DEL"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 is verified on"
+  echo "          the committing host by wall clock against the earliest sacct Submit."
+fi
+python3 "$SC" --selftest --runsdir "$WS/runs" >/tmp/cvg1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' /tmp/cvg1_selftest.$$) checks, $(grep -c '^  FAIL' /tmp/cvg1_selftest.$$) failures)" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -40 /tmp/cvg1_selftest.$$; }
+grep -q 'ZERO non-ResNet rows in the corpus' /tmp/cvg1_selftest.$$ \
+  && echo "guard 1c2: the corpus-census section ran (the scope limit is re-derived, not quoted)" \
+  || guard_fail "guard 1c2: the corpus-census section did not run"
+echo "guard 1c: scorer sha256 $( (sha256sum "$SC" 2>/dev/null || shasum -a 256 "$SC") | awk '{print $1}')"
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^cvg1-' "$CSVP" && guard_fail "guard 2: cvg1-* already in the CSV" \
+                         || echo "guard 2: no cvg1-* name collision in the corpus"
+grep -q "$NET" "$CSVP" && guard_fail "guard 2a: $NET already appears in the CSV" \
+                       || echo "guard 2a: $NET appears NOWHERE in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/cvg1-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cvg1-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT cvg1-*.out files already exist"
+fi
+
+# ---- guard 3: the CIFAR-100 data is staged on THIS account ------------------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4a-c: THE LIVE SOURCE CARRIES THE PATCH, PROVED ADDITIVE ---------
+mkdir -p "$SAVE"
+[ -f "$BNLIVE" ] || guard_fail "guard 4: no live build_network.py at $BNLIVE"
+BNSHA=$( (sha256sum "$BNLIVE" 2>/dev/null || shasum -a 256 "$BNLIVE") | awk '{print $1}')
+NV=$(grep -c 'PATCH_VGGBN' "$BNLIVE" 2>/dev/null); NV=${NV:-0}
+[ "$NV" -ge 2 ] && echo "guard 4a: live build_network.py carries PATCH_VGGBN ($NV markers)" \
+                || guard_fail "guard 4a: live build_network.py lacks PATCH_VGGBN -- apply patches/patch_vggbn.py first"
+[ -f "$BNPRE" ] && echo "guard 4b: pre-patch backup present: $BNPRE" \
+                || guard_fail "guard 4b: no pre-patch backup at $BNPRE"
+# HF.py must NOT have been touched by this patch -- it is the whole inertness claim
+grep -q 'PATCH_VGGBN' "$HFLIVE" && guard_fail "guard 4b2: PATCH_VGGBN appears in HF.py -- the patch must touch build_network.py ONLY" \
+                                || echo "guard 4b2: HF.py carries NO PATCH_VGGBN marker (optimiser untouched, as claimed)"
+if [ -f "$TESTV" ] && [ -f "$BNPRE" ]; then
+  if python3 "$TESTV" --pre "$BNPRE" --post "$BNLIVE" --hf "$HFLIVE" --csv "$CSVP" \
+       >/tmp/cvg1_vggtest.$$ 2>&1; then
+    echo "guard 4c: tests/test_vggbn.py PASSES on the LIVE tree ($(grep -c '^  PASS' /tmp/cvg1_vggtest.$$) checks)"
+    grep -E '^  PASS V0f|^  PASS V1b|^  PASS V3' /tmp/cvg1_vggtest.$$ | sed 's/^/          /'
+  else
+    guard_fail "guard 4c: tests/test_vggbn.py FAILED on the LIVE tree"; tail -40 /tmp/cvg1_vggtest.$$
+  fi
+else
+  guard_fail "guard 4c: cannot run the additivity proof -- $TESTV or $BNPRE missing"
+fi
+
+# ---- guard 4c': the literal specs here and in the scorer agree --------------
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+MANIFEST2="$WS/runs/cvg1-PARTITION-MANIFEST.txt"
+python3 - "$SC" "$G_K01" "$G_KL" "$NET" "$NTENS" "$TOTPAR" <<'PYEOF' \
+  || guard_fail "guard 4c': the launcher's design and the scorer's frozen design disagree"
+import sys, re, ast
+sc = open(sys.argv[1]).read()
+mine = {"k01": sys.argv[2], "kL": sys.argv[3]}
+m = re.search(r"^SPEC = (\{.*?^\})", sc, re.S | re.M)
+if not m:
+    print("!!! guard 4c': could not find SPEC in the scorer"); raise SystemExit(1)
+theirs = ast.literal_eval(m.group(1))
+bad = 0
+for k in mine:
+    if mine[k] != theirs.get(k):
+        print("!!! guard 4c': %s launcher=%r scorer=%r" % (k, mine[k], theirs.get(k))); bad += 1
+for name, val in (("NET", sys.argv[4]), ("NTENS", sys.argv[5]), ("TOTPAR", sys.argv[6])):
+    mm = re.search(r"^%s = (.+)$" % name, sc, re.M)
+    got = mm.group(1).strip().strip('"') if mm else None
+    if got != val:
+        print("!!! guard 4c': %s launcher=%r scorer=%r" % (name, val, got)); bad += 1
+if bad:
+    raise SystemExit(1)
+print("guard 4c': the 2 spec strings, NET, NTENS and TOTPAR are identical in launcher and scorer")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, printed with tensor NAMES ------------
+python3 - "$CIF" "$MANIFEST" "$NTENS" "$TOTPAR" "$CLIP_C" "$EPOCHS" "$BATCH" \
+         "$NET" "$G_K01" "$G_KL" <<'PYEOF' \
+  || guard_fail "guard 4: live partition / design / source check FAILED"
+import sys, os, inspect
+cif, out, ntens, totpar = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+clip_c, epochs, bsz, net_name = sys.argv[5], int(sys.argv[6]), int(sys.argv[7]), sys.argv[8]
+specs = {"k01": sys.argv[9], "kL": sys.argv[10]}
+sys.path.insert(0, cif); os.chdir(cif)
+import torch
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]
+numel = [int(p.numel()) for _, p in net.named_parameters()]
+T, tot = len(nps), sum(numel)
+bad = 0
+print("guard 4: live %s -- %d parameter tensors, %d parameters" % (net_name, T, tot))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar))
+    raise SystemExit(1)
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "CLIP_C %s" % clip_c, "EPOCHS %d" % epochs,
+         "META_STEPS %d" % (epochs * (50000 // bsz))]
+print("guard 4: THE FULL MANIFEST ON THE LIVE MODEL (1-based):")
+for i in range(T):
+    print("         %3d  %-18s %9d" % (i + 1, names[i], numel[i]))
+    lines.append("TENSOR %d %s %d" % (i + 1, names[i], numel[i]))
+# the structural facts the batch rests on
+w512 = [(i + 1, names[i]) for i in range(T)
+        if numel[i] == 512 and names[i].endswith(".weight")
+        and len(nps[i][1]) == 1]
+print("guard 4: 512-wide 1-D *.weight tensors (the BN scales an isolation would target):")
+for i, n in w512:
+    print("         %2d  %s" % (i, n))
+if len(w512) < 3:
+    print("!!! guard 4: fewer than 3 512-wide BN scales -- isolation is not statable"); bad += 1
+lines.append("BN512 %s" % ",".join("%d:%s" % (i, n) for i, n in w512))
+if any("shortcut" in n for n in names):
+    print("!!! guard 4: a parameter name contains `shortcut` -- this is not a plain net"); bad += 1
+else:
+    print("guard 4: NO parameter name contains `shortcut` -- no residual projection exists")
+src = inspect.getsource(type(net).forward)
+if "+=" in src:
+    print("!!! guard 4: the network's forward contains `+=` -- a residual addition"); bad += 1
+else:
+    print("guard 4: the network's forward contains NO `+=` -- no residual addition")
+# the two granularities, end to end through the LIVE init_meta
+for arm in ("k01", "kL"):
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    HF.init_meta(o, specs[arm], nps, 1e-6)
+    shp = [tuple(b.shape) for b in o.beta]
+    want_type = "scalar" if arm == "k01" else "layerwise"
+    want_shp = [()] if arm == "k01" else [(T,)]
+    ok = o.stepsize_type == want_type and shp == want_shp and not getattr(o, "_rednorm", False)
+    print("guard 4: %-4s %-10s init_meta: type=%s beta shapes=%s len_beta_list=%d rednorm=%s"
+          % (arm, specs[arm], o.stepsize_type, shp, o.len_beta_list,
+             getattr(o, "_rednorm", None)))
+    if not ok:
+        print("!!! guard 4: %s does not route as registered" % arm); bad += 1
+    lines.append("ARMSPEC %s SPEC %s TYPE %s M %d"
+                 % (arm, specs[arm], o.stepsize_type, 1 if arm == "k01" else T))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write("\n".join(lines) + "\n")
+print("guard 4: manifest verified on the LIVE model; PARTITION-MANIFEST.txt -> %s" % out)
+PYEOF
+if [ -s "$MANIFEST" ]; then
+  cp "$MANIFEST" "$MANIFEST2"
+  echo "guard 4b3: manifest is non-empty ($(wc -c < "$MANIFEST") bytes) and is written to BOTH"
+  echo "          $MANIFEST"
+  echo "          $MANIFEST2"
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+
+# ---- guard 4g: provenance -----------------------------------------------------
+PROV="$SAVE/PROVENANCE.txt"
+PRESHA=$( [ -f "$BNPRE" ] && (sha256sum "$BNPRE" 2>/dev/null || shasum -a 256 "$BNPRE") | awk '{print $1}')
+HFSHA=$( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')
+{ echo "BUILD_NETWORK_SHA256 $BNSHA"; echo "BUILD_NETWORK_PRE_VGGBN_SHA256 ${PRESHA:-none}";
+  echo "HF_SHA256 $HFSHA"; echo "PATCH_VGGBN_MARKERS $NV";
+  echo "SUBMIT_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "PROBE $PROBE PROBE_TENSOR $PT"; } > "$PROV"
+echo "guard 4g: live build_network.py sha256 $BNSHA; provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions -----------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 6"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  TL=$(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)
+  R=$(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+  D=$(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 5b: $P timelimit $TL   running $R   pending $D"
+done
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest ------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cvg1", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)"
+      % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH \
+        gamma=$GAMMA dataset=$DSET NN-name=$NET weight-decay-meta=0 \
+        meta-stepsize=$MST alpha0=$A0)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01) G=$G_K01 ;;
+      kL)  G=$G_KL ;;
+    esac
+    RN="cvg1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if ! guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1; then
+      echo "!!! RULE 20: an axis does not round-trip for $RN"
+      guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = 6 ] || { echo "!!! composed $N lines, the design says 6"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cvg1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cvg1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cvg1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cvg1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cvg1 job started inside the window.  Re-check with:"
+       echo "         export METAOPT_WS=$WS"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name cvg1- --batch-consistency --vary stepsize-groups --vary seed --vary run-name" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cvg1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "ENV AUDIT (BETA_CLIP and PROBE ride the runner's ENV line; PROBE_TENSOR rides the patch's own line):"
+  echo "    grep -h '^ENV:' $WS/runs/cvg1-*.out | sed 's/ PROBE_DIR=[^ ]*//' | sort | uniq -c   # ONE line, x6"
+  echo "    grep -h '^PROBE_TENSOR:' $WS/runs/cvg1-*.out | sed 's/ dir=.*//' | sort | uniq -c   # scalar x3, layerwise x3"
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 6/6 RUN_DONE):"
+  echo "    python3 $REPO/analysis/cVG1_vggbn_gap_score.py $WS/runs"
+fi

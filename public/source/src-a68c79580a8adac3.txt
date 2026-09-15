@@ -1,0 +1,348 @@
+#!/bin/bash
+# =============================================================================
+# c76_chunk_coarse_extension.sh -- `cx2`, THE CHUNK LADDER'S COARSE END.
+# Runs on cluster_a ONLY (needs PATCH_CHUNKWISE).
+# 6 jobs: chunk{8192, 65536} x seeds 0-2, ms=1e-4, 100 ep, probe ON.
+#
+# WHY THIS BATCH EXISTS
+#   `ck1` measured chunk{1,2,16,128,1024}, i.e. m from 11,173,962 down to 10,944,
+#   and K3 CONFIRMED plateau5 rising monotonically the whole way (90.979 -> 92.526).
+#   It deliberately skipped the coarse end on the argument that the tuned ladder is
+#   already flat there.  That argument is now weaker than it was when it was made:
+#   chunk1024 reads 92.526, which is ABOVE nodewise's 92.450-at-its-own-argmax and
+#   still BELOW layerwise's 92.887 -- so the chunk curve is climbing INTO the region
+#   the tuned ladder's interior optimum sits in, and nothing measures what it does
+#   when it gets there.
+#
+#   chunk<huge> == layerwise BITWISE (tests/test_chunkwise.py C2), so the chunk
+#   family's coarse endpoint IS layerwise, m=62, 92.887.  Adding m=1,407 and m=220
+#   turns 62 <-> 11,173,962 into a SEVEN-rung continuum in one partition family with
+#   one knob, which is the object the campaign has been interpolating across since
+#   CORRECTIONS 104.8.
+#
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+#
+#   X0    VALIDITY.  n_records == 10000; beta moved; epochs_done == requested == 100.
+#   X0.2  n_beta == m(K) EXACTLY on EVERY record.  Guard 4 MEASURES m(8192) and
+#         m(65536) from the ALLOCATED beta on the real built network before
+#         submitting; the values 1,407 and 220 appear in ck1's header as measured
+#         numbers and are RE-MEASURED here rather than inherited from that comment.
+#   X0.3  THE INSTRUMENT FIRED.  neg_counts.json, n_tot == n_beta, npy shape from
+#         its HEADER == (n_tot,).
+#   X0.4  BOX-FREE at BOTH guards, rec_-based 5% gate, PRIMARY and UNCHANGED.
+#
+#   X1    **K3 EXTENDED.  REGISTERED.**  plateau5 monotone NON-DECREASING as K rises
+#         across 1024 -> 8192 -> 65536, ties within +-0.15 pp, chained onto ck1's
+#         chunk1024 = 92.526.  REFUTES if an adjacent pair inverts by more than
+#         0.15 pp -> the monotone rise K3 confirmed does NOT continue to the coarse
+#         end, and the chunk curve turns over somewhere inside 62..10,944.
+#
+#   X2    **DOES THE CHUNK FAMILY OVERSHOOT LAYERWISE?  REGISTERED.**
+#         Layerwise is the chunk family's own coarse endpoint (m=62) and is the
+#         best rung of the five-rung tuned ladder at 92.887 (n=11, FINDINGS 74.3).
+#         **PREDICTS: chunk8192 and chunk65536 are BOTH <= 92.887 + 0.15** -- the
+#              chunk curve converges to layerwise from BELOW, monotonically, and the
+#              tuned ladder's interior optimum at layerwise survives inside the
+#              chunk family.
+#         **REFUTES if EITHER exceeds 92.887 + 0.15** -> the chunk family has an
+#              interior optimum ABOVE the best rung of the entire tuned ladder,
+#              reached by a partition knob that ignores architecture completely.
+#              That would be a METHOD result and not only a measurement one, so it
+#              is registered here with its threshold BEFORE the data exists.
+#         Note the asymmetry deliberately: X2 is ONE-SIDED.  Landing below 92.887
+#         confirms nothing interesting on its own -- it is the ordinary outcome --
+#         and it must not be reported as a positive finding.
+#
+#   X3    THE FIELD OVER THE WHOLE RANGE.  **DESCRIPTIVE, NO DIRECTION REGISTERED.**
+#         a_raw, a_deb, pbar, bias_share and N_eff/m at m=1,407 and m=220,
+#         completing the chunk family's field curve over 62..11,173,962 with the
+#         partition held FIXED -- the first time any agreement curve in this
+#         campaign varies only the group count within a single partition family.
+#         **The "53.1%" sentence is NOT reproduced and must NOT be written.**
+#
+# WHAT THIS BATCH DELIBERATELY DOES NOT DO
+#   * It does NOT run chunk<huge>.  That arm is layerwise BITWISE and layerwise
+#     already has n=11 in this exact cell; re-running it would buy nothing.
+#   * It does NOT sweep ms.  Guard 2b re-derives that ms=1e-4 is the INTERIOR argmax
+#     of layerwise, which is the endpoint this batch approaches.  **THE RISK IS THE
+#     SAME ONE ck1 STATED: if an interior K's argmax is away from 1e-4, X1's shape
+#     is confounded with distance-from-optimum.**
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 analysis/c75_ck1_score.py --selftest   (74/74)
+#   2. python3 analysis/c55_neff_noise.py --selftest  (51/51)
+#   3. `cx2` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   4. plateau5 is PRIMARY.  best_test inflates ~0.37 pp.
+#
+# USAGE
+#   bash c76_chunk_coarse_extension.sh            # dry run
+#   bash c76_chunk_coarse_extension.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cx2
+CIFAR=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=$(whoami)
+
+NJOBS=6
+CLIP=-15:-2.3026               # ck1's box EXACTLY -- not a new box
+MST=1e-4
+EPOCHS=100
+WALL=03:50:00
+WRITE_EVERY=500
+KS="8192 65536"
+LAY_REF=92.887                 # layerwise, the chunk family's coarse ENDPOINT
+X2_MARGIN=0.15
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  cx2 -- THE CHUNK LADDER'S COARSE END"
+echo "    chunk{$KS} x seeds 0,1,2 = $NJOBS jobs"
+echo "    ms=$MST, BETA_CLIP=$CLIP, ${EPOCHS}ep, PROBE=5 AND PROBE5=1"
+echo "    X1: K3's monotone rise must continue 1024 -> 8192 -> 65536"
+echo "    X2 (ONE-SIDED): does the chunk family overshoot layerwise's $LAY_REF?"
+echo "=============================================================="
+
+# --- GUARD 0 ---------------------------------------------------------------
+[ -f "$CSVP" ] || { echo "GUARD FAIL: no CSV at $CSVP"; exit 1; }
+[ -f "$RUNNER" ] || { echo "GUARD FAIL: no runner at $RUNNER"; exit 1; }
+echo "guard 0: runner and CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || exit 1
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script exports for")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in mine[0]:
+        sys.exit("GUARD FAIL: export line missing %r -- that is bf8's bug" % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+if keys(mine[0]) != keys(ref[0]):
+    sys.exit("GUARD FAIL: export KEYS differ from tw0's CONFIRMED-FIRING line")
+print("guard 1c: export keys identical to tw0's CONFIRMED-FIRING line")
+PYEOF
+
+# --- GUARD 1d -- PATCH_CHUNKWISE IS PRESENT ON THIS ACCOUNT ----------------
+python3 - "$WS" <<'PYEOF' || exit 1
+import os, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks",
+                  "MetaOptimize", "cifar10", "Optimizers", "HF.py")
+src = open(hf).read()
+if "PATCH_CHUNKWISE" not in src:
+    sys.exit("GUARD FAIL: PATCH_CHUNKWISE is NOT applied to %s" % hf)
+for need in ("chunkwise", "chunk_size", "repeat_interleave"):
+    if need not in src:
+        sys.exit("GUARD FAIL: PATCH_CHUNKWISE marker present but %r missing -- partial" % need)
+print("guard 1d: PATCH_CHUNKWISE present and complete on this account")
+PYEOF
+
+# --- GUARD 2 -- the 13-axis signature, re-derived FROM THE CSV --------------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$MST" "$LAY_REF" <<'PYEOF' || exit 1
+import csv, sys, statistics
+csvp, clip, epochs, mst, layref = sys.argv[1:6]
+rd = list(csv.DictReader(open(csvp)))
+AX = ['network','dataset','batch_size','base','meta','alpha0','gamma',
+      'augment','beta_clip','hier','lam','eta_ratio','epochs_done']
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row")
+sig = {a: ref[0][a] for a in AX}
+mine = {'network':'ResNet18','dataset':'CIFAR10','batch_size':'100','base':'SGDm',
+        'meta':'Lion','alpha0':'1e-3','gamma':'1','augment':'1',
+        'beta_clip':clip,'epochs_done':epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a,m,s in bad: print("  axis %s: this batch %r vs reference %r" % (a,m,s))
+    sys.exit("GUARD FAIL: cx2 does not match the ladder's axis signature")
+print("guard 2: all 13 axes match the rs-lay-1e4 signature read FROM THE CSV")
+
+def cell(gran):
+    out = {}
+    for r in rd:
+        if r.get('granularity') != gran: continue
+        if not r.get('plateau5','').strip(): continue
+        if any(r.get(a,'') != sig[a] for a in AX): continue
+        out.setdefault(r['meta_stepsize'], []).append(float(r['plateau5']))
+    return out
+
+# guard 2b: ms=1e-4 must be the INTERIOR argmax of layerwise, the endpoint approached.
+c = cell('layerwise')
+best = max(c, key=lambda k: statistics.mean(c[k]))
+grid = sorted(c, key=float)
+if float(best) != float(mst):
+    sys.exit("GUARD FAIL: layerwise's argmax is ms=%s, not the %s held fixed" % (best, mst))
+if best in (grid[0], grid[-1]):
+    sys.exit("GUARD FAIL: layerwise's argmax ms=%s is at a grid EDGE %s" % (best, grid))
+print("guard 2b: layerwise argmax ms=%-6s plateau5=%.3f (n=%d), INTERIOR in %s"
+      % (best, statistics.mean(c[best]), len(c[best]), grid))
+
+# guard 2c: X2's threshold must be the layerwise value the CSV actually holds.
+lay = statistics.mean(c[best])
+if abs(lay - float(layref)) > 0.001:
+    sys.exit("GUARD FAIL: layerwise reads %.3f in the CSV, not the %s registered as "
+             "X2's threshold" % (lay, layref))
+print("guard 2c: X2 threshold layerwise = %.3f (n=%d) as registered" % (lay, len(c[best])))
+
+# guard 2d: X1 chains onto ck1's chunk1024, so that value must still read 92.526.
+c1024 = [float(r['plateau5']) for r in rd
+         if r['run'].startswith('ck1-k1024-') and r.get('plateau5','').strip()]
+if len(c1024) != 3 or abs(statistics.mean(c1024) - 92.526) > 0.002:
+    sys.exit("GUARD FAIL: X1's chain point reads %.3f (n=%d), not 92.526 (n=3)"
+             % (statistics.mean(c1024) if c1024 else float('nan'), len(c1024)))
+print("guard 2d: X1 chain point ck1 chunk1024 = %.3f (n=3) as registered"
+      % statistics.mean(c1024))
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs -------------------
+python3 - "$REPO" "$CLIP" <<'PYEOF' || exit 1
+import sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if "cx2" not in c55.BOXES:
+    sys.exit("GUARD FAIL: `cx2` is not registered in c55_neff_noise.BOXES.  Register "
+             "it from THIS script's CLIP= line BEFORE submitting or the root is skipped.")
+lo, hi, prov = c55.BOXES["cx2"]
+want = tuple(float(x) for x in clip.split(":"))
+if (lo, hi) != want:
+    sys.exit("GUARD FAIL: c55 registers cx2 as %s but CLIP= is %s" % ((lo,hi), want))
+print("guard 3: cx2 registered as (%.1f, %.4f) from %s" % (lo, hi, prov))
+PYEOF
+
+# --- GUARD 4 -- m(K) MEASURED FROM THE ALLOCATED BETA, NOT INHERITED -------
+# ck1's header lists m(8192)=1,407 and m(65536)=220 as measured values.  This guard
+# RE-MEASURES both on the real built network rather than trusting that comment, and
+# also asserts the coarse endpoint identity the batch's X2 argument rests on:
+# a chunk larger than the biggest tensor is layerwise, m=62.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$CIFAR" || exit 1
+  python - "$KS" <<'PYEOF' || exit 1
+import sys, math, torch
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+KS = [int(k) for k in sys.argv[1].split()]
+WANT = {8192: 1407, 65536: 220}
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": 1e-4, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def alloc(gran):
+    torch.manual_seed(0)
+    net = build_network("ResNet18", "cpu")
+    opt = HF(net, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+             args_meta=dict(META), gamma=1, writer=NullWriter())
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+net = build_network("ResNet18", "cpu")
+ns = [int(p.numel()) for p in net.parameters()]
+for K in KS:
+    if K not in WANT:
+        sys.exit("GUARD FAIL: K=%d has no registered m(K)" % K)
+    formula = sum(math.ceil(n / K) for n in ns)
+    m = alloc("chunk%d" % K)
+    print("guard 4: chunk%-6d formula m=%-6d ALLOCATED beta m=%-6d (registered %d)"
+          % (K, formula, m, WANT[K]))
+    if formula != m:
+        sys.exit("GUARD FAIL: chunk%d formula %d != allocated %d" % (K, formula, m))
+    if m != WANT[K]:
+        sys.exit("GUARD FAIL: m(chunk%d) is %d, not the %d registered" % (K, m, WANT[K]))
+ms = [alloc("chunk%d" % K) for K in KS]
+if ms != sorted(ms, reverse=True):
+    sys.exit("GUARD FAIL: m(K) is not decreasing across %s: %s" % (KS, ms))
+m_lay = alloc("layerwise")
+m_huge = alloc("chunk%d" % (1 << 24))
+print("guard 4b: layerwise m=%d, chunk2^24 m=%d" % (m_lay, m_huge))
+if m_lay != m_huge or m_lay != len(ns):
+    sys.exit("GUARD FAIL: the coarse endpoint identity chunk<huge> == layerwise does "
+             "NOT hold (%d vs %d, %d tensors) -- X2's argument is invalid"
+             % (m_huge, m_lay, len(ns)))
+print("guard 4c: coarse endpoint identity holds -- layerwise IS the chunk family's")
+print("          m=%d endpoint, so X2 compares inside ONE partition family" % m_lay)
+if not (m_lay < min(ms)):
+    sys.exit("GUARD FAIL: the new rungs do not sit strictly between layerwise and "
+             "chunk1024 in m")
+print("guard 4d: new rungs %s sit strictly inside (%d, 10944)" % (ms, m_lay))
+PYEOF
+) || { echo "GUARD 4 FAILED -- nothing submitted"; exit 1; }
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" <<'PYEOF' || exit 1
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+need_gb = 6 * 0.055
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)" % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# --- GUARD 6 -- queue depth ------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS"
+if [ "$PEND" -gt 40 ]; then
+  echo "GUARD FAIL: $PEND already pending, over the 40 cap"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for K in $KS; do
+  for S in 0 1 2; do
+    RN="cx2-k${K}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_k${K}_cx2_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "chunk${K}" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+exit 0

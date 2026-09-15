@@ -1,0 +1,389 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 58 -- DOES THE HORIZON REVERSAL SURVIVE PER-ARM TUNING?
+# cluster_a (account_a).  9 jobs.  Tag `hz9-*`.  100 epochs.
+#
+# WRITTEN WHILE cluster_a WAS DOWN FOR A THIRD CONSECUTIVE TICK (FINDINGS 58.0) AND
+# NOT SUBMITTED.  Registered now so the next tick submits rather than designs.
+# Its own guards re-check every precondition at submit time.
+#
+# WHAT THIS IS ABOUT.  CORRECTIONS 86.3 made "the accuracy-optimal granularity
+# REVERSES with training horizon" the campaign's headline, on the strength of a
+# unanimous, twice-replicated paired curve: nodewise-layerwise goes -3.946 (0/7)
+# at epoch 10 to +1.258 (7/7) at epoch 40.  Cycle 58 re-derived that table from
+# the raw .out series and reproduced it to three decimals (FINDINGS 58.1), then
+# asked the two questions 86.3 did not.
+#
+#   (i)  IS THE SHAPE GENERAL?  YES, and far more general than 86.3 claimed.
+#        The U in training time appears in ~30 config cells across 5 independent
+#        batch families, 3 networks and 2 datasets.  What is NOT general is the
+#        CROSSING EPOCH: it falls with the meta-stepsize (~20 at ms=1e-3, a
+#        MEASURED 47 at ms=3e-4, still descending at epoch 20 at ms<=2e-4), rises
+#        with depth (ResNet34 is still -1.1pp at epoch 20 in 5 of 5 batches), and
+#        falls with task difficulty (CIFAR-100 has crossed by ~16).  86.3's
+#        "between epoch 15 and 25" is a ResNet18/CIFAR10/ms=1e-3 number.
+#
+#   (ii) DOES IT SURVIVE PER-ARM TUNING?  **THE PILOT SAYS NO, AND THAT IS WHAT
+#        THIS BATCH TESTS.**  Every cell in (i) holds ms FIXED and SHARED across
+#        the two arms.  ms=1e-3 is above the 1e-4 joint optimum (FINDINGS 57.2),
+#        so at that cell layerwise is 1.86pp off its own peak while nodewise is
+#        0.10pp off its own.  Let each arm sit at ITS OWN optimum instead --
+#        layerwise@1e-4 against nodewise@3e-4, on `rs`, complete-to-100 runs --
+#        and the curve comes out MIRRORED:
+#
+#            epoch    10     20     30     40     50     60     80    100
+#            node-lay +3.286 +1.800 +1.809 +0.891 +0.317 -0.121 -0.199 -0.168
+#
+#        Nodewise starts AHEAD and fades to a TIE.  Under tuning there is no
+#        reversal to have.  **This is n=1 nodewise against n=2 layerwise and
+#        UNPAIRED.  It cannot carry the claim.  It can and does justify 9 jobs.**
+#
+# WHY THIS OUTRANKS `rw9` AND `sp8` ON RECONNECT.  Both were correctly ranked by
+# their own cycles and both still get submitted -- only the ORDER changes, and
+# only on cluster_a, where hz9 and rw9 compete.  rw9 (18 jobs) decides D2, a question
+# about the weightwise arm.  hz9 (9 jobs) decides whether the campaign's CURRENT
+# HEADLINE is a general claim about granularity or a statement about a shared,
+# over-large meta-stepsize.  That is the more load-bearing question and it is
+# half the cost.  sp8 is on cluster_b and does not compete with either.
+#
+# THE 9 JOBS, AND WHY EACH EXISTS.
+#   4x  hz9-node-3e4-s{1,2,3,4}   nodewise AT ITS OWN OPTIMUM.  Corpus has n=1
+#                                 complete (rs-node-3e4-s0; s1 truncated at 89).
+#                                 Takes the tuned nodewise arm from n=1 to n=5.
+#   3x  hz9-lay-1e4-s{0,1,2}      layerwise AT ITS OWN OPTIMUM.  Corpus has n=2
+#                                 (rs-lay-1e4-s3,s4).  Takes it to n=5, and the
+#                                 seeds are chosen so `rs` supplies 3,4 and this
+#                                 batch supplies 0,1,2 with no seed collision.
+#   2x  hz9-node-1e3-s{3,4}       THE FIXED-ms CELL, PAIRED, AT 100 EPOCHS.
+#                                 rs-lay-1e3 has exactly seeds 3,4, so these two
+#                                 jobs convert an unpaired +1.594@100 into a
+#                                 PAIRED measurement and extend 86.3's paired
+#                                 curve from 40 epochs to 100.
+#
+#   NOTE these are re-runs of cells `c40_surface.sh` ALREADY REQUESTED.  c40 asked
+#   for rs-node at seeds 0-4 x 5 stepsizes = 25 jobs; the corpus contains 10, of
+#   which 6 are truncated.  15 nodewise jobs never produced output.  This batch is
+#   not new compute so much as the tuned half of the surface that never landed.
+#
+# PRE-REGISTERED GATES -- score against these, in this order, not against what lands.
+#
+#   (H0) VALIDITY, HARD DROP.  epochs_done == 100 == epochs_requested on EVERY
+#        job.  FINDINGS 57.1: the c40 surface silently mixed 12 truncated runs
+#        into its blk6 and nodewise rows -- 46% and 60% of those arms, 0% of
+#        scalar and layerwise -- and the depression was monotone in severity.
+#        **The nodewise arm is the one that was contaminated, and this batch is
+#        nodewise-heavy.**  Any job with epochs_done < 100 is DROPPED, never
+#        down-weighted; if that leaves a cell at n=0 it is reported MISSING.
+#
+#   (H0.3) THE GUARD GATE.  BETA_CLIP=-15:-2.3026 live, `collapsed` false,
+#        plateau > 40, per job.  A failure voids that job, not the batch.
+#
+#   (H0.5) THE POOLING GATE, AND IT CAN ONLY VOID.  H1 pools `hz9` runs with
+#        `rs` runs, which is exactly the cross-root comparison CORRECTIONS 68/71
+#        exist to prevent.  Guard 3 diffs the operating point at SUBMIT time;
+#        this gate checks the RESULT at score time:
+#            hz9-lay-1e4-s{0,1,2}   must sit within 3 sd of rs-lay-1e4 (92.824,
+#                                   sd 0.291, n=2) at matched-k=5, epoch 100
+#            hz9-node-3e4-s{1..4}   must sit within 3 sd of rs-node-3e4-s0
+#                                   (92.656, n=1, so use layerwise's 0.291)
+#        **If either fails, the two roots are not matched, POOLING IS VOID and H1
+#        IS NOT SCORED.**  Report the within-batch hz9-only comparison instead and
+#        say plainly that the corpus arm could not be joined.
+#
+#   (H1) THE PRIMARY TEST -- THE SLOPE, scored only if H0/H0.3/H0.5 pass.
+#        D = (node@3e-4 - lay@1e-4)@100 - (node@3e-4 - lay@1e-4)@50, matched-k=5
+#        plateau, n=5 vs n=5, UNPAIRED (the two arms sit at different ms, so
+#        there is nothing to pair; seeds are matched in COUNT, not in role).
+#        The slope is used rather than the level because it is insensitive to a
+#        constant offset between two arms tuned to different stepsizes.
+#
+#        T-A  D >= +0.30  -> **THE REVERSAL SURVIVES TUNING.**  86.3 stands as a
+#             general horizon claim about granularity and is the headline.
+#        T-B  D <= -0.30  -> **IT DOES NOT.**  86.3 must be rewritten as what
+#             FINDINGS 57.2 already called it -- partitioning buys TOLERANCE TO AN
+#             OVER-LARGE META-STEPSIZE -- and the sentence "the accuracy-optimal
+#             granularity reverses with horizon" may not be written without the
+#             scope "at a meta-stepsize shared across arms and above the joint
+#             optimum".  The finding does not die; its NAME changes, exactly as in
+#             CORRECTIONS 86.1.
+#        else UNDECIDED.  Say so and price the extra seeds.
+#
+#        **A DIRECTION IS REGISTERED HERE, AND DELIBERATELY.**  The pilot above
+#        gives D = -0.485 and points at T-B.  It is written down BEFORE the batch
+#        runs so that a T-B result is scored as a REPLICATION of a pilot, never
+#        as a discovery (the FINDINGS 55.6 convention), and so that a T-A result
+#        is visibly an overturning of this cycle's own read.  This is the opposite
+#        of rw9's "no direction registered", and the difference is that rw9's one
+#        data point was consistent with BOTH branches while this one is not.
+#
+#   (H1b) THE LEVEL, reported alongside.  (node - lay)@100 against a +-0.50 bar
+#        (2.7 SE at n=5,5 and sd 0.291 -- STANDING RULE 9, the bar is stated
+#        against the measured noise of the thing it measures, not blanket +-0.10).
+#        |level| < 0.50 => **TIED**, and TIED IS A RESULT: it says that once each
+#        arm is tuned, the choice among PARTITIONS is unresolvable and only
+#        partition-vs-none matters.  The corpus already puts that latter gap at
+#        +0.63pp (scalar 92.198 against the three partitioned arms at 92.65-92.82,
+#        which span 0.17pp -- inside layerwise's own sd).
+#
+#   (H2) THE FIXED-ms CELL, PAIRED, AT 100 EPOCHS -- A REPLICATION, NOT A
+#        DISCOVERY.  hz9-node-1e3-s{3,4} against rs-lay-1e3-s{3,4}, paired within
+#        seed.  Registered expectation, from br6/bl5's paired +1.258 at 40 epochs
+#        and rs's unpaired +1.594 at 100: **+1.0 to +2.0, and 2/2 seeds favouring
+#        nodewise.**  Outside that range the 40->100 extension of 86.3 fails and
+#        the headline curve may not be quoted past 40 epochs.
+#
+# NOT INCLUDED, deliberately:
+#   * ms=1e-4 nodewise top-ups.  The pilot puts that cell 0.476pp below layerwise
+#     at epoch 100 and still rising, with a predicted crossing at epoch 102 -- an
+#     out-of-sample hit worth reporting but not worth resolving, because it is a
+#     statement about nodewise OFF its own optimum and H1 is about arms ON it.
+#   * alpha0=1e-6.  Three cells there invert catastrophically (-8 to -24pp at
+#     epoch 20) and all are n=1 at a 20-epoch budget, so nothing can be concluded
+#     and a 100-epoch alpha0=1e-6 batch is a separate, larger question.
+#   * ResNet34, where the crossing is latest and the effect would be clearest.
+#     It needs a 100-epoch R34 root the corpus does not have.  Ranked next.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. H0, H0.3, H0.5 above, run not assumed, PER JOB and IN THAT ORDER
+#   2. python3 analysis/c58_horizon_reversal.py --selftest   (42/42)
+#   3. python3 analysis/c58_horizon_reversal.py --control    (must print
+#      REPRODUCED EXACTLY -- it re-derives 86.3 from the raw .out series)
+#   4. python3 analysis/c57_surface_truncation.py --audit    # hz9 must show 0
+#   5. Re-derive every number above from results/all_runs.csv and the .out
+#      series, never quote it from this comment (STANDING RULE 1).
+#
+# USAGE
+#   bash c58_tuned_horizon.sh            # dry run: prints every sbatch line
+#   bash c58_tuned_horizon.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_a/metaopt                   # cluster_a -- the rs-* workspace
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+SAVE=$WS/runs/hz9
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_a
+PEND_CAP=40
+NJOBS=9
+CLIP=-15:-2.3026               # the c40 surface's guard; matched, not chosen
+EPOCHS=100
+WALL=03:50:00                  # c40's own request; guard 7 checks it vs throughput
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c58 hz9 -- does the horizon reversal survive PER-ARM TUNING? (cluster_a) ==="
+echo "    node@3e-4 s1-4 (4) + lay@1e-4 s0-2 (3) + node@1e-3 s3-4 (2) = 9 jobs, ${EPOCHS}ep"
+echo "    pilot (n=1 vs n=2, unpaired): node-lay +0.317@50 -> -0.168@100, D=-0.485 -> T-B"
+echo "    H1: D>=+0.30 T-A reversal survives / D<=-0.30 T-B it is a shared-ms effect"
+echo
+
+# GUARD 1 -- the runner and the optimizer source exist and compile.
+[ -r "$RUNNER" ] || { echo "GUARD FAIL: $RUNNER not readable"; exit 1; }
+[ -r "$HF" ]     || { echo "GUARD FAIL: $HF not readable"; exit 1; }
+echo "guard 1: runner and HF.py readable  OK"
+
+python3 -c "import py_compile; py_compile.compile('$HF', doraise=True)" 2>/dev/null || {
+  echo "GUARD FAIL: $HF does not compile"; exit 1; }
+echo "guard 2: HF.py compiles  OK"
+
+# GUARD 3 -- THE POOLING PRECONDITION.  H1 joins hz9 runs to rs runs, so the
+# operating point is DIFFED against c40_surface.sh itself, never asserted.  This
+# is the uc5 lesson (CORRECTIONS 68/71) and it is the whole basis of H0.5.
+C40=$(dirname "$0")/c40_surface.sh
+if [ -r "$C40" ]; then
+  for f in "BETA_CLIP=-15:-2.3026" "--alpha0 1e-3" "--num-epochs 100" \
+           "--dataset CIFAR10" "--NN-name ResNet18" "--batch-size 100" "--gamma 1" \
+           "--alg-base SGDm" "--momentum-param-base 0.99" "--weight-decay-base 0.1" \
+           "--alg-meta Lion" "--momentum-param-meta 0.99" "--Lion-beta2-meta 0.9" \
+           "AUGMENT=1"; do
+    grep -q -- "$f" "$C40" || {
+      echo "GUARD FAIL: '$f' absent from c40_surface.sh -- rs and hz9 are NOT the"
+      echo "            same operating point, so H1's pooling is invalid.  STOP."; exit 1; }
+  done
+  echo "guard 3: operating point byte-matches the c40 surface (14 fields)  OK"
+else
+  echo "GUARD FAIL: c40_surface.sh not readable -- cannot diff the operating point"; exit 1
+fi
+
+# GUARD 3b -- NO SEED COLLISION WITH THE CORPUS.  H0.5 pools by (config, gran,
+# seed); if hz9 re-ran a seed rs already has, the pooled cell would silently pick
+# one of them.  Assert the seed split this batch depends on, against c40.
+python3 - <<'PYEOF' || exit 1
+# What c40 already requested, read from its own loops rather than from prose:
+#   rs-lay-1e4  seeds {3,4}      (the "top-ups to n=5" loop)
+#   rs-lay-1e3  seeds {3,4}      (same loop)
+#   rs-node-*   seeds {0,1,2,3,4} at 5 stepsizes -- REQUESTED, but only s0/s1
+#               reached the corpus and 6 of 10 nodewise rows are truncated.
+hz9 = {("layerwise", "1e-4"): {0, 1, 2},
+       ("nodewise", "3e-4"): {1, 2, 3, 4},
+       ("nodewise", "1e-3"): {3, 4}}
+corpus_complete = {("layerwise", "1e-4"): {3, 4},
+                   ("layerwise", "1e-3"): {3, 4},
+                   ("nodewise", "3e-4"): {0},
+                   ("nodewise", "1e-3"): {0}}
+for k, s in hz9.items():
+    clash = s & corpus_complete.get(k, set())
+    assert not clash, f"seed collision at {k}: {clash} already complete in the corpus"
+# H1 needs n=5 on BOTH tuned arms after pooling.
+n_lay = len(hz9[("layerwise", "1e-4")] | corpus_complete[("layerwise", "1e-4")])
+n_node = len(hz9[("nodewise", "3e-4")] | corpus_complete[("nodewise", "3e-4")])
+assert n_lay == 5, f"tuned layerwise would reach n={n_lay}, not 5"
+assert n_node == 5, f"tuned nodewise would reach n={n_node}, not 5"
+# H2 needs the fixed-ms cell to be PAIRABLE: node seeds must match lay seeds.
+assert hz9[("nodewise", "1e-3")] == corpus_complete[("layerwise", "1e-3")], \
+    "H2's nodewise seeds do not match rs-lay-1e3's -- the cell would not pair"
+assert sum(len(v) for v in hz9.values()) == 9, "the batch is not 9 jobs"
+print(f"guard 3b: no seed collision; tuned arms reach n={n_lay}/{n_node}; "
+      f"H2 pairs on seeds {sorted(hz9[('nodewise', '1e-3')])}  OK")
+PYEOF
+
+# GUARD 4 -- the design arithmetic, re-run rather than trusted to the comment.
+python3 - <<'PYEOF' || exit 1
+# The tuned peak row at 100 epochs, re-derived in FINDINGS 58.8 on the FULL
+# 14-column config key (P0 hard drop, matched-k=5).  This pools the `ms`, `mx`
+# and `rs` families, which are the only three at this exact operating point and
+# which agree within sd.  **These are NOT the rs-only numbers FINDINGS 58.6 first
+# printed** -- 58.6 was corrected by 58.8 and this guard carries the corrected row.
+peak = {"layerwise": (92.906, "1e-4", 5, 0.166), "nodewise": (92.656, "3e-4", 1, None),
+        "resnet18_blocks": (92.652, "1e-4", 2, 0.079), "scalar": (92.262, "1e-4", 5, 0.222)}
+# 1. each arm's optimum is where this batch puts it.
+assert peak["layerwise"][1] == "1e-4" and peak["nodewise"][1] == "3e-4", \
+    "the tuned optima moved -- re-derive before spending 9 jobs"
+# 2. partition-vs-none must still be the resolvable effect, and the spread AMONG
+#    partitions must still be the smaller one.  It is no longer inside one sd
+#    (58.8 corrects 58.6 on exactly this), so the assertion is the ORDERING, not
+#    a within-sd claim that the data does not support.
+part = [peak[k][0] for k in ("layerwise", "nodewise", "resnet18_blocks")]
+sd = peak["layerwise"][3]
+spread = max(part) - min(part)
+pvn = min(part) - peak["scalar"][0]
+assert spread < pvn, "the spread among partitions now exceeds partition-vs-none"
+assert pvn > 0.30, "partition-vs-none is no longer resolvable"
+# 3. THE REASON THIS BATCH EXISTS, as arithmetic: the nodewise arm is n=1, so its
+#    position in that row is not placeable at all, and the whole peak row turns on it.
+assert peak["nodewise"][2] == 1, "nodewise is no longer n=1 -- re-rank this batch"
+# 4. H1's bar must be resolvable at the n this batch buys.
+n = 5
+se = sd * (2 / n) ** 0.5
+assert 0.30 / se > 1.5, f"H1's +-0.30 slope bar is only {0.30 / se:.1f} SE -- not resolvable"
+assert 0.50 / se > 2.5, f"H1b's +-0.50 level bar is only {0.50 / se:.1f} SE"
+# 5. the pilot slope must actually straddle neither branch -- it must PICK one,
+#    because a direction is registered and must be falsifiable.
+pilot = -0.168 - 0.317
+assert pilot <= -0.30, "the pilot does not point at T-B; the registered direction is wrong"
+print(f"guard 4: optima 1e-4/3e-4; spread among partitions {spread:.3f} < "
+      f"partition-vs-none {pvn:.3f}; nodewise still n=1 (the reason for this batch); "
+      f"SE(n=5,5)={se:.3f} so the +-0.30 bar is {0.30 / se:.1f} SE and +-0.50 is "
+      f"{0.50 / se:.1f} SE; pilot D={pilot:.3f} registers T-B  OK")
+PYEOF
+
+# GUARD 5 -- queue depth.  9 jobs is well inside the ~20-job / 0.5%-RawUsage rule.
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: FairShare=${FS:-unknown} (informational), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+# GUARD 6 -- THE WALL-CLOCK REQUEST MUST FIT THE TIGHTEST PARTITION IN $PARTS.
+# CORRECTIONS 71's failure mode, silent-until-total: sbatch rejects against the
+# SMALLEST MaxTime among the requested partitions, so one over-long --time loses
+# the WHOLE batch.  Read from `sinfo` LIVE, never from a comment (FINDINGS 54.6).
+python3 - "$WALL" "$PARTS" <<'PYEOF' || exit 1
+import subprocess, sys
+def secs(t):
+    d, _, rest = t.partition("-")
+    if not rest: rest, d = d, "0"
+    p = [int(x) for x in rest.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return int(d) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+want, parts = sys.argv[1], sys.argv[2].split(",")
+out = subprocess.run(["sinfo", "-h", "-o", "%P %l"], capture_output=True, text=True).stdout
+lim = {}
+for ln in out.split("\n"):
+    f = ln.split()
+    if len(f) == 2 and f[1] not in ("infinite", "n/a"):
+        lim[f[0].rstrip("*")] = secs(f[1])
+tight = [(p, lim[p]) for p in parts if p in lim]
+if not tight:
+    sys.exit("GUARD FAIL: sinfo returned no limit for any requested partition")
+name, cap = min(tight, key=lambda kv: kv[1])
+if secs(want) > cap:
+    sys.exit(f"GUARD FAIL: --time={want} exceeds {name}'s MaxTime "
+             f"({cap // 3600}:{cap % 3600 // 60:02d}) -- sbatch would reject the WHOLE batch")
+print(f"guard 6: --time={want} fits the tightest partition {name} "
+      f"({cap // 3600}:{cap % 3600 // 60:02d})  OK")
+PYEOF
+
+# GUARD 7 -- THROUGHPUT HEADROOM, and it encodes FINDINGS 57.1.  This batch is
+# NODEWISE-HEAVY and nodewise is the arm the c40 surface lost 60% of to
+# truncation.  Rates measured over the ResNet18/CIFAR10 corpus with usable
+# wallclock and epochs_done >= 10 (99 nodewise runs, 499 layerwise).
+python3 - "$WALL" <<'PYEOF' || exit 1
+import sys
+def secs(t):
+    p = [int(x) for x in t.split(":")]
+    return p[0] * 3600 + p[1] * 60 + p[2]
+median, slowest, epochs = 2.326, 1.053, 100      # nodewise ep/min, the slower arm
+wall_min = secs(sys.argv[1]) / 60
+need_slow = epochs / slowest
+if need_slow > wall_min:
+    sys.exit(f"GUARD FAIL: {epochs} nodewise epochs need {need_slow:.0f} min at the "
+             f"SLOWEST observed rate but --time is {wall_min:.0f} min -- would truncate")
+print(f"guard 7: {epochs} nodewise epochs need {epochs / median:.0f} min median / "
+      f"{need_slow:.0f} min slowest, against a {wall_min:.0f} min wall "
+      f"({wall_min / need_slow:.1f}x headroom on the slowest)  OK")
+PYEOF
+
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+# nice 0 = H1's two tuned arms.  nice 50 = H2, which is a replication and can wait.
+for J in "nodewise:3e-4:3e4:1,2,3,4:0" \
+         "layerwise:1e-4:1e4:0,1,2:0" \
+         "nodewise:1e-3:1e3:3,4:50"; do
+  IFS=: read -r GRAN MST TAG SEEDS NICE <<<"$J"
+  SHORT=$([ "$GRAN" = nodewise ] && echo node || echo lay)
+  IFS=, read -r -a SLIST <<<"$SEEDS"
+  for S in "${SLIST[@]}"; do
+    RN="hz9-${SHORT}-${TAG}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice="$NICE"
+      --export="ALL,AUGMENT=1,BETA_CLIP=$CLIP"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+echo "reduce with, IN THIS ORDER:"
+echo "  1. H0    epochs_done == 100 PER JOB.  DROP any short job -- nodewise is the arm"
+echo "           the c40 surface lost 60% of.  python3 analysis/c57_surface_truncation.py --audit"
+echo "  2. H0.3  BETA_CLIP live, collapsed false, plateau > 40, per job"
+echo "  3. H0.5  POOLING GATE, CAN ONLY VOID: hz9-lay-1e4 within 3sd of rs-lay-1e4"
+echo "           (92.824, sd 0.291) and hz9-node-3e4 within 3sd of rs-node-3e4-s0"
+echo "           (92.656).  FAIL => pooling void, H1 NOT SCORED, report hz9-only."
+echo "  4. H1    D = (node@3e-4 - lay@1e-4)@100 - same@50, n=5 vs 5, matched-k=5."
+echo "           >=+0.30 T-A reversal survives tuning / <=-0.30 T-B shared-ms effect."
+echo "           Pilot D=-0.485 registers T-B: a T-B result REPLICATES, it does not discover."
+echo "  5. H1b   level (node-lay)@100 vs a +-0.50 bar; |.|<0.50 => TIED, which is a RESULT"
+echo "  6. H2    paired node-lay at ms=1e-3, epoch 100, seeds 3,4 vs rs-lay-1e3-s{3,4}."
+echo "           Registered expectation +1.0..+2.0 and 2/2.  Outside => 86.3 may not be"
+echo "           quoted past epoch 40."
+echo "  scoring instrument: python3 analysis/c58_horizon_reversal.py --control (must"
+echo "  print REPRODUCED EXACTLY first), then --crossing and --slopes; H1/H0.5 need"
+echo "  cells(pool=True), which is legitimate ONLY because guard 3 diffed the roots."

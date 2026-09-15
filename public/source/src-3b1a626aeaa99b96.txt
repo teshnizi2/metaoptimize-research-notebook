@@ -1,0 +1,80 @@
+"""PATCH_PROBE5 -- per-group marginal sign counts, so the independence floor can be
+CORRECTED for heterogeneity.
+
+WHY.  twochannel.py estimates the independence floor of the agreement statistic as
+p_bar(1-p_bar)/n, using the cross-sectional negative fraction.  With heterogeneous groups --
+each coordinate carrying its own persistent sign preference p_b -- the true floor is the
+SMALLER mean_b[p_b(1-p_b)]/n (Jensen).  Consequences, from FINDINGS 44.5:
+
+  * for the per-rung rho_s this is CONSERVATIVE: the common mode is under-stated, so a
+    positive reading is a lower bound.  Those numbers stand.
+  * for the SCALE PROFILE it is fatal.  Heterogeneity grows with group size (a whole tensor
+    has a far more persistent sign than one weight), so the downward bias is strongest at the
+    coarse rungs.  That depresses rho_s(coarse) and makes the implied per-weight rho FALL
+    with block size -- which is exactly the signature of short-range correlation.  The
+    profile therefore cannot be read from the pooled statistic at all.
+
+WHAT THIS ADDS.  A running count, per coordinate of the arm's own partition, of how often its
+meta-gradient was negative.  From it:
+
+    p_b = neg_count_b / n_records            per-group marginal
+    floor_corrected = mean_b[p_b(1-p_b)] / n      (times n_rec/(n_rec-1); the plug-in
+                                                   p_b(1-p_b) is biased low by (1-1/n_rec))
+
+which turns the scale profile from confounded into measured.  It also delivers the marginal
+BIAS distribution directly, which is the 85%-of-budget channel in FINDINGS 44.3 and has never
+been observed per-coordinate -- only in aggregate.
+
+COST.  One float32 tensor the width of the arm's partition: 4 bytes x 11.17M = 45 MB on the
+weightwise arm, nothing on the others.  Written to disk every WRITE_EVERY probe records
+(5 dumps over a 100-record run), so I/O is ~225 MB per weightwise run.
+
+INERTNESS.  Pure accumulation inside the existing probe, which is itself inside
+`torch.no_grad()` and already runs after meta_update.  It never touches z, beta, or optimizer
+state.  Gated on PROBE5=1 so that PROBE-only runs stay byte-identical to every earlier batch.
+"""
+import sys, os
+
+P = os.environ.get(
+    "HF_PATH",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/"
+    "MetaOptimize/cifar10/Optimizers/HF.py")
+src = open(P).read()
+
+if "PATCH_PROBE5" in src:
+    print("ALREADY_PATCHED")
+    sys.exit(0)
+
+# Anchor on the two lines PATCH_PROBE2 writes (HF_patched.py:360-361).  `zall` is the arm's
+# OWN partition vector: 62 entries layerwise, 14,420 nodewise, 11.17M weightwise.
+anchor = ("        frac_neg = (zall < 0).sum().item() / max(n_tot, 1)\n"
+          "        frac_zero = (zall == 0).sum().item() / max(n_tot, 1)\n")
+assert src.count(anchor) == 1, f"anchor count={src.count(anchor)} -- refusing to patch"
+
+add = '''        # --- PATCH_PROBE5: per-group marginal sign counts (heterogeneity floor) ---
+        if os.environ.get('PROBE5', '') == '1':
+            if getattr(self, '_p5_neg', None) is None or self._p5_neg.numel() != n_tot:
+                self._p5_neg = torch.zeros(n_tot, dtype=torch.float32, device=zall.device)
+                self._p5_n = 0
+            self._p5_neg += (zall < 0).float()
+            self._p5_n += 1
+            _p5_every = int(os.environ.get('PROBE5_WRITE_EVERY', '20'))
+            if self._p5_n % max(_p5_every, 1) == 0:
+                import numpy as _np
+                _tmp = os.path.join(self._probe_dir, 'neg_counts.npy.tmp')
+                _dst = os.path.join(self._probe_dir, 'neg_counts.npy')
+                _np.save(_tmp, self._p5_neg.detach().cpu().numpy())
+                os.replace(_tmp, _dst)
+                with open(os.path.join(self._probe_dir, 'neg_counts.json'), 'w') as _fh:
+                    json.dump({'n_records': int(self._p5_n), 'n_tot': int(n_tot),
+                               'stepsize_type': self.stepsize_type}, _fh)
+'''
+
+src = src.replace(anchor, anchor + add, 1)
+
+# `json` is imported at the top of _probe as `import json, os`; assert that so the inserted
+# block cannot reference a name that is not bound.
+assert "import json, os" in src, "expected `import json, os` inside _probe"
+
+open(P, "w").write(src)
+print("PATCHED PATCH_PROBE5 ->", P)

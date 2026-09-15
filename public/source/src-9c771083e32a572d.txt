@@ -1,0 +1,175 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 50 -- THE WIDE-CLIP CONTROL.  Runs on cluster_b.  18 jobs.
+#
+# OPEN QUESTION IT ANSWERS, and it is the ONE refuted prediction of cycle 50.
+#   `ml5-*` turned frozen-vs-free into a curve and CORRECTIONS 58 now reads it as a DIAL:
+#     b(steady) = 0.343 frozen -> 0.219 at ms=1e-4 -> 0.081 at ms=1e-3, smooth and monotone,
+#     with the suppression at k=1 running 1.00x -> 3.37x -> 21.09x while layerwise stays ~1.
+#   The fourth rung BREAKS that monotonicity: b(ms=1e-2) = 0.328, back at the FROZEN value.
+#   `c49_ms_ladder_p5.sh` pre-registered exactly this as its KNOWN RISK -- BETA_CLIP
+#   saturation making a fast arm measure "a CLIPPED process, not a faster-adapting one" --
+#   and its fallback rule (decide L1 without that column) was applied.
+#
+#   BUT THAT ATTRIBUTION IS AN INFERENCE, NOT A MEASUREMENT.  It rests on a hazard being
+#   named in advance and on the confounded arm resembling the frozen one (b 0.328 vs 0.343,
+#   N_eff/m 0.050 vs 0.042).  Resemblance is not causation.  This batch makes the clip an
+#   EXPERIMENTAL VARIABLE instead of a fixed confound, which is the only way to know.
+#
+# WHICH BOUND, AND WHY ONLY ONE MOVES.  Measured on `ml5-*` (FINDINGS 50.1, and re-derived
+# here before the script was written): the guard that binds is the LOW one.  Fraction of
+# (record,tensor) beta cells at each bound, ms=1e-2:
+#       rung   at HI (-2.3026)   at LO (-15)
+#       w             0.00%          0.47%
+#       node          0.00%          0.19%
+#       lay           0.00%         11.31%
+#       blk6          0.00%         28.14%
+#   The HIGH bound is at 0.00% in EVERY arm of the whole 36-job batch.  So a large
+#   meta-stepsize does not blow the step size UP -- it overshoots DOWNWARD and pins groups
+#   at alpha ~ 3e-7, i.e. it kills them.  A pinned group is a frozen group, which is a
+#   mechanism for "the fast arm looks frozen" that is concrete and testable.
+#   Therefore: LOW bound -15 -> -30 (alpha floor 3.1e-7 -> 9.4e-14).  HIGH bound UNCHANGED
+#   at -2.3026, because it provably never binds and moving it would vary a second field.
+#
+# PRE-REGISTERED PREDICTIONS -- score the verdict against these, not against what lands.
+#
+#   (W0) VALIDITY GATE, and it gates everything else.
+#        1. beta must MOVE: beta_true_max != beta_true_min on the last record, 18/18.
+#        2. n_records == 2000 and n_tot matches the ml5 partner EXACTLY per rung:
+#           w 11,173,962 / node 14,420 / lay 62.  A mismatch voids the contrast.
+#        3. THE CONTROL MUST BE NULL.  The wide-clip ms=1e-3 arm must reproduce its
+#           narrow-clip ml5 partner: b within 0.05 of 0.081 and rho_s(w) within 2x of
+#           9.657e-08.  At ms=1e-3 the guard binds on 0.00% of weightwise cells, so
+#           widening it CANNOT matter; if it does, the widening changed something other
+#           than the clip and NOTHING in this batch is quotable.  This is the whole reason
+#           the ms=1e-3 rungs are included at full n=3 rather than reused from ml5.
+#
+#   (W1) THE PRIMARY TEST -- IS b(1e-2) = 0.328 THE CLIP?
+#        Wide-clip b(ms=1e-2) <= 0.15, i.e. it drops off the frozen value (0.343) and
+#        continues the dial below b(ms=1e-3) = 0.081 or lands near it.
+#        --> CONFIRMS CORRECTIONS 58: the dial is monotone across all four rungs and the
+#            apparent turn-around was the guard.  Write the filter as a dial without the
+#            "unconfounded rungs only" hedge.
+#        REFUTATION: wide-clip b(ms=1e-2) still >= 0.25 with the guard now binding on
+#        <5% of records.  Then the turn-around is REAL, the dial is NON-MONOTONE with an
+#        interior optimum near ms=1e-3, and CORRECTIONS 58 must be rewritten again -- this
+#        time as "suppression is maximised at an intermediate drive", which is a different
+#        and more interesting claim than either a switch or a dial.  Say so plainly; do not
+#        retreat to "confounded" a second time.
+#        IN BETWEEN (0.15 < b < 0.25): the clip explains PART of it.  Report the fraction
+#        explained as (0.328 - b_wide) / (0.328 - 0.081) and claim nothing sharper.
+#
+#   (W2) THE MECHANISM, checked directly rather than inferred.  With the floor at -30 the
+#        binding fraction at ms=1e-2 must FALL below 5% of records at layerwise (from
+#        88.0%).  If it does NOT fall, beta is being driven to -30 as readily as to -15,
+#        the widening did not relieve anything, and W1 is UNINTERPRETABLE rather than
+#        refuted.  **Score W2 BEFORE W1** -- W1 is only meaningful if the guard was
+#        actually relieved.  Report BOTH denominators (STANDING RULE 5, CORRECTIONS 58):
+#        per (record,tensor) cell AND per record-with-any-tensor-bound.
+#
+#   (W3) THE SUPPRESSION CURVE.  If W1 confirms, gain@k=1 at wide-clip ms=1e-2 exceeds
+#        21.09x (the ms=1e-3 value), continuing the dial in the statistic that does not
+#        need a power-law fit.  Reported as a BOUND if the weightwise rung does not resolve.
+#        This is a SECONDARY reading: gain is a ratio of levels and b is a fit, and cycle 50
+#        found they can disagree (FINDINGS 50.2's C2, shape vs magnitude).  If b and gain
+#        disagree here, report both and claim neither.
+#
+#   RESOLUTION, per CORRECTIONS 33's standing rule, computed BEFORE submission.  rho_min is
+#   set by T and m and does NOT depend on the clip, so ml5's measured floors carry over:
+#       rung        rho_min (T=1000 steady, 3 seeds)   verdict at ms=1e-2
+#       weightwise  ~8.5e-09                           RESOLVES (ml5 measured rho_s 1.7e-06)
+#       nodewise    ~7.0e-06                           RESOLVES (thin)
+#       layerwise   ~1.5e-03                           MARGINAL -- ml5's lay_m2_s1 already
+#                                                      fell below its own floor on the
+#                                                      steady half.  A layerwise null is a
+#                                                      BOUND, never an absence.
+#   b is fit across the three rungs; if layerwise drops out, b becomes a 2-point fit and is
+#   reported as a SLOPE BETWEEN TWO POINTS, not as an exponent.  Say which happened.
+#
+# NOT INCLUDED, deliberately:
+#   * blk6.  It is EXCLUDED from every steady-half fit in the whole ml5 batch (below its own
+#     rho_min in 9 of 9 arms) and at ms=1e-2 it is the most clip-saturated rung, so it would
+#     contribute a confound and no number.  Dropping it saves 6 jobs and costs nothing.
+#   * ms=1e-4.  Its guard binds on 0.00% of cells at every rung, so widening the clip is a
+#     provable no-op there.  Spending 6 jobs to confirm a no-op twice is not informative;
+#     the ms=1e-3 arm is already the null control and it is the one nearer the hazard.
+#
+# WHY cluster_b.  Account assignment is BY COMPARATOR (CORRECTIONS 46(6)).  Every number this
+# batch is differenced against -- the whole `ml5-*` ladder and the `p5`/`fr5` anchors -- is
+# on cluster_b.  cluster_a holds the fz3/ff5 family ladders and is left free for them.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. W0.1-W0.3 above, run not assumed
+#   2. python3 analysis/c50_dial.py --selftest   (24/24)   -- clip fractions, both denominators
+#   3. python3 analysis/probe5_window.py --selftest && analysis/neff_instrument.py --selftest
+#   4. Window scan on every arm.  Never quote a profile number without its window.
+#
+# USAGE
+#   bash c50_wideclip_ladder.sh            # dry run: prints every sbatch line
+#   bash c50_wideclip_ladder.sh --submit   # submits, ONLY if the guards below pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_b/metaopt                          # cluster_b
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+SAVE=$WS/runs/wc5
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_b
+PEND_CAP=40
+NJOBS=18
+WIDE_CLIP=-30:-2.3026                              # LOW bound widened; HIGH bound unchanged
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c50 WIDE-CLIP control ladder + PROBE5 (cluster_b) ==="
+echo "    BETA_CLIP=$WIDE_CLIP   (ml5 partner used -15:-2.3026)"
+
+if ! grep -q PATCH_PROBE5 "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5 not present in $HF"; exit 1
+fi
+if ! grep -q PATCH_PROBE5_FIX "$HF" 2>/dev/null; then
+  echo "GUARD FAIL: PATCH_PROBE5_FIX not present -- unfixed patch crashes at record 500"; exit 1
+fi
+echo "guard 1: PATCH_PROBE5 + PATCH_PROBE5_FIX present  OK"
+
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 2: FairShare=${FS:-unknown} (informational), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+mkdir -p "$SAVE"
+N=0
+for G in layerwise nodewise weightwise; do
+  case $G in
+    layerwise)  TAG=lay  ;;
+    nodewise)   TAG=node ;;
+    weightwise) TAG=w    ;;
+  esac
+  for MS in 1e-3:m3 1e-2:m2; do
+    MSV=${MS%:*}; MST=${MS#*:}
+    for S in 0 1 2; do
+      RN="wc5-${TAG}-${MST}-s${S}"
+      PD="$SAVE/probe_${TAG}_${MST}_s${S}"
+      CMD=(sbatch --job-name="$RN" --partition="$PARTS" --time=03:50:00
+        --export="ALL,AUGMENT=1,BETA_CLIP=$WIDE_CLIP,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$PD"
+        "$RUNNER"
+        --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+        --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0
+        --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+        --max-time 999:00:00 --gamma 1 --meta-stepsize "$MSV" --alpha0 1e-3
+        --num-epochs 20 --stepsize-groups "$G" --seed "$S"
+        --save-directory "$SAVE" --run-name "$RN")
+      N=$((N+1))
+      if [ "$SUBMIT" = "1" ]; then "${CMD[@]}" >/dev/null; else printf '%s\n' "${CMD[*]}"; fi
+    done
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with, IN THIS ORDER:"
+echo "  1. python3 analysis/c50_dial.py                    # W2 FIRST -- was the guard relieved?"
+echo "  2. python3 analysis/probe5_window.py <probe root>  # W0.3 control, then W1 (steady half)"
+echo "  3. python3 analysis/neff_instrument.py <probe root># W3, N_eff/m"

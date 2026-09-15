@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""G16 -- STANDING RULE 20 audit of the eb1 batch, from SLURM'S OWN RECORD.
+
+WHY THIS EXISTS.  bin/_lib_guards.sh's guard_postlaunch reads the first run's
+`ARGS:` line out of its .out file.  That works only once a job has STARTED.  The
+eb1 batch was accepted behind 33 already-queued jobs from another batch, so
+after the guard's 900 s window not one eb1 job had begun and it returned rc 2 --
+UNVERIFIED, which is NOT the same thing as MISMATCH (rc 1).  The launcher's
+abort text does not draw that distinction (the same defect was fixed for the G3
+scorer at commit d2a2074), so it printed a VOID banner for a batch that had
+simply not started.  The batch is not void; it was unverified.
+
+Slurm records the exact `sbatch` line it accepted, in `sacct`'s SubmitLine
+field.  That is a stronger post-launch artefact than the string the launcher
+composed -- it is what the scheduler holds -- and it is available the instant a
+job is queued.  This script audits every eb1 SubmitLine:
+
+  * no repeated flag anywhere on the line, and every declared design flag has
+    the declared EFFECTIVE value, both checked by analysis/argsline_guard.py so
+    the pre-submission check and this audit share ONE parser;
+  * the per-arm --export block carries EXACTLY the HIER / ETA_RATIO / EB_RHO the
+    arm is defined by, and nothing else -- an arm is defined by what is SET and
+    equally by what is UNSET (`lay` is the no-op control only if HIER is absent);
+  * --seed and --run-name agree with the job name.
+
+It does NOT replace the .out audit.  Once the runs start, still run
+
+    python3 analysis/argsline_guard.py <runs_dir> --name eb1-
+
+which reads what each run itself reported, and the registered scorer's G0 gate
+re-checks the ARGS/ENV of every admitted run in any case.
+
+USAGE (on the cluster):
+    python3 analysis/cG16_submitline_audit.py [--user account_b] [--prefix eb1-]
+Exit 0 = every SubmitLine clean.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GUARD = os.path.join(HERE, "argsline_guard.py")
+
+EXPECT = ["alg-base=SGDm", "alg-meta=Lion", "dataset=CIFAR10",
+          "NN-name=ResNet18", "stepsize-groups=layerwise", "alpha0=1e-6",
+          "num-epochs=100", "batch-size=100", "gamma=1", "meta-stepsize=1e-3"]
+
+# arm -> the env the arm IS.  None means "must be absent from --export".
+ARMENV = {
+    "lay":  {"HIER": None,       "ETA_RATIO": None,   "EB_RHO": None},
+    "a1":   {"HIER": "additive", "ETA_RATIO": "1",    "EB_RHO": None},
+    "a06":  {"HIER": "additive", "ETA_RATIO": "0.06", "EB_RHO": None},
+    "ebjs": {"HIER": "ebjs",     "ETA_RATIO": None,   "EB_RHO": None},
+    "ebjr": {"HIER": "ebjs",     "ETA_RATIO": None,   "EB_RHO": "0.9"},
+    "ebjz": {"HIER": "ebjz",     "ETA_RATIO": None,   "EB_RHO": None},
+}
+
+
+def submitlines(user, prefix):
+    """[(jobname, submitline)] for every job of `user` whose name starts with
+    `prefix`, queued or finished."""
+    q = subprocess.run(["squeue", "-h", "-u", user, "-o", "%i %j"],
+                       capture_output=True, text=True)
+    ids = [l.split()[0] for l in q.stdout.splitlines()
+           if len(l.split()) == 2 and l.split()[1].startswith(prefix)]
+    if not ids:
+        s = subprocess.run(["sacct", "-u", user, "-X", "-P", "-n",
+                            "--format=JobID,JobName%30"],
+                           capture_output=True, text=True)
+        ids = [l.split("|")[0] for l in s.stdout.splitlines()
+               if "|" in l and l.split("|")[1].startswith(prefix)]
+    if not ids:
+        return []
+    s = subprocess.run(["sacct", "-j", ",".join(ids), "-X", "-P", "-n",
+                        "--format=JobName%30,SubmitLine%800"],
+                       capture_output=True, text=True)
+    out = []
+    for line in s.stdout.splitlines():
+        if "|" in line:
+            n, c = line.split("|", 1)
+            if n.startswith(prefix):
+                out.append((n.strip(), c.strip()))
+    return out
+
+
+def audit_one(name, cmd):
+    m = re.match(r"^(?P<pre>[a-z0-9]+)-(?P<arm>[a-z0-9]+)-s(?P<seed>\d+)$", name)
+    if not m or m.group("arm") not in ARMENV:
+        return False, "job name %r is not a registered eb1 arm" % name
+    arm, seed = m.group("arm"), m.group("seed")
+    args = [sys.executable, GUARD, "--quiet", "--cmdline", cmd]
+    for e in EXPECT + ["seed=%s" % seed, "run-name=%s" % name]:
+        args += ["--expect", e]
+    r = subprocess.run(args, capture_output=True, text=True)
+    why = []
+    if r.returncode != 0:
+        why.append("argsline_guard FAILED:\n" + r.stdout.strip()[-1200:])
+    ex = re.search(r"--export=(\S+)", cmd)
+    env = dict(kv.split("=", 1) for kv in ex.group(1).split(",") if "=" in kv) if ex else {}
+    for k, want in ARMENV[arm].items():
+        got = env.get(k)
+        if want is None and got is not None:
+            why.append("%s=%s is SET but arm %s is defined by it being unset" % (k, got, arm))
+        if want is not None and got != want:
+            why.append("%s=%s want %s for arm %s" % (k, got, want, arm))
+    tag = "HIER=%s ETA_RATIO=%s EB_RHO=%s" % (env.get("HIER"), env.get("ETA_RATIO"),
+                                              env.get("EB_RHO"))
+    return (not why), (tag if not why else tag + "\n      " + "\n      ".join(why))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--user", default=os.environ.get("USER", "account_b"))
+    ap.add_argument("--prefix", default="eb1-")
+    a = ap.parse_args()
+    rows = submitlines(a.user, a.prefix)
+    if not rows:
+        print("no %s* jobs found for %s" % (a.prefix, a.user))
+        return 1
+    bad = 0
+    for name, cmd in sorted(rows):
+        ok, msg = audit_one(name, cmd)
+        if not ok:
+            bad += 1
+        print("  %-16s %-4s  %s" % (name, "PASS" if ok else "FAIL", msg))
+    print("\n%d/%d SubmitLines clean (STANDING RULE 20, from Slurm's own record)"
+          % (len(rows) - bad, len(rows)))
+    print("Still run, once the jobs start:")
+    print("  python3 analysis/argsline_guard.py <runs_dir> --name %s" % a.prefix)
+    return 0 if bad == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

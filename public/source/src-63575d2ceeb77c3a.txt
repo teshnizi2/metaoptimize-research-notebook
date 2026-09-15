@@ -1,0 +1,382 @@
+#import numpy as np
+#import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def build_network(network_name, device):
+
+    ### For MNIST
+    
+    if network_name == 'M1':
+        return Net_2layer_M1().to(device)
+    
+    if network_name == 'M2':
+        return Net_3layer_M2().to(device)
+
+
+    ### For ImageNet:
+
+    if network_name == 'ResNet18':
+        return ResNet(BasicBlock, [2, 2, 2, 2]).to(device)
+
+    # --- PATCH_RESNET_GN: the ONLY new name.  Same block, same depths, same class
+    # count; GroupNorm(32, C) in place of BatchNorm2d(C).  Reachable only by an exact
+    # `--NN-name ResNet18_gn`, which no prior batch used. ---
+    if network_name == 'ResNet18_gn':
+        return ResNet(BasicBlock, [2, 2, 2, 2], norm='gn').to(device)
+
+    # --- added: dataset + scale axes ---
+    if network_name == 'ResNet18_c100':
+        return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=100).to(device)
+    if network_name == 'ResNet10':
+        return ResNet(BasicBlock, [1, 1, 1, 1]).to(device)
+    if network_name == 'ResNet34':
+        return ResNet(BasicBlock, [3, 4, 6, 3]).to(device)
+    if network_name == 'ResNet10_c100':
+        return ResNet(BasicBlock, [1, 1, 1, 1], num_classes=100).to(device)
+    if network_name == 'ResNet34_c100':
+        return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=100).to(device)
+    
+    # --- PATCH_TINYIMAGENET: the ONLY new name.  Same block type, same depths,
+    # same normaliser; a 200-way head and a stride-2 stem pool so that everything
+    # after the stem sees the SAME tensor shapes the 32px runs saw. ---
+    if network_name == 'ResNet18_tin':
+        return ResNet_tin(BasicBlock, [2, 2, 2, 2], num_classes=200).to(device)
+
+    # --- PATCH_VGGBN: the ONLY new names.  A PLAIN (non-residual) BatchNorm conv
+    # stack: no shortcut, no addition, but BatchNorm scales and a 512-wide deepest
+    # stage retained, so a carrier-isolation contrast is statable on it.  Reachable
+    # only by an exact --NN-name, neither of which any prior batch used. ---
+    if network_name == 'VGG11_bn':
+        return VGG_bn(VGG_CFG11, num_classes=10).to(device)
+    if network_name == 'VGG11_bn_c100':
+        return VGG_bn(VGG_CFG11, num_classes=100).to(device)
+
+    if network_name == 'ResNet18_soft':
+        return ResNet_soft(BasicBlock_soft, [2, 2, 2, 2]).to(device)
+        
+    if network_name == 'ResNet34':
+        return ResNet(BasicBlock, [3, 4, 6, 3]).to(device)
+    
+    if network_name == 'ResNet50':
+        return ResNet(Bottleneck, [3, 4, 6, 3]).to(device)
+    
+    if network_name == 'ResNet101':
+        return ResNet(Bottleneck, [3, 4, 23, 3]).to(device)
+    
+    if network_name == 'ResNet152':
+        return ResNet(Bottleneck, [3, 8, 36, 3]).to(device)
+    
+
+    0/0 # raise error if network_name is out of the above list
+
+
+
+
+
+
+ 
+
+##########################
+##    Networks of MNIST
+##########################
+
+class Net_2layer_M1(nn.Module):
+    def __init__(self):
+        super(Net_2layer_M1, self).__init__()
+        self.fc1 = nn.Linear(28*28, 50)
+        self.fc2 = nn.Linear(50, 10)
+
+    def forward(self, x):
+        x = x.view(-1, 28*28)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class Net_3layer_M2(nn.Module):
+    def __init__(self):
+        super(Net_3layer_M2, self).__init__()
+        self.fc1 = nn.Linear(28*28, 512)
+        self.fc2 = nn.Linear(512, 128)
+        self.fc3 = nn.Linear(128, 10)
+        #self.name_of_last_layer = "fc3"
+
+    def forward(self, x):
+        x = x.view(-1, 28*28)
+        x = F.relu(self.fc1(x))  
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+    
+
+
+
+
+
+#######################
+##     ResNets
+#######################
+
+
+# --- PATCH_RESNET_GN: the normaliser factory. -----------------------------------
+# nn.GroupNorm(G, C) has weight and bias of shape (C,), EXACTLY as nn.BatchNorm2d(C)
+# does, so the parameter shape list -- and therefore every step-size partition HF.py
+# computes from it -- is IDENTICAL for the two.  BN's running_mean/running_var are
+# BUFFERS and never enter named_parameters(), so they never carried a step size.
+# G = 32 divides every ResNet18 channel count (64/128/256/512), including the three
+# downsample shortcuts.  An unknown `norm` raises via the file's own 0/0 idiom rather
+# than falling back to BatchNorm, so a typo cannot silently produce the control arm.
+GN_GROUPS = 32
+
+
+def _norm2d(norm, c):
+    if norm == 'bn':
+        return nn.BatchNorm2d(c)
+    if norm == 'gn':
+        return nn.GroupNorm(GN_GROUPS, c)
+    0/0  # unknown normaliser -- fail loudly, exactly as build_network does
+
+
+class BasicBlock_soft(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock_soft, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = F.softplus(self.bn1(self.conv1(x)),beta=10)
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.softplus(out,beta=10)
+        return out
+    
+class ResNet_soft(nn.Module):
+    def __init__(self, block, num_blocks, num_classes=10):
+        super(ResNet_soft, self).__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        self.linear = nn.Linear(512*block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.softplus(self.bn1(self.conv1(x)),beta=10)
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    # --- PATCH_RESNET_GN: `norm` added with the default 'bn'.  The attribute names
+    # bn1 / bn2 and the shortcut Sequential's index 1 are DELIBERATELY UNCHANGED, so
+    # named_parameters() yields the same names in the same order under either norm --
+    # HF.init_meta consumes that list POSITIONALLY.
+    def __init__(self, in_planes, planes, stride=1, norm='bn'):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = _norm2d(norm, planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = _norm2d(norm, planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes,
+                          kernel_size=1, stride=stride, bias=False),
+                _norm2d(norm, self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    # --- PATCH_RESNET_GN: `norm` added with the default 'bn'; names unchanged. ---
+    def __init__(self, in_planes, planes, stride=1, norm='bn'):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = _norm2d(norm, planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=stride, padding=1, bias=False)
+        self.bn2 = _norm2d(norm, planes)
+        self.conv3 = nn.Conv2d(planes, self.expansion *
+                               planes, kernel_size=1, bias=False)
+        self.bn3 = _norm2d(norm, self.expansion*planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes,
+                          kernel_size=1, stride=stride, bias=False),
+                _norm2d(norm, self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet(nn.Module):
+    # --- PATCH_RESNET_GN: `norm` added with the default 'bn'.  self._norm is set
+    # BEFORE the first _make_layer call, because _make_layer reads it.  Attribute
+    # names (bn1, layerN, linear) are unchanged, so named_parameters() ordering is
+    # identical under either norm. ---
+    def __init__(self, block, num_blocks, num_classes=10, norm='bn'):
+        super(ResNet, self).__init__()
+        self.in_planes = 64
+        self._norm = norm
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn1 = _norm2d(norm, 64)
+        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        self.linear = nn.Linear(512*block.expansion, num_classes)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride, norm=self._norm))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+# --- PATCH_TINYIMAGENET ---------------------------------------------------------
+# ResNet_tin subclasses ResNet and overrides ONLY forward().  It defines no new
+# module and no new parameter, so named_parameters() yields the same names in the
+# same order as ResNet18 -- which HF.init_meta consumes POSITIONALLY -- and the
+# layerwise group count m is unchanged.  The single inserted op is a parameterless
+# stride-2 max-pool that takes the 64x64 stem output to 32x32, after which every
+# tensor shape in the network is identical to the CIFAR path, including the 4x4
+# feature map that ResNet.forward's fixed `F.avg_pool2d(out, 4)` requires.
+class ResNet_tin(ResNet):
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = F.max_pool2d(out, kernel_size=3, stride=2, padding=1)  # 64 -> 32
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+
+
+# --- PATCH_VGGBN ----------------------------------------------------------------
+# A plain VGG11-with-BatchNorm in the CIFAR formulation.  Present so that the
+# campaign has ONE architecture with NO residual addition anywhere, while keeping
+# BatchNorm, convolutions and a 512-wide deepest stage -- the three things the
+# tensor-level finding is stated in terms of.
+#
+# Sub-modules are registered by explicit setattr in construction order, NOT inside an
+# nn.Sequential, for two reasons that are load-bearing rather than cosmetic:
+#   (1) named_parameters() then yields conv1.weight / bn1.weight / bn1.bias / ... ,
+#       names the `sets:` grammar (PATCH_NAMESETS) can address BY NAME;
+#   (2) it reproduces ResNet18's (conv, bn.weight, bn.bias) TRIPLE structure, so
+#       `class == index mod 3` holds at every index 1..24 with zero exceptions.
+# Convs carry bias=False, exactly as ResNet18's do, so the 1-D tensors of this model
+# are exactly the BatchNorm scales and shifts plus linear.bias.
+# Five max-pools take 32 -> 16 -> 8 -> 4 -> 2 -> 1, so the head is a single Linear,
+# matching ResNet's self.linear rather than torchvision VGG's three-FC classifier.
+VGG_CFG11 = [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M']
+
+
+def _vgg_make(cfg):
+    """(channel list, pool-after-conv-index set) from a VGG cfg. Pure, no torch."""
+    chans, pools, k = [], set(), 0
+    for v in cfg:
+        if v == 'M':
+            if k == 0:
+                0/0  # a cfg may not begin with a pool -- fail loudly
+            pools.add(k)
+        else:
+            chans.append(int(v))
+            k += 1
+    return chans, pools
+
+
+class VGG_bn(nn.Module):
+    def __init__(self, cfg, num_classes=10):
+        super(VGG_bn, self).__init__()
+        chans, pools = _vgg_make(cfg)
+        self.n_conv = len(chans)
+        self.pools = pools
+        in_c = 3
+        for i, c in enumerate(chans, 1):
+            setattr(self, 'conv%d' % i,
+                    nn.Conv2d(in_c, c, kernel_size=3, stride=1, padding=1, bias=False))
+            setattr(self, 'bn%d' % i, nn.BatchNorm2d(c))
+            in_c = c
+        self.linear = nn.Linear(in_c, num_classes)
+
+    def forward(self, x):
+        out = x
+        for i in range(1, self.n_conv + 1):
+            out = F.relu(getattr(self, 'bn%d' % i)(getattr(self, 'conv%d' % i)(out)))
+            if i in self.pools:
+                out = F.max_pool2d(out, 2)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out

@@ -1,0 +1,699 @@
+#!/bin/bash
+# =============================================================================
+# c97_permnode_replication.sh -- `rp1`, THE PERMNODE REPLICATION AND THE
+# TWO-WAY (PERMUTATION-DRAW x RUN-SEED) VARIANCE DECOMPOSITION OF THE
+# ALIGNMENT NULL.  Runs on cluster_a ONLY (needs PATCH_PERMNODE).
+# 24 jobs: nodewise x 6 seeds, plus permnode{101,202,303} x the same 6 seeds.
+# ms=1e-4, 100 ep, box -15:-2.3026, probe ON -- the `cc1`/`pp1` configuration
+# unchanged in every axis.
+#
+# **NO PATCH IS NEEDED.**  `permnode<S>` already takes an EXPLICIT permutation
+# seed S: HF.py's PATCH_PERMNODE matches `^permnode(\d+)$`, stores
+# `self.perm_seed = S`, and builds each tensor's permutation from
+# `torch.Generator().manual_seed(S * 1000003 + tensor_index)`.  Nothing in that
+# path reads the run seed.  Guard 1d and guard 4 assert all of it on the LIVE
+# tree before a job is composed.
+#
+# WHY THIS BATCH EXISTS
+#   `pp1`'s P2 is the campaign's SECOND HEADLINE -- "alignment is refuted as the
+#   carrier": permuting WHICH weights share a group, at fixed group COUNT and
+#   fixed per-tensor size MULTISET, moved plateau5 by A = -0.009 +- 0.157 pp.
+#   THREE THINGS ARE WRONG WITH THAT NUMBER AND ALL THREE ARE FIXED HERE.
+#
+#   (1) **IT IS SEED-CONFOUNDED.**  `bin/c77_permuted_partition.sh`'s arm loop
+#       passed `permnode${S}` where S = THE RUN SEED.  pp1's three permnode runs
+#       are therefore three different permutations AND three different inits at
+#       once; pp1's own header says the batch "CANNOT separate the two".
+#       **THIS BATCH DECOUPLES THEM.  THE PERMUTATION SEED IS DECOUPLED FROM THE
+#       RUN SEED:** three FIXED draws (101, 202, 303) fully crossed with six
+#       fresh run seeds (6..11), so no run's permutation is a function of its
+#       init and the 3x6 block is BALANCED.
+#   (2) **IT IS n=3.**  se 0.157, 95% CI [-0.317, +0.299] -- roughly [-55%, +51%]
+#       of the D it is meant to decompose, and an MDE of 0.440 pp = 76% of D.
+#   (3) **THE REGISTRATION ITSELF WAS DEFECTIVE.**  pp1's NULL band half-width
+#       is 0.15 pp while pp1's REALISED se was 0.157 pp: **the pre-registered
+#       band was NARROWER than the realised se**, so landing inside it could
+#       never have separated a true zero from an effect the size of the whole
+#       band.  T1b below repairs that with an explicit equivalence rule and
+#       PRINTS THE DEFECT EITHER WAY, for rp1 and for pp1.
+#
+#   Nothing else changes: same box, same ms, same base/meta, same epochs, same
+#   architecture, same dataset, same probe, same runner.  `rp1` is pp1's
+#   alignment leg re-measured with the confound removed and the n raised, plus
+#   the decomposition pp1 was structurally unable to do.
+#
+# THE ARMS.  m = 14,420 on EVERY arm; there is no chunk arm in this batch.
+#     node  nodewise      groups = output channels;  sizes HETEROGENEOUS
+#     p101  permnode101   nodewise's group COUNT and per-tensor size MULTISET
+#     p202  permnode202   EXACTLY; only WHICH weights share a group is
+#     p303  permnode303   randomised, WITHIN each tensor, from an explicit seed
+#   run seeds 6,7,8,9,10,11 on all four arms -> 6 + 3*6 = 24 runs, ONE batch.
+#
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+# The scorer `analysis/c97_rp1_score.py` was written, selftested and placed on
+# disk BEFORE this script composed a single job (STANDING RULE 21), and its
+# selftest asserts every constant below against THIS FILE'S OWN TEXT.
+#
+#   V0    VALIDITY.  n_records == 10000; beta moved; epochs_done == requested
+#         == 100.
+#   V0.2  n_beta EXACT 14420 on EVERY record of EVERY arm.  Guard 4 MEASURES it
+#         from the ALLOCATED beta on the real built network for nodewise and for
+#         all three draws, and ALSO asserts, per draw, that the per-tensor
+#         group-size multiset equals nodewise's, that the draw is a true
+#         permutation of each tensor's flat indices, that it is not the
+#         identity, that the three draws differ from EACH OTHER, and that none
+#         of them coincides with pp1's draws 0/1/2.  Nothing is inherited from a
+#         comment.
+#   V0.3  THE INSTRUMENT FIRED.  neg_counts.json, n_tot == n_beta, npy shape
+#         read from its HEADER == (n_tot,).  Header, never file size.
+#   V0.4  BOX-FREE at BOTH guards, the published rec_-based 5% gate, UNCHANGED.
+#         36 arms at this exact ms and box read rec_lo == rec_hi == 0.0000
+#         EXACTLY, so a bind here would be NEW.  **A BIND DOES NOT VOID T1** --
+#         T1 is an accuracy contrast -- but it withdraws comparability with
+#         pp1's P2 and the scorer then prefixes T1's verdict BOX-BOUND.
+#         **NO ARM IS EVER DROPPED POST HOC**, for a bind or for anything else.
+#
+#   T1    **THE PRIMARY.  THE ALIGNMENT LEG AT n=6, PAIRED WITHIN RUN SEED.**
+#         For each run seed s: pbar_s = mean over the three draws of
+#         plateau5(permnode); d_s = pbar_s - plateau5(nodewise at s).
+#         A = mean_s d_s over the six seeds, se = sd(d_s)/sqrt(6), t on 5 df.
+#         **THE BANDS ARE pp1's P2 BANDS, TRANSCRIBED UNCHANGED**, so the two
+#         readings sit on one scale:
+#           A >  +0.30      -> **ALIGNMENT HURTS.**  Grouping by output channel
+#                is WORSE than grouping the same number of same-sized arbitrary
+#                subsets of the same layer.
+#           (+0.15, +0.30] -> **UNDECIDED**, registered in advance.
+#           [-0.15, +0.15] -> **NULL.**  Alignment is not the carrier.
+#           [-0.30, -0.15) -> **UNDECIDED**, registered in advance.
+#           A <= -0.30      -> **ALIGNMENT HELPS.**  Channel structure is a
+#                genuine benefit.
+#         SYMMETRIC because no prior favours either sign.  T1 REQUIRES THE
+#         COMPLETE 24; on a short batch the scorer prints what it has and
+#         refuses the verdict rather than scoring a smaller design.
+#
+#   T1b   **THE EQUIVALENCE RULE.  THE REGISTRATION DEFECT, PRINTED EITHER WAY.**
+#         pp1's band half-width 0.15 was NARROWER than the realised se 0.157.
+#         A NULL is therefore only reported as **EQUIVALENT TO ZERO WITHIN
+#         +-0.15** when the WHOLE two-sided 95% CI lies inside [-0.15, +0.15].
+#         Otherwise it reads **CONSISTENT WITH NULL, UNDERPOWERED**, and the CI
+#         is printed against the band.  The scorer ALWAYS prints se, the 95% CI,
+#         the CI half-width, the ratio (CI half-width)/0.15, and the MDE at 80%
+#         power two-sided = (z_.975 + z_.80) * se = 2.8016 * se -- the SAME
+#         normal-approximation formula that produced pp1's quoted MDE of 0.440
+#         pp, so the two are directly comparable.  **This gate fires whatever
+#         rp1 returns; the defect in pp1's registration is on the record either
+#         way.**
+#
+#   T2    **THE TWO-WAY DECOMPOSITION: PERMUTATION DRAW vs RUN SEED.  THE REASON
+#         THE BATCH EXISTS.**  On the balanced 3 (draw) x 6 (seed) permnode
+#         grid, one observation per cell, the additive random-effects model
+#         y_ps = mu + a_p + b_s + e_ps gives SS_draw (df 2), SS_seed (df 5) and
+#         SS_resid (df 10).  **The residual is interaction + noise and the two
+#         are NOT separable at one observation per cell** -- stated here, before
+#         the data exists, not discovered afterwards.  F_draw = MS_draw/MS_resid
+#         on (2,10), F_seed = MS_seed/MS_resid on (5,10); variance components
+#         from the balanced EMS, negative estimates TRUNCATED AT ZERO with the
+#         truncation printed.
+#         REGISTERED READINGS, BOTH DIRECTIONS FIXED IN ADVANCE:
+#           F_draw p <  0.05 -> **THE PERMUTATION DRAW IS A REAL EFFECT.**  Which
+#                arbitrary same-size partition you happen to draw changes
+#                plateau5.  pp1 then folded a REAL effect into its seed
+#                variance; every single-draw alignment measurement is a
+#                statement about that draw; and the alignment null must be
+#                stated over the permutation DISTRIBUTION or not at all.
+#           F_draw p >= 0.05 -> **THE PERMUTATION DRAW IS EXCHANGEABLE AT THIS
+#                RESOLUTION.**  pp1's confound inflated no variance it did not
+#                already carry, and A may be read as a statement about the
+#                permutation distribution rather than about one draw.
+#                **REGISTERED AS A NULL WITH A STATED MDE, NEVER AS PROOF OF
+#                ZERO** -- the smallest sigma_draw the design could have
+#                resolved is printed with it.
+#           The same two-way reading is registered for F_seed and is read
+#           against the corpus METHODS finding that SEED is null (F 1.21,
+#           p 0.213): agreement reproduces it, disagreement is reportable.
+#
+#   T3    THE PER-DRAW CONTRASTS.  A_p = mean_s (permnode_p - nodewise) for each
+#         draw, with its own paired se on six seeds, plus the spread across the
+#         three draws.  **NO INDEPENDENT VERDICT, AND THAT IS DELIBERATE:**
+#         A = mean_p A_p algebraically, so scoring the three separately would
+#         score one degree of freedom three times.  T3 exists so a reader can
+#         see whether a SINGLE draw, run pp1-style, would have returned a
+#         different verdict from the same experiment; if the three straddle a
+#         registered band boundary that is printed, not buried.
+#   T4    THE POWER RECEIPT.  se(A) here against pp1's realised 0.157 and
+#         against the design's promised ~0.09.  A DESIGN RECEIPT, NOT A FINDING;
+#         no threshold is applied to it.
+#   T5    **A ON THE SCALE OF D.  CROSS-BATCH AND DESCRIPTIVE.  NO VERDICT.**
+#         `rp1` has NO chunk777 arm -- it is the alignment leg only -- so D is
+#         IMPORTED from the two batches that measured it WITHIN batch at this
+#         exact configuration (pp1 seeds 0-2, cc1 seeds 3-5) and is RE-DERIVED
+#         FROM THE CSV AT SCORE TIME, never quoted from prose.  The +-0.25 pp
+#         unmodelled cross-batch offset applies to the import and is printed
+#         with it.  Nothing in T5 carries a gate.
+#
+# WHAT THIS BATCH DELIBERATELY DOES NOT DO
+#   * It does NOT add a chunk777 arm.  The design asked for is the alignment leg
+#     at three draws x six seeds; adding a fourth arm would be a different batch
+#     and a different registration.  The price is that D must be imported, and
+#     T5 states that in the open rather than hiding a cross-batch ratio inside a
+#     within-batch table.
+#   * It does NOT sweep ms.  ms=1e-4 is held because that is where pp1's P2 was
+#     measured and where the box is readable.  **THE RISK IS STATED AND IT IS
+#     pp1's RISK INHERITED: nodewise is read at 1e-4, not at its own argmax of
+#     3e-4, so every verdict here is a statement at ms=1e-4.**
+#   * The permutation is WITHIN each tensor.  `rp1` asks whether an output
+#     channel is special AMONG THE SAME-SIZED SUBSETS OF ITS OWN LAYER -- the
+#     question the Adam-mini / Adalayer / SGG line asks -- and it does NOT test
+#     whether LAYER boundaries matter.  No verdict here may be written as
+#     "architecture is irrelevant".
+#   * It does NOT pool its A with pp1's A.  A is a within-batch quantity and the
+#     cross-batch offset does not cancel across two batches.
+#
+# THE BOX IS NOT NEW AND IS NOT REGISTERED AGAIN.  `rp1` uses pp1's and cc1's
+# BETA_CLIP verbatim and registers no field / N_eff gate, so it is deliberately
+# NOT added to `analysis/c55_neff_noise.BOXES`; guard 3 instead asserts equality
+# against BOTH already-registered entries.  c55's `box_for` raises on an
+# unregistered root rather than guessing, which is the safe failure.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 tests/test_permnode.py                  (CPU, run by guard 1e)
+#   2. python3 analysis/c97_rp1_score.py --selftest    (run by guard S)
+#   3. python3 analysis/c52_boxfree.py --selftest
+#   4. plateau5 is PRIMARY.  The CSV `plateau` column is mean-of-last-20 and is
+#      BANNED as a primary.  best_test inflates ~0.37 pp.
+#
+# USAGE
+#   bash c97_permnode_replication.sh            # dry run
+#   bash c97_permnode_replication.sh --submit   # submits, ONLY if guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+USER_NAME="${USER:-$(whoami)}"
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/rp1
+WALL=04:00:00
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+NJOBS=24
+CLIP=-15:-2.3026               # pp1's / cc1's / mm1's / bn1's box EXACTLY
+MST=1e-4                       # where pp1's P2 was measured; the readable ms
+EPOCHS=100
+WRITE_EVERY=500
+PERM_SEEDS="101 202 303"       # THE PERMUTATION DRAWS -- not run seeds
+RUN_SEEDS="6 7 8 9 10 11"      # FRESH: nodewise 0-5 at this config are spent
+M_NODE=14420
+M_PERM=14420                   # permnode carries nodewise's count EXACTLY
+PP1_SE=0.157                   # pp1's realised se on this contrast
+BAND=0.15                      # pp1's NULL band half-width -- NARROWER than it
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+SCORER="$REPO/analysis/c97_rp1_score.py"
+
+# --- THE DESIGN, DECLARED ONCE (CORRECTIONS 125.4, step 1) -----------------
+# Every flag that is FIXED across the batch.  --stepsize-groups and --seed are
+# the two axes and are deliberately absent.  No optimiser flag is restated
+# anywhere else in this file except inside the single BFLAGS array below.
+DESIGN=(alg-base=SGDm alg-meta=Lion meta-stepsize=1e-4 alpha0=1e-3
+        num-epochs=100 dataset=CIFAR10 NN-name=ResNet18 batch-size=100
+        gamma=1 optimizer=HF momentum-param-base=0.99 weight-decay-base=0.1
+        momentum-param-meta=0.99 Lion-beta2-meta=0.9 weight-decay-meta=0)
+
+# shellcheck disable=SC1091
+. "$(dirname "$0")/_lib_guards.sh"
+
+echo "=============================================================="
+echo "  rp1 -- PERMNODE REPLICATION + TWO-WAY VARIANCE DECOMPOSITION"
+echo "    nodewise (m=$M_NODE) x $RUN_SEEDS"
+echo "    permnode{$PERM_SEEDS} (m=$M_PERM) x the same seeds = $NJOBS jobs"
+echo "    THE PERMUTATION SEED IS DECOUPLED FROM THE RUN SEED (pp1 passed"
+echo "    S = THE RUN SEED; that confound is what this batch removes)"
+echo "    ms=$MST, BETA_CLIP=$CLIP, ${EPOCHS}ep, probe ON"
+echo "    T1 (PRIMARY): A = permnode - nodewise, paired within run seed, n=6"
+echo "       A > +0.30 HURTS | [-0.15,+0.15] NULL | A <= -0.30 HELPS"
+echo "    T1b: a NULL is EQUIVALENCE only if the 95% CI is inside the band"
+echo "    T2:  F_draw on (2,10) and F_seed on (5,10) from the 3x6 grid"
+echo "=============================================================="
+
+# --- GUARD S -- STANDING RULE 21: THE SCORER EXISTS AND PASSES ITS SELFTEST -
+# Run FIRST, before any job is composed.  A batch with no scorer has no verdict.
+guard_scorer_registered "$SCORER" || { echo "ABORTED (rule 21)"; exit 2; }
+(
+  cd "$REPO" || exit 1
+  python3 "$SCORER" --selftest > /tmp/rp1_selftest.$$ 2>&1
+  RC=$?
+  tail -2 /tmp/rp1_selftest.$$
+  if [ $RC -ne 0 ]; then
+    echo "GUARD FAIL: the registered scorer's selftest does NOT pass:"
+    grep FAIL /tmp/rp1_selftest.$$ | head -20
+    rm -f /tmp/rp1_selftest.$$
+    exit 1
+  fi
+  rm -f /tmp/rp1_selftest.$$
+) || { echo "ABORTED (rule 21: scorer selftest)"; exit 2; }
+
+# --- GUARD 0 ---------------------------------------------------------------
+[ -f "$CSVP" ] || { echo "GUARD FAIL: no CSV at $CSVP"; exit 1; }
+[ -f "$RUNNER" ] || { echo "GUARD FAIL: no runner at $RUNNER"; exit 1; }
+echo "guard 0: runner and CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || exit 1
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script exports for")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in mine[0]:
+        sys.exit("GUARD FAIL: export line missing %r -- that is bf8's bug" % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+if keys(mine[0]) != keys(ref[0]):
+    sys.exit("GUARD FAIL: export KEYS differ from tw0's CONFIRMED-FIRING line")
+print("guard 1c: export keys identical to tw0's CONFIRMED-FIRING line")
+PYEOF
+
+# --- GUARD 1d -- PATCH_PERMNODE IS PRESENT, COMPLETE, AND READS AN EXPLICIT S
+python3 - "$WS" <<'PYEOF' || exit 1
+import os, re, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks",
+                  "MetaOptimize", "cifar10", "Optimizers", "HF.py")
+src = open(hf).read()
+if "PATCH_PERMNODE" not in src:
+    sys.exit("GUARD FAIL: PATCH_PERMNODE is NOT applied to %s" % hf)
+for need in ("permnode", "perm_idx", "perm_inv", "perm_gsize", "perm_groups",
+             "perm_seed"):
+    if need not in src:
+        sys.exit("GUARD FAIL: PATCH_PERMNODE present but %r missing -- partial patch"
+                 % need)
+if src.count("self.stepsize_type == 'permnode'") != 3:
+    sys.exit("GUARD FAIL: expected 3 permnode branches, found %d"
+             % src.count("self.stepsize_type == 'permnode'"))
+if src.count("self.stepsize_type = 'permnode'") != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 permnode type assignment")
+# THE DECOUPLING, ASSERTED IN THE CODE: the permutation seed comes from the
+# `permnode<S>` token and the generator is seeded from it alone.  If either of
+# these ever stopped being true this batch would silently become pp1 again.
+if not re.search(r"permnode\(\\d\+\)\$", src):
+    sys.exit("GUARD FAIL: permnode's regex does not capture an explicit integer S")
+if not re.search(r"self\.perm_seed\s*=\s*int\(_pm\.group\(1\)\)", src):
+    sys.exit("GUARD FAIL: perm_seed is not taken from the permnode<S> token")
+if not re.search(r"manual_seed\(\s*_S\s*\*\s*1000003\s*\+\s*_i2\s*\)", src):
+    sys.exit("GUARD FAIL: the permutation generator is not seeded from (S, tensor)")
+if re.search(r"perm_seed\s*=\s*.*\bseed\b.*args", src):
+    sys.exit("GUARD FAIL: perm_seed appears to read the RUN seed -- the confound "
+             "this batch exists to remove would still be present")
+print("guard 1d: PATCH_PERMNODE complete; perm_seed comes from the permnode<S> "
+      "token and the generator is seeded from (S, tensor index) ALONE -- the run "
+      "seed is not in that path")
+PYEOF
+
+# --- GUARD 1e -- THE PERMNODE SUITE PASSES ON THIS TREE, ON CPU ------------
+(
+  cd "$REPO" || exit 1
+  PERM_TEST_DEVICE=cpu python3 tests/test_permnode.py > /tmp/rp1_permtest.$$ 2>&1
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    echo "GUARD FAIL: tests/test_permnode.py did NOT pass on this tree:"
+    tail -20 /tmp/rp1_permtest.$$
+    rm -f /tmp/rp1_permtest.$$
+    exit 1
+  fi
+  grep -c PASS /tmp/rp1_permtest.$$ | xargs -I{} echo "guard 1e: test_permnode.py {} PASS, 0 FAIL, on CPU, against the LIVE tree"
+  rm -f /tmp/rp1_permtest.$$
+) || exit 1
+
+# --- GUARD 2 -- the 13-axis signature, re-derived FROM THE CSV --------------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$MST" <<'PYEOF' || exit 1
+import csv, statistics, sys
+csvp, clip, epochs, mst = sys.argv[1:5]
+rd = list(csv.DictReader(open(csvp)))
+AX = ['network','dataset','batch_size','base','meta','alpha0','gamma',
+      'augment','beta_clip','hier','lam','eta_ratio','epochs_done']
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row")
+sig = {a: ref[0][a] for a in AX}
+mine = {'network':'ResNet18','dataset':'CIFAR10','batch_size':'100','base':'SGDm',
+        'meta':'Lion','alpha0':'1e-3','gamma':'1','augment':'1',
+        'beta_clip':clip,'epochs_done':epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a,m,s in bad: print("  axis %s: this batch %r vs reference %r" % (a,m,s))
+    sys.exit("GUARD FAIL: rp1 does not match the ladder's axis signature")
+print("guard 2: all 13 axes match the rs-lay-1e4 signature read FROM THE CSV")
+
+def pl(prefix):
+    return [float(r['plateau5']) for r in rd
+            if r['run'].startswith(prefix) and r.get('plateau5','').strip()]
+
+# guard 2b: pp1's P2 is the quantity this batch re-measures.  Re-derive it NOW
+# from the CSV; if it has moved, the premise printed in this header is stale.
+pm, nd = pl('pp1-perm-s'), pl('pp1-node-s')
+if len(pm) != 3 or len(nd) != 3:
+    sys.exit("GUARD FAIL: expected pp1's 3+3 rows, found %d+%d" % (len(pm), len(nd)))
+A = statistics.mean(pm) - statistics.mean(nd)
+se = ((statistics.stdev(pm)**2)/3 + (statistics.stdev(nd)**2)/3) ** 0.5
+if abs(A - (-0.009)) > 0.002 or abs(se - 0.157) > 0.002:
+    sys.exit("GUARD FAIL: pp1's P2 reads A=%+.3f se=%.3f now, not the -0.009 +- "
+             "0.157 this batch is built on.  Re-reduce before submitting."
+             % (A, se))
+print("guard 2b: pp1's P2 re-derived from the CSV = %+.3f +- %.3f (n=3) as stated"
+      % (A, se))
+if se <= 0.15:
+    sys.exit("GUARD FAIL: pp1's realised se is %.3f, NOT wider than the 0.15 band "
+             "-- T1b's registration-defect premise would be false" % se)
+print("guard 2c: pp1's realised se %.3f > its own NULL band half-width 0.15 -- the "
+      "registration defect T1b repairs is REAL and is re-derived, not quoted" % se)
+
+# guard 2d: rp1 must not collide with an existing run name.
+clash = [r['run'] for r in rd if r['run'].startswith('rp1-')]
+if clash:
+    sys.exit("GUARD FAIL: %d rp1-* runs already in the CSV: %s"
+             % (len(clash), clash[:5]))
+print("guard 2d: no rp1-* run name already exists in the CSV")
+PYEOF
+
+# --- GUARD 3 -- THE BOX IS pp1's AND cc1's, VERBATIM, AND IS NOT NEW --------
+python3 - "$REPO" "$CLIP" <<'PYEOF' || exit 1
+import sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+want = tuple(float(x) for x in clip.split(":"))
+for fam in ("pp1", "cc1"):
+    if fam not in c55.BOXES:
+        sys.exit("GUARD FAIL: %s is not registered in c55_neff_noise.BOXES" % fam)
+    lo, hi, prov = c55.BOXES[fam]
+    if (lo, hi) != want:
+        sys.exit("GUARD FAIL: c55 registers %s as %s but CLIP= is %s"
+                 % (fam, (lo, hi), want))
+if "rp1" in c55.BOXES:
+    sys.exit("GUARD FAIL: rp1 has been added to BOXES.  It registers no field / "
+             "N_eff gate and must not claim a root there; the box it uses is "
+             "pp1's, already registered.")
+print("guard 3: CLIP=%s is pp1's and cc1's registered box VERBATIM; rp1 claims no "
+      "new BOXES root (no field gate) and c55.box_for will raise rather than guess"
+      % clip)
+PYEOF
+
+# --- GUARD 4 -- EVERY m MEASURED FROM THE ALLOCATED BETA, AND EVERY DRAW ----
+# --- ASSERTED TO CARRY NODEWISE'S EXACT SIZE MULTISET AND TO BE DISTINCT ----
+# The batch's entire claim is that each permnode arm differs from nodewise ONLY
+# in membership, and that the three draws are three DIFFERENT permutations that
+# are not functions of any run seed.  All of that is MEASURED here, on the real
+# built network, from the beta the optimizer actually allocates and from the
+# permutations it actually builds -- not from a formula and not from a comment.
+(
+  cd "$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10" || exit 1
+  python - "$M_NODE" "$M_PERM" "$MST" $PERM_SEEDS <<'PYEOF' || exit 1
+import sys, torch
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+want_node, want_perm = int(sys.argv[1]), int(sys.argv[2])
+MST = float(sys.argv[3])
+DRAWS = [int(x) for x in sys.argv[4:]]
+PP1_DRAWS = [0, 1, 2]
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": MST, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def build(gran):
+    torch.manual_seed(0)
+    net = build_network("ResNet18", "cpu")
+    return HF(net, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+net = build_network("ResNet18", "cpu")
+shapes = [tuple(p.shape) for p in net.parameters()]
+numels = [int(p.numel()) for p in net.parameters()]
+
+o_nd = build("nodewise")
+m_node = m_of(o_nd)
+print("guard 4: nodewise      ALLOCATED beta m=%-8d (registered %d)"
+      % (m_node, want_node))
+if m_node != want_node:
+    sys.exit("GUARD FAIL: m(nodewise) is %d, not the %d registered" % (m_node, want_node))
+
+node_groups = [s[0] for s in shapes]
+node_gsize = [n // g for n, g in zip(numels, node_groups)]
+node_multiset = sorted(gs for g, gs in zip(node_groups, node_gsize) for _ in range(g))
+
+built = {}
+for S in DRAWS:
+    o = build("permnode%d" % S)
+    built[S] = o
+    m = m_of(o)
+    if m != want_perm:
+        sys.exit("GUARD FAIL: m(permnode%d) is %d, not the %d registered"
+                 % (S, m, want_perm))
+    if list(o.perm_groups) != node_groups:
+        sys.exit("GUARD FAIL: permnode%d group COUNTS differ from nodewise's" % S)
+    if list(o.perm_gsize) != node_gsize:
+        sys.exit("GUARD FAIL: permnode%d group SIZES differ from nodewise's" % S)
+    ms = sorted(gs for g, gs in zip(o.perm_groups, o.perm_gsize) for _ in range(g))
+    if ms != node_multiset:
+        sys.exit("GUARD FAIL: permnode%d size MULTISET differs from nodewise's" % S)
+    bad = [i for i, n in enumerate(o.perm_numel)
+           if not torch.equal(torch.sort(o.perm_idx[i].cpu()).values, torch.arange(n))]
+    if bad:
+        sys.exit("GUARD FAIL: permnode%d is not a permutation on tensors %s"
+                 % (S, bad[:5]))
+    ident = sum(1 for i, n in enumerate(o.perm_numel)
+                if torch.equal(o.perm_idx[i].cpu(), torch.arange(n)))
+    if ident > 2:
+        sys.exit("GUARD FAIL: permnode%d is the identity on %d tensors" % (S, ident))
+    print("guard 4: permnode%-4d ALLOCATED beta m=%-8d  size multiset IDENTICAL to "
+          "nodewise's (%d groups, %d distinct sizes, min %d max %d), perm verified"
+          % (S, m, len(ms), len(set(ms)), min(ms), max(ms)))
+
+big = [i for i, n in enumerate(built[DRAWS[0]].perm_numel) if n > 64]
+for i in range(len(DRAWS)):
+    for j in range(i + 1, len(DRAWS)):
+        a, b = built[DRAWS[i]], built[DRAWS[j]]
+        same = sum(1 for k in big
+                   if torch.equal(a.perm_idx[k].cpu(), b.perm_idx[k].cpu()))
+        if same:
+            sys.exit("GUARD FAIL: draws %d and %d share %d permutations"
+                     % (DRAWS[i], DRAWS[j], same))
+print("guard 4b: the %d draws are pairwise DIFFERENT on all %d sizeable tensors"
+      % (len(DRAWS), len(big)))
+
+for P in PP1_DRAWS:
+    o = build("permnode%d" % P)
+    for S in DRAWS:
+        same = sum(1 for k in big
+                   if torch.equal(o.perm_idx[k].cpu(), built[S].perm_idx[k].cpu()))
+        if same:
+            sys.exit("GUARD FAIL: draw %d coincides with pp1's draw %d on %d tensors"
+                     % (S, P, same))
+print("guard 4c: none of the draws coincides with pp1's draws %s -- these are three "
+      "genuinely new permutations" % PP1_DRAWS)
+
+# THE DECOUPLING, MEASURED: the permutation must not depend on the RUN seed.
+# torch.manual_seed is the only global RNG a run seed could move, so build the
+# same draw under two different global seeds and require the permutation to be
+# BITWISE identical.  If it were not, permnode<S> would still be seed-confounded.
+def build_under(gran, gseed):
+    torch.manual_seed(gseed)
+    net2 = build_network("ResNet18", "cpu")
+    return HF(net2, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+S0 = DRAWS[0]
+a = build_under("permnode%d" % S0, 6)
+b = build_under("permnode%d" % S0, 11)
+diff = [k for k in range(len(a.perm_idx))
+        if not torch.equal(a.perm_idx[k].cpu(), b.perm_idx[k].cpu())]
+if diff:
+    sys.exit("GUARD FAIL: permnode%d's permutation MOVED when the global torch seed "
+             "changed (%d tensors) -- it is still coupled to the run seed and this "
+             "batch would not answer its own question" % (S0, len(diff)))
+print("guard 4d: permnode%d's permutation is BITWISE IDENTICAL under global seeds 6 "
+      "and 11 -- THE PERMUTATION SEED IS DECOUPLED FROM THE RUN SEED, measured on "
+      "the live tree" % S0)
+PYEOF
+) || { echo "GUARD 4 FAILED -- nothing submitted"; exit 1; }
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" "$NJOBS" <<'PYEOF' || exit 1
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+need_gb = int(sys.argv[2]) * 0.060
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)" % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# --- GUARD 6 -- queue depth ------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS"
+if [ "$PEND" -gt 40 ]; then
+  echo "GUARD FAIL: $PEND already pending, over the 40 cap"; exit 1
+fi
+
+# --- GUARD 7 -- THE RUN SEEDS ARE ACTUALLY FRESH ---------------------------
+# Checked against the RUNS' OWN ARGS LINES on the cluster (STANDING RULE 20),
+# not only against the CSV -- a stale CSV mirror would let a collision through.
+# A "clash" requires the FULL declared design to match, not just the seed and
+# the granularity.  The first version of this guard matched on
+# (granularity, seed, ms, epochs) alone and fired on another agent's `g3m`,
+# which is ResNet34 and therefore not the same cell at all.  A freshness guard
+# that cannot tell two architectures apart is a guard that will one day be
+# switched off for crying wolf.
+python3 - "$CSVP" "$WS/runs" "$CLIP" "$EPOCHS" "$MST" "$RUN_SEEDS" "${DESIGN[@]}" <<'PYEOF' || exit 1
+import csv, glob, os, re, sys
+csvp, outdir, clip, epochs, mst, seeds = sys.argv[1:7]
+design = dict(kv.split("=", 1) for kv in sys.argv[7:])
+want = set(seeds.split())
+
+def eff(line):
+    """last-wins, exactly like argparse."""
+    out, cur = {}, None
+    for t in line.split():
+        if t.startswith("--") and len(t) > 2:
+            cur = t[2:]
+            out[cur] = ""
+        elif cur is not None:
+            out[cur] = (out[cur] + " " + t).strip()
+    return out
+
+files = glob.glob(os.path.join(outdir, "*.out"))
+hits, sweep = [], 0
+for f in files:
+    args = env = None
+    try:
+        with open(f, errors="ignore") as fh:
+            for l in fh:
+                if l.startswith("ARGS:"):
+                    args = l[5:]
+                elif l.startswith("ENV:"):
+                    env = l
+                if args and env:
+                    break
+    except OSError:
+        continue
+    if not args:
+        continue
+    sweep += 1
+    a = eff(args)
+    g = a.get("stepsize-groups", "")
+    if not (g == "nodewise" or re.match(r"^permnode\d+$", g)):
+        continue
+    if a.get("seed") not in want:
+        continue
+    # THE FULL DECLARED DESIGN, every flag of it.  Anything that differs on any
+    # axis is a different cell and is NOT a clash.
+    if any(a.get(k) != v for k, v in design.items()):
+        continue
+    if not env or ("BETA_CLIP=%s " % clip) not in env or "AUGMENT=1 " not in env:
+        continue
+    hits.append((os.path.basename(f), g, a.get("seed")))
+if hits:
+    for h in hits[:10]:
+        print("  CLASH on disk: %s (%s seed %s)" % h)
+    sys.exit("GUARD FAIL: run seeds %s are NOT fresh for nodewise/permnode at the "
+             "FULL declared design -- %d colliding .out" % (sorted(want), len(hits)))
+print("guard 7a: %d .out swept on the cluster (%d carry an ARGS line); run seeds %s "
+      "are ABSENT for nodewise and for every permnode<S> at the FULL declared design "
+      "(all %d flags, plus AUGMENT=1 and BETA_CLIP=%s) -- FRESH"
+      % (len(files), sweep, sorted(want), len(design), clip))
+
+rd = list(csv.DictReader(open(csvp)))
+clash = [(r['run'], r['granularity'], r['seed']) for r in rd
+         if (r['granularity'] == 'nodewise' or r['granularity'].startswith('permnode'))
+         and r['meta_stepsize'] == mst and r['beta_clip'] == clip
+         and r['epochs_done'] == epochs and r['seed'] in want
+         and r['network'] == design.get('NN-name')
+         and r['dataset'] == design.get('dataset')
+         and r['base'] == design.get('alg-base') and r['meta'] == design.get('alg-meta')
+         and r['alpha0'] == design.get('alpha0')
+         and r['batch_size'] == design.get('batch-size')]
+if clash:
+    for c in clash: print("  CLASH in CSV: %s (%s seed %s)" % c)
+    sys.exit("GUARD FAIL: the CSV also carries these seeds at this design")
+print("guard 7b: the CSV agrees -- no nodewise/permnode row at this design carries "
+      "any of seeds %s" % sorted(want))
+PYEOF
+
+# ---------------------------------------------------------------------------
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+CHECKED=""
+# The ONLY place any optimiser flag appears.  A `$BFLAGS`-then-append shape is
+# what voided ml2 and sm3; there is no append here and guard_presubmit proves it
+# on the composed line rather than on this comment.
+BFLAGS=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+        --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for S in $RUN_SEEDS; do
+  ARMS="nodewise:node"
+  for P in $PERM_SEEDS; do ARMS="$ARMS permnode${P}:p${P}"; done
+  for ARM in $ARMS; do
+    GRAN="${ARM%%:*}"; SHORT="${ARM##*:}"
+    RN="rp1-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_rp1_s${S}"
+      "$RUNNER" "${BFLAGS[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # STANDING RULE 20, step 3: check the FIRST composed CMD of every arm.
+    case " $CHECKED " in
+      *" $SHORT "*) ;;
+      *)
+        echo "--- guard_presubmit: arm $SHORT (--stepsize-groups $GRAN)"
+        guard_presubmit "${CMD[*]}" "${DESIGN[@]}" \
+          stepsize-groups="$GRAN" seed="$S" \
+          || { echo "ABORTED (rule 20) -- NOTHING SUBMITTED"; exit 2; }
+        CHECKED="$CHECKED $SHORT"
+        ;;
+    esac
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+
+# --- STANDING RULE 20, step 4: audit the FIRST LAUNCHED run's OWN ARGS line -
+if [ "$SUBMIT" = "1" ] && [ "$N" = "$NJOBS" ]; then
+  guard_postlaunch "$WS/runs" "rp1-" "${DESIGN[@]}" \
+    || { echo "!!! rp1 is UNVERIFIED or VOID -- see above"; exit 2; }
+fi
+exit 0

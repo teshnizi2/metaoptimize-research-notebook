@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cAU1_smoke_gen.py -- SYNTHETIC run directory for the `cau1` SCORING-PATH SMOKE
+# TEST (Track U1, cycle 151).  NOT A SCORER.  EVERY NUMBER IT WRITES IS INVENTED
+# and is never evidence of anything about the real batch.
+#
+# Purpose: prove that the REGISTERED, UNEDITED scorer
+#     python3 analysis/cAU1_unaug_denominator_score.py <runsdir>
+# reaches a FINAL: line on files in the EXACT format the harness writes, found
+# by its documented one-argument invocation (the cdn1 failure mode, 171).
+#
+# Shares NO code with the scorer (imports nothing from the repo).  The file
+# structure is copied from real .out files on cluster_b:
+#   jobs/run_cifar.sh lines 18-24 (NODE / ARGS / ENV echo, nvidia-smi line,
+#   python -u train.py, RUN_DONE), runs/ub9-b6-s0-4796072.out (a PROBE=5
+#   AUGMENT=0 MetaOptimize run: the args_meta line, the two torchvision lines,
+#   the CuDNN warning, `43  minutes`) and runs/cdn1-lr001-s0-4920408.out (an
+#   SGD+cosine run).  The ENV line carries EB_RHO / EB_LOG as the LIVE runner
+#   echoes them.  The composition of ARGS and exported ENV is transcribed from
+#   bin/cAU1_unaug_denominator.sh (compose_sgd / compose_meta), not from the
+#   scorer's expected_args()/expected_env().  probe.jsonl records copy the keys
+#   of runs/ub9/probe_b6_ub9_s0/probe.jsonl.
+#
+# USAGE
+#   python3 analysis/cAU1_smoke_gen.py <outdir> [--drop ARM-sSEED] [--no-shadow]
+# Writes <outdir>/cau1-<arm>-s<seed>-<jobid>.out for all 27 (arm, seed), a
+# truncated higher-jobid resubmit shadowing cau1-lr01-s50 (149.2), a non-cau1
+# distractor .out, and <outdir>/cau1/probe_<run>/ for the 6 meta runs.
+# =============================================================================
+import argparse
+import json
+import os
+import random
+
+WS_RUNS = "/cluster/account_b/metaopt/runs"          # the real layout, as a string only
+SAVE = WS_RUNS + "/cau1"
+SEEDS = (50, 51, 52)
+LRS = [("0.005", "0005"), ("0.01", "001"), ("0.02", "002"), ("0.05", "005"),
+       ("0.1", "01"), ("0.2", "02"), ("0.4", "04")]
+META = [("m6", "1e-6", "-60:6.0"), ("m6t", "3e-4", "-15:-2.3026")]
+
+# invented plateau levels (pp) -- NOT predictions, NOT evidence
+LVL_SGD = {"0005": 70.0, "001": 72.5, "002": 74.0, "005": 75.5, "01": 75.0,
+           "02": 73.5, "04": 71.0}
+LVL_META = {"m6": 74.6, "m6t": 75.2}
+
+
+def env_line(exported):
+    """the runner's echo, line 20 of jobs/run_cifar.sh, with its own defaults"""
+    g = lambda k, d: exported.get(k, d)
+    return ("ENV: AUGMENT=%s BETA_CLIP=%s HIER=%s LAM=%s ETA_RATIO=%s COS_TOTAL=%s "
+            "COS_WARMUP=%s SCHED=%s SCHED_TOTAL=%s SCHED_WARMUP=%s SCHED_MIN=%s PROBE=%s "
+            "PROBE_DIR=%s EB_RHO=%s EB_LOG=%s"
+            % (g("AUGMENT", "0"), g("BETA_CLIP", "none"), g("HIER", "none"),
+               g("LAM", "na"), g("ETA_RATIO", "na"), g("COS_TOTAL", "default"),
+               g("COS_WARMUP", "default"), g("SCHED", "none"), g("SCHED_TOTAL", "none"),
+               g("SCHED_WARMUP", "none"), g("SCHED_MIN", "none"), g("PROBE", "0"),
+               g("PROBE_DIR", "none"), g("EB_RHO", "na"), g("EB_LOG", "0")))
+
+
+def sgd_job(lr, tag, seed):
+    rn = "cau1-lr%s-s%d" % (tag, seed)
+    args = ("--optimizer SGD --dataset CIFAR10 --NN-name ResNet18 --batch-size 100 "
+            "--max-time 999:00:00 --num-epochs 100 --alpha0 %s --seed %d "
+            "--save-directory %s --run-name %s" % (lr, seed, SAVE, rn))
+    exp = {"AUGMENT": "0", "COS_TOTAL": "50000", "COS_WARMUP": "1000", "HIER": "none",
+           "SCHED": "none", "PROBE": "0"}
+    return rn, args, exp, False
+
+
+def meta_job(arm, a0, clip, seed):
+    rn = "cau1-%s-s%d" % (arm, seed)
+    args = ("--optimizer HF --alg-base AdamW --normalizer-param-base 0.999 "
+            "--momentum-param-base 0.9 --weight-decay-base 0.1 --alg-meta Adam "
+            "--normalizer-param-meta 0.999 --momentum-param-meta 0.9 --weight-decay-meta 0 "
+            "--dataset CIFAR10 --NN-name ResNet18 --batch-size 100 --max-time 999:00:00 "
+            "--gamma 1 --meta-stepsize 1e-3 --alpha0 %s --num-epochs 100 "
+            "--stepsize-groups resnet18_blocks --seed %d --save-directory %s --run-name %s"
+            % (a0, seed, SAVE, rn))
+    exp = {"AUGMENT": "0", "BETA_CLIP": clip, "HIER": "none", "SCHED": "none",
+           "PROBE": "5", "PROBE_DIR": SAVE + "/probe_" + rn}
+    return rn, args, exp, True
+
+
+def curve(level, meta, rng, n_ep=100):
+    te, tr = [], []
+    for e in range(n_ep):
+        if meta:                                   # fast rise, flat
+            t = min(level, 45.0 + 12.0 * e) + rng.uniform(-0.3, 0.3)
+            r = min(100.0, 55.0 + 11.0 * e)
+        else:                                      # depressed high-lr phase, anneal at the end
+            t = (level - 9.0 + 9.0 * max(0.0, (e - 70) / 29.0) ** 1.5
+                 + rng.uniform(-0.3, 0.3))
+            r = min(100.0, 35.0 + 0.7 * e + 30.0 * max(0.0, (e - 60) / 39.0))
+        te.append(max(10.0, min(99.0, t)))
+        tr.append(max(10.0, min(100.0, r)))
+    return te, tr
+
+
+def write_out(outdir, rn, jid, args, exp, meta, te, tr, run_done=True, node="[HOST_e8d809bd94]"):
+    L = ["NODE=%s | JOB=%s %d | AUGMENT=%s" % (node, rn, jid, exp.get("AUGMENT", "0")),
+         "ARGS: " + args, env_line(exp), "NVIDIA L4, 23034 MiB"]
+    if meta:
+        L += ["", "args_meta includes unnecessary attributes {'Lion_beta2'} ", ""]
+    L += ["Files already downloaded and verified", "Files already downloaded and verified",
+          "/cluster/user/metaopt/envs/mo/lib/python3.10/site-packages/torch/nn/"
+          "modules/conv.py:459: UserWarning: Applied workaround for CuDNN issue, install "
+          "nvrtc.so (Triggered internally at ../aten/src/ATen/native/cudnn/Conv_v8.cpp:80.)",
+          "  return F.conv2d(input, weight, bias, self.stride,"]
+    for e in range(len(te)):
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, tr[e], te[e]))
+    if run_done:
+        L += ["43  minutes", "RUN_DONE"]
+    with open(os.path.join(outdir, "%s-%d.out" % (rn, jid)), "w") as f:
+        f.write("\n".join(L) + "\n")
+
+
+def write_probe(outdir, rn, clip, rng, n=40):
+    lo, hi = [float(x) for x in clip.split(":")]
+    d = os.path.join(outdir, "cau1", "probe_" + rn)
+    os.makedirs(d, exist_ok=True)
+    json.dump({"sub_seed": 0, "k": 6, "n_tot": 6, "stepsize_type": "blockwise",
+               "t_n": [6], "idx": [2, 5, 3, 0, 1, 4]}, open(os.path.join(d, "probe_index.json"), "w"))
+    json.dump({"stepsize_type": "blockwise",
+               "n_b": [1856, 147968, 525568, 2099712, 8393728, 5130]},
+              open(os.path.join(d, "block_sizes.json"), "w"))
+    with open(os.path.join(d, "probe.jsonl"), "w") as f:
+        for i in range(n):
+            beta = [max(lo, min(hi, -13.8 + 0.1 * i + rng.uniform(-0.5, 0.5))) for _ in range(6)]
+            f.write(json.dumps({"step": 500 * i, "beta": beta,
+                                "beta_true_min": min(beta), "beta_true_max": max(beta),
+                                "n_beta": 6, "n_at_lo": sum(b <= lo for b in beta),
+                                "n_at_hi": sum(b >= hi for b in beta),
+                                "probe_idx": [2, 5, 3, 0, 1, 4]}) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("outdir")
+    ap.add_argument("--drop", default=None, help="e.g. m6-s51")
+    ap.add_argument("--no-shadow", action="store_true")
+    a = ap.parse_args()
+    os.makedirs(a.outdir, exist_ok=True)
+    rng = random.Random(20260910)
+    jid = 7000001
+    n = 0
+    for s in SEEDS:
+        jobs = [sgd_job(lr, t, s) for lr, t in LRS] + [meta_job(m, a0, c, s) for m, a0, c in META]
+        for rn, args, exp, meta in jobs:
+            key = rn[len("cau1-"):]
+            if a.drop and key == a.drop:
+                jid += 1
+                continue
+            lvl = LVL_META[key.split("-")[0]] if meta else LVL_SGD[key.split("-")[0][2:]]
+            te, tr = curve(lvl, meta, rng)
+            write_out(a.outdir, rn, jid, args, exp, meta, te, tr)
+            if meta:
+                write_probe(a.outdir, rn, exp["BETA_CLIP"], rng)
+            jid += 1
+            n += 1
+    if not a.no_shadow:            # an abandoned, truncated resubmit with a HIGHER job id
+        rn, args, exp, meta = sgd_job("0.1", "01", 50)
+        te, tr = curve(20.0, False, rng, n_ep=30)
+        write_out(a.outdir, rn, 7999999, args, exp, meta, te, tr, run_done=False)
+    # a distractor from another batch that the scorer's regex must ignore
+    write_out(a.outdir, "cvk1-k22-s55", 7888888, "--optimizer HF", {"AUGMENT": "1"}, True,
+              *curve(60.0, True, rng))
+    print("wrote %d cau1 runs (+%s shadow, +1 distractor) to %s"
+          % (n, "0" if a.no_shadow else "1", a.outdir))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""INDEPENDENT re-derivation of cvg1. Reads ONLY the raw .out files and the
+batch's own probe json. Shares no code with analysis/cVG1_vggbn_gap_score.py.
+Written for the cycle-149 attack pass."""
+import glob, json, math, os, re, sys, collections
+
+RUNS = sys.argv[1] if len(sys.argv) > 1 else "/cluster/account_b/metaopt/runs"
+EPRE = re.compile(r"^Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,\s*Test Accuracy:\s*([0-9.]+)\s*%")
+
+def parse(path):
+    tr, te = {}, {}
+    done = tb = 0
+    env = argsline = probetensor = None
+    for ln in open(path, errors="replace"):
+        m = EPRE.match(ln)
+        if m:
+            e = int(m.group(1)); tr[e] = float(m.group(2)); te[e] = float(m.group(3))
+        elif ln.startswith("RUN_DONE"): done += 1
+        elif "Traceback" in ln: tb += 1
+        elif ln.startswith("ENV:"): env = ln.strip()
+        elif ln.startswith("ARGS:"): argsline = ln.strip()
+        elif ln.startswith("PROBE_TENSOR:"): probetensor = ln.strip()
+    return dict(tr=tr, te=te, done=done, tb=tb, env=env, args=argsline, pt=probetensor)
+
+def mean(xs): return sum(xs)/len(xs)
+def sd(xs):
+    m = mean(xs); return math.sqrt(sum((x-m)**2 for x in xs)/(len(xs)-1))
+
+files = sorted(glob.glob(os.path.join(RUNS, "cvg1-*.out")))
+print("FILES", len(files))
+runs = {}
+for f in files:
+    b = os.path.basename(f)
+    arm = b.split("-")[1]; seed = b.split("-")[2]
+    r = parse(f); r["file"] = b; r["arm"] = arm; r["seed"] = seed
+    runs[(arm, seed)] = r
+
+print("\n=== PER-RUN, plateau5 = mean TEST over epochs 95..99 from the run's own .out ===")
+print(f"{'run':<14}{'nep':>5}{'done':>5}{'tb':>4}{'test5':>10}{'train5':>10}{'ep99te':>9}{'ep99tr':>9}")
+ok = True
+for k in sorted(runs):
+    r = runs[k]
+    eps = sorted(r["te"])
+    win = [e for e in range(95, 100)]
+    have = all(e in r["te"] for e in win)
+    t5 = mean([r["te"][e] for e in win]) if have else float("nan")
+    tr5 = mean([r["tr"][e] for e in win]) if have else float("nan")
+    r["t5"] = t5; r["tr5"] = tr5
+    if len(eps) != 100 or r["done"] != 1 or r["tb"] != 0 or not have: ok = False
+    print(f"{r['arm']+'-'+r['seed']:<14}{len(eps):>5}{r['done']:>5}{r['tb']:>4}{t5:>10.4f}{tr5:>10.4f}"
+          f"{r['te'].get(99,float('nan')):>9.2f}{r['tr'].get(99,float('nan')):>9.2f}")
+print("G-SOUND(6/6 RUN_DONE, 100 epoch lines, 0 traceback, ep95-99 present):", "PASS" if (ok and len(runs)==6) else "FAIL")
+
+arms = collections.defaultdict(list)
+for k, r in runs.items(): arms[r["arm"]].append(r)
+print("\n=== ARM MEANS (in-batch, 3 seeds) ===")
+am, atr, rng = {}, {}, {}
+for a in sorted(arms):
+    v = sorted(arms[a], key=lambda r: r["seed"])
+    t = [r["t5"] for r in v]; tt = [r["tr5"] for r in v]
+    am[a] = mean(t); atr[a] = mean(tt); rng[a] = max(t)-min(t)
+    print(f"  {a:<5} TEST5 per-seed {['%.4f'%x for x in t]}  mean {mean(t):.4f}  range {max(t)-min(t):.4f}  sd {sd(t):.4f}")
+    print(f"  {a:<5} TRAIN5 per-seed {['%.4f'%x for x in tt]} mean {mean(tt):.4f}")
+
+D = am["kL"] - am["k01"]
+Dtr = atr["kL"] - atr["k01"]
+print(f"\nD (TEST)  = plateau5(kL) - plateau5(k01) = {am['kL']:.4f} - {am['k01']:.4f} = {D:+.4f} pp")
+print(f"D (TRAIN) = {atr['kL']:.4f} - {atr['k01']:.4f} = {Dtr:+.4f} pp")
+
+# pooled within-arm SD, df 4
+ss = 0.0; df = 0
+for a in arms:
+    t = [r["t5"] for r in arms[a]]; m = mean(t)
+    ss += sum((x-m)**2 for x in t); df += len(t)-1
+sig_in = math.sqrt(ss/df)
+SIG_PRIOR = 0.585420
+sig_used = max(SIG_PRIOR, sig_in)
+se = sig_used*math.sqrt(2/3)
+print(f"SIGMA_INBATCH (pooled within-arm, df {df}) = {sig_in:.6f}")
+print(f"SIGMA_USED = max(prior 0.585420, inbatch) = {sig_used:.6f};  SE_ARM_DIFF = {se:.6f} pp")
+print(f"D / SE = {D/se:+.2f} SE")
+
+print("\n=== GATES ===")
+mx = max(am.values()); mn = min(am.values())
+print(f"  G-FLOOR   max arm mean {mx:.4f} >= 15.00 : {'PASS' if mx>=15.0 else 'FAIL -> HARNESS-UNSOUND'}")
+print(f"  G-CEIL    max arm mean {mx:.4f} <= 90.00 : {'PASS' if mx<=90.0 else 'FAIL'}")
+print(f"  G-DIVERGE within-arm ranges k01 {rng['k01']:.4f} kL {rng['kL']:.4f} <= 5.0 : "
+      f"{'PASS' if max(rng.values())<=5.0 else 'FAIL'}")
+envs = set(re.sub(r" PROBE_DIR=\S+", "", r["env"]) for r in runs.values())
+pts = collections.Counter(re.sub(r" dir=.*", "", r["pt"]) for r in runs.values())
+print(f"  G-ENV     distinct ENV lines (PROBE_DIR stripped) = {len(envs)} : {'PASS' if len(envs)==1 else 'FAIL'}")
+for e in envs:
+    print("            ", e)
+    print("            AUGMENT=1:", "AUGMENT=1" in e, "| BETA_CLIP=-15:-2.3026:", "BETA_CLIP=-15:-2.3026" in e,
+          "| PROBE=100:", "PROBE=100" in e)
+for p, c in pts.items(): print(f"            PROBE_TENSOR x{c}: {p}")
+
+print("\n=== G-STRUCT from the batch's OWN manifest ===")
+man = os.path.join(RUNS, "cvg1-PARTITION-MANIFEST.txt")
+mt = open(man).read()
+ntens = int(re.search(r"NUM_PARAM_TENSORS (\d+)", mt).group(1))
+ntot = int(re.search(r"TOTAL_PARAMS (\d+)", mt).group(1))
+tensors = re.findall(r"^TENSOR (\d+) (\S+) (\d+)$", mt, re.M)
+bn512 = [ (int(i), n) for i, n, s in tensors if int(s) == 512 and n.endswith(".weight") ]
+shortcut = [n for i, n, s in tensors if "shortcut" in n]
+sumn = sum(int(s) for i,n,s in tensors)
+print(f"  tensors {ntens} (listed {len(tensors)}, sum params {sumn}) | TOTAL_PARAMS {ntot} | match {sumn==ntot==9274532 and ntens==26}")
+print(f"  512-wide *.weight: {bn512}  (n={len(bn512)} >= 3: {len(bn512)>=3})")
+print(f"  names containing 'shortcut': {shortcut} -> {'PASS' if not shortcut else 'FAIL'}")
+
+print("\n=== ARITY CHECK on the LIVE model (block_sizes.json written by the run itself) ===")
+for k in sorted(runs):
+    a, s = k
+    d = os.path.join(RUNS, "cvg1", f"probe_cvg1-{a}-{s}")
+    bs = json.load(open(os.path.join(d, "block_sizes.json")))
+    nb = bs["n_b"]
+    first = json.loads(open(os.path.join(d, "probe.jsonl")).readline())
+    nrec = sum(1 for _ in open(os.path.join(d, "probe.jsonl")))
+    print(f"  {a}-{s}: stepsize_type={bs['stepsize_type']:<9} m=len(n_b)={len(nb):<3} sum(n_b)={sum(nb)} "
+          f"len(beta)={len(first['beta'])} len(z_tensor)={len(first['z_tensor'])} probe_records={nrec}")
+
+print("\n=== BETA / PIN STATE (terminal record) ===")
+for k in sorted(runs):
+    a, s = k
+    d = os.path.join(RUNS, "cvg1", f"probe_cvg1-{a}-{s}")
+    recs = [json.loads(l) for l in open(os.path.join(d, "probe.jsonl"))]
+    last = recs[-1]
+    b = last["beta"]
+    npin = sum(1 for x in b if x <= -14.999)
+    print(f"  {a}-{s}: records {len(recs)} last step {last['step']} | beta min {min(b):.4f} max {max(b):.4f} "
+          f"| pinned@-15: {npin}/{len(b)}")
+
+print("\n=== VERDICT (bars: GAP_BAR +10.0 -> GAP-REPLICATES ; |D|<=2.0 -> GAP-ABSENT) ===")
+if mx < 15.0: v = "HARNESS-UNSOUND"
+elif D >= 10.0: v = "GAP-REPLICATES"
+elif abs(D) <= 2.0: v = "GAP-ABSENT"
+elif D <= -2.0: v = "GAP-REVERSED"
+else: v = "GAP-PARTIAL"
+print("  INDEPENDENT VERDICT:", v, f"(D = {D:+.4f} pp)")

@@ -1,0 +1,341 @@
+#!/bin/bash
+# =============================================================================
+# cdn1_c100_denominator.sh -- THE CIFAR-100 DENOMINATOR.  cluster_b (account_b).
+# 24 jobs, ONE submission, tag `cdn1-*`.
+#
+# The full pre-registration -- arms, point predictions, branches, bars, floors,
+# gates and the SCOPE registration -- lives in and is enforced by
+#   analysis/cdn1_denominator_score.py   (34/34 --selftest at registration)
+# which was committed BEFORE this batch was submitted.  This script IMPORTS
+# that module and derives its ladder, its seeds, its epoch counts and its
+# cosine horizons FROM IT, so the design and the scorer cannot drift apart.
+#
+# WHY THIS BATCH EXISTS.  There is no tuned non-meta baseline anywhere in this
+# corpus outside CIFAR-10.  On CIFAR-10 the denominator exists and is in the
+# abstract (`bl-sgd-01` 95.124 n=5 vs a best MetaOptimize cell of 93.317 n=3,
+# a -1.807 pp deficit, 119.11).  On CIFAR-100 there is nothing, so the whole
+# family may sit below the plain optimiser it is implicitly compared to.
+#
+# THE ARMS
+#   A  cdn1-lr{001,002,005,01,02,03}-s{0,1,2}   18 jobs.  --optimizer SGD.
+#      CIFAR100 / ResNet18_c100 / batch 100 / AUGMENT=1 / 100 epochs, momentum
+#      0.9, weight decay 5e-4, cosine-to-zero, 1000-step warmup.
+#      LR ladder {0.01, 0.02, 0.05, 0.1, 0.2, 0.3}.
+#   M  cdn1-m-s{0,1,2}                           3 jobs.  IN-BATCH replicate of
+#      the corpus's best CIFAR-100 cell `gm2-ch` (chunk771, ms 1e-4, alpha0
+#      1e-3, box -15:-2.3026, SGDm/Lion).  Makes the headline gap WITHIN-batch
+#      and measures this batch's offset against gm2.
+#   C  cdn1-h2-s{0,1,2}                          3 jobs.  Arm A at lr=0.1 for
+#      200 epochs, cosine horizon rescaled to match.  SECONDARY.
+#
+# THE SGD PATH IS PRE-EXISTING AND IS NOT PATCHED BY THIS BATCH.
+# Optimizers/build_optimizer.py, class SGD_optimizer (added cycle 35):
+#     wd  = float(os.environ.get('SGD_WD', 5e-4))
+#     mom = float(os.environ.get('SGD_MOM', 0.9))
+#     torch.optim.SGD(net.parameters(), lr=lr, momentum=mom,
+#                     weight_decay=wd, nesterov=False)
+#     total_steps  = int(os.environ.get('COS_TOTAL',  422000))
+#     warmup_steps = int(os.environ.get('COS_WARMUP',  10000))
+#     self.scheduler = CosineDecayWithWarmupScheduler(...)
+# and build_optimizer() routes `--optimizer SGD` to it with lr=args.alpha0.
+# SGD_WD and SGD_MOM are DELIBERATELY NOT SET: 5e-4 / 0.9 is the standard
+# recipe, and run_cifar.sh does NOT echo those two variables, so a value passed
+# through the environment could not be audited from the runs' own logs.  Left
+# at their defaults they are pinned by the file's sha256, which guard 3 checks
+# and which is recorded in docs/CORRECTIONS.md.  COS_TOTAL and COS_WARMUP ARE
+# echoed by run_cifar.sh and so ARE passed and ARE audited.
+#
+# 500 optimiser steps per epoch (50,000 CIFAR-100 train images / batch 100), so
+# COS_TOTAL=50000 for 100 epochs and 100000 for 200; the warmup stays at 1000
+# steps (2 epochs) in BOTH so the horizon is the only thing that changes.
+#
+# BUDGET.  Measured, not guessed: the CIFAR-10 `bl-sgd-*` runs (same harness,
+# same 50,000 images, same 100 epochs, plain SGD) took 29 wallclock minutes on
+# the L4 nodes and 60 on the slowest node in the corpus.  gm2's HF runs on this
+# exact CIFAR-100 cell took 40-118 min.  Expected 18*0.5 + 3*1.0 + 3*1.2 =
+# ~16 GPU-h; worst case on the slowest nodes ~32 GPU-h.  Every arm fits inside
+# gpu-short's 4 h limit, arm C included, so no arm needs a long partition and
+# nothing should sit PENDING (the hz3-R2 lesson).
+#
+# USAGE
+#   export METAOPT_WS=/cluster/account_b/metaopt     # BEFORE anything else
+#   bash bin/cdn1_c100_denominator.sh            # dry run: prints all 24 lines
+#   bash bin/cdn1_c100_denominator.sh --submit
+#   bash bin/cdn1_c100_denominator.sh --envaudit # AFTER launch, ENV-line audit
+# =============================================================================
+set -u
+
+MODE=dry
+case "${1:-}" in
+  --submit)   MODE=submit ;;
+  --envaudit) MODE=envaudit ;;
+  "")         MODE=dry ;;
+  *) echo "unknown argument: $1"; exit 2 ;;
+esac
+
+FAIL=0
+guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cdn1
+CIF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+CSVP="$REPO/results/all_runs.csv"
+SCORER="$REPO/analysis/cdn1_denominator_score.py"
+
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+WALL=03:50:00
+NET=ResNet18_c100; DSET=CIFAR100; BATCH=100; AUG=1
+SEEDS="0 1 2"
+LRS="0.01:001 0.02:002 0.05:005 0.1:01 0.2:02 0.3:03"
+EPOCHS_A=100;  COS_A=50000
+EPOCHS_C=200;  COS_C=100000
+LR_C=0.1
+COS_WARM=1000
+# arm M, byte-identical to bin/c91_c100_mech.sh's gm2-ch arm
+M_CLIP="-15:-2.3026"; M_MST=1e-4; M_A0=1e-3; M_G=chunk771; M_GAMMA=1
+# the sha256 that pins SGD_WD=5e-4 / SGD_MOM=0.9 and the cosine class
+BOPT_SHA=25a899b3745e9d66fbf630795a1202c6075e2067daffa077e4a54c28e54c7ec2
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# =============================================================================
+# post-launch ENV audit.  BETA_CLIP / PROBE / COS_TOTAL / COS_WARMUP ride the
+# ENVIRONMENT, not the ARGS line, so argsline_guard.py cannot see them.  This
+# reads the `ENV:` line run_cifar.sh echoes and asserts it per arm family.
+# =============================================================================
+if [ "$MODE" = envaudit ]; then
+  echo "=== cdn1 ENV-LINE AUDIT (separate from RULE 20's ARGS audit) ==="
+  RC=0
+  for FAM in lr h2 m; do
+    case $FAM in
+      lr) PAT="$SAVE/../cdn1-lr*.out";  WANT_COS=$COS_A; WANT_CLIP=none; WANT_PROBE=0 ;;
+      h2) PAT="$SAVE/../cdn1-h2*.out";  WANT_COS=$COS_C; WANT_CLIP=none; WANT_PROBE=0 ;;
+      m)  PAT="$SAVE/../cdn1-m-*.out";  WANT_COS=default; WANT_CLIP=$M_CLIP; WANT_PROBE=5 ;;
+    esac
+    N=0; BAD=0
+    for f in $PAT; do
+      [ -f "$f" ] || continue
+      L=$(grep -m1 '^ENV:' "$f")
+      [ -n "$L" ] || { echo "  $f: NO ENV LINE"; BAD=$((BAD+1)); continue; }
+      N=$((N+1))
+      echo "$L" | grep -q "AUGMENT=$AUG "        || { echo "  $f AUGMENT"; BAD=$((BAD+1)); }
+      echo "$L" | grep -q "BETA_CLIP=$WANT_CLIP" || { echo "  $f BETA_CLIP: $L"; BAD=$((BAD+1)); }
+      echo "$L" | grep -q "COS_TOTAL=$WANT_COS " || { echo "  $f COS_TOTAL: $L"; BAD=$((BAD+1)); }
+      echo "$L" | grep -q "COS_WARMUP=$([ "$FAM" = m ] && echo default || echo $COS_WARM) " \
+                                                || { echo "  $f COS_WARMUP: $L"; BAD=$((BAD+1)); }
+      echo "$L" | grep -q "SCHED=none "          || { echo "  $f SCHED"; BAD=$((BAD+1)); }
+      echo "$L" | grep -q "PROBE=$WANT_PROBE "   || { echo "  $f PROBE: $L"; BAD=$((BAD+1)); }
+    done
+    echo "  family $FAM: $N files audited, $BAD violations"
+    [ "$BAD" -gt 0 ] && RC=1
+  done
+  echo "ENV AUDIT VERDICT: $([ $RC = 0 ] && echo PASS || echo FAIL)"
+  exit $RC
+fi
+
+echo "=============================================================="
+echo " cdn1 -- THE CIFAR-100 DENOMINATOR.  24 jobs, ONE submission."
+echo "   A  6 LR rungs x 3 seeds, plain SGD+cosine, 100 ep   (18)"
+echo "   M  in-batch replicate of gm2-ch, the corpus best     (3)"
+echo "   C  SGD lr=$LR_C at 200 ep, secondary                    (3)"
+echo " WS=$WS  SAVE=$SAVE"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)" \
+               || guard_fail "guard 0: no CSV at $CSVP"
+
+# ---- guard 1: no name collision --------------------------------------------
+if grep -q '^cdn1-' "$CSVP" 2>/dev/null; then
+  guard_fail "guard 1: cdn1-* already in the CSV"
+else
+  echo "guard 1: no cdn1-* name collision"
+fi
+
+# ---- guard 2: the runner and the live tree ---------------------------------
+[ -f "$RUNNER" ] && echo "guard 2: runner $RUNNER present" \
+                 || guard_fail "guard 2: no runner at $RUNNER"
+grep -q 'ARGS: \$@' "$RUNNER" 2>/dev/null && echo "guard 2b: runner echoes ARGS" \
+  || guard_fail "guard 2b: runner does not echo an ARGS line -- RULE 20 unauditable"
+if grep -q 'ENV: AUGMENT' "$RUNNER" 2>/dev/null \
+   && grep -q 'COS_TOTAL=' "$RUNNER" 2>/dev/null \
+   && grep -q 'COS_WARMUP=' "$RUNNER" 2>/dev/null; then
+  echo "guard 2c: runner echoes ENV, including COS_TOTAL and COS_WARMUP"
+else
+  guard_fail "guard 2c: the runner's ENV line does not carry the cosine horizon -- unauditable"
+fi
+
+# ---- guard 3: the SGD path exists, UNPATCHED, with the documented defaults --
+BO="$CIF/Optimizers/build_optimizer.py"
+GOT=$(sha256sum "$BO" 2>/dev/null | awk '{print $1}')
+if [ "$GOT" = "$BOPT_SHA" ]; then
+  echo "guard 3: build_optimizer.py sha256 matches the registered pin"
+else
+  guard_fail "guard 3: build_optimizer.py sha256 is $GOT, registered $BOPT_SHA"
+fi
+grep -q "if args.optimizer == 'SGD'" "$BO" \
+  && grep -q "SGD_WD', 5e-4" "$BO" && grep -q "SGD_MOM', 0.9" "$BO" \
+  && grep -q "COS_TOTAL" "$BO" && grep -q "COS_WARMUP" "$BO" \
+  && echo "guard 3b: SGD branch present; SGD_WD default 5e-4, SGD_MOM default 0.9" \
+  || guard_fail "guard 3b: the SGD branch or its documented defaults are not there"
+
+# ---- guard 4: arm M's granularity still allocates gm2's beta ----------------
+python3 - "$CIF" "$NET" "$M_A0" "$M_MST" "$M_G" <<'PYEOF' || guard_fail "guard 4: beta allocation"
+import sys, os
+cif, net, a0, mst, gran = sys.argv[1:6]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s) -- run on the cluster "
+             "inside the venv." % ex)
+class NW:
+    def add_scalar(self, *a, **k): pass
+B = {"alg": "SGDm", "momentum_param": 0.99, "weight_decay": 0.1}
+M = {"alg": "Lion", "meta_stepsize": float(mst), "momentum_param": 0.99,
+     "Lion_beta2": 0.9, "weight_decay": 0}
+torch.manual_seed(0)
+opt = HF(build_network(net, "cpu"), stepsize_groups=gran, alpha0=float(a0),
+         args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+m = sum(int(b.numel()) for b in opt.beta)
+assert m == 14595, "m(%s) is %d, gm2 registered 14595 -- arm M is NOT a replicate" % (gran, m)
+print("guard 4: %s ALLOCATES beta m=%d, byte-matching gm2-ch" % (gran, m))
+n = build_network(net, "cpu")
+print("guard 4b: %s has %d parameters" % (net, sum(p.numel() for p in n.parameters())))
+PYEOF
+
+# ---- guard 5: THE SCORER IMPORTS AND ITS DEFAULT INVOCATION RESOLVES --------
+# 164.2: a missing optional flag published a WRONG verdict for an hour.  The
+# scorer's default takes NO arguments; prove it here, before anything is
+# submitted, and prove this script's ladder IS the scorer's ladder.
+python3 - "$SCORER" "$LRS" <<'PYEOF' || guard_fail "guard 5: scorer default"
+import sys, os, importlib.util
+scorer, lrs = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("cdn1", scorer)
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+assert os.path.isfile(mod.CSV_DEFAULT), "the scorer's DEFAULT --csv does not resolve: %s" % mod.CSV_DEFAULT
+print("guard 5: scorer default --csv resolves to %s" % mod.CSV_DEFAULT)
+mine = [tuple(x.split(":")) for x in lrs.split()]
+assert mine == mod.LADDER, "this script's ladder %s != the scorer's %s" % (mine, mod.LADDER)
+print("guard 5b: this script's LR ladder IS the scorer's LADDER: %s" % (mod.LADDER,))
+assert mod.SEEDS == [0, 1, 2] and len(mod.arm_names()) == 24
+print("guard 5c: the scorer expects exactly the 24 names this script submits")
+print("guard 5d: registered SE = %.5f pp, m=1 floor = %.3f pp, sigma_seed = %.4f"
+      % (mod.SE, mod.SCALAR_FLOOR, mod.SIGMA_SEED))
+PYEOF
+
+# ---- guard 6: the scorer's own selftest, before submission ------------------
+if python3 "$SCORER" --selftest >/tmp/cdn1_selftest.$$ 2>&1; then
+  echo "guard 6: scorer --selftest $(tail -1 /tmp/cdn1_selftest.$$)"
+else
+  guard_fail "guard 6: scorer --selftest FAILED -- see /tmp/cdn1_selftest.$$"
+fi
+
+# ---- guard 7: queue depth and disk ------------------------------------------
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+echo "guard 7: ${FREE:-?} GB free; mine pending=$PEND running=$RUN, adding 24"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 7: $PEND pending, over the 40 cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! ABORTED -- nothing submitted."; exit 2; }
+
+mkdir -p "$SAVE"
+N=0; REJ=0
+LINES=/tmp/cdn1_lines.$$
+: > "$LINES"
+
+emit() {  # $1 = composed command
+  printf '%s\n' "$1" >> "$LINES"
+  if [ "$MODE" = submit ]; then
+    if eval "$1" >/dev/null 2>&1; then N=$((N+1)); else REJ=$((REJ+1)); fi
+  else
+    printf '%s\n\n' "$1"; N=$((N+1))
+  fi
+}
+
+# ---- arm A: the LR ladder ---------------------------------------------------
+for PAIR in $LRS; do
+  LR=${PAIR%%:*}; TAG=${PAIR##*:}
+  for S in $SEEDS; do
+    RN="cdn1-lr${TAG}-s${S}"
+    emit "sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL \
+--export=ALL,AUGMENT=$AUG,COS_TOTAL=$COS_A,COS_WARMUP=$COS_WARM,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer SGD --dataset $DSET --NN-name $NET --batch-size $BATCH \
+--max-time 999:00:00 --num-epochs $EPOCHS_A --alpha0 $LR --seed $S \
+--save-directory $SAVE --run-name $RN"
+  done
+done
+
+# ---- arm M: the in-batch replicate of gm2-ch --------------------------------
+for S in $SEEDS; do
+  RN="cdn1-m-s${S}"
+  emit "sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL \
+--export=ALL,AUGMENT=$AUG,BETA_CLIP=$M_CLIP,HIER=none,SCHED=none,PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=500,PROBE_DIR=$SAVE/probe_m_s${S} \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $M_GAMMA --meta-stepsize $M_MST --alpha0 $M_A0 --num-epochs $EPOCHS_A \
+--stepsize-groups $M_G --seed $S --save-directory $SAVE --run-name $RN"
+done
+
+# ---- arm C: the 200-epoch horizon arm ---------------------------------------
+for S in $SEEDS; do
+  RN="cdn1-h2-s${S}"
+  emit "sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL \
+--export=ALL,AUGMENT=$AUG,COS_TOTAL=$COS_C,COS_WARMUP=$COS_WARM,HIER=none,SCHED=none,PROBE=0 \
+$RUNNER --optimizer SGD --dataset $DSET --NN-name $NET --batch-size $BATCH \
+--max-time 999:00:00 --num-epochs $EPOCHS_C --alpha0 $LR_C --seed $S \
+--save-directory $SAVE --run-name $RN"
+done
+
+# ---- RULE 20, PRE-SUBMISSION: every composed line through argsline_guard ----
+echo "---- argsline_guard on all $(wc -l < "$LINES") composed command lines ----"
+GBAD=0
+while IFS= read -r L; do
+  python3 "$REPO/analysis/argsline_guard.py" --cmdline "$L" --quiet >/tmp/cdn1_ag.$$ 2>&1
+  grep -q 'VERDICT: PASS' /tmp/cdn1_ag.$$ || { GBAD=$((GBAD+1)); cat /tmp/cdn1_ag.$$; }
+done < "$LINES"
+if [ "$GBAD" = 0 ]; then
+  echo "argsline_guard: all $(wc -l < "$LINES") lines PASS -- no repeated flag anywhere"
+else
+  echo "!!! argsline_guard: $GBAD lines FAILED"
+  [ "$MODE" = submit ] && echo "(they were already submitted -- VOID THE BATCH)"
+fi
+rm -f /tmp/cdn1_ag.$$
+
+echo "---- $N jobs ($( [ "$MODE" = submit ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+[ "$REJ" -gt 0 ] && echo "!!! $REJ sbatch calls FAILED -- do not treat this batch as submitted"
+
+cat <<'EOT'
+---- AFTER LAUNCH, IN THIS ORDER, BEFORE ANY NUMBER IS QUOTED ----
+ 1. RULE 21 proof:
+      git log -1 --format=%ct -- analysis/cdn1_denominator_score.py
+      sacct -u account_b --name=<any cdn1 job> -o Submit,JobName --parsable2
+    state the margin in seconds.
+ 2. RULE 20, ARGS audit, FULL coverage (24/24), then per family:
+      export METAOPT_WS=/cluster/account_b/metaopt
+      python3 analysis/argsline_guard.py $METAOPT_WS/runs --name cdn1-
+      python3 analysis/argsline_guard.py $METAOPT_WS/runs --name cdn1-lr \
+          --batch-consistency --strict --vary seed --vary run-name \
+          --vary save-directory --vary alpha0
+      python3 analysis/argsline_guard.py $METAOPT_WS/runs --name cdn1-h2 \
+          --batch-consistency --strict --vary seed --vary run-name --vary save-directory
+      python3 analysis/argsline_guard.py $METAOPT_WS/runs --name cdn1-m- \
+          --batch-consistency --strict --vary seed --vary run-name --vary save-directory
+ 3. THE SEPARATE ENV AUDIT (BETA_CLIP/PROBE/COS_* cannot ride the ARGS line):
+      bash bin/cdn1_c100_denominator.sh --envaudit
+ 4. Ingest, then score with the DEFAULT invocation, which takes no arguments:
+      python3 analysis/cdn1_denominator_score.py
+    V0 -> V1 -> V2 -> V3, in that order, before GAP_in is quoted.
+EOT

@@ -1,0 +1,421 @@
+#!/bin/bash
+# =============================================================================
+# cG16_eb_batch.sh -- `eb1`, THE DIAL-FREE EMPIRICAL-BAYES / JAMES-STEIN BATCH.
+#
+# ACCOUNT: account_b (cluster_b) ONLY.  This script REFUSES to run as any other
+# user.  108 jobs from the previous cycle are live on the account_a
+# account and nothing here may touch them.
+#
+# REGISTERED SCORER: analysis/cG16_eb_score.py, git-committed BEFORE this batch
+# is submitted (STANDING RULE 21).  Every bar quoted below is frozen there, its
+# selftest() asserts each one against THIS FILE'S OWN TEXT, and guard 1c pins
+# the scorer by sha256 so it cannot be edited after its data exist (RULE 16).
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION
+# -----------------------------------------------------------------------------
+# The additive operator (HF.py, PATCH_HIER, `_apply_hier`, layerwise branch) is
+#
+#     d      = beta_t - beta_{t-1}          the realised meta-update
+#     dm     = mean(d)                      its shared component
+#     beta_t := beta_{t-1} + dm + r*(d - dm)
+#
+# r = 1 is the arithmetic identity.  The archived ten-rung r-curve at this cell
+# (GUARD 2 re-derives it from the live CSV; nothing here is quoted from prose)
+# peaks at r = 0.06, worth +2.31 pp over r = 1 -- but that optimum had to be
+# FOUND by sweeping ten values.  A shrinkage strength that must be tuned per
+# setting is a hyperparameter, not a method.
+#
+# G16 (PATCH_EBJS) removes the dial.  At every meta-step it ESTIMATES the
+# retained-deviation fraction from the data by the positive-part James-Stein
+# rule, treating the per-group beta increment as a noisy draw from a common
+# population:
+#
+#     x    = d = beta_t - beta_{t-1}                      m = 62 groups
+#     SS   = sum_b (x_b - xbar)^2
+#     v_b <- rho*v_b + (1-rho)*(x_b - mhat_b)^2           EWMA, pre-update mean
+#     mhat_b <- rho*mhat_b + (1-rho)*x_b
+#     s2   = (1/m) sum_b v_b / (1 - rho^t)                pooled, bias-corrected
+#     c    = min(1, (m-3)*s2/SS)
+#     rhat = 1 - c
+#     beta_t := beta_{t-1} + dm + rhat*(d - dm)
+#
+# rho DEFAULTS to the meta-optimiser's own momentum_param (0.99 here), so the
+# method introduces no new hyperparameter at all.  s2 is built from TEMPORAL
+# fluctuation, never from group size n_b, because the i.i.d.-across-coordinates
+# noise model that would justify n_b is refuted by this project's own
+# measurement (53.1% sign agreement over 11,173,962 per-weight meta-gradients;
+# predicted drift slope -0.500, measured -0.113).
+#
+# THE PREDICTION, AND IT CAN COME OUT EITHER WAY.  With no dial, rhat either
+# lands in the band the sweep already showed to be good, [0.03, 0.10], or it
+# does not.  rhat ~ 0.9 (barely pooling, no gain) and rhat ~ 0 (collapsed onto
+# the scalar arm, -2.3 pp) are both entirely live outcomes.
+#
+# -----------------------------------------------------------------------------
+# WHY NOT SHRINK THE BETA LEVELS.  A James-Stein contraction applied to the beta
+# LEVELS every step is unstable toward collapse: each application scales the
+# spread by (1-c), so SS falls, so c = min(1,(m-3)s2/SS) rises, so the next
+# contraction is stronger.  Its only fixed point is SS = 0, the scalar arm.  It
+# is also the saturating time-constant operator this cycle exists to replace:
+# LAM = 1e-3 has half-life ln2 / -ln(1-1e-3) = 692.8 steps against 500 steps/
+# epoch x 100 epochs = 50,000 steps, i.e. 72.2 half-lives.  Both G16 modes act
+# on an INCREMENT or on a single step's meta-gradient, never on an accumulated
+# level, so neither saturates and neither collapses.
+#
+# -----------------------------------------------------------------------------
+# THE DESIGN.  18 jobs, ONE submission, so BATCH -- the unit of replication
+# (F(62,85)=5.47, p 6.9e-13) -- is held constant and every contrast is WITHIN
+# this batch.  Six arms x seeds {0,1,2}, all at
+#   ResNet18 / CIFAR-10 / layerwise (m=62) / SGDm + Lion / alpha0 1e-6 /
+#   meta-stepsize 1e-3 / 100 epochs / batch 100 / gamma 1 /
+#   BETA_CLIP -15:-2.3026 / AUGMENT=1 / PROBE=0 / EB_LOG=500.
+#
+#   lay   HIER unset                  THE NO-OP CONTROL.
+#   a1    HIER=additive ETA_RATIO=1   THE IDENTITY CONTROL.
+#   a06   HIER=additive ETA_RATIO=0.06  THE MANIFOLD (the archived argmax).
+#   ebjs  HIER=ebjs                   PRIMARY, rho inherited (0.99).
+#   ebjr  HIER=ebjs EB_RHO=0.9        ROBUSTNESS of the noise estimator.
+#   ebjz  HIER=ebjz                   SECONDARY, descriptive only.
+#
+# -----------------------------------------------------------------------------
+# PRE-REGISTERED.  plateau5 = mean of the LAST 5 test epochs is PRIMARY; the CSV
+# `plateau` column (last 20) is BANNED as primary and `best_test` is not a
+# plateau at all.
+#
+#   LIFT = mean plateau5(ebjs) - mean plateau5(a1)
+#   GAP  = mean plateau5(a06)  - mean plateau5(ebjs)
+#
+#   SUCCESS  LIFT >= 1.16 pp AND GAP <= 0.58 pp
+#   FAILURE  LIFT <= 0.30 pp
+#   PARTIAL  anything strictly between, and it is reported as PARTIAL.
+#
+# WHERE THE BARS COME FROM.  TUNED = archived mean(r=0.06) - archived mean(r=1)
+# = 2.314 pp.  SUCCESS_LIFT_BAR = 0.50 * TUNED = 1.16; SUCCESS_GAP_BAR =
+# 0.25 * TUNED = 0.58.  Neither is chosen; both are halves and quarters of a
+# measured quantity, and the scorer's selftest re-derives them.
+# SIGMA_W = 0.1438 pp is the pooled WITHIN-CELL SD of plateau5 over the ten
+# archived additive r-cells (df 47).  SE of a 3-seed mean = 0.0830 pp; SE of a
+# difference = 0.1174 pp.  FAILURE_BAR = 0.30 pp is 2.56 SE of that difference.
+# MANIFOLD_BAR = 0.50 pp and G1_BAND = 0.45 pp.
+#
+# -----------------------------------------------------------------------------
+# THE GATES, IN ORDER.  Full text in analysis/cG16_eb_score.py.
+#   G0  PROVENANCE, absolutely gating, from each run's OWN ARGS/ENV line.
+#   G1  THE NO-OP CONTROL: `lay` reproduces the archived plain layerwise and
+#       `a1` the archived additive r=1, each within 0.45 pp.  A miss means the
+#       patch changed behaviour when OFF -> VOID-PATCHBROKE.
+#   G2  THE MANIFOLD GATE: a06 - a1 >= 0.50 pp in THIS batch.
+#   G3  THE ESTIMATOR'S OWN OUTPUT: rhat against [0.03, 0.10].  Descriptive.
+#   G4  THE PRIMARY: LIFT and GAP against the registered bars.
+#
+# MAY NOT CLAIM: anything about ResNet50, CIFAR-100, Tiny-ImageNet, alpha0 other
+# than 1e-6, meta-stepsize other than 1e-3, a granularity other than layerwise,
+# a budget other than 100 epochs, or the z-space mode's accuracy against a tuned
+# z-space optimum (which does not exist in the corpus).
+#
+# USAGE   bash bin/cG16_eb_batch.sh            # dry run, prints all 18 lines
+#         bash bin/cG16_eb_batch.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+# Nothing may leak from the submitting shell into --export=ALL.  The `lay` arm
+# is defined by HIER being UNSET; a stray HIER here would silently void it.
+unset HIER LAM ETA_RATIO EB_RHO EB_LOG SCHED SCHED_TOTAL SCHED_WARMUP SCHED_MIN 2>/dev/null || true
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/eb1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+
+# ---- venv activation preamble.  Guards that import torch fail without it;
+# ---- five consecutive submission aborts were caused by omitting this.
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# shellcheck disable=SC1090
+. "$(dirname "$0")/_lib_guards.sh"
+# _lib_guards.sh re-derives WS from METAOPT_WS; re-assert ours regardless.
+WS=$METAOPT_WS
+
+PREFIX=eb1
+NET=ResNet18; DSET=CIFAR10; GRAN=layerwise
+ALPHA0=1e-6; MS=1e-3; EPOCHS=100; BATCH=100; GAMMA=1
+CLIP="-15:-2.3026"; AUG=1; PROBE=0; EBLOG=500
+M_LAYERWISE=62
+SEEDS="0 1 2"
+ARMS="lay a1 a06 ebjs ebjr ebjz"
+NJOBS=18
+SIGMA_W=0.1438
+SUCCESS_LIFT_BAR=1.16; SUCCESS_GAP_BAR=0.58; FAILURE_BAR=0.30
+MANIFOLD_BAR=0.50; G1_BAND=0.45
+SCORER="$REPO/analysis/cG16_eb_score.py"
+EQUIV="$REPO/analysis/cG16_noop_equiv.py"
+# sha256 of analysis/cG16_eb_score.py at the commit that registered it.  RULE 16:
+# the scorer is run UNEDITED.  Guard 1c refuses to submit if it has moved.
+SCORER_SHA256=6a4025760c3befc5d916f01b76b1fdd68ffbcdf4526614e35c678f910821846f
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+# WALL measured, not guessed: the 63 archived account_b runs at EXACTLY this cell
+# (R18/CIFAR10/layerwise/alpha0=1e-6/ms=1e-3/SGDm+Lion/AUGMENT=1/100 ep) read
+# p50 31 min, p90 77, max 78.  78 x 1.5 = 117 min.  Over-provisioning gets you
+# priority-starved: a 10 h wall sat unschedulable for a week where 7 h ran.
+WALL=02:00:00
+
+echo "=============================================================="
+echo " eb1 -- DIAL-FREE EMPIRICAL-BAYES / JAMES-STEIN SHRINKAGE (G16)"
+echo " arms {$ARMS} x seeds {$SEEDS} = $NJOBS jobs"
+echo " $NET/$DSET/$GRAN m=$M_LAYERWISE  alpha0 $ALPHA0  ms $MS  box $CLIP"
+echo " AUGMENT=$AUG PROBE=$PROBE EB_LOG=$EBLOG  wall $WALL"
+echo " bars: SUCCESS LIFT>=$SUCCESS_LIFT_BAR & GAP<=$SUCCESS_GAP_BAR;"
+echo "       FAILURE LIFT<=$FAILURE_BAR; manifold>=$MANIFOLD_BAR; G1 band $G1_BAND"
+echo " account $USER_NAME   WS $WS"
+echo "=============================================================="
+
+CSVP="$REPO/results/all_runs.csv"
+
+# ---- GUARD -1 -- THE ACCOUNT.  cluster_b ONLY. -------------------------------
+if [ "$USER_NAME" != "account_b" ]; then
+  guard_fail "guard -1: this batch may ONLY be submitted as account_b (cluster_b); \
+running as '$USER_NAME'.  108 jobs are live on the other account."
+else
+  echo "guard -1: running as account_b (cluster_b)"
+fi
+
+# ---- GUARD 0 -- the corpus is where we think it is -------------------------
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- GUARD 1 -- STANDING RULE 21: the scorer exists and passes its selftest -
+guard_scorer_registered "$SCORER" || guard_fail "guard 1: no registered scorer"
+python3 "$SCORER" --selftest --csv "$CSVP" >/tmp/eb1_selftest.$$ 2>&1
+if tail -1 /tmp/eb1_selftest.$$ | grep -q PASS; then
+  echo "guard 1: scorer selftest $(tail -1 /tmp/eb1_selftest.$$)"
+else
+  echo "--- scorer selftest output ---"; cat /tmp/eb1_selftest.$$
+  guard_fail "guard 1: the registered scorer's selftest does not pass"
+fi
+rm -f /tmp/eb1_selftest.$$
+
+# ---- GUARD 1c -- RULE 16: the scorer is UNEDITED since registration --------
+LIVE_SHA="$( (sha256sum "$SCORER" 2>/dev/null || shasum -a 256 "$SCORER" 2>/dev/null) | awk '{print $1}')"
+if [ "$LIVE_SHA" = "$SCORER_SHA256" ]; then
+  echo "guard 1c: scorer sha256 matches its registration ($SCORER_SHA256)"
+else
+  guard_fail "guard 1c: scorer sha256 is $LIVE_SHA, registered $SCORER_SHA256 \
+-- the scorer has been edited since it was committed (RULE 16)"
+fi
+
+# ---- GUARD 1d -- THE NO-OP PROOF, RUN HERE, NOT ASSERTED -------------------
+# 919 runs live on this account and 2,177 rows are in the CSV.  All of them were
+# produced by the HF.py this patch edits.  The proof is bitwise: the pre-patch
+# and post-patch files are loaded as two modules in ONE process and the full
+# optimiser state is hashed after identical fixed-seed step sequences, across
+# every pre-existing HIER setting.  No PASS here, no submission.
+PRE="$CIF/Optimizers/HF.py.bak_ebjs"
+POST="$CIF/Optimizers/HF.py"
+PINNED=${PINNED_HF:-$WS/hmo-g16/patches/HF_pinned_d3202635.py}
+if [ ! -f "$PRE" ]; then
+  guard_fail "guard 1d: no $PRE -- patches/patch_ebjs.py has not been applied"
+else
+  PINARG=""; [ -f "$PINNED" ] && PINARG="--pinned $PINNED"
+  # shellcheck disable=SC2086
+  python3 "$EQUIV" --pre "$PRE" --post "$POST" --cifar "$CIF" $PINARG \
+      >/tmp/eb1_equiv.$$ 2>&1
+  if grep -q "^VERDICT: PASS" /tmp/eb1_equiv.$$; then
+    echo "guard 1d: NO-OP PROOF PASS -- $(grep -c ' SAME ' /tmp/eb1_equiv.$$) \
+identical comparisons"
+    grep -E "^  (pre|post|pinned|net)|SAME|DIFFER|inert_on_pre" /tmp/eb1_equiv.$$ | sed 's/^/         /'
+  else
+    echo "--- equivalence harness output ---"; cat /tmp/eb1_equiv.$$
+    guard_fail "guard 1d: PATCH_EBJS is NOT a no-op when disabled.  Nothing may \
+be submitted and the patch must be reverted from $POST."
+  fi
+  rm -f /tmp/eb1_equiv.$$
+fi
+
+# ---- GUARD 2 -- THE PREMISE, re-derived on the live CSV --------------------
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2: premise"
+import csv, sys, statistics, collections
+NET,DSET,GRAN,A0,MS,CLIP,AUG,EP="ResNet18","CIFAR10","layerwise","1e-6","1e-3","-15:-2.3026","1","100"
+def keep(r):
+    return (r["network"]==NET and r["dataset"]==DSET and r["granularity"]==GRAN
+        and r["alpha0"]==A0 and r["meta_stepsize"]==MS and r["base"]=="SGDm"
+        and r["meta"]=="Lion" and r["beta_clip"]==CLIP and r["augment"]==AUG
+        and r["epochs_requested"]==EP and r["collapsed"]=="0"
+        and r["complete"]=="1" and r["window_ok"]=="1" and r["plateau5"])
+rows=[r for r in csv.DictReader(open(sys.argv[1]))]
+cell=[r for r in rows if keep(r)]
+add=collections.defaultdict(list); plain=[]
+for r in cell:
+    if r["hier"]=="additive": add["%g"%float(r["eta_ratio"])].append(float(r["plateau5"]))
+    elif (r["hier"] or "")=="": plain.append(float(r["plateau5"]))
+assert add, "no archived additive r-curve at this cell"
+means={k:statistics.mean(v) for k,v in add.items()}
+arg=max(means, key=lambda k: means[k])
+print("guard 2: archived plain layerwise %.3f (n=%d)"%(statistics.mean(plain),len(plain)))
+for k in sorted(means, key=float):
+    print("guard 2: archived additive r=%-5s %.3f (n=%d)"%(k,means[k],len(add[k])))
+assert arg=="0.06", "the archived argmax is r=%s, not 0.06; re-derive the design"%arg
+tuned=means["0.06"]-means["1"]
+print("guard 2: TUNED lift = %.3f pp; SUCCESS bars are %.2f (half) and %.2f (quarter)"
+      %(tuned, 0.5*tuned, 0.25*tuned))
+assert abs(0.5*tuned-1.16)<=0.01 and abs(0.25*tuned-0.58)<=0.01, "the bars have drifted"
+band=sorted(float(k) for k in means if means[k]>=means[arg]-0.70)
+print("guard 2: GOOD_BAND [%g, %g] over %s"%(min(band),max(band),band))
+assert 0.0 not in band and 1.0 not in band, "the band includes an endpoint; it would be trivial"
+n=sum(1 for r in rows if r["hier"] in ("ebjs","ebjz"))
+print("guard 2: %d ebjs/ebjz rows already in the corpus"%n)
+assert n==0, "eb1-style runs already exist; this is not a first registration"
+PYEOF
+
+# ---- GUARD 3 -- m MEASURED on the LIVE tree, not declared ------------------
+python3 - "$CIF" "$NET" "$ALPHA0" "$GRAN" "$M_LAYERWISE" <<'PYEOF' || guard_fail "guard 3: beta allocation"
+import sys, os
+cif, net, a0, gran, want = sys.argv[1:6]
+sys.path.insert(0, cif); sys.path.insert(0, os.path.join(cif, "Optimizers"))
+try:
+    import torch
+    from build_network import build_network
+    from HF import HF
+except Exception as ex:
+    sys.exit("GUARD FAIL: cannot import the LIVE tree (%s) -- run on the cluster "
+             "inside the venv." % ex)
+class NW:
+    def add_scalar(self, *a, **k): pass
+B = {"alg": "SGD", "weight_decay": 0.1}
+M = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99,
+     "Lion_beta2": 0.9, "weight_decay": 0}
+torch.manual_seed(0)
+opt = HF(build_network(net, "cpu"), stepsize_groups=gran, alpha0=float(a0),
+         args_base=dict(B), args_meta=dict(M), gamma=1, writer=NW())
+m = sum(int(b.numel()) for b in opt.beta)
+assert m == int(want), "m(%s) is %d, registered %s" % (gran, m, want)
+print("guard 3: %s on %s ALLOCATED beta m=%d (registered %s)" % (gran, net, m, want))
+print("guard 3: m-3 = %d, so the positive-part James-Stein form is defined" % (m - 3))
+PYEOF
+
+# ---- GUARD 3b -- the operator in the LIVE tree IS the registered arithmetic -
+python3 - "$CIF" <<'PYEOF' || guard_fail "guard 3b: operator arithmetic"
+import sys
+src = open(sys.argv[1] + "/Optimizers/HF.py").read()
+assert "PATCH_EBJS" in src, "PATCH_EBJS is not in the live HF.py"
+assert "PATCH_HIER" in src and "PATCH_ZMPOOL" in src, "the tree is not the pinned lineage"
+for need in ["c = ((m - 3) * s2 / (ss + self.epsilon)).clamp(0.0, 1.0)",
+             "r = 1.0 - c",
+             "self._ebjs_var = rho * self._ebjs_var + (1.0 - rho) * d * d",
+             "self._ebjs_mean = rho * self._ebjs_mean + (1.0 - rho) * x",
+             "bc = 1.0 - rho ** self._ebjs_t",
+             "self.beta[0] = self._beta_prev + dm + r * (d - dm)",
+             "elif self._hier == 'ebjz':  # PATCH_EBJS"]:
+    assert need in src, "the live estimator does not read: %s" % need
+i = src.index("def _apply_hier")
+body = src[i:i + 2600]
+assert "self._beta_prev + dm + self._hier_ratio * (d - dm)" in body, \
+    "the pre-existing additive branch has been altered"
+print("guard 3b: the LIVE estimator is the registered positive-part James-Stein rule")
+print("guard 3b: the pre-existing additive branch is byte-identical, so r=1 is")
+print("guard 3b: still the arithmetic identity and G1 is a real control")
+PYEOF
+
+# ---- GUARD 3c -- PROVENANCE: the runner must ECHO the new env vars ---------
+if grep -q 'EB_RHO=' "$RUNNER" && grep -q 'EB_LOG=' "$RUNNER"; then
+  echo "guard 3c: $RUNNER echoes EB_RHO and EB_LOG on its ENV line"
+else
+  guard_fail "guard 3c: $RUNNER does not echo EB_RHO/EB_LOG, so the scorer's G0 \
+cannot verify each run's own provenance (RULE 20)"
+fi
+
+# ---- GUARD 4 -- no name collision ------------------------------------------
+if grep -q "^$PREFIX-" "$CSVP"; then guard_fail "guard 4: $PREFIX-* already in the CSV"
+else echo "guard 4: no $PREFIX-* name collision in the corpus"; fi
+if ls "$WS/runs"/${PREFIX}-*.out >/dev/null 2>&1; then
+  guard_fail "guard 4b: $WS/runs already holds $PREFIX-*.out"
+else echo "guard 4b: no $PREFIX-*.out under $WS/runs"; fi
+
+# ---- GUARD 5 -- room and queue ---------------------------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free; pending=$PEND, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+# ---- compose, check EVERY line, then (maybe) submit ------------------------
+DESIGN=(alg-base=SGDm alg-meta=Lion dataset=$DSET NN-name=$NET \
+        stepsize-groups=$GRAN alpha0=$ALPHA0 num-epochs=$EPOCHS \
+        batch-size=$BATCH gamma=$GAMMA meta-stepsize=$MS)
+
+arm_env() {   # the ONLY thing that differs between arms
+  case "$1" in
+    lay)  echo "" ;;
+    a1)   echo ",HIER=additive,ETA_RATIO=1" ;;
+    a06)  echo ",HIER=additive,ETA_RATIO=0.06" ;;
+    ebjs) echo ",HIER=ebjs" ;;
+    ebjr) echo ",HIER=ebjs,EB_RHO=0.9" ;;
+    ebjz) echo ",HIER=ebjz" ;;
+    *)    echo "BADARM"; return 1 ;;
+  esac
+}
+
+mkdir -p "$SAVE"
+N=0; REJ=0; NCHK=0
+for S in $SEEDS; do
+ for A in $ARMS; do
+   AENV="$(arm_env "$A")" || guard_fail "guard 6: unknown arm $A"
+   case "$AENV" in *BADARM*) guard_fail "guard 6: unknown arm $A"; continue;; esac
+   RN="$PREFIX-$A-s${S}"
+   CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=14G --time=$WALL \
+--export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP,SCHED=none,PROBE=$PROBE,EB_LOG=$EBLOG$AENV \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 \
+--Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset $DSET --NN-name $NET \
+--batch-size $BATCH --max-time 999:00:00 --gamma $GAMMA --meta-stepsize $MS \
+--alpha0 $ALPHA0 --num-epochs $EPOCHS --stepsize-groups $GRAN --seed $S \
+--save-directory $SAVE --run-name $RN"
+
+   # STANDING RULE 20, BEFORE sbatch: no repeated flag anywhere on the line, and
+   # the effective value of every declared design flag is what we declared.
+   guard_presubmit "$CMD" "${DESIGN[@]}" seed="$S" run-name="$RN" \
+      >/tmp/eb1_pre.$$ 2>&1 || { echo "--- $RN ---"; cat /tmp/eb1_pre.$$; \
+      guard_fail "guard 6: $RN failed the pre-submission ARGS check"; }
+   NCHK=$((NCHK+1))
+   rm -f /tmp/eb1_pre.$$
+
+   if [ "$SUBMIT" = 1 ] && [ "$FAIL" = 0 ]; then
+     eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+   else
+     echo "$CMD"
+     N=$((N+1))
+   fi
+ done
+done
+
+echo "guard 6: $NCHK/$NJOBS composed command lines passed the RULE 20 pre-check"
+[ "$NCHK" = "$NJOBS" ] || guard_fail "guard 6: only $NCHK of $NJOBS lines checked"
+
+if [ "$FAIL" = 1 ]; then
+  echo "!!! SUBMIT ABORTED -- guards failed."
+  [ "$SUBMIT" = 1 ] && echo "!!! If any job was already accepted, scancel --name by prefix $PREFIX-."
+  exit 2
+fi
+
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -q "^$PREFIX-" "$REPO/bin/PROTECTED.txt" 2>/dev/null || \
+    echo "$PREFIX-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- $PREFIX- added to bin/PROTECTED.txt; no trim may cancel it ----"
+  # STANDING RULE 20, AFTER launch: read the FIRST RUN'S OWN ARGS line and abort
+  # the batch on any mismatch.  jobs/run_cifar.sh carries
+  #   #SBATCH --output=/cluster/account_b/metaopt/runs/%x-%j.out
+  # so the .out files land in $WS/runs, NOT in --save-directory.
+  guard_postlaunch "$WS/runs" "$PREFIX-" "${DESIGN[@]}" || {
+    echo "!!! THE LAUNCHED BATCH IS VOID AS DESIGNED.  Cancel it now."
+    exit 2; }
+  echo "---- score with:  python3 analysis/cG16_eb_score.py --runs $WS/runs"
+fi

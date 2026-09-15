@@ -1,0 +1,75 @@
+set -u
+cd /cluster/account_b/metaopt
+R=/cluster/account_b/metaopt/runs
+P="gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g"
+C="BETA_CLIP=-15:-2.3026"
+SUB=jobs/run_cifar.sh
+LIONMETA="--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0"
+B_ADAM="--optimizer HF --alg-base AdamW --momentum-param-base 0.9 --normalizer-param-base 0.999 --weight-decay-base 0.1"
+mkdir -p $R/aprobe $R/again
+
+# ===========================================================================
+# CYCLE 28 -- the AGREEMENT LADDER UNDER AdamW, and the gain ladder that must
+# mirror it.  Provoked by `gate2`, an Aug-18 probe batch that had never been
+# reduced (zero mentions in FINDINGS or CORRECTIONS until this cycle).
+#
+# What gate2 says, on the legacy z_mean statistic, R18/C10, a0=1e-6, 100ep, n=3:
+#     base=SGDm  (gate1) : m=6 63.65+-0.55  ->  m=62 54.69+-1.23   FALLS
+#     base=AdamW (gate2) : m=6 71.20+-2.55  ->  m=62 79.96+-1.82   RISES
+# i.e. the monotone fall of sign-agreement with partition fineness -- 26.3's
+# mechanism, and the thing the paper leans on -- INVERTS under AdamW.  If that
+# holds on the frac_neg statistic it is the mechanism for H4's null, which the
+# campaign has had as a bare fact since cycle 12.
+#
+# Two caveats this batch removes: gate1/gate2 differ in the META optimizer too
+# (Lion vs Adam), and the legacy probe format carries no frac_neg, so gate2's
+# numbers are NOT on the published ladder's scale (they disagree by 7pp at m=6;
+# CORRECTIONS 18).  Everything below holds meta=Lion fixed and writes the
+# modern probe format.
+#
+# PRE-REGISTERED.
+#   PREDICTED (a): AdamW agreement at m=62 EXCEEDS AdamW agreement at m=6,
+#     on frac_neg, in `ap-*` + the already-queued `bp-adamw-s*` layerwise rung.
+#   PREDICTED (b): since 26.3 asserts the M1 gain runs OPPOSITE to agreement,
+#     the AdamW gain must FALL from m=6 to m=11.17M -- the reverse of the SGDm
+#     ordering `gp-*` is measuring right now.
+#   FALSIFIED IF: the AdamW agreement ladder falls with fineness like SGDm's
+#     (gate2 is then an artifact of the z_mean statistic), OR agreement and
+#     gain both rise with fineness (26.3 is then not a mechanism).
+# ===========================================================================
+
+# --- A. `ap-*`: AdamW agreement ladder, p7/bp config exactly (a0=1e-3, 20ep,
+#     free adaptation, PROBE=100).  Layerwise is NOT submitted -- `bp-adamw-s*`
+#     already runs that cell at this identical config (gotcha: grep the config,
+#     not the run-name prefix).
+prb(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=01:30:00 \
+  --export="ALL,AUGMENT=1,$C,PROBE=100,PROBE_DIR=$R/aprobe/$1" $SUB $B_ADAM $LIONMETA \
+  --dataset CIFAR10 --NN-name ResNet18 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize 1e-3 --alpha0 1e-3 --num-epochs 20 --stepsize-groups $2 --seed $3 \
+  --save-directory $R/aprobe --run-name $1 >/dev/null; }
+for s in 0 1 2; do
+  prb ap-blk6-s$s resnet18_blocks $s
+  prb ap-node-s$s nodewise        $s
+  prb ap-w-s$s    weightwise      $s
+done
+echo "AP=$(squeue -h -u account_b -o '%j' | grep -c '^ap-')"
+
+# --- B. `ag-*`: AdamW M1 r-curve at each granularity.  Mirrors `sub_gp.sh`
+#     field for field (a0=1e-6, 100ep, HIER=additive, LAM unset == LAM=0 per
+#     HF.py:24) with ONLY the base optimizer changed, so gp-vs-ag is a clean
+#     one-variable contrast.  r=1 is the identity control and must reproduce
+#     the plain AdamW arms.  Layerwise is covered by the queued `bo-adamw-r*`.
+gain(){ sbatch --parsable --job-name=$1 --partition=$P --gres=gpu:1 --cpus-per-task=6 --mem=14G --time=03:50:00 \
+  --export=ALL,AUGMENT=1,$C,HIER=additive,ETA_RATIO=$3 $SUB $B_ADAM $LIONMETA \
+  --dataset CIFAR10 --NN-name ResNet18 --batch-size 100 --max-time 999:00:00 --gamma 1 \
+  --meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups $2 --seed $4 \
+  --save-directory $R/again --run-name $1 >/dev/null; }
+for spec in "blk6:resnet18_blocks" "node:nodewise" "w:weightwise"; do
+  tag=${spec%%:*}; g=${spec#*:}
+  for rs in "0:r0" "0.06:r006" "1:r1"; do
+    r=${rs%%:*}; rt=${rs#*:}
+    for s in 0 1 2; do gain ag-$tag-$rt-s$s $g $r $s; done
+  done
+done
+echo "AG=$(squeue -h -u account_b -o '%j' | grep -c '^ag-')"
+echo "TOTAL_cluster_b=$(squeue -h -u account_b | wc -l)"

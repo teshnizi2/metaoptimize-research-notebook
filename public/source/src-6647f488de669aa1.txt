@@ -1,0 +1,323 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 57 -- `rs-w`, CORRECTED.  Does per-weight granularity FAIL STRUCTURALLY,
+# or does it recover under tuning?  PLAN.md D2's fork.
+# cluster_a (account_a).  18 jobs.  Tag `rw9-*`.
+#
+# WRITTEN WHILE cluster_a WAS DOWN (FINDINGS 57.0) AND NOT SUBMITTED.  Both login
+# nodes were unreachable for the whole of cycles 55, 56 and 57; this batch is
+# registered now so the next tick submits rather than designs.  Its own guards
+# re-check every precondition at submit time.
+#
+# WHY THIS REPLACES `bin/c40_surface.sh`'s TIER 2 RATHER THAN RESUBMITTING IT.
+#
+#   CORRECTIONS 85 (cycle 56) ranked the 12 unrun `rs-w-*` jobs as the highest-
+#   value resubmission on reconnect.  The RANKING is right and is kept.  The
+#   GRID is not, and cycle 57 found why.
+#
+#   c40_surface.sh:85 specifies  rs-w  over  ms = 3e-4 / 1e-3 / 3e-3 / 1e-2.
+#   FINDINGS 57.2 measured, on the config-matched 100-epoch pool, that EVERY
+#   other arm peaks at ms = 1e-4:
+#
+#       arm                peak     @ms      pp lost per decade ABOVE the peak
+#       scalar            92.231    1e-4     5.871
+#       resnet18_blocks   92.581    1e-4     1.060
+#       layerwise         92.795    1e-4     1.801
+#       nodewise          92.547    1e-3     2.593  (n=1 cells)
+#
+#   **`rs-w`'s grid STARTS at 3e-4 -- entirely above that optimum.**  As written
+#   it can measure weightwise's FALLOFF and cannot measure its PEAK HEIGHT, and
+#   peak height is the whole of D2.  A result from the original grid would have
+#   had to be compared against the tuned peak row it never sampled.  That is
+#   FINDINGS 57.3's W-C, and it is why 12 jobs became 18 rather than being
+#   resubmitted as specified.
+#
+#   THE GRID HERE IS THE ORIGINAL FOUR PLUS THE TWO THAT BRACKET THE OPTIMUM:
+#       3e-5   1e-4   3e-4   1e-3   3e-3   1e-2
+#       ^^^^   ^^^^   -- added; 1e-4 is where every other arm peaks and 3e-5
+#                        brackets it from below so the peak is INTERIOR
+#                        (CORRECTIONS 25: an edge maximum is not a peak).
+#
+# WHAT IS ALREADY KNOWN, AND IT IS ONE RUN.
+#   `kt2_ww_a1e-3_s0` is the ONLY matched 100-epoch plain weightwise run in the
+#   corpus at R18/CIFAR10/SGDm+Lion/alpha0=1e-3/AUGMENT=1/BETA_CLIP=-15:-2.3026:
+#
+#       plateau = 90.913, n=1, at ms=1e-3
+#
+#   FINDINGS 57.3 places it against the config-matched ms=1e-3 column:
+#       nodewise 92.547(1) > blk6 91.560(5) > layerwise 91.097(14) >
+#       **weightwise 90.913(1)** > scalar 87.758(14)
+#   -- 4th of 5, above scalar only, and 1.32-1.88pp BELOW every arm's tuned peak.
+#
+#   CORRECTIONS 85 read the same run as "+3.10pp above the surface's own scalar
+#   cell".  That comparison is against `scalar @ ms=1e-3`, which 57.2 shows is
+#   **scalar's WORST cell on the entire grid** (4.47pp below scalar's own peak),
+#   sitting in exactly the over-large-ms regime where scalar collapses and no
+#   partitioned arm does.  The fork survives, but NOT on that number.
+#
+#   IT SURVIVES ON THIS ONE: at ms=1e-3 weightwise (90.913) and layerwise
+#   (91.097) differ by **0.18pp**, inside layerwise's own seed sd at that cell.
+#   At the one ms where they can be compared, weightwise behaves like a
+#   PARTITIONED arm, not a collapsing one.  n=1.  Nothing may cite it.
+#
+# PRE-REGISTERED PREDICTIONS -- score against these, not against what lands.
+#
+#   (P0) VALIDITY.  epochs_done == 100 == epochs_requested on EVERY job.
+#        **THIS GATE IS NEW AND IT EXISTS BECAUSE OF FINDINGS 57.1.**  The c40
+#        surface silently mixed 12 truncated runs into its blk6 and nodewise
+#        rows -- 46% and 60% of those arms, 0% of scalar and layerwise -- and
+#        the depression was monotone in severity (24ep -> 76.81, 29ep -> 78.73,
+#        36ep -> 82.18).  A truncated run's `plateau` is a plateau at
+#        `epochs_done`.  **ANY job with epochs_done < 100 is DROPPED, not
+#        down-weighted**, and if that leaves a cell at n=0 the cell is reported
+#        as MISSING, never as its surviving seed.
+#
+#   (P0.3) THE GUARD GATE, SCORED SECOND.  BETA_CLIP=-15:-2.3026 must be live.
+#        Unguarded weightwise at alpha0=1e-6 COLLAPSES to 10.0 in 10 of 10 runs
+#        in the corpus.  alpha0 here is 1e-3, where the one matched run reached
+#        90.913 -- but the guard is not optional and its presence is asserted.
+#        `collapsed` false and plateau > 40 per job; a failure voids that job.
+#
+#   (P1) THE PRIMARY TEST -- PEAK HEIGHT, scored only if P0/P0.3 pass.
+#        Weightwise's peak over the 6-point grid, as a cell MEAN over surviving
+#        seeds, against the tuned peak row (scalar 92.231+-0.170 n=5, blk6
+#        92.581+-0.040 n=2, layerwise 92.795+-0.159 n=5, nodewise 92.547 n=1).
+#        Welch t, and the peak must be INTERIOR (both neighbours measured).
+#
+#        W-A  peak >= 92.0 and interior
+#             -> **"per-weight granularity fails structurally" is FALSE.**
+#                D2 resolves to the tuning-budget branch.  Weightwise joins the
+#                tuned peak row and 57.2's "any partition suffices, finer buys
+#                nothing" extends to m = 11,173,962.
+#        W-B  peak <= 90.0, or falloff steeper than scalar's 5.871 pp/decade
+#             -> the structural-failure claim is TRUE **but scoped to weightwise
+#                alone**, since 57.2 shows m=6 already buys the whole robustness
+#                effect.  This is the branch that makes the claim writable.
+#        W-C  peak in (90.0, 92.0)  -> UNDECIDED.  Say so, price the extra seeds,
+#             do not round it to whichever branch the prose already prefers.
+#
+#        **NO DIRECTION IS REGISTERED.**  The single 90.913 point is consistent
+#        with W-A (it sits 0.18pp from layerwise at the same ms) and with W-B (it
+#        sits 1.88pp below layerwise's peak).  One run at one ms cannot choose,
+#        which is precisely why this batch is worth 18 jobs.  Inventing a
+#        direction now would be the uc5 failure mode (CORRECTIONS 68).
+#
+#   (P2) THE FALLOFF, reported regardless.  pp lost per decade above the peak,
+#        against the measured row above.  57.2's mechanism claim is that
+#        PARTITIONING buys tolerance to an over-large ms and that peak height is
+#        a separate, ~10x smaller effect; weightwise is the extreme partition and
+#        is the strongest available test of it.  A weightwise falloff at or under
+#        blk6's 1.060 pp/decade CONFIRMS 57.2; one above scalar's 5.871 REFUTES
+#        it and is W-B's second trigger.
+#
+#   (P3) THE ms=1e-3 CELL IS A REPLICATION, NOT A DISCOVERY.  It re-measures
+#        `kt2_ww_a1e-3_s0` at n=3.  90.913 +- seed noise confirms the corpus;
+#        a large departure means the two roots are not matched and P1 is void.
+#        **Registered here, before the batch runs, so it cannot be fitted after.**
+#
+# NOT INCLUDED, deliberately:
+#   * alpha0=1e-6.  57.3 fixed the operating point at the surface's own 1e-3.
+#     The 1e-6 weightwise runs reach 78.0-78.1 guarded and 10.0 unguarded; that
+#     axis is measured and is not this fork.
+#   * A 4th/5th seed.  n=3 against the ~0.17 pooled cell sd resolves a 0.5pp
+#     difference at >3 SE.  The UNDECIDED branch says what to do instead.
+#   * The 12 truncated `rs-blk6`/`rs-node` reruns.  Those restore n on cells
+#     that already have a surviving seed (57.1) and are a SEPARATE, lower-value
+#     batch -- ranked, not bundled, so this one stays inside the ~20-job rule.
+#   * Other networks/datasets.  R18/CIFAR-10 is where the whole tuned peak row
+#     lives; a peak height is only comparable against its own surface.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. P0, P0.3 above, run not assumed, PER JOB and IN THAT ORDER
+#   2. python3 analysis/c57_surface_truncation.py --selftest   (43/43)
+#   3. python3 analysis/c57_surface_truncation.py --audit      # rw9 must show 0 truncated
+#   4. Re-derive the tuned peak row from results/all_runs.csv, never quote it
+#      from this comment (STANDING RULE 1).
+#
+# USAGE
+#   bash c57_rsw_peak.sh            # dry run: prints every sbatch line
+#   bash c57_rsw_peak.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+WS=/cluster/account_a/metaopt                   # cluster_a -- the rs-* workspace
+RUNNER=$WS/jobs/run_cifar.sh
+HF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/Optimizers/HF.py
+SAVE=$WS/runs/rw9
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+USER_NAME=account_a
+PEND_CAP=40
+NJOBS=18
+CLIP=-15:-2.3026               # the c40 surface's guard; NOT optional for weightwise
+EPOCHS=100
+WALL=03:50:00                  # c40's own request; guard 7 checks it against throughput
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+echo "=== c57 rs-w CORRECTED -- weightwise PEAK HEIGHT, the D2 fork (cluster_a) ==="
+echo "    grid ms = 3e-5 1e-4 3e-4 1e-3 3e-3 1e-2   seeds 0-2   alpha0=1e-3   ${EPOCHS}ep"
+echo "    c40's rs-w grid started at 3e-4, ABOVE the 1e-4 optimum every other arm peaks at"
+echo "    tuned peak row to beat: scal 92.231 / blk6 92.581 / lay 92.795 / node 92.547"
+echo "    the ONE matched weightwise run: kt2_ww_a1e-3_s0 = 90.913 (n=1, ms=1e-3)"
+echo
+
+# GUARD 1 -- the runner and the optimizer source exist and compile.
+[ -r "$RUNNER" ] || { echo "GUARD FAIL: $RUNNER not readable"; exit 1; }
+[ -r "$HF" ]     || { echo "GUARD FAIL: $HF not readable"; exit 1; }
+echo "guard 1: runner and HF.py readable  OK"
+
+python3 -c "import py_compile; py_compile.compile('$HF', doraise=True)" 2>/dev/null || {
+  echo "GUARD FAIL: $HF does not compile"; exit 1; }
+echo "guard 2: HF.py compiles  OK"
+
+# GUARD 3 -- "the same operating point as the c40 surface" is a CLAIM and is
+# DIFFED against c40_surface.sh itself, never asserted (the uc5 lesson, C71).
+# A peak height is only comparable against the surface it is being compared to.
+C40=$(dirname "$0")/c40_surface.sh
+if [ -r "$C40" ]; then
+  for f in "BETA_CLIP=-15:-2.3026" "--alpha0 1e-3" "--num-epochs 100" \
+           "--dataset CIFAR10" "--NN-name ResNet18" "--batch-size 100" "--gamma 1" \
+           "--alg-base SGDm" "--momentum-param-base 0.99" "--weight-decay-base 0.1" \
+           "--alg-meta Lion" "--momentum-param-meta 0.99" "--Lion-beta2-meta 0.9" \
+           "AUGMENT=1"; do
+    grep -q -- "$f" "$C40" || {
+      echo "GUARD FAIL: '$f' absent from c40_surface.sh -- operating point NOT matched"; exit 1; }
+  done
+  echo "guard 3: operating point byte-matches the c40 surface (14 fields)  OK"
+else
+  echo "GUARD FAIL: c40_surface.sh not readable -- cannot diff the operating point"; exit 1
+fi
+
+# GUARD 3b -- THE REASON THIS BATCH EXISTS, asserted against c40 rather than
+# claimed in prose: c40's rs-w grid must NOT contain 1e-4, and this one must.
+if grep -A3 'boundary case' "$C40" | grep -q '1e-4:1e4'; then
+  echo "GUARD FAIL: c40's rs-w grid already contains 1e-4 -- FINDINGS 57.3's W-C is wrong,"
+  echo "            re-read the surface before spending 18 jobs"; exit 1
+fi
+echo "guard 3b: c40's rs-w grid does NOT contain 1e-4 -- the gap this batch fills is real  OK"
+
+# GUARD 4 -- the design arithmetic, re-run rather than trusted to the comment.
+python3 - <<'PYEOF' || exit 1
+# The tuned peak row, re-derived in FINDINGS 57.2 from the config-matched pool.
+peak = {"scalar": (92.231, 1e-4), "resnet18_blocks": (92.581, 1e-4),
+        "layerwise": (92.795, 1e-4), "nodewise": (92.547, 1e-3)}
+grid = [3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]
+c40_grid = [3e-4, 1e-3, 3e-3, 1e-2]
+# 1. every arm but nodewise peaks at 1e-4, and c40's rs-w grid misses it entirely.
+assert sum(ms == 1e-4 for _, ms in peak.values()) == 3, "the tuned peak row moved"
+assert 1e-4 not in c40_grid, "c40's rs-w grid already covers the optimum"
+assert 1e-4 in grid, "this grid does not cover the optimum either"
+# 2. the peak must be able to come out INTERIOR (CORRECTIONS 25).
+assert min(grid) < 1e-4 < max(grid), "1e-4 is not interior to this grid"
+assert grid[grid.index(1e-4) - 1] == 3e-5, "1e-4 is not bracketed from below"
+# 3. the W-A/W-B bars must straddle the one measured point, or the batch is rigged.
+one_run, W_A, W_B = 90.913, 92.0, 90.0
+assert W_B < one_run < W_A, "the 90.913 point does not sit between the branches"
+# 4. the branches must be decidable at n=3 against the pooled cell sd.
+sd, n = 0.170, 3
+se = sd * (2 / n) ** 0.5
+assert (W_A - one_run) / se > 2, "W-A is not resolvable at n=3"
+print(f"guard 4: grid covers 1e-4 (interior, bracketed by 3e-5); c40's did not; "
+      f"branches straddle 90.913; SE(n=3)={se:.3f} so a {W_A - one_run:.2f}pp "
+      f"move resolves at {(W_A - one_run) / se:.1f} SE  OK")
+PYEOF
+
+# GUARD 5 -- queue depth.  18 jobs is inside the ~20-job / 0.5%-RawUsage rule.
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: FairShare=${FS:-unknown} (informational), pending=$PEND, adding $NJOBS"
+if [ "$SUBMIT" = "1" ]; then
+  [ "$((PEND + NJOBS))" -le "$PEND_CAP" ] || {
+    echo "ABORT: $PEND pending + $NJOBS would exceed the $PEND_CAP cap"; exit 1; }
+fi
+
+# GUARD 6 -- THE WALL-CLOCK REQUEST MUST FIT THE TIGHTEST PARTITION IN $PARTS.
+# CORRECTIONS 71's failure mode, silent-until-total: sbatch rejects against the
+# SMALLEST MaxTime among the requested partitions, so one over-long --time loses
+# the WHOLE batch.  Read from `sinfo` LIVE, never from a comment (FINDINGS 54.6).
+python3 - "$WALL" "$PARTS" <<'PYEOF' || exit 1
+import subprocess, sys
+def secs(t):
+    d, _, rest = t.partition("-")
+    if not rest: rest, d = d, "0"
+    p = [int(x) for x in rest.split(":")]
+    while len(p) < 3: p.insert(0, 0)
+    return int(d) * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+want, parts = sys.argv[1], sys.argv[2].split(",")
+out = subprocess.run(["sinfo", "-h", "-o", "%P %l"], capture_output=True, text=True).stdout
+lim = {}
+for ln in out.split("\n"):
+    f = ln.split()
+    if len(f) == 2 and f[1] not in ("infinite", "n/a"):
+        lim[f[0].rstrip("*")] = secs(f[1])
+tight = [(p, lim[p]) for p in parts if p in lim]
+if not tight:
+    sys.exit("GUARD FAIL: sinfo returned no limit for any requested partition")
+name, cap = min(tight, key=lambda kv: kv[1])
+if secs(want) > cap:
+    sys.exit(f"GUARD FAIL: --time={want} exceeds {name}'s MaxTime "
+             f"({cap // 3600}:{cap % 3600 // 60:02d}) -- sbatch would reject the WHOLE batch")
+print(f"guard 6: --time={want} fits the tightest partition {name} "
+      f"({cap // 3600}:{cap % 3600 // 60:02d})  OK")
+PYEOF
+
+# GUARD 7 -- THROUGHPUT HEADROOM.  **NEW THIS CYCLE, AND IT ENCODES 57.1.**
+# The c40 surface lost 12 runs to truncation and their plateaus were read as
+# 100-epoch numbers.  Truncation there was node/preemption, not walltime -- but
+# the cheap check that the REQUESTED budget can physically finish inside the
+# REQUESTED wall time was never made, so make it, from measured throughput.
+python3 - "$WALL" <<'PYEOF' || exit 1
+import sys
+def secs(t):
+    p = [int(x) for x in t.split(":")]
+    return p[0] * 3600 + p[1] * 60 + p[2]
+# Measured over 168 ResNet18/CIFAR10 weightwise runs with usable wallclock
+# (analysis/c57_surface_truncation.py corpus, epochs_done >= 10):
+median_ep_per_min, slowest_ep_per_min, epochs = 2.174, 1.053, 100
+wall_min = secs(sys.argv[1]) / 60
+need_slow = epochs / slowest_ep_per_min
+if need_slow > wall_min:
+    sys.exit(f"GUARD FAIL: 100 weightwise epochs need {need_slow:.0f} min at the SLOWEST "
+             f"observed rate but --time is {wall_min:.0f} min -- this batch would truncate")
+print(f"guard 7: 100 weightwise epochs need {epochs / median_ep_per_min:.0f} min median / "
+      f"{need_slow:.0f} min slowest, against a {wall_min:.0f} min wall "
+      f"({wall_min / need_slow:.1f}x headroom on the slowest)  OK")
+PYEOF
+
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+# nice 0 = the peak region P1 needs; nice 100 = the far falloff P2 wants but can wait.
+for G in "3e-5:3e5:0" "1e-4:1e4:0" "3e-4:3e4:0" "1e-3:1e3:0" "3e-3:3e3:100" "1e-2:1e2:100"; do
+  MST=${G%%:*}; REST=${G#*:}; TAG=${REST%%:*}; NICE=${REST#*:}
+  for S in 0 1 2; do
+    RN="rw9-w-${TAG}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice="$NICE"
+      --export="ALL,AUGMENT=1,BETA_CLIP=$CLIP"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups weightwise --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+echo "reduce with, IN THIS ORDER:"
+echo "  1. P0    epochs_done == 100 PER JOB.  DROP any short job -- do not average it in."
+echo "           python3 analysis/c57_surface_truncation.py --audit   # rw9 must show 0"
+echo "  2. P0.3  BETA_CLIP live, collapsed false, plateau > 40, per job"
+echo "  3. P1    weightwise peak over the 6-point grid vs the RE-DERIVED tuned peak row;"
+echo "           peak must be INTERIOR.  >=92.0 W-A / <=90.0 W-B / else UNDECIDED."
+echo "  4. P2    pp lost per decade above the peak vs scal 5.871 / blk6 1.060 / lay 1.801"
+echo "  5. P3    the ms=1e-3 cell REPLICATES kt2_ww_a1e-3_s0 = 90.913; a large departure"
+echo "           means the roots are not matched and P1 is VOID"

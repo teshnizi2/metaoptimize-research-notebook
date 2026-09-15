@@ -1,0 +1,506 @@
+#!/bin/bash
+# =============================================================================
+# c78_degenerate_tail.sh -- `bn1`, IS THE MATCHED-COUNT PARTITION GAP THE
+# DEGENERATE SIZE-1 TAIL?
+# Runs on cluster_a ONLY (needs PATCH_CHUNKWISE and PATCH_NODEBN).
+# 9 jobs: {nodewise1d, chunk2325, nodewise} x seeds 0-2, ms=1e-4, 100 ep, probe ON.
+#
+# WHY THIS BATCH EXISTS
+#   cycle 78's `pp1` decomposed the matched-count partition gap and put ALL of it
+#   on one leg (CORRECTIONS 107.2/107.4, FINDINGS 77.1-77.3):
+#
+#     A  nodewise -> permnode  ALIGNMENT       -0.009 pp  t = -0.06   -> NULL
+#     B  permnode -> chunk777  SIZE DISTRIBUTION +0.590 pp  t = +5.53
+#     D  nodewise -> chunk777  both            +0.581 pp  t = +4.11   (mm1: +0.485)
+#
+#   So grouping BY ARCHITECTURE is worth nothing, and the group-size DISTRIBUTION
+#   is worth everything.  This batch asks WHAT ABOUT THE DISTRIBUTION.
+#
+#   MEASURED on the built ResNet18 (FINDINGS 77.6), not inferred:
+#
+#     nodewise size    1 :  9,610 groups = 66.64% of groups, covering 0.09% of weights
+#                  4,608 :  1,536 groups = 10.65% of groups, covering 63.34% of weights
+#
+#   Every ONE-DIMENSIONAL tensor -- 40 BatchNorm scales and shifts plus linear.bias,
+#   41 tensors holding 9,610 scalars -- has numel//shape[0] == 1, so nodewise gives
+#   each of those scalars its OWN step size.  **On ResNet18, "one step size per output
+#   channel" is two-thirds WEIGHTWISE meta-learning on the normalisation parameters,
+#   by group count.**  chunk777 gives each of those tensors ONE group, because every
+#   channel count on this net (64..512) is below 777.
+#
+#   That is the concrete difference the B leg is made of.  `nodewise1d` (PATCH_NODEBN,
+#   cycle 78) removes it and NOTHING else: nodewise on every tensor with ndim >= 2 --
+#   so the per-output-channel partition on every conv and linear WEIGHT MATRIX is left
+#   exactly in place -- and ONE group per 1-D tensor.
+#
+#     m(nodewise)   = 14,420
+#     m(nodewise1d) =  4,851
+#     m(chunk2325)  =  4,851   EXACTLY.  Found by search over K, verified from the
+#                              ALLOCATED beta by guard 4.  A PERFECT match, not mm1's
+#                              one-group-apart.
+#
+# THE THREE ARMS, ONE BATCH, ms=1e-4, seeds 0-2:
+#     n1d   nodewise1d  m= 4,851   channels on ndim>=2, one group per 1-D tensor
+#     c23   chunk2325   m= 4,851   uniform flat chunks, architecture-blind
+#     node  nodewise    m=14,420   the anchor: bitwise mm1's and pp1's nodewise arm
+#
+# THE PRE-REGISTERED GATES.  Nothing below may be edited after the data lands.
+#
+#   T0    VALIDITY.  n_records == 10000; beta moved; epochs_done == requested == 100.
+#   T0.2  n_beta EXACT on EVERY record: n1d 4851, c23 4851, node 14420.  Guard 4
+#         MEASURES all three from the ALLOCATED beta on the real built network before
+#         anything is submitted, and ALSO asserts m(c23) == m(n1d) exactly.
+#   T0.3  THE INSTRUMENT FIRED.  neg_counts.json, n_tot == n_beta, npy shape from its
+#         HEADER == (n_tot,).
+#   T0.4  BOX-FREE at BOTH guards, rec_-based 5% gate, PRIMARY and UNCHANGED.  All 9
+#         pp1 arms and all 6 mm1 arms read 0.0000 on all four columns in this SAME
+#         box, so a bind on n1d or c23 would be NEW and would be reported as such.
+#
+#   T1    **THE PRIMARY.  FIVE-WAY, SYMMETRIC, WITHIN-BATCH, MATCHED COUNT EXACTLY.**
+#         G = plateau5(chunk2325) - plateau5(nodewise1d).  Both arms m = 4,851.
+#         The bands are mm1's M1 bands and pp1's P2 bands, deliberately, so all three
+#         legs of this programme are read on ONE scale.
+#           [-0.15, +0.15] -> **THE DEGENERATE TAIL WAS THE CARRIER.**  The +0.53 pp
+#                matched-count gap COLLAPSES once nodewise's 9,610 size-1 groups are
+#                merged away, while the per-output-channel partition on every weight
+#                MATRIX is left in place.  This is a PRESCRIPTIVE result for the
+#                Adam-mini / Adalayer / SGG line: do not give each normalisation
+#                scalar its own step size; the rest of the architectural partition is
+#                fine.  **This is the outcome the batch is built to be able to see,
+#                and it is the NULL band -- so it cannot be reached by finding an
+#                effect, only by failing to.**
+#           (+0.15, +0.30] -> **UNDECIDED**, registered in advance.
+#           G >  +0.30      -> **THE GAP SURVIVES THE TAIL'S REMOVAL.**  Uniform still
+#                beats architecture-aligned at matched count with the degenerate
+#                groups gone, so size HETEROGENEITY as such -- not the degenerate tail
+#                -- is the carrier.  More general than the NULL branch, and it means
+#                the fix is NOT simply "merge the 1-D tensors".
+#           [-0.30, -0.15) -> **UNDECIDED**, registered in advance.
+#           G <= -0.30      -> **REVERSAL: ALIGNMENT PAYS ONCE THE TAIL IS GONE.**
+#                nodewise1d BEATS uniform chunks at matched count.  **THIS IS A LIVE
+#                POSSIBILITY AND IT IS REGISTERED HERE, NOT ADDED AFTERWARDS:** pp1's
+#                P2 nulled alignment WITH the degenerate tail present, and that tail is
+#                two thirds of nodewise's groups, so a real alignment benefit on the
+#                weight matrices could have been swamped by it.  If this branch fires,
+#                pp1's P2 must be re-read as "alignment is null IN THE PRESENCE OF the
+#                tail", which is a weaker statement than 107.2 currently makes.
+#         SYMMETRIC because there is no prior favouring either sign over the other.
+#
+#   T2    **THE SECONDARY.  DIRECTIONAL, REGISTERED -- AND CONFOUNDED BY DESIGN.**
+#         H = plateau5(nodewise1d) - plateau5(nodewise), within-batch.
+#         PREDICTS H > 0: removing 9,569 degenerate groups helps.
+#           H >  +0.30 -> CONFIRMS | (-0.15, +0.30] -> UNDECIDED | H <= -0.15 -> REFUTES
+#         **THE CONFOUND IS STATED BEFORE THE DATA EXISTS AND IS NOT REPAIRABLE INSIDE
+#         THIS CONTRAST:** n1d and node differ in COUNT (4,851 vs 14,420) as well as in
+#         the tail, and ck1's K3 measured that within ONE partition family COARSER IS
+#         BETTER over this range (~0.51 pp/decade).  A count effect alone therefore
+#         predicts H > 0.  **So a CONFIRM here is NOT evidence about the tail
+#         specifically, and must never be reported as if it were.**  T1 is the
+#         confound-free contrast.  T2 is registered because a REFUTE would be
+#         informative (it would mean the tail helps enough to beat the count effect),
+#         and because leaving it unregistered would invite reading it post-hoc.
+#
+#   T2b   THE COUNT-CORRECTED REMAINDER.  **POST-HOC, DESCRIPTIVE, NO VERDICT.**
+#         The chunk family now spans SEVEN rungs at a FIXED partition (ck1 + cx2 +
+#         mm1 + this batch's c23), so the count effect between m=14,420 and m=4,851
+#         can be read off that curve and subtracted from H, exactly as
+#         analysis/c76_partition_vs_count.py did for ck1.  It carries no direction and
+#         is a reading, not a result -- and it inherits the +-0.25 pp cross-batch
+#         offset of CORRECTIONS 106.3 wherever the curve crosses batches.
+#
+#   T3    THE BATCH-OFFSET METER.  nodewise@1e-4 here vs pp1's 92.012 and mm1's
+#         92.044, bar +-0.50.  **THIS CANNOT VOID T1 OR T2** -- both are within-batch
+#         differences and are immune to any offset common to their arms.  T3 measures
+#         the offset for the RECORD.  106.3 found the cross-batch offset has no stable
+#         sign (+0.083 against ck1's -0.255), so this is a third draw from it.
+#
+#   T4    THE FIELD, THREE WAYS.  **DESCRIPTIVE, NO DIRECTION.**
+#         a_raw, a_deb, pbar, dev_bias, bias_share, N_eff/m for all three arms.
+#         **The "53.1%" sentence is NOT reproduced and must NOT be written.**
+#
+#   T5    **THE DISSOCIATION RE-TEST.  REGISTERED, AND ITS POST-HOC ORIGIN DECLARED.**
+#         FINDINGS 77.5 found, POST-HOC and outside every registered gate, that across
+#         nodewise -> permnode the field moved hugely while accuracy did not move at
+#         all: N_eff/m 0.0547 +-0.0010 -> 0.0414 +-0.0003 (t ~ 13) against a plateau5
+#         difference of -0.009 pp (t = -0.06).  That is ONE contrast at n=3.  A
+#         prediction DERIVED from a post-hoc finding and tested on NEW data is a
+#         legitimate registration, which is why it is written here rather than scored
+#         off pp1's own numbers.
+#         This batch supplies an INDEPENDENT matched-count pair (c23 vs n1d, both
+#         m=4,851).  Let t_F = |N_eff/m(c23) - N_eff/m(n1d)| / se.
+#           T1 is NULL and t_F >= 3  -> **DISSOCIATION REPLICATED** on a second and
+#                independent contrast.  The sign-agreement field is not a sufficient
+#                statistic for what a partition does to optimisation, and the brief's
+#                direction-C default is then refuted on its own terms rather than
+#                merely blocked.
+#           T1 is NULL and t_F <  3  -> the field TRACKS accuracy here; 77.5's
+#                dissociation does not generalise and must be reported as a one-off.
+#           T1 is NOT NULL           -> **NOT APPLICABLE.**  The test is defined only
+#                on an accuracy tie, and this branch is registered so that a non-NULL
+#                T1 cannot be used to fish for a dissociation afterwards.
+#         The threshold is on t, not on an absolute field difference, because the sem
+#         is measured per batch and an absolute bar fixed from pp1's sems would import
+#         pp1's noise level into this batch's verdict.
+#
+# WHAT THIS BATCH DELIBERATELY DOES NOT DO
+#   * It does NOT sweep ms.  ms=1e-4 is held because that is the ms mm1's M1, ck1's K2
+#     and pp1's P1/P2 were all measured at, so T1 sits on the same scale as them.
+#     **THE RISK IS INHERITED AND RESTATED: nodewise is read at 1e-4, not at its own
+#     argmax of 3e-4, so every verdict here is a statement at ms=1e-4.**  nodewise1d's
+#     own argmax has never been measured at all, which is a stronger version of the
+#     same caveat and applies to T1 as well as T2.
+#   * It does NOT test whether LAYER boundaries matter.  Every arm here is a
+#     within-tensor partition (verified: chunkwise iterates layers and zero-pads the
+#     ragged tail; nodewise1d is per-tensor by construction).  CORRECTIONS 107.7 item
+#     (2) is still open and is not touched by this batch.
+#   * It does NOT separate "the tail is degenerate (size 1)" from "the tail is on the
+#     NORMALISATION parameters".  Those coincide exactly on ResNet18 -- every 1-D
+#     tensor is a BN scale/shift or the output bias -- so this batch cannot tell a
+#     size story from a parameter-role story.  Stated, not hidden; separating them
+#     needs a net where they come apart, not another arm here.
+#
+# STRUCTURAL CHECKS BEFORE USING ANY NUMBER (Rule 4)
+#   1. python3 tests/test_nodebn.py           (CPU, N0 asserts determinism first)
+#   2. python3 tests/test_permnode.py         (CPU, unchanged by PATCH_NODEBN)
+#   3. python3 tests/test_chunkwise.py        (CPU, unchanged by PATCH_NODEBN)
+#   4. python3 analysis/c55_neff_noise.py --selftest   (51/51 -- the selftest does not
+#      enumerate BOXES, so this count does NOT move when a family is registered)
+#   5. `bn1` registered in c55_neff_noise.BOXES BEFORE scoring, from THIS CLIP=.
+#   6. plateau5 is PRIMARY.  best_test inflates ~0.37 pp.
+#
+# USAGE
+#   bash c78_degenerate_tail.sh            # dry run
+#   bash c78_degenerate_tail.sh --submit   # submits, ONLY if the guards pass
+# =============================================================================
+set -u
+
+SUBMIT=0
+[ "${1:-}" = "--submit" ] && SUBMIT=1
+
+USER_NAME="${USER:-$(whoami)}"
+WS=/cluster/account_a/metaopt
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/bn1
+WALL=04:00:00
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+
+NJOBS=9
+CLIP=-15:-2.3026               # pp1's/mm1's/ck1's box EXACTLY -- not a new box
+MST=1e-4                       # the ms M1, K2, P1 and P2 were all measured at
+EPOCHS=100
+WRITE_EVERY=500
+CHUNK_K=2325                   # m(2325) = 4,851 = m(nodewise1d) EXACTLY
+M_N1D=4851
+M_CHUNK=4851
+M_NODE=14420
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo "  bn1 -- IS THE MATCHED-COUNT GAP THE DEGENERATE SIZE-1 TAIL?"
+echo "    nodewise1d (m=$M_N1D) / chunk${CHUNK_K} (m=$M_CHUNK) / nodewise (m=$M_NODE)"
+echo "    seeds 0,1,2 = $NJOBS jobs;  ms=$MST, BETA_CLIP=$CLIP, ${EPOCHS}ep"
+echo "    T1 (PRIMARY): G = chunk${CHUNK_K} - nodewise1d, COUNT MATCHED EXACTLY"
+echo "       [-0.15,+0.15] TAIL WAS THE CARRIER | G > +0.30 GAP SURVIVES"
+echo "       G <= -0.30 REVERSAL, alignment pays | +-(0.15,0.30] UNDECIDED"
+echo "=============================================================="
+
+# --- GUARD 0 ---------------------------------------------------------------
+[ -f "$CSVP" ] || { echo "GUARD FAIL: no CSV at $CSVP"; exit 1; }
+[ -f "$RUNNER" ] || { echo "GUARD FAIL: no runner at $RUNNER"; exit 1; }
+echo "guard 0: runner and CSV present ($(wc -l < "$CSVP") CSV lines)"
+
+# --- GUARD 1 -- the probe patch is present AND ENABLED (STANDING RULE 19) ---
+python3 - "$WS" "$REPO" "$0" <<'PYEOF' || exit 1
+import os, re, sys
+ws, repo, me = sys.argv[1], sys.argv[2], sys.argv[3]
+hf = os.path.join(ws, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                  "cifar10", "Optimizers", "HF.py")
+if not os.path.exists(hf):
+    sys.exit("GUARD FAIL: %s absent" % hf)
+src = open(hf).read()
+if not re.search(r"os\.environ\.get\(\s*['\"]PROBE5['\"].*?\)\s*==\s*['\"]1['\"]", src):
+    sys.exit("GUARD FAIL: HF.py's PROBE5 gate is not the =='1' form this script exports for")
+print("guard 1a: HF.py gates the sign-count writer on PROBE5 == '1'")
+mine = [l for l in open(me).read().splitlines()
+        if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+if len(mine) != 1:
+    sys.exit("GUARD FAIL: expected exactly 1 --export line with PROBE_DIR, found %d" % len(mine))
+for need in ("PROBE=5", "PROBE5=1", "PROBE5_WRITE_EVERY="):
+    if need not in mine[0]:
+        sys.exit("GUARD FAIL: export line missing %r -- that is bf8's bug" % need)
+print("guard 1b: this script exports PROBE=5 AND PROBE5=1 AND PROBE5_WRITE_EVERY")
+tw0 = os.path.join(repo, "bin", "c74_tuned_weightwise_probe.sh")
+ref = [l for l in open(tw0).read().splitlines()
+       if l.strip().startswith('--export="ALL,') and "PROBE_DIR" in l]
+def keys(l):
+    return sorted(k.split("=")[0] for k in re.search(r'"ALL,([^"]+)"', l).group(1).split(","))
+if keys(mine[0]) != keys(ref[0]):
+    sys.exit("GUARD FAIL: export KEYS differ from tw0's CONFIRMED-FIRING line")
+print("guard 1c: export keys identical to tw0's CONFIRMED-FIRING line")
+PYEOF
+
+# --- GUARD 1d -- ALL THREE PARTITION PATCHES PRESENT ON THIS ACCOUNT -------
+python3 - "$WS" <<'PYEOF' || exit 1
+import os, sys
+hf = os.path.join(sys.argv[1], "MetaOptimize", "codes", "Supervised_tasks",
+                  "MetaOptimize", "cifar10", "Optimizers", "HF.py")
+src = open(hf).read()
+for marker, needs in (("PATCH_CHUNKWISE", ("chunkwise", "chunk_size")),
+                      ("PATCH_PERMNODE", ("permnode", "perm_idx", "perm_inv")),
+                      ("PATCH_NODEBN", ("nodewise1d", "n1d_groups", "n1d_gsize",
+                                        "n1d_shape", "n1d_numel"))):
+    if marker not in src:
+        sys.exit("GUARD FAIL: %s is NOT applied to %s" % (marker, hf))
+    for need in needs:
+        if need not in src:
+            sys.exit("GUARD FAIL: %s present but %r missing -- partial patch"
+                     % (marker, need))
+# The three nodewise1d branches must all exist: beta init, alpha, product.
+if src.count("self.stepsize_type == 'nodewise1d'") != 3:
+    sys.exit("GUARD FAIL: expected 3 nodewise1d branches, found %d"
+             % src.count("self.stepsize_type == 'nodewise1d'"))
+# and it must be reachable from the dispatch list
+if "'weightwise', 'nodewise1d'" not in src:
+    sys.exit("GUARD FAIL: nodewise1d is not in the exact-match dispatch list")
+# A SUBSTRING dispatch on 'nodewise' would silently route nodewise1d into the
+# nodewise branches.  The patch asserted this before writing; re-assert on the LIVE file.
+if "'nodewise' in self.stepsize_type" in src or '"nodewise" in self.stepsize_type' in src:
+    sys.exit("GUARD FAIL: a SUBSTRING dispatch on nodewise exists -- nodewise1d would leak")
+if src.count("self.stepsize_type == 'nodewise'") != 3:
+    sys.exit("GUARD FAIL: the plain nodewise branches were disturbed")
+print("guard 1d: PATCH_CHUNKWISE, PATCH_PERMNODE and PATCH_NODEBN all present, "
+      "nodewise1d reachable, plain nodewise undisturbed")
+PYEOF
+
+# --- GUARD 1e -- THE NODEBN SUITE PASSES ON THIS TREE, ON CPU --------------
+# STANDING RULE 20: an equivalence suite must run on a deterministic device, and its
+# FIRST assertion must be that a configuration equals ITSELF.  This does not trust the
+# earlier scratch run -- it re-runs against the tree the jobs will import.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$REPO" || exit 1
+  NODEBN_TEST_DEVICE=cpu python3 tests/test_nodebn.py > /tmp/bn1_nodebntest.$$ 2>&1
+  RC=$?
+  if [ $RC -ne 0 ]; then
+    echo "GUARD FAIL: tests/test_nodebn.py did NOT pass on this tree:"
+    tail -25 /tmp/bn1_nodebntest.$$
+    rm -f /tmp/bn1_nodebntest.$$
+    exit 1
+  fi
+  grep -c PASS /tmp/bn1_nodebntest.$$ | xargs -I{} echo "guard 1e: test_nodebn.py {} PASS, 0 FAIL, on CPU, against the LIVE tree"
+  rm -f /tmp/bn1_nodebntest.$$
+) || exit 1
+
+# --- GUARD 2 -- the 13-axis signature, re-derived FROM THE CSV --------------
+python3 - "$CSVP" "$CLIP" "$EPOCHS" "$MST" <<'PYEOF' || exit 1
+import csv, sys, statistics
+csvp, clip, epochs, mst = sys.argv[1:5]
+rd = list(csv.DictReader(open(csvp)))
+AX = ['network','dataset','batch_size','base','meta','alpha0','gamma',
+      'augment','beta_clip','hier','lam','eta_ratio','epochs_done']
+ref = [r for r in rd if r['run'].startswith('rs-lay-1e4')]
+if not ref:
+    sys.exit("GUARD FAIL: no rs-lay-1e4 reference row")
+sig = {a: ref[0][a] for a in AX}
+mine = {'network':'ResNet18','dataset':'CIFAR10','batch_size':'100','base':'SGDm',
+        'meta':'Lion','alpha0':'1e-3','gamma':'1','augment':'1',
+        'beta_clip':clip,'epochs_done':epochs}
+bad = [(a, mine[a], sig[a]) for a in mine if mine[a] != sig[a]]
+if bad:
+    for a,m,s in bad: print("  axis %s: this batch %r vs reference %r" % (a,m,s))
+    sys.exit("GUARD FAIL: bn1 does not match the ladder's axis signature")
+print("guard 2: all 13 axes match the rs-lay-1e4 signature read FROM THE CSV")
+
+def pl(prefix):
+    return [float(r['plateau5']) for r in rd
+            if r['run'].startswith(prefix) and r.get('plateau5','').strip()]
+
+# guard 2b: the quantity T1 is trying to make disappear, re-derived from the CSV RIGHT
+# NOW.  If the CSV has moved since 107.4 read it, this batch's framing is stale.
+ch = pl('pp1-ch-s'); nd = pl('pp1-node-s'); pm = pl('pp1-perm-s')
+if len(ch) != 3 or len(nd) != 3 or len(pm) != 3:
+    sys.exit("GUARD FAIL: expected pp1's 3+3+3 rows, found %d+%d+%d"
+             % (len(ch), len(nd), len(pm)))
+D = statistics.mean(ch) - statistics.mean(nd)
+A = statistics.mean(pm) - statistics.mean(nd)
+if abs(D - 0.581) > 0.002:
+    sys.exit("GUARD FAIL: pp1's D reads %+.3f now, not the +0.581 this batch is "
+             "built around.  The CSV moved; re-reduce before submitting." % D)
+if abs(A) > 0.15:
+    sys.exit("GUARD FAIL: pp1's A reads %+.3f, outside its own NULL band.  The "
+             "premise that alignment is null does not hold on the current CSV." % A)
+print("guard 2b: pp1's D = %+.3f (the gap T1 tests) and A = %+.3f (NULL, the premise)"
+      % (D, A))
+
+# guard 2c: mm1's nodewise is the SAME configuration this batch's node arm runs.
+mn = pl('mm1-node-s')
+if len(mn) != 3 or abs(statistics.mean(mn) - 92.044) > 0.002:
+    sys.exit("GUARD FAIL: mm1 nodewise reads %s, not the 92.044 registered"
+             % (("%.3f" % statistics.mean(mn)) if mn else "absent"))
+print("guard 2c: nodewise anchors -- mm1 %.3f, pp1 %.3f.  T3 meters against both."
+      % (statistics.mean(mn), statistics.mean(nd)))
+
+# guard 2d: bn1 must not collide with an existing run name.
+clash = [r['run'] for r in rd if r['run'].startswith('bn1-')]
+if clash:
+    sys.exit("GUARD FAIL: %d bn1-* runs already in the CSV: %s"
+             % (len(clash), clash[:5]))
+print("guard 2d: no bn1-* run name already exists in the CSV")
+PYEOF
+
+# --- GUARD 3 -- the box is registered BEFORE any job runs -------------------
+python3 - "$REPO" "$CLIP" <<'PYEOF' || exit 1
+import sys, os
+repo, clip = sys.argv[1], sys.argv[2]
+sys.path.insert(0, os.path.join(repo, "analysis"))
+import c55_neff_noise as c55
+if "bn1" not in c55.BOXES:
+    sys.exit("GUARD FAIL: `bn1` is not registered in c55_neff_noise.BOXES.  Register "
+             "it from THIS script's CLIP= line BEFORE submitting or the root is skipped.")
+lo, hi, prov = c55.BOXES["bn1"]
+want = tuple(float(x) for x in clip.split(":"))
+if (lo, hi) != want:
+    sys.exit("GUARD FAIL: c55 registers bn1 as %s but CLIP= is %s" % ((lo,hi), want))
+if (lo, hi) != c55.BOXES.get("pp1", (None, None, None))[:2]:
+    sys.exit("GUARD FAIL: bn1's box is not pp1's box -- T3 would not be comparable")
+print("guard 3: bn1 registered as (%.1f, %.4f) from %s, identical to pp1's"
+      % (lo, hi, prov))
+PYEOF
+
+# --- GUARD 4 -- ALL THREE m MEASURED FROM THE ALLOCATED BETA, AND THE ------
+# --- MATCHED COUNT ASSERTED EXACT -----------------------------------------
+# The batch's primary is a MATCHED-COUNT contrast, so the match is MEASURED here, on
+# the real built network, from the beta the optimizer actually allocates -- not from a
+# formula and not from a comment in the patch.
+(
+  module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+  # shellcheck disable=SC1091
+  source "$WS/envs/mo/bin/activate"
+  cd "$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10" || exit 1
+  python - "$CHUNK_K" "$M_CHUNK" "$M_NODE" "$M_N1D" <<'PYEOF' || exit 1
+import sys, torch
+sys.path.insert(0, ".")
+from build_network import build_network
+from Optimizers.HF import HF
+K, want_chunk, want_node, want_n1d = (int(x) for x in sys.argv[1:5])
+
+BASE = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+META = {"alg": "Lion", "meta_stepsize": 1e-4, "momentum_param": 0.99,
+        "Lion_beta2": 0.9, "weight_decay": 0}
+
+class NullWriter:
+    def add_scalar(self, *a, **k):
+        pass
+
+def build(gran):
+    torch.manual_seed(0)
+    net = build_network("ResNet18", "cpu")
+    return HF(net, stepsize_groups=gran, alpha0=1e-3, args_base=dict(BASE),
+              args_meta=dict(META), gamma=1, writer=NullWriter())
+
+def m_of(opt):
+    return int(sum(int(b.numel()) for b in opt.beta))
+
+net = build_network("ResNet18", "cpu")
+shapes = [tuple(p.shape) for p in net.parameters()]
+numels = [int(p.numel()) for p in net.parameters()]
+
+o_n1d = build("nodewise1d")
+o_ch = build("chunk%d" % K)
+o_nd = build("nodewise")
+m_n1d, m_chunk, m_node = m_of(o_n1d), m_of(o_ch), m_of(o_nd)
+print("guard 4: nodewise1d   ALLOCATED beta m=%-8d (registered %d)" % (m_n1d, want_n1d))
+print("guard 4: chunk%-7d ALLOCATED beta m=%-8d (registered %d)" % (K, m_chunk, want_chunk))
+print("guard 4: nodewise     ALLOCATED beta m=%-8d (registered %d)" % (m_node, want_node))
+for got, want, name in ((m_n1d, want_n1d, "nodewise1d"),
+                        (m_chunk, want_chunk, "chunk%d" % K),
+                        (m_node, want_node, "nodewise")):
+    if got != want:
+        sys.exit("GUARD FAIL: m(%s) is %d, not the %d registered" % (name, got, want))
+
+# THE PRIMARY'S WHOLE CLAIM: the two matched arms are matched EXACTLY.
+if m_n1d != m_chunk:
+    sys.exit("GUARD FAIL: T1's two arms are NOT count-matched: %d vs %d" % (m_n1d, m_chunk))
+print("guard 4b: T1's two arms are count-matched EXACTLY at m=%d (0 groups apart)" % m_n1d)
+
+# nodewise1d must differ from nodewise ONLY on the 1-D tensors.  Measured per tensor.
+node_groups = [s[0] for s in shapes]
+want_groups = [1 if len(s) == 1 else s[0] for s in shapes]
+if list(o_n1d.n1d_groups) != want_groups:
+    sys.exit("GUARD FAIL: nodewise1d group counts are not (1 per 1-D tensor, shape[0] else)")
+changed = [i for i in range(len(shapes)) if o_n1d.n1d_groups[i] != node_groups[i]]
+oned = [i for i, s in enumerate(shapes) if len(s) == 1]
+if changed != oned:
+    sys.exit("GUARD FAIL: nodewise1d changed tensors %s but the 1-D tensors are %s"
+             % (changed[:5], oned[:5]))
+if any(o_n1d.n1d_groups[i] * o_n1d.n1d_gsize[i] != numels[i] for i in range(len(numels))):
+    sys.exit("GUARD FAIL: nodewise1d has a group that does not tile its tensor")
+n_deg = sum(1 for i in range(len(numels)) for _ in range(node_groups[i])
+            if numels[i] // node_groups[i] == 1)
+n_deg_after = sum(1 for i in range(len(numels)) for _ in range(o_n1d.n1d_groups[i])
+                  if o_n1d.n1d_gsize[i] == 1)
+print("guard 4c: %d of the %d tensors changed, and they are EXACTLY the 1-D tensors"
+      % (len(changed), len(shapes)))
+print("guard 4d: size-1 groups: nodewise %d (%.2f%% of its groups) -> nodewise1d %d"
+      % (n_deg, 100.0 * n_deg / m_node, n_deg_after))
+if n_deg_after != 0:
+    sys.exit("GUARD FAIL: nodewise1d still has %d size-1 groups" % n_deg_after)
+if n_deg != 9610:
+    sys.exit("GUARD FAIL: nodewise has %d size-1 groups, not the 9,610 FINDINGS 77.6 "
+             "measured -- the network changed under the finding" % n_deg)
+PYEOF
+) || { echo "GUARD 4 FAILED -- nothing submitted"; exit 1; }
+
+# --- GUARD 5 -- disk -------------------------------------------------------
+python3 - "$WS" <<'PYEOF' || exit 1
+import shutil, sys
+free_gb = shutil.disk_usage(sys.argv[1]).free / 1e9
+need_gb = 9 * 0.060
+if free_gb < 20 * need_gb:
+    sys.exit("GUARD FAIL: %.1f GB free vs ~%.2f GB needed (20x wanted)" % (free_gb, need_gb))
+print("guard 5: %.0f GB free vs ~%.2f GB needed  OK" % (free_gb, need_gb))
+PYEOF
+
+# --- GUARD 6 -- queue depth ------------------------------------------------
+FS=$(sshare -U -u "$USER_NAME" -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 6: FairShare=${FS:-unknown} (informational), pending=$PEND running=$RUN, adding $NJOBS"
+if [ "$PEND" -gt 40 ]; then
+  echo "GUARD FAIL: $PEND already pending, over the 40 cap"; exit 1
+fi
+
+# ---------------------------------------------------------------------------
+mkdir -p "$SAVE"
+N=0
+FAIL=0
+SGDM=(--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1
+      --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0)
+for S in 0 1 2; do
+  for ARM in "nodewise1d:n1d" "chunk${CHUNK_K}:c23" "nodewise:node"; do
+    GRAN="${ARM%%:*}"; SHORT="${ARM##*:}"
+    RN="bn1-${SHORT}-s${S}"
+    CMD=(sbatch --job-name="$RN" --partition="$PARTS" --gres=gpu:1 --cpus-per-task=6
+      --mem=14G --time="$WALL" --nice=0
+      --export="ALL,AUGMENT=1,BETA_CLIP=${CLIP},PROBE=5,PROBE5=1,PROBE5_WRITE_EVERY=${WRITE_EVERY},PROBE_DIR=$SAVE/probe_${SHORT}_bn1_s${S}"
+      "$RUNNER" "${SGDM[@]}"
+      --dataset CIFAR10 --NN-name ResNet18 --batch-size 100
+      --max-time 999:00:00 --gamma 1 --meta-stepsize "$MST" --alpha0 1e-3
+      --num-epochs "$EPOCHS" --stepsize-groups "$GRAN" --seed "$S"
+      --save-directory "$SAVE" --run-name "$RN")
+    # COUNT WHAT SLURM ACCEPTED, NOT WHAT WE TRIED (CORRECTIONS 71).
+    if [ "$SUBMIT" = "1" ]; then
+      if "${CMD[@]}" >/dev/null; then N=$((N+1)); else FAIL=$((FAIL+1)); fi
+    else
+      N=$((N+1)); printf '%s\n' "${CMD[*]}"
+    fi
+  done
+done
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo ACCEPTED BY SLURM || echo 'dry run, nothing submitted' )); $FAIL rejected ----"
+[ "$N" = "$NJOBS" ] || echo "!!! expected $NJOBS jobs, built $N -- DO NOT TREAT AS SUBMITTED"
+[ "$FAIL" -gt 0 ] && echo "!!! $FAIL sbatch calls FAILED -- do not treat this batch as submitted"
+exit 0

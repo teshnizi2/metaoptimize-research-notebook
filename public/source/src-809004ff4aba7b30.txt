@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+# =============================================================================
+# argsline_guard.py -- STANDING RULE 20, MADE MECHANICAL.
+#
+# "A batch's science is what the runs' OWN `ARGS` line says, never what the
+#  submission script's header says."
+#
+# WHY THIS EXISTS.  `jobs/run_cifar.sh` echoes `ARGS: "$@"` and then calls
+# `python -u train.py "$@"`.  `train.py` uses argparse, and argparse takes the
+# LAST occurrence of a repeated option.  Two batches were built, submitted, run
+# to completion and reported before anyone read an ARGS line:
+#
+#   ml2  -- voided by a repeated flag.
+#   sm3  -- voided by the SAME bug one cycle after the diagnosis, because the
+#           audit was performed on the SCRIPT HEADER instead of the run's own
+#           ARGS line.  `bin/c96_secondmoment.sh` composes
+#             BFLAGS="... --alg-meta RMSProp --normalizer-param-meta 0.999 \
+#                     --weight-decay-meta 0"     (line ~126)
+#           and then appends
+#             --alg-meta Lion --momentum-param-meta 0.99 ...   (line ~131)
+#           so the batch advertised as the RMSProp/second-moment corner in fact
+#           ran Lion.  `--alg-meta` and `--weight-decay-meta` each appear twice.
+#
+# WHAT IT DOES.  Given run directories, .out files, or a literal command line,
+# it parses every `ARGS:` line exactly the way argparse resolves it, FAILS
+# LOUDLY on any repeated flag, prints the effective value of every flag, and
+# (optionally) checks the effective values against a declared design and
+# reports flags that vary across the runs of one batch.
+#
+# NO THIRD-PARTY IMPORTS.  Standard library only, Python >= 3.6.  It runs on
+# the cluster with or without the venv activated.
+#
+# ---------------------------------------------------------------------------
+# USAGE
+#   # audit a whole batch by its .out files (the normal case)
+#   python3 analysis/argsline_guard.py /cluster/account_a/metaopt/runs --name sm3
+#   python3 analysis/argsline_guard.py runs/sm3-*.out
+#
+#   # audit a directory of .out files
+#   python3 analysis/argsline_guard.py /cluster/account_a/metaopt/runs/
+#
+#   # check a command line BEFORE sbatch (used by bin/_lib_guards.sh)
+#   python3 analysis/argsline_guard.py --cmdline "$CMD"
+#
+#   # additionally assert the declared design
+#   python3 analysis/argsline_guard.py runs --name sm3 \
+#          --expect alg-base=AdamW --expect alg-meta=RMSProp
+#
+#   # flag anything that varies across the batch other than the design axes
+#   python3 analysis/argsline_guard.py runs --name cc1 --batch-consistency \
+#          --vary seed --vary run-name --vary stepsize-groups
+#
+# EXIT CODES
+#   0  every file parsed, no repeated flag, all --expect satisfied
+#   1  a repeated flag, an --expect mismatch, or (with --strict) an
+#      unexpected across-run inconsistency
+#   2  usage error, or no ARGS line found anywhere in the inputs
+# =============================================================================
+
+from __future__ import print_function
+
+import os
+import re
+import sys
+import glob
+import shlex
+import argparse
+import collections
+
+ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+
+# ---------------------------------------------------------------------------
+# parsing
+# ---------------------------------------------------------------------------
+
+
+def tokenize(line):
+    """Split an ARGS payload into tokens the way the shell handed them to
+    train.py.  shlex is used so quoted values survive; it falls back to a plain
+    split if the line is not lexable (an unbalanced quote in a run name)."""
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_flags(tokens):
+    """Return an ordered list of (flag, value, index) occurrences.
+
+    A token beginning with `--` opens a flag.  `--flag=value` carries its own
+    value.  Otherwise every following token that does NOT begin with `--` is
+    part of the value (so negative numbers such as `--Lion-beta2-base -1` and
+    colon-separated boxes such as `-15:-2.3026` are values, not flags).
+    A flag with no following value gets the value `''` (a store_true-style
+    switch, e.g. sbatch's `--wait`).
+    """
+    occ = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith("--") and len(tok) > 2:
+            if "=" in tok:
+                flag, val = tok.split("=", 1)
+                occ.append((flag.lstrip("-"), val, i))
+                i += 1
+                continue
+            flag = tok.lstrip("-")
+            vals = []
+            j = i + 1
+            while j < n and not (tokens[j].startswith("--") and len(tokens[j]) > 2):
+                vals.append(tokens[j])
+                j += 1
+            occ.append((flag, " ".join(vals), i))
+            i = j
+            continue
+        i += 1
+    return occ
+
+
+def split_launcher_payload(tokens):
+    """For a full sbatch command line, split at the runner script.
+
+    Everything up to and including the first token ending in `.sh` is the
+    launcher (sbatch's own flags); everything after it is the payload that
+    reaches train.py.  Duplicates in EITHER half are bugs, but they are
+    reported separately because they mean different things.
+    Returns (launcher_tokens, payload_tokens); payload is empty when there is
+    no `.sh` token (the input was already a bare ARGS payload).
+    """
+    for k, tok in enumerate(tokens):
+        if tok.endswith(".sh"):
+            return tokens[: k + 1], tokens[k + 1:]
+    return [], tokens
+
+
+def effective(occ):
+    """argparse semantics: the LAST occurrence of a flag wins."""
+    eff = collections.OrderedDict()
+    for flag, val, _ in occ:
+        eff[flag] = val
+    return eff
+
+
+def duplicates(occ):
+    """OrderedDict flag -> [values in order of appearance], repeats only."""
+    seen = collections.OrderedDict()
+    for flag, val, _ in occ:
+        seen.setdefault(flag, []).append(val)
+    return collections.OrderedDict(
+        (f, v) for f, v in seen.items() if len(v) > 1)
+
+
+# ---------------------------------------------------------------------------
+# input collection
+# ---------------------------------------------------------------------------
+
+
+def collect_files(paths, name_prefix):
+    """Expand directories and globs into a sorted list of candidate files."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            pat = (name_prefix + "*") if name_prefix else "*"
+            out.extend(glob.glob(os.path.join(p, pat + ".out")))
+            if not name_prefix:
+                out.extend(glob.glob(os.path.join(p, "*.out")))
+        elif os.path.isfile(p):
+            if name_prefix and not os.path.basename(p).startswith(name_prefix):
+                continue
+            out.append(p)
+        else:
+            hits = glob.glob(p)
+            if not hits:
+                sys.stderr.write("argsline_guard: no such path: %s\n" % p)
+            for h in hits:
+                if name_prefix and not os.path.basename(h).startswith(name_prefix):
+                    continue
+                if os.path.isfile(h):
+                    out.append(h)
+    return sorted(set(out))
+
+
+def args_line_of(path):
+    """First `ARGS:` line in a .out, or None.  Only the head is read: the ARGS
+    line is line 2 of every run_cifar.sh job and these files are large."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for k, line in enumerate(fh):
+                if k > 200:
+                    break
+                m = ARGS_RE.match(line)
+                if m:
+                    return m.group(1).strip()
+    except IOError as ex:
+        sys.stderr.write("argsline_guard: cannot read %s (%s)\n" % (path, ex))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# checking / reporting
+# ---------------------------------------------------------------------------
+
+
+def values_equal(a, b):
+    """String equality, with a numeric fallback so 1e-4 == 0.0001."""
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def report_section(label, tokens, expect, quiet):
+    """Check one token stream.  Returns (ok, effective_dict)."""
+    occ = parse_flags(tokens)
+    if not occ:
+        return True, collections.OrderedDict()
+    dup = duplicates(occ)
+    eff = effective(occ)
+
+    if dup:
+        print("  !!! REPEATED FLAGS in %s -- argparse keeps the LAST value:" % label)
+        for flag, vals in dup.items():
+            shown = " | ".join("'%s'" % v for v in vals)
+            print("      --%-24s x%d  %s   ->  EFFECTIVE '%s'"
+                  % (flag, len(vals), shown, vals[-1]))
+    elif not quiet:
+        print("  %s: no repeated flag (%d flags)" % (label, len(eff)))
+
+    if not quiet:
+        print("  --- effective values (%s) ---" % label)
+        for flag, val in eff.items():
+            mark = "  <-- LAST OF %d" % len(dup[flag]) if flag in dup else ""
+            print("      --%-26s %s%s" % (flag, val if val != "" else "(set)", mark))
+
+    mismatched = []
+    for want_flag, want_val in expect:
+        got = eff.get(want_flag)
+        if got is None:
+            mismatched.append((want_flag, want_val, "<absent>"))
+        elif not values_equal(got, want_val):
+            mismatched.append((want_flag, want_val, got))
+    if mismatched:
+        print("  !!! DESIGN MISMATCH in %s:" % label)
+        for f, w, g in mismatched:
+            print("      --%-24s declared '%s'  but EFFECTIVE '%s'" % (f, w, g))
+
+    return (not dup and not mismatched), eff
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(
+        prog="argsline_guard.py",
+        description="STANDING RULE 20: fail loudly on any repeated flag in a "
+                    "run's own ARGS line, and print every effective value.")
+    ap.add_argument("paths", nargs="*",
+                    help="run directories, .out files, or globs")
+    ap.add_argument("--cmdline", default=None,
+                    help="check a literal command line instead of .out files "
+                         "(pre-submission use; sbatch flags and the train.py "
+                         "payload are checked separately)")
+    ap.add_argument("--stdin", action="store_true",
+                    help="read the command line to check from stdin")
+    ap.add_argument("--name", default=None,
+                    help="only files whose basename starts with this prefix "
+                         "(e.g. --name sm3)")
+    ap.add_argument("--expect", action="append", default=[], metavar="FLAG=VAL",
+                    help="assert the effective value of FLAG (repeatable); "
+                         "leading dashes optional")
+    ap.add_argument("--batch-consistency", action="store_true",
+                    help="report flags whose effective value differs across "
+                         "the inputs")
+    ap.add_argument("--vary", action="append", default=[], metavar="FLAG",
+                    help="flag allowed to vary across the batch (repeatable); "
+                         "default: seed run-name stepsize-groups save-directory")
+    ap.add_argument("--strict", action="store_true",
+                    help="an unexpected across-run inconsistency is a failure, "
+                         "not a warning")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only failures and the one-line verdict")
+    a = ap.parse_args(argv)
+
+    expect = []
+    for e in a.expect:
+        if "=" not in e:
+            sys.stderr.write("argsline_guard: --expect needs FLAG=VALUE, got %r\n" % e)
+            return 2
+        f, v = e.split("=", 1)
+        expect.append((f.lstrip("-"), v))
+
+    vary = set(x.lstrip("-") for x in (a.vary or
+               ["seed", "run-name", "stepsize-groups", "save-directory"]))
+
+    # ---- literal command line ---------------------------------------------
+    if a.cmdline is not None or a.stdin:
+        cmd = a.cmdline if a.cmdline is not None else sys.stdin.read()
+        cmd = cmd.replace("\\\n", " ").replace("\n", " ")
+        toks = tokenize(cmd)
+        launcher, payload = split_launcher_payload(toks)
+        print("=== argsline_guard: COMMAND LINE ===")
+        ok = True
+        if launcher:
+            ok_l, _ = report_section("launcher (sbatch)", launcher, [], a.quiet)
+            ok = ok and ok_l
+        ok_p, _ = report_section("payload (train.py)", payload or toks,
+                                 expect, a.quiet)
+        ok = ok and ok_p
+        print("VERDICT: %s" % ("PASS" if ok else "FAIL"))
+        return 0 if ok else 1
+
+    # ---- .out files --------------------------------------------------------
+    if not a.paths:
+        ap.print_usage(sys.stderr)
+        sys.stderr.write("argsline_guard: give paths, or --cmdline/--stdin\n")
+        return 2
+
+    files = collect_files(a.paths, a.name)
+    if not files:
+        sys.stderr.write("argsline_guard: no candidate files under %s%s\n"
+                         % (", ".join(a.paths),
+                            (" with prefix %s" % a.name) if a.name else ""))
+        return 2
+
+    n_ok = n_bad = n_noargs = 0
+    per_file_eff = {}
+    for path in files:
+        line = args_line_of(path)
+        if line is None:
+            n_noargs += 1
+            continue
+        if not a.quiet:
+            print("=== %s ===" % path)
+        ok, eff = report_section(os.path.basename(path), tokenize(line),
+                                 expect, a.quiet)
+        per_file_eff[path] = eff
+        if ok:
+            n_ok += 1
+        else:
+            n_bad += 1
+            if a.quiet:
+                print("  (in %s)" % path)
+
+    if not per_file_eff:
+        sys.stderr.write("argsline_guard: %d file(s) matched but NONE carried "
+                         "an ARGS line -- wrong directory, or the jobs have "
+                         "not started\n" % len(files))
+        return 2
+
+    inconsistent = collections.OrderedDict()
+    if a.batch_consistency and len(per_file_eff) > 1:
+        allflags = collections.OrderedDict()
+        for eff in per_file_eff.values():
+            for f in eff:
+                allflags[f] = True
+        for f in allflags:
+            vals = set(eff.get(f, "<absent>") for eff in per_file_eff.values())
+            if len(vals) > 1 and f not in vary:
+                inconsistent[f] = sorted(vals)
+        if inconsistent:
+            print("!!! ACROSS-RUN INCONSISTENCY (flags that are not declared "
+                  "design axes but differ between runs):")
+            for f, vals in inconsistent.items():
+                print("    --%-24s %s" % (f, " | ".join(vals)))
+        elif not a.quiet:
+            print("batch-consistency: every non-axis flag is identical across "
+                  "%d runs" % len(per_file_eff))
+
+    print("---------------------------------------------------------------")
+    print("argsline_guard: %d clean, %d WITH REPEATED FLAGS OR DESIGN "
+          "MISMATCH, %d without an ARGS line"
+          % (n_ok, n_bad, n_noargs))
+    failed = n_bad > 0 or (a.strict and bool(inconsistent))
+    print("VERDICT: %s" % ("FAIL -- STANDING RULE 20" if failed else "PASS"))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

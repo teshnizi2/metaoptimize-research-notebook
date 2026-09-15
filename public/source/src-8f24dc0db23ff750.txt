@@ -1,0 +1,210 @@
+"""PATCH_PROBE_TENSOR -- an OPT-IN, READ-ONLY per-tensor view of the meta-signal
+the harness reduces away, logged into the EXISTING probe record.
+
+-------------------------------------------------------------------------------
+WHY
+-------------------------------------------------------------------------------
+For the `scalar` granularity `HF.block_product` returns ONE number,
+
+    z = sum_i <h_condenced[i], g[i]>            (the unnormalised sum, 62 terms)
+
+and `_probe` runs AFTER `base_update` has already overwritten `h_condenced`, so
+nothing downstream of the reduction can recover the 62 per-tensor terms.  The
+tensor-level domination question (which tensors carry the sign the single beta
+follows) therefore needs the terms captured BETWEEN `block_product` and
+`base_update`, from the SAME (h, g) pair `block_product` consumed.
+
+And the sign that moves beta is NOT sign(z).  On the live source,
+
+    Lion_meta_update:
+        beta_i <- (1 - ms*wd)*beta_i - ms * sign(b2*momentum_meta_i + (1-b2)*z_i)
+        momentum_meta_i <- mp*momentum_meta_i + (1-mp)*z_i          (zero-initialised)
+
+so the quantity whose sign is consumed is L = b2*m + (1-b2)*z with m an EMA of z.
+Both m and z are LINEAR in the per-tensor terms, so L decomposes EXACTLY:
+
+    z   = sum_i z_i,     m = sum_i m_i  (m_i the same EMA recursion applied to z_i),
+    L   = sum_i L_i,     L_i = b2*m_i + (1-b2)*z_i .
+
+m_i cannot be reconstructed from every-100th-step samples of z_i, so this patch
+keeps the per-tensor EMA itself, at every meta-step, in float32 with the same
+recursion and the same coefficients the harness uses (`args_meta`).
+
+-------------------------------------------------------------------------------
+WHAT IT ADDS (only when PROBE_TENSOR=1 AND PROBE>0 AND PROBE_DIR are all set)
+-------------------------------------------------------------------------------
+  * `_pt_capture(u, v, z)`, called on the line after `block_product`.  It
+    recomputes zt_i = (u_i*v_i).sum() for every tensor -- the same expression
+    the scalar branch sums -- updates its own per-tensor EMA, and at probe
+    steps snapshots (clones of) the harness's OWN pre-update `z`,
+    `momentum_meta` and `beta`, so the scorer can check sum_i zt_i == z and
+    sum_i m_i == momentum_meta to float tolerance on the live GPU, and can
+    check the applied step sign against beta_post - beta_pre.
+  * `_pt_attach(rec)`, called on the line before `_probe` writes its record.
+    It APPENDS keys to the record dict: `z_tensor`, `m_tensor` (both list[62]),
+    `z_agg`, `mom_pre`, `beta_pre` (each list of per-group lists, the harness's
+    own pre-update values), `pt_mp`, `pt_b2`.  Every pre-existing key is
+    untouched and keeps its position, so the serialised prefix of the record
+    is byte-identical to the unpatched record.
+  * `_pt_init()`, run once on first call: reads the three env vars, writes
+    `<PROBE_DIR>/probe_tensor.json` (numels, coefficients, granularity) and
+    prints ONE `PROBE_TENSOR: on ...` line to stdout so the .out file carries
+    the fact for the ENV audit (the runner's ENV line cannot know about it).
+
+WHAT IT DOES NOT DO.  It never assigns to any attribute the optimizer reads
+(`beta`, `momentum_meta`, `h_condenced`, `alpha`, `trace_*`, `counter`).  It
+does not touch `block_product`, `meta_update`, the clamp, the pools or the
+schedule.  It reads `z` and `momentum_meta` and clones them; it does not
+modify them.  It allocates 62 scalars per step.  With PROBE_TENSOR unset the
+only executed code is one attribute test per step and one per record.
+
+-------------------------------------------------------------------------------
+INERTNESS
+-------------------------------------------------------------------------------
+THREE insertions, every one ADDITIVE, NO existing line edited:
+  1. one call line in `step()` after `HtT_gradft = self.block_product(...)`;
+  2. one call line in `_probe()` before the record is written;
+  3. the three methods, appended before the `# Updates` section marker.
+`tests/test_probe_tensor.py` proves it the way tests/test_rednorm.py does:
+R0 deletes the three inserted regions from the patched file and checks the
+result is the pre-patch file BYTE FOR BYTE; R1/R2 run the real HF on the real
+ResNet18_c100 on CPU (scalar and layerwise) three ways -- unpatched, patched
+with PROBE_TENSOR unset, patched with PROBE_TENSOR=1 -- and require bit-
+identical beta trajectories at EVERY step and byte-identical probe.jsonl for
+the first two, and for the third a record that equals the unpatched record
+byte-for-byte once the appended keys are removed; R3 checks the
+decomposition identities on those records; R4 checks the applied-sign
+identity; R5 checks PROBE_TENSOR=1 without PROBE is a no-op.
+
+RULE 20.  This patch adds an ENVIRONMENT variable, not an ARGS flag, so
+analysis/argsline_guard.py is unaffected and IS NOT EDITED.  The variable is
+audited from the `PROBE_TENSOR:` line the patch prints into every .out file.
+
+Apply:  HF_PATH=/path/to/Optimizers/HF.py python3 patches/patch_probe_tensor.py
+        (writes HF.py.pre_probe_tensor beside it first)
+"""
+import os, sys
+
+P = os.environ.get(
+    "HF_PATH",
+    "/cluster/account_b/metaopt/MetaOptimize/codes/Supervised_tasks/MetaOptimize/"
+    "cifar10/Optimizers/HF.py")
+src = open(P).read()
+orig = src
+
+if "PATCH_PROBE_TENSOR" in src:
+    print("ALREADY_PATCHED")
+    sys.exit(0)
+
+# --- 0. the assumptions this patch rests on, checked BEFORE anything is written ----
+assert "def block_product(self, u, v):" in src, "block_product is not where expected"
+assert "def Lion_meta_update(self,HtT_gradft):" in src, "Lion_meta_update is missing"
+assert "self.momentum_meta = [0.0 for _ in  range(self.len_beta_list)]" in src, \
+    "init_meta no longer zero-initialises momentum_meta the way this patch assumes"
+assert "def _probe(self, z):" in src and "def _probe_init(self):" in src, \
+    "PATCH_PROBE is not present -- this patch extends the probe record and needs it"
+
+# --- 1. the capture call, on the line after block_product -------------------------
+A1 = "            HtT_gradft = self.block_product(self.h_condenced, g)\n"
+assert src.count(A1) == 1, "anchor 1 count=%d -- refusing to patch" % src.count(A1)
+I1 = "            self._pt_capture(self.h_condenced, g, HtT_gradft)  # PATCH_PROBE_TENSOR\n"
+src = src.replace(A1, A1 + I1, 1)
+
+# --- 2. the attach call, on the line before the probe record is written ---------
+A2 = ("        with open(os.path.join(self._probe_dir, 'probe.jsonl'), 'a') as fh:\n"
+      "            fh.write(json.dumps(rec) + chr(10))\n")
+assert src.count(A2) == 1, "anchor 2 count=%d -- refusing to patch" % src.count(A2)
+I2 = "        self._pt_attach(rec)  # PATCH_PROBE_TENSOR\n"
+src = src.replace(A2, I2 + A2, 1)
+
+# --- 3. the methods, before the Updates marker ------------------------------------
+A3 = ("###################################################\n"
+      "###################################################\n"
+      "    # Updates")
+assert src.count(A3) == 1, "anchor 3 count=%d -- refusing to patch" % src.count(A3)
+I3 = '''    # ----------------------------------------------------- PATCH_PROBE_TENSOR
+    def _pt_init(self):
+        import os, json
+        self._pt_on = False
+        self._pt_last = None
+        _on = os.environ.get('PROBE_TENSOR', '') == '1'
+        _every = int(os.environ.get('PROBE', '0') or 0)
+        _dir = os.environ.get('PROBE_DIR', '')
+        if not (_on and _every > 0 and _dir):
+            if _on:
+                print('PROBE_TENSOR: requested but PROBE=%r PROBE_DIR=%r -- OFF'
+                      % (_every, _dir), flush=True)
+            return
+        self._pt_on = True
+        self._pt_every = _every
+        self._pt_mp = float(self.args_meta.get('momentum_param', 0.0))
+        self._pt_b2 = float(self.args_meta.get('Lion_beta2', 1.0))
+        self._pt_alg = str(self.args_meta.get('alg', ''))
+        self._pt_mom = None
+        os.makedirs(_dir, exist_ok=True)
+        with open(os.path.join(_dir, 'probe_tensor.json'), 'w') as fh:
+            json.dump({'PROBE_TENSOR': 1, 'every': int(_every),
+                       'stepsize_type': self.stepsize_type,
+                       'n_tensors': int(self.num_layers),
+                       'param_numels': [int(v) for v in self.param_numels],
+                       'len_beta_list': int(self.len_beta_list),
+                       'meta_alg': self._pt_alg, 'momentum_param': self._pt_mp,
+                       'Lion_beta2': self._pt_b2}, fh)
+        print('PROBE_TENSOR: on every=%d type=%s tensors=%d meta_alg=%s '
+              'momentum_param=%g Lion_beta2=%g dir=%s'
+              % (_every, self.stepsize_type, self.num_layers, self._pt_alg,
+                 self._pt_mp, self._pt_b2, _dir), flush=True)
+
+    def _pt_capture(self, u, v, z):
+        """Runs right after block_product, BEFORE base_update and meta_update.
+        READ-ONLY on the optimizer: recomputes <u_i, v_i> per tensor from the
+        same (u, v) block_product consumed, keeps its own per-tensor EMA with
+        the harness's coefficients, and at probe steps snapshots CLONES of the
+        harness's own pre-update z, momentum_meta and beta."""
+        if not hasattr(self, '_pt_on'):
+            self._pt_init()
+        if not self._pt_on:
+            return
+        zt = torch.stack([(u_*v_).sum() for u_, v_ in zip(u, v)]).detach().float()
+        if self._pt_mom is None:
+            self._pt_mom = torch.zeros_like(zt)
+        mom_pre = self._pt_mom
+        if self.counter % self._pt_every == 0:
+            _zh = [zz.detach().reshape(-1).float().clone() for zz in z]
+            _mh = []
+            for _k, mm in enumerate(self.momentum_meta):
+                if torch.is_tensor(mm):
+                    _mh.append(mm.detach().reshape(-1).float().clone())
+                else:
+                    _mh.append(torch.full((_zh[_k].numel(),), float(mm),
+                                          dtype=torch.float32, device=zt.device))
+            _bp = [bb.detach().reshape(-1).float().clone() for bb in self.beta]
+            self._pt_last = {'step': int(self.counter), 'z_tensor': zt.clone(),
+                             'm_tensor': mom_pre.clone(), 'z_harness': _zh,
+                             'mom_harness': _mh, 'beta_pre': _bp}
+        self._pt_mom = self._pt_mp * mom_pre + (1.0 - self._pt_mp) * zt
+
+    def _pt_attach(self, rec):
+        """APPENDS keys to the probe record; never touches an existing key."""
+        if not getattr(self, '_pt_on', False) or self._pt_last is None:
+            return
+        L = self._pt_last
+        self._pt_last = None
+        if L['step'] != rec.get('step'):
+            rec['pt_step_mismatch'] = [int(L['step']), rec.get('step')]
+            return
+        rec['z_tensor'] = L['z_tensor'].cpu().tolist()
+        rec['m_tensor'] = L['m_tensor'].cpu().tolist()
+        rec['z_agg'] = [x.cpu().tolist() for x in L['z_harness']]
+        rec['mom_pre'] = [x.cpu().tolist() for x in L['mom_harness']]
+        rec['beta_pre'] = [x.cpu().tolist() for x in L['beta_pre']]
+        rec['pt_mp'] = self._pt_mp
+        rec['pt_b2'] = self._pt_b2
+
+'''
+src = src.replace(A3, I3 + A3, 1)
+
+open(P + ".pre_probe_tensor", "w").write(orig)
+open(P, "w").write(src)
+print("PATCHED PATCH_PROBE_TENSOR -> %s  (+%d lines; backup %s.pre_probe_tensor)"
+      % (P, src.count("\n") - orig.count("\n"), P))

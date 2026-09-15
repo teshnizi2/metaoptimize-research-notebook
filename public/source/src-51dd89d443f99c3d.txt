@@ -1,0 +1,225 @@
+"""G16 -- THE NO-OP PROOF for PATCH_EBJS.
+
+WHY THIS IS THE FIRST THING G16 SHIPS.  There are 919 completed runs on the
+account_b tree and 2,177 rows in results/all_runs.csv.  Every one of them was
+produced by an HF.py that G16 is about to edit.  A patch that changes ANY
+pre-existing behaviour retroactively invalidates all of them.  So the claim
+"PATCH_EBJS is a no-op when disabled" is not asserted from reading the diff --
+it is MEASURED here, and the batch launcher refuses to submit until it passes.
+
+METHOD.  Both files -- the tree as it stood immediately BEFORE the edit, and the
+tree AFTER it -- are loaded as two independent modules in ONE process with
+importlib.  For each configuration below the harness:
+
+    1. seeds torch identically,
+    2. builds the same network on CPU (CPU so the comparison is exactly
+       deterministic; CUDA kernel nondeterminism would make a bitwise test
+       meaningless),
+    3. constructs HF from module A and runs K optimiser steps on a fixed
+       synthetic batch sequence,
+    4. repeats 1-3 with module B,
+    5. hashes the FULL post-run state -- every beta tensor, every network
+       parameter, and the whole h_condenced trace -- as float64 bytes, SHA-256.
+
+Equal hashes over every pre-existing configuration is the proof.  Because both
+modules run in the same process on the same seeds, ANY behavioural difference,
+however small, changes the hash.
+
+The configurations cover every HIER value that exists in the corpus (none,
+shrink, additive, zpool, zmpool), both beta layouts (single-tensor `layerwise`
+and the per-tensor list used by `nodewise`), the scalar arm, and the BETA_CLIP
+guard, because those are the code paths the 919 runs actually took.
+
+Two comparisons are reported and BOTH must pass:
+    PRE   vs POST  -- isolates THIS patch (the reference is the file as it stood
+                      the moment before patch_ebjs.py ran, so a concurrent
+                      edit by another agent is not attributed to G16);
+    PINNED vs POST -- the question that actually protects the archive: is the
+                      tree AS IT NOW STANDS still a no-op against the version the
+                      archived runs were produced by?
+A PINNED-vs-POST failure with a PRE-vs-POST pass means someone ELSE's block
+broke the archive; the script says so explicitly rather than blaming G16.
+
+USAGE (on the cluster, inside the venv):
+    python3 analysis/cG16_noop_equiv.py --pre <HF.py.bak_ebjs> --post <HF.py> \\
+        [--pinned <pristine HF.py>] [--cifar <cifar10 dir>] [--steps 6]
+Exit 0 = PASS (every required comparison identical), 1 = FAIL.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+# Every pre-existing configuration.  (tag, granularity, env-dict).  The env dict
+# is applied on top of a cleared HIER/LAM/ETA_RATIO/BETA_CLIP/EB_* environment.
+CONFIGS = [
+    ("layerwise-none",        "layerwise", {}),
+    ("layerwise-none-clip",   "layerwise", {"BETA_CLIP": "-15:-2.3026"}),
+    ("layerwise-shrink-0.1",  "layerwise", {"HIER": "shrink", "LAM": "0.1"}),
+    ("layerwise-add-0.06",    "layerwise", {"HIER": "additive", "ETA_RATIO": "0.06"}),
+    ("layerwise-add-1",       "layerwise", {"HIER": "additive", "ETA_RATIO": "1"}),
+    ("layerwise-zpool-0.1",   "layerwise", {"HIER": "zpool", "ETA_RATIO": "0.1"}),
+    ("layerwise-zmpool-0.1",  "layerwise", {"HIER": "zmpool", "ETA_RATIO": "0.1"}),
+    ("scalar-none",           "scalar",    {}),
+    ("blk6-none",             "resnet18_blocks", {}),
+    ("nodewise-shrink-0.1",   "nodewise",  {"HIER": "shrink", "LAM": "0.1"}),
+    ("nodewise-add-0.06",     "nodewise",  {"HIER": "additive", "ETA_RATIO": "0.06"}),
+]
+
+# The new modes.  These are NOT part of the no-op proof (they are supposed to do
+# something); they are smoke-tested separately for finiteness and for rhat in
+# [0,1], and they must be ABSENT from the pre-patch module.
+NEW_MODES = [
+    ("layerwise-ebjs", "layerwise", {"HIER": "ebjs"}),
+    ("layerwise-ebjz", "layerwise", {"HIER": "ebjz"}),
+]
+
+ENV_KEYS = ["HIER", "LAM", "ETA_RATIO", "BETA_CLIP", "SCHED", "SCHED_TOTAL",
+            "SCHED_WARMUP", "SCHED_MIN", "PROBE", "PROBE_DIR",
+            "EB_RHO", "EB_LOG"]
+
+
+class _NullWriter(object):
+    def add_scalar(self, *a, **k):
+        pass
+
+    def add_scalars(self, *a, **k):
+        pass
+
+
+def load_module(path, tag):
+    """Load an HF.py by PATH, whatever its extension.  The pre-patch reference is
+    HF.py.bak_ebjs, so spec_from_file_location's suffix sniffing is not usable --
+    an explicit SourceFileLoader is."""
+    name = "hf_%s" % tag
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def set_env(env):
+    for k in ENV_KEYS:
+        os.environ.pop(k, None)
+    for k, v in env.items():
+        os.environ[k] = v
+
+
+def run_one(HFcls, gran, env, cifar, steps, net_name, seed=0):
+    """Fixed-seed step sequence.  Returns (sha256 hex, list of rhat floats)."""
+    import torch
+    import numpy as np
+    sys.path.insert(0, cifar)
+    from build_network import build_network
+
+    set_env(env)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    net = build_network(net_name, "cpu")
+    args_base = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+    args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99,
+                 "Lion_beta2": 0.9, "weight_decay": 0}
+    opt = HFcls(net, stepsize_groups=gran, alpha0=1e-6, args_base=args_base,
+                args_meta=args_meta, gamma=1, writer=_NullWriter())
+
+    # Fixed synthetic data, generated from its own generator so that the number
+    # of draws taken by build_network cannot shift it.
+    g = torch.Generator().manual_seed(1234)
+    lossfn = torch.nn.CrossEntropyLoss()
+    for _ in range(steps):
+        x = torch.randn(8, 3, 32, 32, generator=g)
+        y = torch.randint(0, 10, (8,), generator=g)
+        opt.step(net, lossfn(net(x), y))
+
+    h = hashlib.sha256()
+    for b in opt.beta:
+        h.update(b.detach().double().cpu().numpy().tobytes())
+    for p in net.parameters():
+        h.update(p.detach().double().cpu().numpy().tobytes())
+    for t in opt.h_condenced:
+        h.update(t.detach().double().cpu().numpy().tobytes())
+    rr = []
+    if getattr(opt, "_ebjs_rn", 0):
+        rr = [float(opt._ebjs_racc) / opt._ebjs_rn]
+    return h.hexdigest(), rr
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pre", required=True, help="HF.py as it stood BEFORE the edit")
+    ap.add_argument("--post", required=True, help="HF.py as it stands now")
+    ap.add_argument("--pinned", default="", help="pristine archive-era HF.py (optional)")
+    ap.add_argument("--cifar", default="/cluster/account_b/metaopt/MetaOptimize/codes/"
+                                       "Supervised_tasks/MetaOptimize/cifar10")
+    ap.add_argument("--net", default="ResNet18")
+    ap.add_argument("--steps", type=int, default=6)
+    a = ap.parse_args()
+
+    for p in (a.pre, a.post):
+        if not os.path.isfile(p):
+            print("FAIL: missing %s" % p)
+            return 1
+
+    pre = load_module(a.pre, "pre")
+    post = load_module(a.post, "post")
+    pinned = load_module(a.pinned, "pinned") if a.pinned else None
+
+    print("== files ==")
+    for tag, p in [("pre", a.pre), ("post", a.post)] + ([("pinned", a.pinned)] if pinned else []):
+        print("  %-7s %s  md5=%s" % (
+            tag, p, hashlib.md5(open(p, "rb").read()).hexdigest()))
+    print("  net=%s steps=%d cifar=%s" % (a.net, a.steps, a.cifar))
+
+    # The patch must be visible in post and absent from pre.
+    src_pre, src_post = open(a.pre).read(), open(a.post).read()
+    if "PATCH_EBJS" in src_pre:
+        print("FAIL: --pre already contains PATCH_EBJS; it is not a pre-patch file")
+        return 1
+    if "PATCH_EBJS" not in src_post:
+        print("FAIL: --post does not contain PATCH_EBJS; nothing to prove")
+        return 1
+
+    bad = 0
+    print("\n== NO-OP PROOF: every pre-existing configuration ==")
+    print("  %-24s %-10s %-10s %s" % ("config", "pre/post", "pin/post", "sha256[:16]"))
+    for tag, gran, env in CONFIGS:
+        hpre, _ = run_one(pre.HF, gran, env, a.cifar, a.steps, a.net)
+        hpost, _ = run_one(post.HF, gran, env, a.cifar, a.steps, a.net)
+        ok1 = "SAME" if hpre == hpost else "DIFFER"
+        if hpre != hpost:
+            bad += 1
+        ok2 = "-"
+        if pinned is not None:
+            hpin, _ = run_one(pinned.HF, gran, env, a.cifar, a.steps, a.net)
+            ok2 = "SAME" if hpin == hpost else "DIFFER"
+            if hpin != hpost:
+                bad += 1
+        print("  %-24s %-10s %-10s %s" % (tag, ok1, ok2, hpost[:16]))
+
+    print("\n== NEW MODES: must run, must be absent from pre ==")
+    for tag, gran, env in NEW_MODES:
+        hpre, _ = run_one(pre.HF, gran, env, a.cifar, a.steps, a.net)
+        hbase, _ = run_one(pre.HF, gran, {}, a.cifar, a.steps, a.net)
+        hpost, rr = run_one(post.HF, gran, env, a.cifar, a.steps, a.net)
+        # On the PRE module an unknown HIER string falls through every arm, so it
+        # must reproduce the plain arm exactly.  That is what makes the string new.
+        inert_pre = (hpre == hbase)
+        active = (hpost != hbase)
+        rtxt = ("rbar=%.6f" % rr[0]) if rr else "rbar=NONE"
+        okr = bool(rr) and 0.0 <= rr[0] <= 1.0
+        print("  %-24s inert_on_pre=%-5s active_on_post=%-5s %s in[0,1]=%s"
+              % (tag, inert_pre, active, rtxt, okr))
+        if not (inert_pre and active and okr):
+            bad += 1
+
+    print("\n%s" % ("VERDICT: PASS -- PATCH_EBJS is a proven no-op when disabled"
+                    if bad == 0 else
+                    "VERDICT: FAIL -- %d comparison(s) not identical" % bad))
+    return 0 if bad == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

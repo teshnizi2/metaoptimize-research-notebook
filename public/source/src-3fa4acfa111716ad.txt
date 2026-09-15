@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""
+c98_figures.py -- the paper's four figures, on ONE palette, from the CSV of record.
+
+    python3 analysis/c98_figures.py --all                 # writes paper/figures/*.pdf + *.png
+    python3 analysis/c98_figures.py --numbers             # prints every number it plots
+    python3 analysis/c98_figures.py --fig f1 f3           # a subset
+
+DESIGN RULES THIS SCRIPT ENFORCES, so a figure cannot silently break a house rule:
+
+  R-A  plateau5 (mean of the last 5 test epochs) is the ONLY accuracy metric read.
+       The CSV `plateau` column (mean of the last 20) is never touched.
+  R-B  Admissibility is `window_ok == 1 AND complete == 1 AND plateau5 present`,
+       applied before any arm mean is formed.
+  R-C  Every contrast is WITHIN one batch. No cross-batch difference is ever drawn.
+  R-D  CIFAR-10 and CIFAR-100 D's are NEVER placed on one percentage-point axis
+       (they sit on ~7-8 pp and ~29-30 pp error budgets respectively).  Panel (a)
+       of F1 therefore carries a hard axis break and panel (b) gives the
+       commensurable quantity, D / headroom.
+  R-E  Rows sharing a `dup_group` are averaged WITHIN the group first, and n is the
+       number of distinct groups.  This is what makes ml2 a 3 v 3 cell, not 6 v 6.
+  R-F  Nothing is hard-coded.  Every plotted value is re-derived here from
+       results/all_runs.csv or, for the within-run budget series, from the raw
+       per-epoch `.out` files.  --numbers prints them all for audit.
+
+Palette: Okabe-Ito, colour-blind safe, identical across all four figures.
+Colour encodes the BASE OPTIMISER; marker shape encodes the DATASET.
+"""
+import argparse, csv, math, os, re, statistics as st, sys
+from glob import glob
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+HERE    = os.path.dirname(os.path.abspath(__file__))
+ROOT    = os.path.normpath(os.path.join(HERE, ".."))
+CSV     = os.path.join(ROOT, "results", "all_runs.csv")
+FIGDIR  = os.path.join(ROOT, "paper", "figures")
+# Where the raw per-epoch .out logs live.  In the working tree they sit beside the
+# repo; in the released artefact `make logs` unpacks them under release/logs/.
+# Set METAOPT_RUNS (colon-separated) to override.
+def _rundirs():
+    if os.environ.get("METAOPT_RUNS"):
+        return [d for d in os.environ["METAOPT_RUNS"].split(os.pathsep) if os.path.isdir(d)]
+    cand = []
+    for base in (os.path.join(ROOT, ".."), os.path.join(ROOT, "logs"), ROOT):
+        for d in ("runs", "runs_cluster_b"):
+            cand.append(os.path.normpath(os.path.join(base, d)))
+    return [d for d in cand if os.path.isdir(d)]
+RUNDIRS = _rundirs()
+
+# ------------------------------------------------------------------ palette
+INK    = "#1B1B1B"
+GRID   = "#D9D6D0"
+MUTE   = "#7A7A7A"
+REPC   = "#007A4D"           # the repaired (hz3q) reading in F3
+FAINT  = "#EDEAE4"
+BASE_C = {                       # Okabe-Ito
+    "SGDm":     "#0072B2",       # blue
+    "SGD":      "#E69F00",       # orange
+    "RMSProp":  "#009E73",       # bluish green
+    "AdamW":    "#D55E00",       # vermillion
+    "SGDm-GN":  "#CC79A7",       # reddish purple  (GroupNorm variant)
+    "AdamW+RMS":"#56B4E9",       # sky blue  (AdamW base, RMSProp META -- NOT an AdamW-level member)
+}
+DSET_M = {"C10": "o", "C100": "D"}          # marker encodes dataset
+NET_MS = {"ResNet-18": 6.0, "ResNet-34": 7.5, "ResNet-50": 9.0}
+
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
+    "font.size": 8.5, "axes.labelsize": 8.5, "axes.titlesize": 9.5,
+    "xtick.labelsize": 7.5, "ytick.labelsize": 7.5, "legend.fontsize": 7.5,
+    "axes.edgecolor": INK, "axes.linewidth": 0.7, "text.color": INK,
+    "axes.labelcolor": INK, "xtick.color": INK, "ytick.color": INK,
+    "xtick.major.width": 0.7, "ytick.major.width": 0.7,
+    "figure.dpi": 160, "savefig.dpi": 300, "savefig.bbox": "tight",
+    "pdf.fonttype": 42, "ps.fonttype": 42,
+    "axes.spines.top": False, "axes.spines.right": False,
+})
+
+# ------------------------------------------------------------------- data
+def _num(r, k):
+    try:    return float(r[k])
+    except (TypeError, ValueError, KeyError): return None
+
+def admissible(r):
+    return (r.get("window_ok") == "1" and r.get("complete") == "1"
+            and _num(r, "plateau5") is not None)
+
+def load(path=CSV):
+    rows = list(csv.DictReader(open(path)))
+    return rows, [r for r in rows if admissible(r)]
+
+# The 18 collapsed pairs registered by the ARGS audit (docs/ARGS-AUDIT.md §5).
+# analysis/args_repair.py writes them into the CSV's `dup_group` column; until it
+# has been run with --apply the column is empty, so we fall back to the SAME
+# registered table rather than silently over-counting.  One source of truth, and
+# the result is identical before and after the patch is applied.
+def _pending_dupes():
+    try:
+        sys.path.insert(0, HERE)
+        from args_repair import GROUPS
+        return {run: name for name, runs in GROUPS for run in runs}
+    except Exception:
+        return {}
+PENDING_DUP = _pending_dupes()
+
+def arm(rows, prefix, gran):
+    """Admissible plateau5 values of one arm, with R-E dup_group collapsing.
+
+    Returns (values, n_groups).  Rows carrying a dup_group -- from the CSV column
+    if the repair has been applied, otherwise from the registered table above --
+    are averaged WITHIN the group first, so a batch that ran one configuration
+    twice under two names contributes ONE number, not two.  This is what makes
+    ml2 a 3 v 3 cell (se 0.195) and not a 6 v 6 one (se 0.142).
+    """
+    sel = [r for r in rows if r["run"].startswith(prefix) and r["granularity"] == gran]
+    groups, singles = {}, []
+    for r in sel:
+        dg = (r.get("dup_group") or "").strip() or PENDING_DUP.get(r["run"], "")
+        if dg: groups.setdefault(dg, []).append(float(r["plateau5"]))
+        else:  singles.append(float(r["plateau5"]))
+    vals = singles + [st.mean(v) for v in groups.values()]
+    return vals, len(vals)
+
+def welch(a, b):
+    d  = st.mean(a) - st.mean(b)
+    se = math.sqrt(st.variance(a) / len(a) + st.variance(b) / len(b))
+    return d, se, (d / se if se else float("nan"))
+
+# ---- the seventeen count-matched cells of Table 2, declared once ------------
+#   (label, network, dataset, base, eta, epochs, chunk-arm, nodewise-arm,
+#    tail-free chunk arm, tail-free nodewise arm)   -- None where the batch has none
+CELLS = [
+ ("cc1",      "ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("cc1-ch","chunk777"), ("cc1-node","nodewise"), ("cc1-c23","chunk2325"), ("cc1-n1d","nodewise1d")),
+ ("mm1",      "ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("mm1-ch","chunk777"), ("mm1-node","nodewise"), None, None),
+ ("pp1",      "ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("pp1-ch","chunk777"), ("pp1-node","nodewise"), None, None),
+ ("gn1 (BN)", "ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("gn1-bn-ch","chunk777"), ("gn1-bn-node","nodewise"), None, None),
+ ("ml2",      "ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("ml2-","chunk777"), ("ml2-","nodewise"), ("ml2-","chunk2325"), ("ml2-","nodewise1d")),
+ ("rl3 @1e-4","ResNet-18",    "C10",  "SGDm",    "1e-4", 100,
+  ("rl3-ch7-m1e4","chunk777"), ("rl3-node-m1e4","nodewise"), ("rl3-c23-m1e4","chunk2325"), ("rl3-n1d-m1e4","nodewise1d")),
+ ("rl3 @3e-4","ResNet-18",    "C10",  "SGDm",    "3e-4", 100,
+  ("rl3-ch7-m3e4","chunk777"), ("rl3-node-m3e4","nodewise"), ("rl3-c23-m3e4","chunk2325"), ("rl3-n1d-m3e4","nodewise1d")),
+ ("fa1",      "ResNet-18",    "C10",  "SGDm",    "3e-4", 100,
+  ("fa1-ch","chunk777"), ("fa1-node","nodewise"), ("fa1-c23","chunk2325"), ("fa1-n1d","nodewise1d")),
+ ("hz3",      "ResNet-18",    "C10",  "SGDm",    "1e-4", 300,
+  ("hz3-ch","chunk777"), ("hz3-node","nodewise"), ("hz3-c23","chunk2325"), ("hz3-n1d","nodewise1d")),
+ ("gn1 (GN)", "ResNet-18",    "C10",  "SGDm-GN", "1e-4", 100,
+  ("gn1-gn-ch","chunk777"), ("gn1-gn-node","nodewise"), None, None),
+ ("aw1",      "ResNet-18",    "C10",  "AdamW",   "1e-4", 100,
+  ("aw1-ch","chunk777"), ("aw1-node","nodewise"), ("aw1-c23","chunk2325"), ("aw1-n1d","nodewise1d")),
+ ("nl1 (SGD)","ResNet-18",    "C10",  "SGD",     "1e-4", 100,
+  ("nl1-sgd-ch","chunk777"), ("nl1-sgd-node","nodewise"), ("nl1-sgd-c23","chunk2325"), ("nl1-sgd-n1d","nodewise1d")),
+ ("nl1 (RMSProp)","ResNet-18","C10",  "RMSProp", "1e-4", 100,
+  ("nl1-rms-ch","chunk777"), ("nl1-rms-node","nodewise"), ("nl1-rms-c23","chunk2325"), ("nl1-rms-n1d","nodewise1d")),
+ ("g3m",      "ResNet-34",    "C10",  "SGDm",    "1e-4", 100,
+  ("g3m-chd","chunk835"), ("g3m-node","nodewise"), ("g3m-chg","chunk2500"), ("g3m-n1d","nodewise1d")),
+ ("r50",      "ResNet-50",    "C10",  "SGDm",    "1e-4", 100,
+  ("r50-ch","chunk295"), ("r50-node","nodewise"), ("r50-c88","chunk884"), ("r50-n1d","nodewise1d")),
+ ("gc1",      "ResNet-18",    "C100", "SGDm",    "1e-4", 100,
+  ("gc1-ch","chunk771"), ("gc1-node","nodewise"), None, None),
+ ("gm2",      "ResNet-18",    "C100", "SGDm",    "1e-4", 100,
+  ("gm2-ch","chunk771"), ("gm2-node","nodewise"), ("gm2-c22","chunk2293"), ("gm2-n1d","nodewise1d")),
+ ("bm2 (SGD)","ResNet-18",     "C10",  "SGD",     "1e-4", 100,
+  ("bm2-sgd-ch","chunk777"), ("bm2-sgd-node","nodewise"), None, None),
+ ("bm2 (RMSProp)","ResNet-18", "C10",  "RMSProp", "1e-4", 100,
+  ("bm2-rms-ch","chunk777"), ("bm2-rms-node","nodewise"), None, None),
+ ("sm3",      "ResNet-18",    "C10",  "AdamW",   "1e-4", 100,
+  ("sm3-awrms-ch","chunk777"), ("sm3-awrms-node","nodewise"),
+  ("sm3-awrms-c23","chunk2325"), ("sm3-awrms-n1d","nodewise1d")),
+ # sm4 is the corpus's ONLY non-Lion partition cell.  It carries its own `base`
+ # string so it can never be pooled into the AdamW level, and it is deliberately
+ # absent from POOL12 -- analysis/c97_sm4_score.py's registered scope note forbids
+ # pooling it with aw1 or sm3.
+ ("sm4",      "ResNet-18",    "C10",  "AdamW+RMS","1e-4", 100,
+  ("sm4-awrms-ch","chunk777"), ("sm4-awrms-node","nodewise"),
+  ("sm4-awrms-c23","chunk2325"), ("sm4-awrms-n1d","nodewise1d")),
+]
+# The cells that share a BYTE-IDENTICAL contrast object on ResNet-18
+# (nodewise -> chunk777, m 14,420 vs 14,421).
+POOL12 = {"cc1","mm1","pp1","gn1 (BN)","rl3 @1e-4","rl3 @3e-4","fa1","hz3",
+          "gn1 (GN)","aw1","nl1 (SGD)","nl1 (RMSProp)",
+          "bm2 (SGD)","bm2 (RMSProp)","sm3"}
+
+# The GroupNorm cell is REMOVED from the paper by R0 checklist item 1
+# (docs/STATUS.md): its own registered scorer, analysis/c84_gn1_score.py, halts at
+# its commensurability gate and refuses to issue a verdict, printing "THIS IS NOT A
+# NULL".  A cell with no verdict cannot be a forest row or a pool member, so it is
+# excluded here by DEFAULT.  Pass --with-gn to put it back and every figure, count
+# and pool follows automatically.
+GN_CELL = "gn1 (GN)"
+WITH_GN = False
+
+def cells(rows):
+    out = []
+    for (lab, net, ds, base, eta, ep, ch, nd, c23, n1d) in CELLS:
+        if lab == GN_CELL and not WITH_GN: continue
+        cv, cn = arm(rows, *ch); nv, nn = arm(rows, *nd)
+        if not cv or not nv:
+            sys.stderr.write("MISSING arm for cell %s -- skipped\n" % lab); continue
+        d, se, t = welch(cv, nv)
+        rec = dict(label=lab, network=net, dataset=ds, base=base, eta=eta, epochs=ep,
+                   n=(cn, nn), D=d, seD=se, tD=t,
+                   aligned=st.mean(nv), uniform=st.mean(cv),
+                   headroom=100.0 - st.mean(nv), G=None, seG=None, tG=None,
+                   DG=None, seDG=None, tDG=None, in12=(lab in POOL12))
+        rec["rel"] = d / rec["headroom"]
+        if c23 and n1d:
+            gv, gn_ = arm(rows, *c23); hv, hn = arm(rows, *n1d)
+            if gv and hv:
+                g, gse, gt = welch(gv, hv)
+                rec.update(G=g, seG=gse, tG=gt, DG=d - g,
+                           seDG=math.sqrt(se**2 + gse**2))
+                rec["tDG"] = rec["DG"] / rec["seDG"]
+        out.append(rec)
+    return out
+
+# ---- DerSimonian-Laird, used by F2 -----------------------------------------
+def meta(items):
+    """items :: [(y, se)] -> (fixed-effect pool, se, Q, df, tau)."""
+    w = [1.0 / se**2 for _, se in items]
+    y = [v for v, _ in items]
+    W = sum(w)
+    m = sum(wi * yi for wi, yi in zip(w, y)) / W
+    Q = sum(wi * (yi - m)**2 for wi, yi in zip(w, y))
+    k = len(items)
+    den = W - sum(wi**2 for wi in w) / W
+    tau2 = max(0.0, (Q - (k - 1)) / den) if den > 0 else 0.0
+    return m, 1.0 / math.sqrt(W), Q, k - 1, math.sqrt(tau2)
+
+# ---- raw per-epoch series, used by F3 --------------------------------------
+def series(pattern):
+    """{seed: [test acc per epoch]} from the raw .out files, searched recursively."""
+    out = {}
+    for d in RUNDIRS:
+        for f in glob(os.path.join(d, pattern)) + glob(os.path.join(d, "**", pattern),
+                                                       recursive=True):
+            m = re.search(r"-s(\d+)-\d+\.out$", f)
+            if not m: continue
+            txt = open(f, errors="replace").read()
+            out[int(m.group(1))] = [float(x) for x in
+                                    re.findall(r"Test Accuracy: ([0-9.]+)", txt)]
+    return out
+
+def pl5(v, B):
+    """plateau5 evaluated at budget B: the mean of test epochs B-5 .. B-1."""
+    return sum(v[B-5:B]) / 5.0
+
+def budget_table():
+    ch, nd = series("hz3-ch-s*.out"), series("hz3-node-s*.out")
+    seeds  = sorted(set(ch) & set(nd))
+    return ch, nd, seeds
+
+# ================================================================== FIGURE 1
+def fig1(rows, cs, numbers=False):
+    order = sorted(cs, key=lambda c: (c["dataset"] == "C100", -c["D"]))
+    ylab  = ["%s  ·  %s%s" % (c["label"], c["network"].replace("ResNet-", "R"),
+             {"C10": "", "C100": "/C100"}[c["dataset"]]) for c in order]
+    ypos  = list(range(len(order)))[::-1]
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(7.4, 4.5),
+                                   gridspec_kw=dict(width_ratios=[1.55, 1.0], wspace=0.06))
+    for ax in (axL, axR):
+        ax.set_axisbelow(True)
+        ax.xaxis.grid(True, color=GRID, lw=0.6)
+        ax.axvline(0.0, color=INK, lw=0.9, zorder=3)
+        ax.set_ylim(-0.9, len(order) - 0.1)
+
+    n_c10 = sum(1 for c in order if c["dataset"] == "C10")
+    split = len(order) - n_c10 - 0.5           # the C10 | C100 divider
+
+    for ax, key, sekey in ((axL, "D", "seD"), (axR, "rel", None)):
+        for y, c in zip(ypos, order):
+            col = BASE_C[c["base"]]
+            v   = c[key]
+            if sekey:
+                lo, hi = v - 1.96 * c[sekey], v + 1.96 * c[sekey]
+            else:
+                lo, hi = ((c["D"] - 1.96 * c["seD"]) / c["headroom"],
+                          (c["D"] + 1.96 * c["seD"]) / c["headroom"])
+            ax.plot([lo, hi], [y, y], color=col, lw=1.5, solid_capstyle="round",
+                    alpha=0.85, zorder=4)
+            ax.plot([v], [y], marker=DSET_M[c["dataset"]], color=col,
+                    ms=NET_MS[c["network"]], mec="white", mew=0.8, zorder=5)
+        ax.axhline(split, color=MUTE, lw=0.7, ls=(0, (4, 3)))
+
+    axL.set_yticks(ypos); axL.set_yticklabels(ylab)
+    axL.set_xlabel("D   (pp, 95% CI)")
+    axL.set_title("(a)  raw effect: uniform chunk − aligned nodewise", loc="left", pad=7)
+    axR.set_yticks(ypos); axR.set_yticklabels([])
+    axR.set_xlabel("D / headroom")
+    axR.set_title("(b)  commensurable: relative error reduction", loc="left", pad=7)
+    axL.set_xlim(-0.25, 2.32)
+    axR.set_xlim(-0.030, 0.215)
+
+    # the axis-break warning that panel (a) exists to carry
+    axR.text(0.985, split - 0.28,
+             "below the rule: CIFAR-100.\nA ≈30 pp error budget,\nagainst ≈7–8 pp above it.",
+             transform=axR.get_yaxis_transform(), ha="right", va="top",
+             fontsize=6.4, color=MUTE, style="italic")
+
+    pool = meta([(c["D"], c["seD"]) for c in cs if c["in12"]])
+    k12 = sum(1 for c in cs if c["in12"])
+    axL.text(0.985, 0.220,
+             "%d-cell fixed-effect pool  %+.3f ± %.3f pp\nQ %.1f on %d df,  τ %.3f pp"
+             % (k12, pool[0], pool[1], pool[2], pool[3], pool[4]),
+             transform=axL.transAxes, ha="right", va="bottom", fontsize=6.6, color=INK,
+             bbox=dict(fc="white", ec=GRID, lw=0.6, pad=3.0))
+
+    present = [b for b in ("SGDm", "SGD", "RMSProp", "AdamW", "SGDm-GN")
+               if any(c["base"] == b for c in order)]
+    handles = [Line2D([], [], color=BASE_C[b], lw=1.6, marker="o", ms=5.5,
+                      mec="white", mew=0.7, label=b) for b in present]
+    handles += [Line2D([], [], color=MUTE, lw=0, marker="D", ms=5.5, mec="white",
+                       mew=0.7, label="CIFAR-100 cell"),
+                Line2D([], [], color=MUTE, lw=0, marker="o", ms=8.0, mec="white",
+                       mew=0.7, label="marker size: R18 / R34 / R50")]
+    fig.legend(handles=handles, loc="lower center", ncol=len(handles), frameon=False,
+               bbox_to_anchor=(0.52, -0.055), handlelength=1.4, columnspacing=1.3)
+
+    if numbers:
+        print("\n== F1 ==   D and D/headroom, %d cells" % len(order))
+        for c in order:
+            print("  %-16s %-10s n %d v %-2d  D %+0.3f ± %0.3f (t %5.2f)   aligned %7.3f  "
+                  "headroom %6.3f  rel %0.4f"
+                  % (c["label"], c["base"], c["n"][0], c["n"][1], c["D"], c["seD"],
+                     c["tD"], c["aligned"], c["headroom"], c["rel"]))
+        k12 = sum(1 for c in cs if c["in12"])
+        print("  %d-cell pool %+0.3f ± %0.3f  Q %.2f/%d  tau %.3f  rms se %.3f"
+              % (k12, pool[0], pool[1], pool[2], pool[3], pool[4],
+                 math.sqrt(sum(c["seD"]**2 for c in cs if c["in12"]) / k12)))
+    return fig
+
+# ================================================================== FIGURE 2
+def fig2(rows, cs, numbers=False):
+    twelve = [c for c in cs if c["in12"]]
+    eleven = [c for c in twelve if c["base"] != "SGDm-GN"]
+    tot12  = meta([(c["D"], c["seD"]) for c in twelve])
+    tot11  = meta([(c["D"], c["seD"]) for c in eleven])
+    n11    = len(eleven)
+    bases  = ["SGDm", "SGD", "RMSProp", "AdamW"]
+    sub    = {b: meta([(c["D"], c["seD"]) for c in eleven if c["base"] == b])
+              for b in bases}
+    within = sum(sub[b][2] for b in bases)
+    wdf    = sum(sub[b][3] for b in bases)
+    between, bdf = tot11[2] - within, tot11[3] - wdf
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(7.4, 3.4),
+                                   gridspec_kw=dict(width_ratios=[1.95, 1.0], wspace=0.30))
+
+    # ---- left: the eleven cells, grouped by base, with each base's pool band
+    x, ticks, labels = 0, [], []
+    ymax = max(c["D"] + 1.96 * c["seD"] for c in eleven)
+    for b in bases:
+        grp = sorted([c for c in eleven if c["base"] == b], key=lambda c: -c["D"])
+        m, sem_, q, df, tau = sub[b]
+        x0 = x
+        half = max(0.55, len(grp) / 2.0 - 0.05)
+        axL.add_patch(plt.Rectangle((x0 - 0.55, m - 1.96 * sem_), (len(grp) - 1) + 2 * 0.55,
+                                    2 * 1.96 * sem_, fc=BASE_C[b], ec="none", alpha=0.15,
+                                    zorder=1))
+        axL.plot([x0 - 0.55, x0 + len(grp) - 1 + 0.55], [m, m], color=BASE_C[b], lw=1.3,
+                 ls=(0, (5, 2)), zorder=2)
+        for c in grp:
+            axL.errorbar(x, c["D"], yerr=1.96 * c["seD"], color=BASE_C[b], lw=1.3,
+                         capsize=2.4, capthick=1.0, marker="o", ms=5.2, mec="white",
+                         mew=0.8, zorder=4)
+            x += 1
+        mid = (x0 + x - 1) / 2.0
+        ticks.append(mid); labels.append(b)
+        axL.text(mid, ymax * 1.055, "k = %d\n%+.3f ± %.3f" % (len(grp), m, sem_),
+                 ha="center", va="bottom", fontsize=6.6, color=BASE_C[b])
+        x += 3.2
+    axL.axhline(0, color=INK, lw=0.8)
+    axL.set_xticks(ticks); axL.set_xticklabels(labels, fontsize=8.5)
+    axL.set_xlim(-1.1, x - 2.7)
+    axL.set_ylim(-0.06, ymax * 1.30)
+    axL.set_ylabel("D  (pp, 95% CI)")
+    axL.set_title("(a)  the base optimiser is the moderator", loc="left", pad=7)
+    axL.yaxis.grid(True, color=GRID, lw=0.6); axL.set_axisbelow(True)
+    # ---- right: where the heterogeneity lives, as one stacked Q bar
+    axR.bar([0], [between], width=0.5, color="#3F3F3F", ec="none", zorder=3,
+            label="between bases   Q %.1f, %d df" % (between, bdf))
+    axR.bar([0], [within], width=0.5, bottom=between, color=FAINT, ec=MUTE, lw=0.7,
+            zorder=3, label="within SGDm   Q %.2f, %d df" % (within, wdf))
+    axR.text(0, between / 2, "%.0f%%\nof Q" % (100 * between / tot11[2]), ha="center",
+             va="center", color="white", fontsize=8.0, zorder=5)
+    # The chi-square p of the within-level Q is anticonservative here (S3.3, S7 T13):
+    # its Monte-Carlo companion is computed, not typed, from the registered simulation.
+    import c99_qcalibration as _K
+    _mc = _K.mc_p(_K.qnull(_K.live_arms([r for r in rows if admissible(r)]), _K.DRAWS, _K.SEED, "percell")["W"], within)
+    axR.annotate("p %.2f (MC %.2f) — the eight SGDm cells are\nhomogeneous, τ = %.3f"
+                 % (chi2_sf(within, wdf), _mc, sub["SGDm"][4]),
+                 xy=(0.26, between + within / 2), xytext=(0.40, between * 0.62),
+                 fontsize=6.8, color=INK, ha="left", va="center",
+                 arrowprops=dict(arrowstyle="-", color=MUTE, lw=0.7))
+    axR.set_xticks([0]); axR.set_xticklabels(["%d cells,  total Q %.1f on %d df"
+                                              % (n11, tot11[2], tot11[3])], fontsize=7.2)
+    axR.set_xlim(-0.45, 1.15)
+    axR.set_ylim(0, tot11[2] * 1.26)
+    axR.set_ylabel("Cochran Q")
+    axR.set_title("(b)  where the heterogeneity lives", loc="left", pad=7)
+    axR.yaxis.grid(True, color=GRID, lw=0.6); axR.set_axisbelow(True)
+    axR.legend(loc="upper center", frameon=False, handlelength=1.1, borderpad=0.3,
+               fontsize=7.0, bbox_to_anchor=(0.5, 1.02))
+
+    if numbers:
+        print("\n== F2 ==   base-optimiser moderator")
+        print("  byte-identical pool over %d cells: %+0.3f ± %0.3f   Q %.2f / %d   tau %.3f"
+              % (len(twelve), tot12[0], tot12[1], tot12[2], tot12[3], tot12[4]))
+        if len(eleven) != len(twelve):
+            print("  ...with the GroupNorm cell dropped (%d): %+0.3f ± %0.3f   Q %.2f / %d   tau %.3f"
+                  % (n11, tot11[0], tot11[1], tot11[2], tot11[3], tot11[4]))
+        for b in bases:
+            m, s, q, df, tau = sub[b]
+            print("    %-8s k=%d  pool %+0.3f ± %0.3f   Q %.2f / %d   tau %.3f"
+                  % (b, sum(1 for c in eleven if c["base"] == b), m, s, q, df, tau))
+        print("  within-base Q %.2f / %d (p %.3f)   between-base Q %.2f / %d (p %.2e)"
+              % (within, wdf, chi2_sf(within, wdf), between, bdf, chi2_sf(between, bdf)))
+        print("  base explains %.1f%% of the %d-cell Q" % (100 * between / tot11[2], n11)
+              + ("" if len(eleven) == len(twelve)
+                 else ", %.1f%% of the %d-cell Q with GroupNorm"
+                      % (100 * between / tot12[2], len(twelve))))
+    return fig
+
+def chi2_sf(x, k):
+    """Upper tail of chi-square with k df, k >= 1, no scipy."""
+    if k <= 0: return float("nan")
+    if k % 2 == 0:                       # even df: closed form
+        m = k // 2
+        s, term = 0.0, 1.0
+        for i in range(m):
+            if i: term *= (x / 2.0) / i
+            s += term
+        return math.exp(-x / 2.0) * s
+    # odd df: series for the regularised lower incomplete gamma
+    a, xx = k / 2.0, x / 2.0
+    if xx < a + 1:
+        term, s, n = 1.0 / a, 1.0 / a, 0
+        while abs(term) > 1e-14 * abs(s) and n < 10000:
+            n += 1; term *= xx / (a + n); s += term
+        return 1.0 - s * math.exp(-xx + a * math.log(xx) - math.lgamma(a))
+    b, c, d, h = xx + 1 - a, 1e300, 1.0 / (xx + 1 - a), 1.0 / (xx + 1 - a)
+    for i in range(1, 10000):
+        an = -i * (i - a); b += 2
+        d = an * d + b;  d = d if abs(d) > 1e-300 else 1e-300
+        c = b + an / c;  c = c if abs(c) > 1e-300 else 1e-300
+        d = 1.0 / d; de = d * c; h *= de
+        if abs(de - 1.0) < 1e-14: break
+    return math.exp(-xx + a * math.log(xx) - math.lgamma(a)) * h
+
+# ================================================================== FIGURE 3
+def fig3(rows, cs, numbers=False):
+    ch, nd, seeds = budget_table()
+    if not seeds:
+        sys.stderr.write("F3: no hz3 .out found under %s -- skipped\n" % RUNDIRS); return None
+    Bs = [100, 200, 300]
+    # which seeds are box-matched?  read the CSV's own beta_clip per run.
+    box = {}
+    for r in rows:
+        m = re.match(r"hz3-(ch|node)-s(\d+)$", r["run"])
+        if m: box.setdefault(int(m.group(2)), {})[m.group(1)] = r["beta_clip"]
+    mismatch = sorted(s for s, v in box.items() if len(v) == 2 and v["ch"] != v["node"])
+    keep = [s for s in seeds if s not in mismatch]
+    # hz3q: the box- and class-matched re-run of the mismatched seed.  It REPLACES
+    # that seed and adds none, so the repaired pool is the same six seeds.  With the
+    # hz3q .out files absent the panel degrades to the two archived readings, which
+    # is exactly what it drew before the repair existed.
+    qch, qnd = series("hz3q-ch-s*.out"), series("hz3q-node-s*.out")
+    rep = sorted(set(qch) & set(qnd) & set(mismatch))
+    RCH, RND = (dict(ch), dict(nd)) if rep else (None, None)
+    for s5 in rep:
+        RCH[s5], RND[s5] = qch[s5], qnd[s5]
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(7.4, 3.5),
+                                   gridspec_kw=dict(width_ratios=[1.30, 1.0], wspace=0.42))
+    col = BASE_C["SGDm"]
+
+    # ---- left: per-seed within-run traces + the arm-set means
+    for s in seeds:
+        ys = [pl5(ch[s], B) - pl5(nd[s], B) for B in Bs]
+        bad = s in mismatch
+        axL.plot(Bs, ys, color=("#B0392B" if bad else col), lw=(1.1 if bad else 1.0),
+                 alpha=(0.95 if bad else 0.28),
+                 ls=("--" if bad else "-"), marker="o", ms=3.0, zorder=(4 if bad else 2),
+                 label=("seed %d, archived: cross-box, cross-class" % s) if bad else None)
+    for s5 in rep:
+        ys = [pl5(RCH[s5], B) - pl5(RND[s5], B) for B in Bs]
+        axL.plot(Bs, ys, color=REPC, lw=1.1, alpha=0.95, ls=(0, (1.2, 1.2)),
+                 marker="o", ms=3.0, zorder=5,
+                 label="seed %d, repaired: same box, same class" % s5)
+    lines = [("archived, all %d seeds" % len(seeds), (ch, nd), seeds, col, "-"),
+             ("archived, box-matched %d" % len(keep), (ch, nd), keep, "#00507F", (0, (5, 2)))]
+    if rep:
+        lines.append(("repaired, %d seeds" % len(seeds), (RCH, RND), seeds, REPC, (0, (1.2, 1.2))))
+    for lab, (C_, N_), ss, c_, ls_ in lines:
+        mu = [st.mean([pl5(C_[s], B) - pl5(N_[s], B) for s in ss]) for B in Bs]
+        se = [st.stdev([pl5(C_[s], B) - pl5(N_[s], B) for s in ss]) / math.sqrt(len(ss)) for B in Bs]
+        axL.errorbar(Bs, mu, yerr=[1.96 * x for x in se], color=c_, lw=2.0, ls=ls_,
+                     marker="s", ms=5.0, capsize=3, capthick=1.0, zorder=6, label=lab)
+    axL.axhline(0, color=INK, lw=0.8)
+    axL.set_xticks(Bs); axL.set_xlabel("training budget (epochs)")
+    axL.set_ylabel("D, paired WITHIN run  (pp)")
+    axL.set_title("(a)  D across the budget, hz3, within run", loc="left", pad=7)
+    axL.yaxis.grid(True, color=GRID, lw=0.6); axL.set_axisbelow(True)
+    axL.set_ylim(-0.02, 1.62)
+    axL.set_xlim(88, 312)
+    h, l = axL.get_legend_handles_labels()
+    order = [l.index(x) for x in sorted(l, key=lambda z: (not z.startswith(("archived,", "repaired,")), l.index(z)))]
+    axL.legend([h[i] for i in order], [l[i] for i in order],
+               loc="upper center", ncol=1, frameon=True, framealpha=1.0, edgecolor=GRID,
+               handlelength=2.1, borderpad=0.5, labelspacing=0.35, fontsize=6.6,
+               bbox_to_anchor=(0.50, 1.005))
+
+    # ---- right: the slope, both ways
+    rowsD = []
+    slope_src = [("repaired, %d seeds" % len(seeds), (RCH, RND), seeds, REPC)] if rep else []
+    slope_src += [("archived, box-matched %d" % len(keep), (ch, nd), keep, "#00507F"),
+                  ("archived, all %d seeds" % len(seeds), (ch, nd), seeds, col)]
+    for lab, (C_, N_), ss, c_ in slope_src:
+        dd = [(pl5(C_[s], 300) - pl5(N_[s], 300)) - (pl5(C_[s], 100) - pl5(N_[s], 100))
+              for s in ss]
+        m_, se_ = st.mean(dd), st.stdev(dd) / math.sqrt(len(dd))
+        rowsD.append((lab, m_, se_, m_ / se_, len(dd), c_))
+    for i, (lab, m_, se_, t_, n_, c_) in enumerate(rowsD):
+        axR.errorbar([m_], [i], xerr=[1.96 * se_], color=c_, lw=1.6, capsize=3,
+                     capthick=1.0, marker="o", ms=6.0, mec="white", mew=0.8, zorder=4)
+        axR.text(m_, i + 0.26, "%+.3f ± %.3f   t %.2f   (n=%d)" % (m_, se_, t_, n_),
+                 ha="center", va="bottom", fontsize=7.0, color=c_)
+    axR.axvline(0, color=INK, lw=0.9)
+    axR.set_yticks(range(len(rowsD)))
+    axR.set_yticklabels([r[0].replace("archived, all ", "archived, ")
+                             .replace("archived, box-matched ", "box-matched ")
+                             .replace("repaired, ", "REPAIRED, ").replace(" seeds", "")
+                         for r in rowsD], fontsize=7.0)
+    axR.set_ylim(-0.80, len(rowsD) - 0.28)
+    axR.set_xlabel("D(300) − D(100)   (pp, 95% CI)")
+    axR.set_title("(b)  the budget slope, and its sensitivity", loc="left", pad=7)
+    axR.xaxis.grid(True, color=GRID, lw=0.6); axR.set_axisbelow(True)
+    axR.text(0.5, 0.030,
+             ("all three readings together, as the repair’s own registered scorer requires.\n"
+              "Only the repaired one excludes zero, and it barely does."
+              if rep else
+              "neither interval excludes zero: the flat verdict does not turn\n"
+              "on the box-mismatched seed — but its t does (−1.42 vs −1.94)"),
+             transform=axR.transAxes, ha="center", va="bottom",
+             fontsize=6.6, color=MUTE, style="italic")
+
+    if numbers:
+        print("\n== F3 ==   hz3 budget, paired within run, plateau5 at each budget")
+        print("  box-mismatched seeds: %s" % (mismatch or "none"))
+        src = [("archived, all", (ch, nd), seeds), ("archived, box-matched", (ch, nd), keep)]
+        if rep: src.append(("repaired", (RCH, RND), seeds))
+        for lab, (C_, N_), ss in src:
+            print("  %s (n=%d, seeds %s)" % (lab, len(ss), ss))
+            for B in Bs:
+                d = [pl5(C_[s], B) - pl5(N_[s], B) for s in ss]
+                se = st.stdev(d) / math.sqrt(len(d))
+                print("     B=%3d  D %+0.3f  se %0.3f  t %5.2f" % (B, st.mean(d), se, st.mean(d) / se))
+            dd = [(pl5(C_[s], 300) - pl5(N_[s], 300)) - (pl5(C_[s], 100) - pl5(N_[s], 100)) for s in ss]
+            se = st.stdev(dd) / math.sqrt(len(dd))
+            print("     D(300)-D(100) %+0.3f  se %0.3f  t %5.2f" % (st.mean(dd), se, st.mean(dd) / se))
+    return fig
+
+# ================================================================== FIGURE 4
+def fig4(rows, cs, numbers=False):
+    have = [c for c in cs if c["G"] is not None]
+    # R-D: CIFAR-100 goes BELOW the rule, never on one pp axis with CIFAR-10.
+    order = sorted(have, key=lambda c: (c["dataset"] == "C100",
+                                        ["SGDm", "SGD", "RMSProp", "AdamW"].index(c["base"])
+                                        if c["base"] in ("SGDm", "SGD", "RMSProp", "AdamW") else 9,
+                                        -c["D"]))
+    n_c10 = sum(1 for c in order if c["dataset"] == "C10")
+    split = len(order) - n_c10 - 0.5
+    y = list(range(len(order)))[::-1]
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(7.4, 4.1),
+                                   gridspec_kw=dict(width_ratios=[1.45, 1.0], wspace=0.07))
+
+    # ---- left: D split into the tail-free part G and the tail part D - G
+    for yy, c in zip(y, order):
+        col = BASE_C[c["base"]]
+        gpos = max(c["G"], 0.0)
+        axL.barh(yy, c["DG"], left=gpos, height=0.56, color=col, ec="white", lw=0.6,
+                 zorder=3, alpha=0.95)
+        axL.barh(yy, c["G"], height=0.56, color=col, ec=col, lw=0.9, alpha=0.22,
+                 hatch="///", zorder=3)
+        axL.plot([c["D"]], [yy], marker="|", ms=11, mew=1.5, color=INK, zorder=6)
+        axL.plot([c["D"] - 1.96 * c["seD"], c["D"] + 1.96 * c["seD"]], [yy, yy],
+                 color=INK, lw=0.9, alpha=0.75, zorder=5)
+    axL.axvline(0, color=INK, lw=0.9)
+    for ax in (axL, axR):
+        ax.axhline(split, color=MUTE, lw=0.7, ls=(0, (4, 3)))
+    axL.text(0.985, split + 0.16, "below the rule: CIFAR-100, a ≈30 pp error budget",
+             transform=axL.transAxes if False else axL.get_yaxis_transform(),
+             ha="right", va="bottom", fontsize=6.4, color=MUTE, style="italic")
+    axL.set_yticks(y)
+    axL.set_yticklabels(["%s  ·  %s" % (c["label"], c["base"]) for c in order])
+    axL.set_ylim(-0.8, len(order) - 0.2)
+    axL.set_xlabel("pp")
+    axL.set_title("(a)  D = G  +  (D − G):  tail-free part, plus the size-1 tail", loc="left", pad=7)
+    axL.xaxis.grid(True, color=GRID, lw=0.6); axL.set_axisbelow(True)
+    fig.legend(handles=[
+        Patch(fc="#0072B2", ec="#0072B2", alpha=0.22, hatch="///", label="G  (tail already removed from both arms)"),
+        Patch(fc="#0072B2", ec="white", alpha=0.95, label="D − G  (the size-1 tail's contribution)"),
+        Line2D([], [], color=INK, lw=0.9, marker="|", ms=9, mew=1.5, label="D, with 95% CI")],
+        loc="lower center", ncol=3, frameon=False, bbox_to_anchor=(0.52, -0.055),
+        handlelength=1.6, columnspacing=1.8)
+
+    # ---- right: the tail share, with its interval; this is where AdamW departs
+    for yy, c in zip(y, order):
+        col = BASE_C[c["base"]]
+        axR.plot([c["DG"] - 1.96 * c["seDG"], c["DG"] + 1.96 * c["seDG"]], [yy, yy],
+                 color=col, lw=1.5, alpha=0.85, zorder=4, solid_capstyle="round")
+        axR.plot([c["DG"]], [yy], marker=DSET_M[c["dataset"]], color=col, ms=6.0,
+                 mec="white", mew=0.8, zorder=5)
+        axR.text(1.035, yy, "t %5.2f" % c["tDG"], transform=axR.get_yaxis_transform(),
+                 va="center", ha="left", fontsize=6.8,
+                 color=(INK if abs(c["tDG"]) >= 2 else MUTE))
+    axR.axvline(0, color=INK, lw=0.9)
+    axR.set_yticks(y); axR.set_yticklabels([]); axR.set_ylim(-0.8, len(order) - 0.2)
+    axR.set_xlabel("D − G   (pp, 95% CI)")
+    axR.set_title("(b)  the tail's contribution", loc="left", pad=7)
+    axR.xaxis.grid(True, color=GRID, lw=0.6); axR.set_axisbelow(True)
+    aw = [c for c in order if c["base"] == "AdamW"]
+    if aw:
+        c = aw[0]
+        axR.text(c["DG"] + 1.96 * c["seDG"] + 0.10, y[order.index(c)],
+                 "AdamW: the tail carries none of D",
+                 fontsize=6.6, color=BASE_C["AdamW"], ha="left", va="center")
+
+    if numbers:
+        print("\n== F4 ==   D / G / D-G decomposition, %d cells" % len(order))
+        for c in order:
+            print("  %-16s %-8s  D %+0.3f ± %0.3f   G %+0.3f ± %0.3f (t %5.2f)   "
+                  "D-G %+0.3f ± %0.3f (t %5.2f)"
+                  % (c["label"], c["base"], c["D"], c["seD"], c["G"], c["seG"], c["tG"],
+                     c["DG"], c["seDG"], c["tDG"]))
+        # R-D again: the pooled SGDm D-G is over CIFAR-10 cells ONLY.  Including
+        # the CIFAR-100 cell moves it +0.514 -> +0.558 and Q 4.52/7 -> 17.17/8,
+        # which is the commensurability rule earning its keep.
+        sg = [c for c in order if c["base"] == "SGDm" and c["dataset"] == "C10"]
+        p = meta([(c["DG"], c["seDG"]) for c in sg])
+        print("  SGDm/CIFAR-10 pooled D-G  %+0.3f ± %0.3f  Q %.2f/%d  (k=%d)"
+              % (p[0], p[1], p[2], p[3], len(sg)))
+        sg6 = [c for c in sg if c["network"] == "ResNet-18"]
+        p6 = meta([(c["DG"], c["seDG"]) for c in sg6])
+        print("  ...restricted to ResNet-18  %+0.3f ± %0.3f  (k=%d)" % (p6[0], p6[1], len(sg6)))
+        gg = meta([(c["G"], c["seG"]) for c in order if c["dataset"] == "C10"])
+        print("  CIFAR-10 pooled G %+0.3f ± %0.3f  Q %.2f/%d" % (gg[0], gg[1], gg[2], gg[3]))
+    return fig
+
+# =================================================================== driver
+FIGS = {"f1": ("f1_forest_D",        fig1),
+        "f2": ("f2_base_moderator",  fig2),
+        "f3": ("f3_budget",          fig3),
+        "f4": ("f4_decomposition",   fig4)}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--fig", nargs="*", default=[])
+    ap.add_argument("--numbers", action="store_true")
+    ap.add_argument("--csv", default=CSV)
+    ap.add_argument("--outdir", default=FIGDIR)
+    ap.add_argument("--with-gn", action="store_true",
+                    help="re-include the GroupNorm cell that R0 item 1 removes")
+    a = ap.parse_args()
+    global WITH_GN
+    WITH_GN = a.with_gn
+    want = list(FIGS) if (a.all or not a.fig) else a.fig
+
+    rows, adm = load(a.csv)
+    cs = cells(adm)
+    print("csv %s -- %d rows, %d admissible, %d count-matched cells"
+          % (os.path.relpath(a.csv, ROOT), len(rows), len(adm), len(cs)))
+    os.makedirs(a.outdir, exist_ok=True)
+    for k in want:
+        stem, fn = FIGS[k]
+        fig = fn(rows, cs, numbers=a.numbers)
+        if fig is None: continue
+        for ext in ("pdf", "png"):
+            p = os.path.join(a.outdir, "%s.%s" % (stem, ext))
+            # deterministic output: no embedded build timestamp, so the artefact's
+            # MANIFEST.md5 still verifies after `make figures` regenerates them.
+            meta = {"CreationDate": None} if ext == "pdf" else {"Software": None}
+            fig.savefig(p, metadata=meta)
+            print("wrote %s" % os.path.relpath(p, ROOT))
+        plt.close(fig)
+
+if __name__ == "__main__":
+    main()

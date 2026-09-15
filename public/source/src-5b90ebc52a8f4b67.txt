@@ -1,0 +1,1013 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cHD1_hdisagree_score.py -- H-DISAGREE, A DYNAMICS HYPOTHESIS, PRE-REGISTERED
+# AGAINST cpk1's CUT-POSITION CURVE.  ZERO GPU.  NO RUNS OF ITS OWN.
+#
+# THIS FILE MAKES NO RULE 21 CLAIM.  It re-analyses probe files already on disk
+# (`cru1`, batch landed and ingested at CORRECTIONS 174) and the corpus CSV, so
+# the normal wall-clock proof (commit time vs earliest sacct Submit) does not
+# exist for it.  It claims ONLY commit-before-first-execution.  Precedent:
+# cQ1 (149), cS1 (159), cZ1 (170), cY2 (174).
+#
+# =============================================================================
+# THE HYPOTHESIS, STATED BEFORE ANY NUMBER IT PRODUCES IS READ
+# =============================================================================
+#   H-DISAGREE: at a cut position k, a 2-group partition [k, 62-k] beats scalar
+#   to the extent that the two groups' aggregate meta-gradient signals DISAGREE
+#   IN SIGN over training.  When both groups' reductions carry the same sign a
+#   single beta serves both and the split buys nothing; when they disagree one
+#   beta must compromise and the split buys the difference.
+#
+#   PREDICTION.  The sign-disagreement rate D(k), k = 1..61, is single-peaked,
+#   its argmax lands at or adjacent to k* = 49 on cpk1's eleven-point grid, and
+#   D(k) correlates positively with cpk1's CAPTURE curve over those eleven k.
+#
+# =============================================================================
+# DISCLOSURE -- WHAT WAS VISIBLE AT REGISTRATION.  THIS IS AN AUDIT WITH A
+# REGISTERED BRANCH MAP, NOT A BLIND TEST.
+# =============================================================================
+#   * cpk1's CAPTURE curve (CORRECTIONS 146.3), its argmax k* = 49, its
+#     single-peakedness, and cts3's 772-epoch rescoping (156) were all visible.
+#     They are the thing being predicted against.
+#   * crn1's reduction probe REPORT.txt (results/crn1_reduction_probe/, 169.3)
+#     was visible: it reports, for scalar, [49,13] and [50,12] over 6,000
+#     meta-steps, how often a GROUP's reduction sign equals the sign of its
+#     largest term, and how often 1/n or sign-vote reweighting flips it.  It
+#     does NOT report between-group sign disagreement at any k.  Nothing in it
+#     is D(k).
+#   * cY2's cru1 probe numbers (frac@lo, between-layer spread) were visible.
+#     They are not D(k).
+#   * The probe schema was inspected before registration: record keys, the
+#     500-record / step 0..49900 layout, block_sizes.json, and the step-0
+#     identity z_std == |z_mean| (the n = 2 check, S3 below) on all three
+#     standard-cell seeds.  NO sign statistic, NO D(k), NO group sum was
+#     computed on any probe before this file was committed.
+#
+# =============================================================================
+# TWO PLACES WHERE THE CYCLE BRIEF'S RECIPE IS WRONG, READ OFF THE SOURCE.
+# BOTH ARE REGISTERED HERE SO THE CHOICE CANNOT BE MADE AFTER THE NUMBERS.
+# =============================================================================
+#   (1) THE BRIEF SAYS z_mean IS A PER-TENSOR MEAN OVER ELEMENTS AND THE GROUP
+#       CONTRIBUTION IS z_mean[i] * numel[i].  IT IS NOT.  The live harness's
+#       layerwise reduction (Optimizers/HF.py, PATCH_GRANULARITY branch of
+#       block_product) is
+#
+#           if self.stepsize_type == 'layerwise':
+#               return [torch.stack([(u[i]*v[i]).sum() for i in range(self.num_layers)])]
+#
+#       -- an UNNORMALISED per-tensor SUM <h_i, g_i>, identical in form to the
+#       blockwise branch's per-group sum.  The blockwise reduction for a
+#       2-group spec [k, 62-k] is therefore sum_{i in group} z_i with NO numel
+#       factor.  The word "mean" in `z_mean` is a mean over TIME (see (2)),
+#       not over elements; `_probe`'s comment "(weightwise/nodewise: per-tensor
+#       means)" applies only to the non-layerwise types, where zv is built with
+#       .mean() -- for layerwise zv = z[0] verbatim.  Verified on the current
+#       live file (sha256 9abd4318...), on the pre-namesets snapshot
+#       (3445ba52..., the parent of cru1's pinned 0d8ee431...) and on
+#       HF_pinned_d3202635.py; the branch is byte-identical in all three, and
+#       the repo's own patches/HF_patched.py carries the same line (S2).
+#
+#       CONSEQUENCE, REGISTERED: the PRIMARY statistic is the harness-faithful
+#       UNWEIGHTED sum (w_i = 1).  The brief's numel-weighted version is kept
+#       and reported in full as CONTROL-NUMEL, because the brief asked for the
+#       pair to be shown side by side and because numel weighting is exactly
+#       the distortion that would let the layer4 convs dominate.  The roles
+#       are the reverse of the brief's, and the reason is the line above.
+#
+#   (2) THE BRIEF TREATS z_mean AS A PER-RECORD SIGNAL.  IT IS CUMULATIVE.
+#       patches/patch_probe.py:  self._z_sum += zv;  self._z_n += 1;
+#                                mean = self._z_sum / max(self._z_n, 1)
+#       and neither accumulator is ever reset (CORRECTIONS at 3325 already
+#       records this).  The record at step s therefore carries the running
+#       mean of z over ALL meta-steps so far.  Its sign is the sign of the
+#       whole history, and sign(cumulative) at record j is not independent of
+#       record j-1.  But the accumulator is exactly recoverable: with
+#       S_j = z_mean_j * n_j, the difference S_j - S_{j-1} is the SUM of z
+#       over the meta-steps between the two records -- one 100-step window at
+#       PROBE=100.  n_j = step_j + 2, because HF.__init__ sets counter = -1,
+#       step() calls _probe BEFORE counter += 1, and _probe increments _z_n
+#       before the `counter % PROBE` test: the step-0 record is written on the
+#       second call with _z_n = 2.  The data confirm this: at step 0 every
+#       tensor has z_std == |z_mean| exactly, which n = 2 with a zero first
+#       term (h_condenced is zero-initialised) predicts and n = 1 forbids
+#       (n = 1 gives std 0).  S3 re-checks this on every file read.
+#
+#       CONSEQUENCE, REGISTERED: the PRIMARY unit is the 100-step WINDOW SUM
+#       W_j[i] = z_mean_j[i]*(step_j+2) - z_mean_{j-1}[i]*(step_{j-1}+2),
+#       j = 1..499 (record 0 spans 2 meta-steps and is dropped).  D(k) is the
+#       fraction of windows on which sign(sum_{i<=k} w_i W_j[i]) differs from
+#       sign(sum_{i>k} w_i W_j[i]).  The literal brief reading -- sign of the
+#       CUMULATIVE group sums per record -- is also computed and printed as
+#       TERTIARY-CUMULATIVE, descriptive only.
+#
+#       PRECISION.  _z_sum is a float32 accumulator on the GPU.  Differencing
+#       two stored means recovers the window sum up to the rounding of ~100
+#       float32 adds plus the two stored roundings.  A window is INDETERMINATE
+#       at cut k if either group sum's magnitude is at or below
+#       FLOOR = sum_{i in group} w_i * 102 * 2^-23 * max(|S_j[i]|, |S_{j-1}[i]|)
+#       and is excluded from D(k)'s denominator; the excluded fraction is
+#       printed at every k.  PRECISION-FLAG fires if that fraction exceeds
+#       0.05 at the argmax; it annotates, it does not move the verdict.
+#
+# =============================================================================
+# THE PROXY CAVEAT.  REGISTERED.  BINDING ON EVERY QUOTATION.
+# =============================================================================
+#   In a LAYERWISE run every tensor has its own beta.  The h_condenced
+#   trajectory, and hence every <h_i, g_i>, is the trajectory the m = 62
+#   optimiser produced -- not the trajectory a 2-group [k, 62-k] run would
+#   have produced, in which the k prefix tensors share one beta and the suffix
+#   another.  H-DISAGREE is being tested on m = 62 dynamics as a STAND-IN for
+#   m = 2 dynamics.  What that costs the inference: a positive result says
+#   "along the layerwise trajectory, the prefix and suffix reductions disagree
+#   most often near k = 49"; it does NOT say that a [49,13] run experiences
+#   that disagreement, because a [49,13] run's beta pair would respond to it
+#   and change it.  A negative result is likewise a statement about the m = 62
+#   trajectory.  NO NUMBER FROM THE PRIMARY SECTION MAY BE QUOTED AS A DIRECT
+#   m = 2 MEASUREMENT.  The scorer prints this sentence under its verdict.
+#
+#   The ONE direct m = 2 measurement available is crn1's reduction probe
+#   (results/crn1_reduction_probe/, raw per-step terms in crn1_stage/*.terms.npy
+#   on cluster_b): per-tensor <h_i, g_i> at EVERY meta-step for 6,000 steps
+#   (12 epochs, seed 0) along the TRUE [49,13] trajectory, the true [50,12]
+#   trajectory and the scalar trajectory.  When those files are reachable the
+#   PER-STEP section computes D_step(k) on each, which at k = 49 on the [49,13]
+#   file IS the m = 2 quantity -- for 12 epochs, one seed.  It is reported as
+#   a CROSS-CHECK with no bar and gates nothing: it is 12 % of the horizon and
+#   one seed, and the primary was registered on the 100-epoch probes.  The
+#   same section recomputes D on 100-step window sums of the per-step terms,
+#   so the cost of (2)'s windowing is measured rather than assumed.
+#
+# =============================================================================
+# THE DATA PREMISE -- EXCLUDE NOTHING THAT EXISTS; STATE WHAT IS FROZEN
+# =============================================================================
+#   THE CELL, frozen: CIFAR100 / ResNet18_c100 / granularity `layerwise` /
+#   SGDm base / Lion meta / meta_stepsize 1e-3 / alpha0 1e-6 / 100 epochs /
+#   batch 100 / gamma 1 / augment 1 / BETA_CLIP -15:-2.3026 / hier unset,
+#   complete = 1, superseded = 0.  The scorer lists EVERY such row in
+#   results/all_runs.csv (23 at registration, from 8 batches: c100, c100b,
+#   c1b, cbl1, cpk1, cru1, cts1, hb1; the 18 same-cell rows carrying
+#   hier = additive/shrink are a different cell by the frozen premise) and
+#   looks for a probe directory `probe_<run>` for each under every root it is
+#   given.  Rows without a probe are PRINTED, not silently dropped; a future
+#   ingest that adds a probed layerwise run at this cell is picked up with no
+#   edit.  At registration the only probed rows at this cell are cru1's
+#   lay-m1e-3-a1e-6 seeds 15, 16, 17 (PROBE=100, 500 records each, so
+#   3 x 499 = 1,497 windows).  The cell listing is read from the CSV the
+#   scorer is pointed at; the cluster_b checkout's CSV predates cru1's ingest,
+#   so a run there must be given the post-ingest CSV with --csv.  Every
+#   other layerwise probe on disk (bd7, bf8, bf9, bl5, br6, cfr1, cfr2, cl5,
+#   fr5, gate1, gate2, ml5, p5, sp8, wc5) is CIFAR-10, or a different
+#   alpha0/clip/horizon, or hier=shrink, and is off-cell by the frozen premise.
+#   cru1's other 27 layerwise probes are at other (ms, alpha0) rungs of the
+#   same batch; they are swept DESCRIPTIVELY in the OFF-CELL section, which
+#   gates nothing.
+#
+#   G-CHECKS (any failure -> VERDICT VOID): each probe's block_sizes.json is
+#   `layerwise` with n_b equal to the frozen 62-tensor table (11,220,132
+#   params); 500 records; steps exactly 0, 100, ..., 49900; 62 entries in
+#   z_mean and z_std; the step-0 n = 2 identity (S3).
+#
+# =============================================================================
+# THE CAPTURE CURVE, RE-DERIVED, NOT QUOTED
+# =============================================================================
+#   From results/all_runs.csv rows cpk1-k{01,17,24,31,38,42,45,47,49,52,55,60,62}
+#   -s{0,1,2}: plateau5 (mean of the last 5 test epochs) averaged over seeds;
+#   CAPTURE(k) = (p5(k) - p5(k01)) / (p5(k62) - p5(k01)).  The CSV `plateau`
+#   column is BANNED as primary and is never read; best_test is never read.
+#
+# =============================================================================
+# REGISTERED PREDICTIONS, BARS, AND THE VERDICT TREE
+# =============================================================================
+#   D(k) is the POOLED rate over all determinate windows of all standard-cell
+#   probes (per-seed rates are printed alongside).  k_hat = argmax_{k=1..61}
+#   D(k), ties broken toward the smaller k (all ties printed).
+#
+#   P1  ARGMAX.  HOLDS if 47 <= k_hat <= 52 -- k* = 49 or one of its two
+#       neighbours on cpk1's eleven-point grid (47 below, 52 above).
+#   P2  SHAPE on the eleven grid points, cK1's rule verbatim: RANGE_BAR 0.05
+#       (X1 FLAT if max-min of D over k = 1..61 is below it), WOBBLE_BAR 0.05
+#       (a fall before the argmax or a rise after it larger than this is a
+#       second mode).  0.05 is ~4 SE of a proportion at n = 1,497 windows.
+#   P3  CORRELATION.  Spearman rho between D(k) and CAPTURE(k) over the eleven
+#       k, average ranks on ties.  NULL: 1,000,000 Monte-Carlo permutations of
+#       the D ranks against the fixed CAPTURE ranks, numpy default_rng seed
+#       20260908, one-sided p = (#{rho_perm >= rho_obs} + 1) / (N + 1).
+#       SUPPORT if rho >= +0.60 AND p <= 0.05.  REFUTE if rho <= 0.
+#       Otherwise INDETERMINATE.
+#
+#   WHAT REFUTES H-DISAGREE OUTRIGHT, in order of test:
+#     X1  FLAT:        range of D over k = 1..61 < 0.05
+#     X2  ELSEWHERE:   k_hat outside [42, 55] (outside cpk1's half-maximum
+#                      hump [42,49] extended by two grid points above 49)
+#     X3  ANTI:        rho <= 0
+#
+#   THE TREE (exhaustive, deterministic), applied to PRIMARY and, with the
+#   same bars, to CONTROL-NUMEL:
+#     X1                                    -> H-DISAGREE-REFUTED-FLAT
+#     X2                                    -> H-DISAGREE-REFUTED-PEAK-ELSEWHERE
+#     X3                                    -> H-DISAGREE-REFUTED-ANTICORRELATED
+#     P1 HOLDS and P3 SUPPORT and P2 single -> H-DISAGREE-SUPPORTED
+#     otherwise                             -> H-DISAGREE-INDETERMINATE
+#
+#   STAMPS (annotate, never move a token):
+#     WEIGHTING-ROBUST / WEIGHTING-DEPENDENT   PRIMARY and CONTROL tokens equal?
+#     SEEDS-AGREE / SEEDS-DISAGREE             every per-seed k_hat in [47,52]?
+#     PRECISION-FLAG                           indeterminate share > 0.05 at k_hat
+#
+#   FINAL: PRIMARY <token> | CONTROL-NUMEL <token> | <WEIGHTING-*> | <SEEDS-*>
+#
+#   ENTITLEMENT, fixed now.  SUPPORTED entitles ONE sentence: "along the
+#   m = 62 trajectory at this cell, the prefix/suffix reduction signs disagree
+#   most often near k = 49, and the disagreement rate tracks cpk1's capture
+#   curve (rho, p as printed)".  It does not entitle "the cut-position effect
+#   is caused by sign disagreement", which needs the m = 2 trajectory at every
+#   k.  Any REFUTED token entitles: "H-DISAGREE's stand-in test fails at this
+#   cell in the stated way", scoped to the proxy.  INDETERMINATE entitles no
+#   mechanism sentence.
+#
+# RUN
+#   python3 analysis/cHD1_hdisagree_score.py                        # defaults
+#   python3 analysis/cHD1_hdisagree_score.py --probe-root <dir> [--probe-root <dir>]
+#          [--csv results/all_runs.csv] [--terms-dir <dir>] [--perms 1000000]
+#   python3 analysis/cHD1_hdisagree_score.py --selftest
+# Default probe roots: /cluster/account_b/metaopt/runs, $METAOPT_WS/runs,
+# ~/metaopt/runs, runs.  Default terms dirs: /cluster/account_b/metaopt/crn1_stage,
+# $METAOPT_WS/crn1_stage, results/crn1_reduction_probe.  Absent terms files
+# are a SKIP for that section, never a FAIL.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import collections
+import csv
+import glob
+import json
+import math
+import os
+import sys
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover
+    np = None
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# ----------------------------------------------------------------- the cell
+CELL = collections.OrderedDict([
+    ("network", "ResNet18_c100"), ("dataset", "CIFAR100"),
+    ("granularity", "layerwise"), ("base", "SGDm"), ("meta", "Lion"),
+    ("meta_stepsize", "1e-3"), ("alpha0", "1e-6"), ("epochs_requested", "100"),
+    ("batch_size", "100"), ("gamma", "1"), ("augment", "1"),
+    ("beta_clip", "-15:-2.3026"), ("hier", ""),
+])
+
+N_TENSORS = 62
+N_PARAMS = 11220132
+# named_parameters() numel, in order, for ResNet18_c100 (cK1's frozen table).
+TENSOR_NUMEL = (
+    [1728, 64, 64]
+    + [36864, 64, 64, 36864, 64, 64] * 2
+    + [73728, 128, 128, 147456, 128, 128, 8192, 128, 128]
+    + [147456, 128, 128, 147456, 128, 128]
+    + [294912, 256, 256, 589824, 256, 256, 32768, 256, 256]
+    + [589824, 256, 256, 589824, 256, 256]
+    + [1179648, 512, 512, 2359296, 512, 512, 131072, 512, 512]
+    + [2359296, 512, 512, 2359296, 512, 512]
+    + [51200, 100]
+)
+
+PROBE_EVERY = 100
+META_STEPS = 50000
+N_RECORDS = META_STEPS // PROBE_EVERY          # 500
+N_OFFSET = 2                                   # _z_n at the step-s record = s + 2
+EXPECTED_STEPS = list(range(0, META_STEPS, PROBE_EVERY))
+
+KGRID = (17, 24, 31, 38, 42, 45, 47, 49, 52, 55, 60)
+KSTAR = 49
+P1_LO, P1_HI = 47, 52
+X2_LO, X2_HI = 42, 55
+RANGE_BAR = 0.05
+WOBBLE_BAR = 0.05
+RHO_BAR = 0.60
+P_BAR = 0.05
+PERM_N = 1_000_000
+PERM_SEED = 20260908
+PRECISION_BAR = 0.05
+FLOAT32_ULP = 2.0 ** -23
+FLOOR_ADDS = 102
+
+TOKENS = ("H-DISAGREE-REFUTED-FLAT", "H-DISAGREE-REFUTED-PEAK-ELSEWHERE",
+          "H-DISAGREE-REFUTED-ANTICORRELATED", "H-DISAGREE-SUPPORTED",
+          "H-DISAGREE-INDETERMINATE")
+
+PROXY_SENTENCE = (
+    "PROXY: every number above is measured along the m = 62 (layerwise) "
+    "trajectory as a stand-in for the m = 2 trajectory a [k,62-k] run would "
+    "produce.  It may not be quoted as a direct m = 2 measurement.")
+
+DEFAULT_ROOTS = ["/cluster/account_b/metaopt/runs",
+                 os.path.join(os.environ.get("METAOPT_WS", ""), "runs"),
+                 os.path.expanduser("~/metaopt/runs"), "runs"]
+DEFAULT_TERMS = ["/cluster/account_b/metaopt/crn1_stage",
+                 os.path.join(os.environ.get("METAOPT_WS", ""), "crn1_stage"),
+                 os.path.join(ROOT, "results", "crn1_reduction_probe")]
+
+
+# =============================================================================
+# corpus: the frozen cell, and the capture curve
+# =============================================================================
+def read_csv(path):
+    with open(path, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def cell_rows(rows):
+    out = []
+    for r in rows:
+        if any(r.get(k, "") != v for k, v in CELL.items()):
+            continue
+        if r.get("complete", "") != "1" or r.get("superseded", "") != "0":
+            continue
+        out.append(r)
+    return sorted(out, key=lambda r: r["run"])
+
+
+def capture_curve(rows):
+    """{k: CAPTURE} over KGRID, plus the anchors, from cpk1's own rows."""
+    p5 = collections.defaultdict(list)
+    for r in rows:
+        name = r["run"]
+        if not name.startswith("cpk1-k"):
+            continue
+        if r.get("complete", "") != "1" or r.get("superseded", "") != "0":
+            continue
+        k = int(name.split("-")[1][1:])
+        p5[k].append(float(r["plateau5"]))
+    need = (1,) + KGRID + (62,)
+    missing = [k for k in need if len(p5.get(k, [])) != 3]
+    if missing:
+        raise SystemExit("cpk1 rows incomplete for k = %s" % missing)
+    mean = {k: sum(v) / len(v) for k, v in p5.items()}
+    lo, hi = mean[1], mean[62]
+    caps = {k: (mean[k] - lo) / (hi - lo) for k in KGRID}
+    return caps, mean, p5
+
+
+# =============================================================================
+# probes
+# =============================================================================
+def find_probe(roots, run):
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for pat in (os.path.join(root, "probe_" + run),
+                    os.path.join(root, "*", "probe_" + run)):
+            for d in sorted(glob.glob(pat)):
+                if os.path.isfile(os.path.join(d, "probe.jsonl")):
+                    return d
+    return None
+
+
+def read_probe(d):
+    recs = []
+    with open(os.path.join(d, "probe.jsonl")) as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                recs.append(json.loads(line))
+    bs = None
+    p = os.path.join(d, "block_sizes.json")
+    if os.path.isfile(p):
+        with open(p) as fh:
+            bs = json.load(fh)
+    return recs, bs
+
+
+def gcheck(recs, bs):
+    bad = []
+    if bs is None:
+        bad.append("no block_sizes.json")
+    else:
+        if bs.get("stepsize_type") != "layerwise":
+            bad.append("stepsize_type %r != layerwise" % bs.get("stepsize_type"))
+        if list(bs.get("n_b", [])) != list(TENSOR_NUMEL):
+            bad.append("n_b differs from the frozen tensor table")
+    if len(recs) != N_RECORDS:
+        bad.append("%d records != %d" % (len(recs), N_RECORDS))
+    steps = [r.get("step") for r in recs]
+    if steps != EXPECTED_STEPS[:len(steps)] or len(steps) != N_RECORDS:
+        bad.append("steps are not 0,100,...,49900")
+    for r in recs:
+        if len(r.get("z_mean", [])) != N_TENSORS or len(r.get("z_std", [])) != N_TENSORS:
+            bad.append("a record lacks 62 z_mean/z_std entries")
+            break
+    if recs and not step0_is_n2(recs[0]):
+        bad.append("step-0 record fails z_std == |z_mean| (the n = 2 identity)")
+    return bad
+
+
+def step0_is_n2(r0):
+    for m, s in zip(r0["z_mean"], r0["z_std"]):
+        if abs(abs(m) - s) > 1e-6 * max(abs(m), 1e-30) + 1e-30:
+            return False
+    return True
+
+
+def window_sums(recs):
+    """[(W[62], FLOOR[62])] for j = 1..len(recs)-1, from the cumulative means."""
+    out = []
+    prev_S = [m * (recs[0]["step"] + N_OFFSET) for m in recs[0]["z_mean"]]
+    for j in range(1, len(recs)):
+        n = recs[j]["step"] + N_OFFSET
+        S = [m * n for m in recs[j]["z_mean"]]
+        W = [a - b for a, b in zip(S, prev_S)]
+        F = [FLOOR_ADDS * FLOAT32_ULP * max(abs(a), abs(b)) for a, b in zip(S, prev_S)]
+        out.append((W, F))
+        prev_S = S
+    return out
+
+
+def cumulative_signals(recs):
+    """[(S[62], FLOOR[62])] for j = 1..: the cumulative group signal itself."""
+    out = []
+    for j in range(1, len(recs)):
+        n = recs[j]["step"] + N_OFFSET
+        S = [m * n for m in recs[j]["z_mean"]]
+        F = [2 * FLOAT32_ULP * abs(a) for a in S]
+        out.append((S, F))
+    return out
+
+
+def sgn(x):
+    return (x > 0) - (x < 0)
+
+
+def disagreement(units, weights):
+    """{k: [n_disagree, n_determinate, n_indeterminate]} for k = 1..61."""
+    tally = {k: [0, 0, 0] for k in range(1, N_TENSORS)}
+    for W, F in units:
+        wW = [w * x for w, x in zip(weights, W)]
+        wF = [w * x for w, x in zip(weights, F)]
+        cs, cf = [0.0], [0.0]
+        for x, f in zip(wW, wF):
+            cs.append(cs[-1] + x)
+            cf.append(cf[-1] + f)
+        tot, ftot = cs[-1], cf[-1]
+        for k in range(1, N_TENSORS):
+            lo, hi = cs[k], tot - cs[k]
+            flo, fhi = cf[k], ftot - cf[k]
+            if abs(lo) <= flo or abs(hi) <= fhi:
+                tally[k][2] += 1
+            else:
+                tally[k][1] += 1
+                if sgn(lo) != sgn(hi):
+                    tally[k][0] += 1
+    return tally
+
+
+def rates(tally):
+    return {k: (v[0] / v[1] if v[1] else float("nan")) for k, v in tally.items()}
+
+
+def indet_share(tally):
+    return {k: (v[2] / (v[1] + v[2]) if (v[1] + v[2]) else float("nan"))
+            for k, v in tally.items()}
+
+
+def merge(tallies):
+    out = {k: [0, 0, 0] for k in range(1, N_TENSORS)}
+    for t in tallies:
+        for k in out:
+            for i in range(3):
+                out[k][i] += t[k][i]
+    return out
+
+
+# =============================================================================
+# statistics
+# =============================================================================
+def argmax_k(D):
+    ks = [k for k in sorted(D) if not math.isnan(D[k])]
+    best = max(D[k] for k in ks)
+    ties = [k for k in ks if D[k] == best]
+    return ties[0], ties
+
+
+def rng_(vals):
+    v = [x for x in vals if not math.isnan(x)]
+    return (max(v) - min(v)) if v else float("nan")
+
+
+def modality(curve):
+    ks = sorted(curve)
+    kstar = max(ks, key=lambda k: (curve[k], -k))
+    i = ks.index(kstar)
+    fall = max([0.0] + [curve[ks[a]] - curve[ks[a + 1]] for a in range(i)])
+    rise = max([0.0] + [curve[ks[a + 1]] - curve[ks[a]] for a in range(i, len(ks) - 1)])
+    return fall, rise
+
+
+def avg_ranks(x):
+    order = sorted(range(len(x)), key=lambda i: x[i])
+    ranks = [0.0] * len(x)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and x[order[j + 1]] == x[order[i]]:
+            j += 1
+        r = (i + j) / 2.0 + 1.0
+        for t in range(i, j + 1):
+            ranks[order[t]] = r
+        i = j + 1
+    return ranks
+
+
+def pearson(a, b):
+    n = len(a)
+    ma, mb = sum(a) / n, sum(b) / n
+    num = sum((x - ma) * (y - mb) for x, y in zip(a, b))
+    da = math.sqrt(sum((x - ma) ** 2 for x in a))
+    db = math.sqrt(sum((y - mb) ** 2 for y in b))
+    return num / (da * db) if da > 0 and db > 0 else float("nan")
+
+
+def spearman(x, y):
+    return pearson(avg_ranks(x), avg_ranks(y))
+
+
+def perm_null(x, y, n_perm=PERM_N, seed=PERM_SEED):
+    """One-sided MC p for rho >= observed, permuting x's ranks against y's."""
+    rho = spearman(x, y)
+    if math.isnan(rho):
+        return rho, float("nan"), 0
+    rx = np.array(avg_ranks(x), dtype=float)
+    ry = np.array(avg_ranks(y), dtype=float)
+    ry_c = ry - ry.mean()
+    rng = np.random.default_rng(seed)
+    n = len(rx)
+    ge = 0
+    chunk = 100_000
+    done = 0
+    sy = math.sqrt(float((ry_c ** 2).sum()))
+    while done < n_perm:
+        m = min(chunk, n_perm - done)
+        P = rng.permuted(np.tile(rx, (m, 1)), axis=1)
+        Pc = P - P.mean(axis=1, keepdims=True)
+        sx = np.sqrt((Pc ** 2).sum(axis=1))
+        r = (Pc @ ry_c) / (sx * sy)
+        ge += int((r >= rho - 1e-12).sum())
+        done += m
+    p = (ge + 1.0) / (n_perm + 1.0)
+    return rho, p, ge
+
+
+def verdict(D_full, caps, rho, p):
+    """THE FROZEN TREE.  D_full: {k: D} over 1..61.  caps: {k: CAPTURE} on KGRID."""
+    r = rng_(D_full.values())
+    khat, ties = argmax_k(D_full)
+    grid = {k: D_full[k] for k in KGRID}
+    fall, rise = modality(grid)
+    single = max(fall, rise) <= WOBBLE_BAR
+    p1 = P1_LO <= khat <= P1_HI
+    p3 = (not math.isnan(rho)) and rho >= RHO_BAR and p <= P_BAR
+    if r < RANGE_BAR:
+        tok = TOKENS[0]
+    elif not (X2_LO <= khat <= X2_HI):
+        tok = TOKENS[1]
+    elif math.isnan(rho) or rho <= 0.0:
+        tok = TOKENS[2]
+    elif p1 and p3 and single:
+        tok = TOKENS[3]
+    else:
+        tok = TOKENS[4]
+    return dict(token=tok, range=r, khat=khat, ties=ties, fall=fall, rise=rise,
+                single=single, p1=p1, p3=p3, rho=rho, p=p)
+
+
+# =============================================================================
+# per-step cross-check on crn1's reduction-probe terms (numpy only)
+# =============================================================================
+def find_terms(dirs):
+    found = {}
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for tag in ("scalar", "4913", "5012"):
+            f = os.path.join(d, "probe_%s.terms.npy" % tag)
+            if tag not in found and os.path.isfile(f):
+                found[tag] = f
+    return found
+
+
+def step_disagreement(T, weights):
+    """T: steps x 62 float64.  Returns {k: D} per step, and on 100-step windows."""
+    Tw = T * np.asarray(weights, dtype=float)[None, :]
+    cs = np.cumsum(Tw, axis=1)
+    tot = cs[:, -1:]
+
+    def D_of(cs_, tot_):
+        out = {}
+        for k in range(1, N_TENSORS):
+            lo = cs_[:, k - 1]
+            hi = tot_[:, 0] - cs_[:, k - 1]
+            det = (lo != 0) & (hi != 0)
+            dis = (np.sign(lo) != np.sign(hi)) & det
+            out[k] = float(dis.sum() / max(det.sum(), 1))
+        return out
+
+    n_win = T.shape[0] // PROBE_EVERY
+    cw = cs[:n_win * PROBE_EVERY].reshape(n_win, PROBE_EVERY, -1).sum(axis=1)
+    return D_of(cs, tot), D_of(cw, cw[:, -1:])
+
+
+# =============================================================================
+# printing
+# =============================================================================
+def fmt(x, w=7, d=4):
+    return ("%*.*f" % (w, d, x)) if not (x is None or math.isnan(x)) else "%*s" % (w, "nan")
+
+
+def print_curve(title, per_seed, pooled, indet, caps=None):
+    seeds = sorted(per_seed)
+    print("\n" + title)
+    head = "   k   numel(prefix)  " + "  ".join("s%-5s" % s for s in seeds) + "   POOLED  indet"
+    if caps is not None:
+        head += "   CAPTURE"
+    print(head)
+    pref = 0
+    for k in range(1, N_TENSORS):
+        pref += TENSOR_NUMEL[k - 1]
+        line = "  %2d  %12d  " % (k, pref)
+        line += "  ".join(fmt(per_seed[s][k], 6, 4) for s in seeds)
+        line += "  " + fmt(pooled[k], 7, 4) + "  " + fmt(indet[k], 5, 3)
+        if caps is not None:
+            line += "   " + (fmt(caps[k], 7, 4) if k in caps else "      -")
+        if k in KGRID:
+            line += "   <- grid" + ("  k*" if k == KSTAR else "")
+        print(line)
+
+
+def print_verdict(label, v, D_full, caps, n_units):
+    print("\n%s" % label)
+    print("   units (determinate windows at k_hat) ... %d" % n_units)
+    print("   RANGE of D over k = 1..61 .............. %.4f   (X1 fires below %.2f)"
+          % (v["range"], RANGE_BAR))
+    print("   argmax k_hat ........................... %d   ties %s   P1 window [%d,%d] -> %s"
+          % (v["khat"], v["ties"], P1_LO, P1_HI, "HOLDS" if v["p1"] else "FAILS"))
+    print("   shape on the eleven: fall %.4f rise %.4f (WOBBLE_BAR %.2f) -> %s"
+          % (v["fall"], v["rise"], WOBBLE_BAR,
+             "SINGLE-PEAKED" if v["single"] else "MULTIMODAL"))
+    print("   Spearman rho(D, CAPTURE) over the eleven  %.4f   MC p (N=%d, seed %d)  %.6f"
+          % (v["rho"], PERM_N, PERM_SEED, v["p"]))
+    print("   P3 (rho >= %.2f and p <= %.2f) ............ %s"
+          % (RHO_BAR, P_BAR, "SUPPORT" if v["p3"] else
+             ("REFUTE" if (math.isnan(v["rho"]) or v["rho"] <= 0) else "INDETERMINATE")))
+    print("   D on the eleven: " + "  ".join("%d:%.3f" % (k, D_full[k]) for k in KGRID))
+    print("   VERDICT: %s" % v["token"])
+
+
+# =============================================================================
+# main
+# =============================================================================
+def main(a):
+    roots = list(a.probe_root) if a.probe_root else DEFAULT_ROOTS
+    print("cHD1_hdisagree_score.py -- H-DISAGREE against cpk1's cut-position curve.")
+    print("commit-before-first-execution ONLY; no RULE 21 claim; no runs of its own.")
+    print("csv: %s" % a.csv)
+    print("probe roots: %s" % [r for r in roots if r])
+
+    rows = read_csv(a.csv)
+    print("corpus rows: %d" % len(rows))
+
+    # --- the capture curve, re-derived ------------------------------------
+    caps, mean, p5 = capture_curve(rows)
+    print("\nCAPTURE, re-derived from cpk1's rows (plateau5, mean of 3 seeds):")
+    print("   anchors  k01 %.4f   k62 %.4f   span %.4f" % (mean[1], mean[62], mean[62] - mean[1]))
+    for k in KGRID:
+        print("   k=%2d  plateau5 %.4f  CAPTURE %+.4f" % (k, mean[k], caps[k]))
+    kc = max(KGRID, key=lambda k: caps[k])
+    print("   cpk1 argmax re-derived: k = %d" % kc)
+
+    # --- the cell: every row, probe or not --------------------------------
+    cr = cell_rows(rows)
+    print("\nTHE FROZEN CELL: %d complete, unsuperseded rows in the corpus" % len(cr))
+    probes = collections.OrderedDict()
+    for r in cr:
+        d = find_probe(roots, r["run"])
+        print("   %-32s seed %-3s plateau5 %8s   %s"
+              % (r["run"], r["seed"], r["plateau5"], d if d else "NO PROBE"))
+        if d:
+            probes[r["run"]] = (r, d)
+    if not probes:
+        print("\nVERDICT: VOID -- no probe file found for any row at the cell.")
+        print(PROXY_SENTENCE)
+        return 2
+
+    # --- read, G-check ----------------------------------------------------
+    data = collections.OrderedDict()
+    void = False
+    for run, (r, d) in probes.items():
+        recs, bs = read_probe(d)
+        bad = gcheck(recs, bs)
+        prov = os.path.join(os.path.dirname(d), "PROVENANCE.txt")
+        pv = ""
+        if os.path.isfile(prov):
+            with open(prov) as fh:
+                pv = " ".join(l.strip() for l in fh if l.startswith(("HF_SHA256", "PATCH_REDNORM")))
+        print("   G-check %-32s %s   %s" % (run, "PASS" if not bad else "FAIL " + "; ".join(bad), pv))
+        if bad:
+            void = True
+        else:
+            data[run] = (r["seed"], recs)
+    if void:
+        print("\nVERDICT: VOID -- a probe at the cell failed its G-check (see above).")
+        print(PROXY_SENTENCE)
+        return 2
+
+    w_prim = [1.0] * N_TENSORS
+    w_ctrl = [float(n) for n in TENSOR_NUMEL]
+
+    # --- PRIMARY and CONTROL on window sums --------------------------------
+    per_seed = {"prim": {}, "ctrl": {}, "cum_prim": {}, "cum_ctrl": {}}
+    tallies = {key: [] for key in per_seed}
+    units_by_seed = {}
+    for run, (seed, recs) in data.items():
+        units = window_sums(recs)
+        cums = cumulative_signals(recs)
+        units_by_seed[seed] = units
+        for key, u, w in (("prim", units, w_prim), ("ctrl", units, w_ctrl),
+                          ("cum_prim", cums, w_prim), ("cum_ctrl", cums, w_ctrl)):
+            t = disagreement(u, w)
+            tallies[key].append(t)
+            per_seed[key][seed] = rates(t)
+    pooled = {key: merge(tallies[key]) for key in tallies}
+    D = {key: rates(pooled[key]) for key in pooled}
+    I = {key: indet_share(pooled[key]) for key in pooled}
+
+    print_curve("PRIMARY  D(k): 100-step WINDOW sums, UNWEIGHTED (harness-faithful: "
+                "z_i is already <h_i,g_i> summed over the tensor)",
+                per_seed["prim"], D["prim"], I["prim"], caps)
+    print_curve("CONTROL-NUMEL  D(k): 100-step WINDOW sums, weights = numel_i "
+                "(the brief's recipe; NOT the harness reduction)",
+                per_seed["ctrl"], D["ctrl"], I["ctrl"], caps)
+
+    # --- verdicts -----------------------------------------------------------
+    xs_p = [D["prim"][k] for k in KGRID]
+    xs_c = [D["ctrl"][k] for k in KGRID]
+    ys = [caps[k] for k in KGRID]
+    rho_p, p_p, _ = perm_null(xs_p, ys, a.perms)
+    rho_c, p_c, _ = perm_null(xs_c, ys, a.perms)
+    vp = verdict(D["prim"], caps, rho_p, p_p)
+    vc = verdict(D["ctrl"], caps, rho_c, p_c)
+    print_verdict("PRIMARY VERDICT", vp, D["prim"], caps, pooled["prim"][vp["khat"]][1])
+    print_verdict("CONTROL-NUMEL VERDICT (same tree, same bars)", vc, D["ctrl"], caps,
+                  pooled["ctrl"][vc["khat"]][1])
+
+    weighting = "WEIGHTING-ROBUST" if vp["token"] == vc["token"] else "WEIGHTING-DEPENDENT"
+    seed_k = {s: argmax_k(per_seed["prim"][s])[0] for s in per_seed["prim"]}
+    seeds_ok = all(P1_LO <= k <= P1_HI for k in seed_k.values())
+    seeds = "SEEDS-AGREE" if seeds_ok else "SEEDS-DISAGREE"
+    prec = I["prim"][vp["khat"]] > PRECISION_BAR
+    print("\nSTAMPS")
+    print("   per-seed PRIMARY argmax: %s -> %s" % (seed_k, seeds))
+    print("   indeterminate share at PRIMARY k_hat = %.4f -> %s"
+          % (I["prim"][vp["khat"]], "PRECISION-FLAG" if prec else "precision ok"))
+    print("   PRIMARY vs CONTROL tokens -> %s" % weighting)
+
+    # --- time-resolved, descriptive ----------------------------------------
+    print("\nTIME-RESOLVED (descriptive): PRIMARY D at k=49 and at k_hat=%d by epoch decile, pooled"
+          % vp["khat"])
+    for dec in range(10):
+        sub = []
+        for s, units in units_by_seed.items():
+            sub.extend(units[dec * 50:(dec + 1) * 50])   # window idx j-1; 50 windows = 10 epochs
+        t = disagreement(sub, w_prim)
+        print("   epochs %3d-%3d  D(49) %s  D(%d) %s  n %d"
+              % (dec * 10, dec * 10 + 9, fmt(rates(t)[49], 6, 4), vp["khat"],
+                 fmt(rates(t)[vp["khat"]], 6, 4), t[49][1]))
+
+    # --- tertiary: the literal-brief cumulative reading ---------------------
+    for key, lab in (("cum_prim", "unweighted"), ("cum_ctrl", "numel-weighted")):
+        Dk = D[key]
+        kh, ties = argmax_k(Dk)
+        rho = spearman([Dk[k] for k in KGRID], ys)
+        print("\nTERTIARY-CUMULATIVE (%s; sign of the CUMULATIVE group sums per record; "
+              "descriptive, gates nothing)" % lab)
+        print("   argmax %d ties %s  range %.4f  rho %.4f" % (kh, ties, rng_(Dk.values()), rho))
+        print("   D on the eleven: " + "  ".join("%d:%.3f" % (k, Dk[k]) for k in KGRID))
+
+    # --- off-cell descriptive sweep over the same batch ----------------------
+    if not a.no_offcell:
+        print("\nOFF-CELL (descriptive, gates nothing): PRIMARY argmax and rho at every other "
+              "layerwise probe in the same batch directory")
+        seen = set(d for _, d in probes.values())
+        for run, (r, d) in probes.items():
+            bdir = os.path.dirname(d)
+            for od in sorted(glob.glob(os.path.join(bdir, "probe_*"))):
+                if od in seen or not os.path.isfile(os.path.join(od, "probe.jsonl")):
+                    continue
+                seen.add(od)
+                recs, bs = read_probe(od)
+                if not bs or bs.get("stepsize_type") != "layerwise":
+                    continue
+                bad = gcheck(recs, bs)
+                if bad:
+                    print("   %-40s skipped: %s" % (os.path.basename(od), "; ".join(bad)))
+                    continue
+                t = disagreement(window_sums(recs), w_prim)
+                Dk = rates(t)
+                kh, ties = argmax_k(Dk)
+                rho = spearman([Dk[k] for k in KGRID], ys)
+                print("   %-40s argmax %2d (ties %d)  D(49) %.4f  D(k_hat) %.4f  range %.4f  rho %+.4f"
+                      % (os.path.basename(od), kh, len(ties), Dk[49], Dk[kh], rng_(Dk.values()), rho))
+
+    # --- per-step cross-check ---------------------------------------------
+    print("\nPER-STEP CROSS-CHECK on crn1's reduction-probe terms (6,000 meta-steps, seed 0; "
+          "no bar; gates nothing)")
+    tdirs = list(a.terms_dir) if a.terms_dir else DEFAULT_TERMS
+    found = find_terms(tdirs) if np is not None else {}
+    if not found:
+        print("   SKIP -- no probe_*.terms.npy under %s" % [d for d in tdirs if d])
+    for tag in ("4913", "5012", "scalar"):
+        if tag not in found:
+            continue
+        T = np.load(found[tag])
+        meta = {}
+        mp = found[tag].replace(".terms.npy", ".meta.json")
+        if os.path.isfile(mp):
+            with open(mp) as fh:
+                meta = json.load(fh)
+        if list(meta.get("numel", TENSOR_NUMEL)) != list(TENSOR_NUMEL) or T.shape[1] != N_TENSORS:
+            print("   %s: numel table mismatch -- skipped" % tag)
+            continue
+        Ds, Dw = step_disagreement(T, w_prim)
+        Dsc, _ = step_disagreement(T, w_ctrl)
+        khs, _ = argmax_k(Ds)
+        khw, _ = argmax_k(Dw)
+        khc, _ = argmax_k(Dsc)
+        rho_s = spearman([Ds[k] for k in KGRID], ys)
+        rho_w = spearman([Dw[k] for k in KGRID], ys)
+        rho_c2 = spearman([Dsc[k] for k in KGRID], ys)
+        wcost = max(abs(Ds[k] - Dw[k]) for k in Ds)
+        print("   spec %-8s steps %d  trajectory = %s"
+              % (meta.get("spec", tag), T.shape[0],
+                 "TRUE m=2 at k=49" if tag == "4913" else
+                 ("TRUE m=2 at k=50" if tag == "5012" else "scalar (m=1)")))
+        print("      per-step   D(49) %.4f  argmax %2d  rho %+.4f  range %.4f"
+              % (Ds[49], khs, rho_s, rng_(Ds.values())))
+        print("      100-step   D(49) %.4f  argmax %2d  rho %+.4f   max_k |D_step - D_win| = %.4f"
+              % (Dw[49], khw, rho_w, wcost))
+        print("      numel-wtd  D(49) %.4f  argmax %2d  rho %+.4f  (per-step)"
+              % (Dsc[49], khc, rho_c2))
+        print("      per-step D on the eleven: " + "  ".join("%d:%.3f" % (k, Ds[k]) for k in KGRID))
+
+    # --- FINAL --------------------------------------------------------------
+    print("\nFINAL: PRIMARY %s | CONTROL-NUMEL %s | %s | %s%s"
+          % (vp["token"], vc["token"], weighting, seeds, " | PRECISION-FLAG" if prec else ""))
+    print(PROXY_SENTENCE)
+    print("SCOPE: CIFAR-100 / ResNet18_c100 / SGDm+Lion / ms 1e-3 / alpha0 1e-6 / 100 epochs; "
+          "cpk1's curve and k* = 49 are 100-epoch objects (CORRECTIONS 156) and so is this.")
+    return 0
+
+
+# =============================================================================
+# selftest
+# =============================================================================
+def selftest():
+    fails = []
+
+    def ok(name, cond, detail=""):
+        print("   %s  %s%s" % ("PASS" if cond else "FAIL", name, ("  " + detail) if detail else ""))
+        if not cond:
+            fails.append(name)
+
+    print("cHD1_hdisagree_score.py --selftest")
+    # S1 frozen table
+    ok("S1 frozen tensor table: 62 entries, 11,220,132 params",
+       len(TENSOR_NUMEL) == N_TENSORS and sum(TENSOR_NUMEL) == N_PARAMS)
+    ok("S1 prefix at k=49 is the 56.28 %% parameter share cK1 registered",
+       abs(sum(TENSOR_NUMEL[:49]) / N_PARAMS - 0.56283) < 5e-5,
+       "%.5f" % (sum(TENSOR_NUMEL[:49]) / N_PARAMS))
+
+    # S2 the two source premises, on the repo's own patch files
+    hfp = os.path.join(ROOT, "patches", "HF_patched.py")
+    prp = os.path.join(ROOT, "patches", "patch_probe.py")
+    if os.path.isfile(hfp) and os.path.isfile(prp):
+        hf = open(hfp).read()
+        pr = open(prp).read()
+        ok("S2 layerwise reduction is the per-tensor SUM (no numel factor)",
+           "return [torch.stack([(u[i]*v[i]).sum() for i in range(self.num_layers)])]" in hf)
+        ok("S2 counter starts at -1 and _probe runs before counter += 1",
+           "self.counter = -1" in hf and hf.index("self._probe(HtT_gradft)") < hf.index("self.counter+=1"))
+        ok("S2 z_mean is a cumulative running mean (never reset)",
+           "self._z_sum += zv" in pr and "mean = self._z_sum / max(self._z_n, 1)" in pr
+           and "_z_sum = None" not in pr.split("def _probe(")[1])
+    else:
+        ok("S2 patch files present for the source premise", False, "missing %s or %s" % (hfp, prp))
+
+    # S3 differencing recovers window sums under n = step + 2
+    import random
+    rnd = random.Random(7)
+    z = [[rnd.uniform(-1, 1) for _ in range(N_TENSORS)] for _ in range(1001)]  # steps -1..999
+    recs = []
+    for s in range(0, 1000, PROBE_EVERY):
+        n = s + N_OFFSET
+        recs.append({"step": s, "z_mean": [sum(z[t][i] for t in range(n)) / n for i in range(N_TENSORS)]})
+    W = window_sums(recs)
+    truth = [[sum(z[t][i] for t in range(recs[j - 1]["step"] + N_OFFSET, recs[j]["step"] + N_OFFSET))
+              for i in range(N_TENSORS)] for j in range(1, len(recs))]
+    err = max(abs(a - b) for Wj, Tj in zip(W, truth) for a, b in zip(Wj[0], Tj))
+    ok("S3 differencing of cumulative means recovers the 100-step window sums", err < 1e-9, "max err %.2e" % err)
+    r0 = {"z_mean": [0.5 * v for v in z[1]], "z_std": [0.5 * abs(v) for v in z[1]]}
+    ok("S3 the step-0 n = 2 identity (z_std == |z_mean|) is what the reader checks", step0_is_n2(r0))
+    ok("S3 an n = 1 record (std 0) fails that identity",
+       not step0_is_n2({"z_mean": [1.0] * N_TENSORS, "z_std": [0.0] * N_TENSORS}))
+
+    # S4 synthetic curves through the tree
+    caps = {k: 0.0 for k in KGRID}
+    for k, c in zip(KGRID, (0.07, 0.10, 0.22, 0.28, 0.39, 0.42, 0.49, 0.70, 0.33, 0.01, 0.04)):
+        caps[k] = c
+    ys = [caps[k] for k in KGRID]
+
+    def hump(center, width, height, base=0.05):
+        return {k: base + height * math.exp(-((k - center) / width) ** 2) for k in range(1, N_TENSORS)}
+
+    Dh = hump(49, 6, 0.4)
+    rho, p, _ = perm_null([Dh[k] for k in KGRID], ys, 20000)
+    v = verdict(Dh, caps, rho, p)
+    ok("S4 a hump at 49 tracking CAPTURE -> SUPPORTED", v["token"] == TOKENS[3], "%s rho %.3f p %.4f" % (v["token"], rho, p))
+    Df = {k: 0.30 + 0.001 * (k % 3) for k in range(1, N_TENSORS)}
+    v = verdict(Df, caps, 0.3, 0.2)
+    ok("S4 a flat curve -> REFUTED-FLAT", v["token"] == TOKENS[0], v["token"])
+    De = hump(10, 4, 0.4)
+    v = verdict(De, caps, -0.2, 0.8)
+    ok("S4 a hump at k=10 -> REFUTED-PEAK-ELSEWHERE", v["token"] == TOKENS[1], v["token"])
+    Da = {k: 0.5 - caps.get(k, 0.2) * 0.4 for k in range(1, N_TENSORS)}
+    Da[49] = 0.6  # argmax inside the window but the grid anti-correlates
+    rho_a = spearman([Da[k] for k in KGRID], ys)
+    v = verdict(Da, caps, rho_a, 0.9)
+    ok("S4 anti-correlated on the grid -> REFUTED-ANTICORRELATED",
+       v["token"] == TOKENS[2], "%s rho %.3f" % (v["token"], rho_a))
+    Dw = hump(49, 6, 0.4)
+    v = verdict(Dw, caps, 0.35, 0.15)
+    ok("S4 right argmax but weak rho -> INDETERMINATE", v["token"] == TOKENS[4], v["token"])
+    Db = hump(52, 2, 0.4)
+    Db[42] += 0.3  # second mode
+    rho_b, p_b, _ = perm_null([Db[k] for k in KGRID], ys, 20000)
+    v = verdict(Db, caps, rho_b, p_b)
+    ok("S4 bimodal -> never SUPPORTED", v["token"] != TOKENS[3], "%s fall %.3f rise %.3f" % (v["token"], v["fall"], v["rise"]))
+    ok("S4 every token the tree emits is in the registered set",
+       all(t in TOKENS for t in (verdict(Dh, caps, 0.9, 0.01)["token"], v["token"])))
+
+    # S5 statistics
+    ok("S5 spearman identity = +1, reversal = -1",
+       abs(spearman([1, 2, 3, 4], [10, 20, 30, 40]) - 1) < 1e-12
+       and abs(spearman([1, 2, 3, 4], [40, 30, 20, 10]) + 1) < 1e-12)
+    ok("S5 average ranks on ties", avg_ranks([3, 1, 3, 2]) == [3.5, 1.0, 3.5, 2.0])
+    if np is not None:
+        rho, p, ge = perm_null(list(range(11)), list(range(11)), 200000)
+        ok("S5 MC null: identity on 11 points has p ~ 1/11! (only exact hits count)",
+           p < 5e-5, "p %.2e (%d hits)" % (p, ge))
+    else:
+        ok("S5 numpy available for the MC null", False)
+
+    # S6 disagreement on hand-made units
+    units = [([1.0] * 49 + [-1.0] * 13, [0.0] * N_TENSORS)] * 4 + [([1.0] * N_TENSORS, [0.0] * N_TENSORS)]
+    t = disagreement(units, [1.0] * N_TENSORS)
+    # prefix of 49 ones, suffix of 13 minus-ones: at k = 49 the sums are +49 / -13
+    # (disagree); at k = 20 they are +20 / +16 (agree); at k = 36 the suffix sum
+    # is exactly 0 and the unit is indeterminate.
+    ok("S6 prefix +, suffix - on 4 of 5 units -> D(49) = 0.8, D(20) = 0, k=36 indeterminate",
+       t[49][0] == 4 and t[49][1] == 5 and t[20][0] == 0 and t[20][1] == 5 and t[36][2] == 4)
+    units = [([1.0] * N_TENSORS, [10.0] * N_TENSORS)]
+    t = disagreement(units, [1.0] * N_TENSORS)
+    ok("S6 a unit under its precision floor is INDETERMINATE, not counted", t[30] == [0, 0, 1])
+
+    # S7 the capture curve from the corpus
+    csvp = os.path.join(ROOT, "results", "all_runs.csv")
+    if os.path.isfile(csvp):
+        caps_r, mean_r, _ = capture_curve(read_csv(csvp))
+        ok("S7 cpk1 CAPTURE re-derived: argmax on the grid is 49, range >= 0.30",
+           max(KGRID, key=lambda k: caps_r[k]) == 49 and rng_(caps_r.values()) >= 0.30,
+           "argmax %d range %.4f" % (max(KGRID, key=lambda k: caps_r[k]), rng_(caps_r.values())))
+        ok("S7 the frozen cell selector finds rows in the corpus", len(cell_rows(read_csv(csvp))) > 0)
+    else:
+        ok("S7 corpus present", False, csvp)
+
+    print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--probe-root", action="append", default=None)
+    ap.add_argument("--csv", default=os.path.join(ROOT, "results", "all_runs.csv"))
+    ap.add_argument("--terms-dir", action="append", default=None)
+    ap.add_argument("--perms", type=int, default=PERM_N)
+    ap.add_argument("--no-offcell", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    sys.exit(selftest() if a.selftest else main(a))

@@ -1,0 +1,176 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 45 -- IDEA 3: the alpha0-robustness tradeoff.  45 jobs across BOTH accounts.
+#
+# THE QUESTION
+#   Every method claim this campaign has made was a PEAK-ACCURACY claim, and
+#   MetaOptimize loses those (best arm 92.795 vs tuned AdamW+cosine 94.417 +-0.113,
+#   n=5 -- CORRECTIONS 30).  But peak accuracy is not the parent paper's claim.  The
+#   paper claims "remarkable robustness to initial step-sizes, even for initial step
+#   sizes several orders of magnitude smaller than the optimal fixed step-size".
+#   That claim has never been tested here.  It is testable in one sweep.
+#
+#   Our own data hints it is true: at alpha0=1e-6 the AdamW+Adam blk6 arm still
+#   plateaus at 91.663 (n=6, `a0-blk6-1e6`), where a FIXED lr of 1e-6 would barely
+#   train.  Every cycle so far has treated that as a confound to control away
+#   (CORRECTIONS 8c).  It is the selling point.
+#
+# THE DESIGN -- head to head over ~5 decades, 7 grid points, 3 seeds, matched budget.
+#   Arm A  `i3a-*`  plain AdamW, FIXED lr, NO schedule and NO warmup.
+#   Arm B  `i3b-*`  MetaOptimize: AdamW base + Adam meta, --stepsize-groups
+#                   resnet18_blocks (m=6, the paper's own setting), guard on.
+#   grid   alpha0 (= lr for arm A) in {1e-6, 1e-5, 1e-4, 3e-4, 1e-3, 1e-2, 1e-1}
+#   fixed  ResNet18 / CIFAR-10 / bs 100 / 100 epochs / AUGMENT=1 / gamma 1 /
+#          meta-stepsize 1e-3 / --max-time 999:00:00
+#   ref    tuned AdamW+cosine 94.417 +-0.113 (n=5) is the PEAK reference and is
+#          already measured (CORRECTIONS 30).  Not re-run.
+#
+# WHY ARM A IS NEW.  Every "fixed" AdamW row already in the CSV goes through
+# AdamW_optimizer, which ALWAYS builds a CosineDecayWithWarmupScheduler.  `fx_adamw_*`
+# inherits the 422000/10000 defaults = a 10,000-step (20-epoch) LINEAR WARMUP followed
+# by a decay to 0.977; `SW_*`/`fxcos-*` are true cosines.  A warmup is a schedule, and
+# at the top of an LR sweep it is the difference between diverging and not.  So there
+# is NO honest fixed-lr arm in this campaign.  This one sets COS_WARMUP=0 and
+# COS_TOTAL=100000000, VERIFIED on the cluster to hold the LR at
+#   step 0     1.000000000e-3
+#   step 50000 9.999993831e-4
+# i.e. constant to 6.2e-7 relative over the whole run.  Do not use the defaults.
+#
+# THE CLIP CONTROL `i3bc-*` (3 extra jobs), and why it exists.
+#   BETA_CLIP=-15:-2.3026 is the campaign guard; exp(-2.3026)=0.09999985, so arm B's
+#   alpha can NEVER exceed 0.1.  At the top grid point alpha0=1e-1 the meta arm
+#   therefore STARTS pinned at its own ceiling (HF.py:100-102 clamps from the first
+#   meta update; the init at HF.py:204-220 is not clamped).  If arm B is flat out to
+#   1e-1, part of that flatness at the top end could be the guard, not the method.
+#   `i3bc-1e1-s{0,1,2}` re-runs that one cell with BETA_CLIP=-15:0 (alpha <= 1.0).
+#     lands on i3b-1e1  -> the guard is not doing the work; arm B's top end is real.
+#     lands far below   -> arm B's top-end flatness is PARTLY the guard.  Say so.
+#   This is Rule 4: verify the dial at both extremes rather than writing the caveat.
+#
+# PRE-REGISTERED PREDICTIONS.  Write the verdict against these, not against whatever
+# lands.  Primary metric is `plateau` (mean of last 20 epochs, CORRECTIONS 11), read
+# only at epochs_done >= 100 and superseded == 0.
+#   (P1) Arm A collapses at the bottom.  lr=1e-6 lands below 60; lr=1e-5 below 85.
+#        Arm A's within-1pp-of-own-best width is <= 1.5 decades.
+#   (P2) Arm B is flat over >= 3 decades: every alpha0 in [1e-6, 1e-3] within 1pp of
+#        arm B's own best.  (Anchor: 1e-6 -> 91.663 n=6, 1e-4 -> 91.638 n=3,
+#        1e-3 -> 92.071 n=6, all already in the CSV at this exact config -- so this
+#        prediction is nearly forced over [1e-6,1e-3] and the sweep's real information
+#        is at 1e-5, 3e-4, 1e-2 and 1e-1.)
+#   (P3) Arm B's PEAK is below arm A's peak, and both are below 94.417.
+#   REFUTATION of the whole idea: if arm B's within-1pp width is NOT strictly wider
+#   than arm A's, the parent paper's own robustness claim fails on its own setting,
+#   at m=6, on CIFAR-10.  That is a publishable negative and must be written as one.
+#   SECOND REFUTATION: if arm A at lr=1e-6 does NOT collapse, the premise that a
+#   fixed small step-size cannot train is wrong and the tradeoff has no denominator.
+#
+# WHAT THIS BATCH CANNOT SAY.  m is fixed at 6 and the architecture/dataset at
+# ResNet18/CIFAR-10.  Robustness measured at one granularity on one task is one cell.
+# Do not generalise the width to other m without running it.
+#
+# ACCOUNT BALANCE -- deliberate, and it is the point of the split.
+#   CORRECTIONS 10 lost a whole comparison to meta-optimizer being confounded with
+#   account.  Here EVERY main-grid cell has the identical account composition
+#   {cluster_a x2, cluster_b x1}: cluster_a runs seeds 0 and 1 of BOTH arms, cluster_b runs seed 2
+#   of BOTH arms.  Account therefore cannot confound any alpha0 or arm contrast.
+#   Pending: cluster_a 28, cluster_b 17 -- both under the 40 cap, so no wave split is needed.
+#
+# USAGE
+#   bash c45_idea3_alpha0_robustness.sh              # dry run on whichever account
+#   bash c45_idea3_alpha0_robustness.sh --submit
+#   bash c45_idea3_alpha0_robustness.sh --submit --force-fairshare   # operator override
+# =============================================================================
+set -u
+
+SUBMIT=0
+FORCE=0
+for a in "$@"; do
+  [ "$a" = "--submit" ] && SUBMIT=1
+  [ "$a" = "--force-fairshare" ] && FORCE=1
+done
+
+# ---- account detection: this script runs unchanged on both accounts ----
+case "$USER" in
+  account_a) ROOT=/cluster/account_a/metaopt; SEEDS="0 1"; CLIP_CTRL=0 ;;
+  account_b)       ROOT=/cluster/account_b/metaopt;        SEEDS="2";   CLIP_CTRL=1 ;;
+  *) echo "ABORT: unknown account '$USER' -- run this on cluster_a or cluster_b"; exit 1 ;;
+esac
+RUNNER=$ROOT/jobs/run_cifar.sh
+OUT=$ROOT/runs/i3
+PARTS=gpu-short,gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+TLIM=03:50:00        # stays inside gpu-short's 4h cap; slowest observed 100-ep run was 67 min
+
+[ -x "$RUNNER" ] || [ -f "$RUNNER" ] || { echo "ABORT: runner not found at $RUNNER"; exit 1; }
+
+# ---- guards ----
+FS=$(sshare -U -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER" -t PENDING | wc -l)
+NJOBS=$([ "$CLIP_CTRL" = 1 ] && echo 17 || echo 28)
+echo "guard: account=$USER FairShare=$FS pending=$PEND adding=$NJOBS (cap 40)"
+if [ "$SUBMIT" = "1" ]; then
+  if [ "$FORCE" = "1" ]; then
+    echo "guard: FairShare floor OVERRIDDEN by operator (--force-fairshare)."
+  else
+    awk -v f="$FS" 'BEGIN{exit !(f>=0.35)}' || { echo "ABORT: FairShare $FS below the 0.35 floor (use --force-fairshare to override)"; exit 1; }
+  fi
+  [ $((PEND + NJOBS)) -le 40 ] || { echo "ABORT: $PEND pending + $NJOBS would exceed the 40 cap"; exit 1; }
+fi
+
+mkdir -p "$OUT"
+n=0
+
+# --- Arm A: plain AdamW, FIXED lr.  COS_WARMUP=0 + COS_TOTAL=1e8 == no schedule. ---
+# Exports NONE of HIER/LAM/ETA_RATIO -- `LAM=na` kills the job (48 jobs lost to this).
+armA () {  # armA <lr> <tok> <seed>
+  local lr=$1 tok=$2 s=$3
+  local name="i3a-${tok}-s${s}"
+  n=$((n+1))
+  local cmd=(sbatch --job-name="$name" --partition="$PARTS" --time="$TLIM"
+    --export=ALL,AUGMENT=1,COS_TOTAL=100000000,COS_WARMUP=0
+    "$RUNNER"
+    --optimizer AdamW --alpha0 "$lr" --seed "$s"
+    --num-epochs 100 --NN-name ResNet18 --dataset CIFAR10 --batch-size 100
+    --max-time 999:00:00 --gamma 1
+    --save-directory "$OUT" --run-name "$name")
+  if [ "$SUBMIT" = "1" ]; then "${cmd[@]}"; else printf '%s\n' "${cmd[*]}"; fi
+}
+
+# --- Arm B: MetaOptimize, AdamW base + Adam meta, m=6.  Byte-matched to `a0-blk6-*`
+#     (cluster_b, cycle ~20) in every argument except --alpha0/--seed/--save-directory. ---
+armB () {  # armB <a0> <tok> <seed> <clip> <prefix>
+  local a0=$1 tok=$2 s=$3 clip=$4 pre=$5
+  local name="${pre}-${tok}-s${s}"
+  n=$((n+1))
+  local cmd=(sbatch --job-name="$name" --partition="$PARTS" --time="$TLIM"
+    --export=ALL,AUGMENT=1,BETA_CLIP=$clip
+    "$RUNNER"
+    --optimizer HF
+    --alg-base AdamW --normalizer-param-base 0.999 --momentum-param-base 0.9 --weight-decay-base 0.1
+    --alg-meta Adam  --normalizer-param-meta 0.999 --momentum-param-meta 0.9 --weight-decay-meta 0
+    --meta-stepsize 1e-3 --gamma 1
+    --NN-name ResNet18 --dataset CIFAR10 --num-epochs 100 --batch-size 100
+    --max-time 999:00:00 --alpha0 "$a0" --stepsize-groups resnet18_blocks --seed "$s"
+    --save-directory "$OUT" --run-name "$name")
+  if [ "$SUBMIT" = "1" ]; then "${cmd[@]}"; else printf '%s\n' "${cmd[*]}"; fi
+}
+
+GRID_VAL=(1e-6 1e-5 1e-4 3e-4 1e-3 1e-2 1e-1)
+GRID_TOK=(1e6  1e5  1e4  3e4  1e3  1e2  1e1)
+
+for s in $SEEDS; do
+  for i in 0 1 2 3 4 5 6; do
+    armA "${GRID_VAL[$i]}" "${GRID_TOK[$i]}" "$s"
+    armB "${GRID_VAL[$i]}" "${GRID_TOK[$i]}" "$s" "-15:-2.3026" i3b
+  done
+done
+
+# --- clip control: arm B's top grid point with the ceiling lifted to alpha <= 1.0 ---
+if [ "$CLIP_CTRL" = "1" ]; then
+  for s in 0 1 2; do
+    armB 1e-1 1e1 "$s" "-15:0" i3bc
+  done
+fi
+
+echo "---- $n jobs on $USER ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with:  python3 analysis/idea3_robustness.py results/all_runs.csv"
+echo "NOTE: run_cifar.sh writes .out to the ROOT of \$ROOT/runs, not to $OUT."

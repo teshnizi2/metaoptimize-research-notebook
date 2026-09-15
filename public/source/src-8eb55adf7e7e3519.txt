@@ -1,0 +1,212 @@
+#!/bin/bash
+# =============================================================================
+# Cycle 46 -- IDEA 3 CONVERGENCE CONTROL.  16 jobs, 300 epochs, EXTREMES ONLY.
+#
+# THE PROBLEM THIS FIXES
+#   `bin/c45_idea3_alpha0_robustness.sh` measures the alpha0-robustness width at
+#   100 epochs.  NEITHER ARM IS CONVERGED AT 100, and we measured that ourselves
+#   (FINDINGS 44.1, the matched-budget horizon ladder, n=3 at 300 and 600):
+#
+#     AdamW + cosine        94.417 -> 94.999 -> 95.138   at 100 / 300 / 600 epochs
+#     AdamW + Adam meta     92.795 -> 93.033 -> 93.201    "
+#
+#   Both arms are still climbing at 100 and only saturate between 300 and 600.
+#   That alone would be tolerable if the budget cost both arms the same -- but this
+#   campaign has already measured that IT DOES NOT.  Audit 5 (CORRECTIONS/FINDINGS
+#   36.2, rule R6) found that over 100 -> 300 epochs "un-pooled arms gain +0.53-0.88pp
+#   while every pooled arm is flat or loses", and that this is enough to ATTENUATE a
+#   measured effect (+1.444 -> +0.279, +2.264 -> +1.210, +1.504 -> +0.086).  A budget
+#   change has already moved a SHAPE in this project once.  That is the precedent.
+#
+#   And here the asymmetry lands exactly where the robustness claim lives.  At
+#   alpha0=1e-6 MetaOptimize must first GROW its step size before the base optimizer
+#   does useful work: `ep_to_85` is +11.4 to +19.0 epochs higher than at a0=1e-3
+#   (audit 5's correction to standing rule R5 -- the floor is ~11, not the 14-25
+#   this project used to quote, AND the damaging part is the DIFFERENTIAL, up to 7.6
+#   epochs between two arms being compared directly).  So a 100-epoch budget charges
+#   arm B a 11-19-epoch startup tax at the BOTTOM of the grid and ~0 at the top: it
+#   systematically UNDERSTATES arm B's robustness at precisely the extreme the parent
+#   paper's claim is about.  If IDEA 3 comes out negative at 100 epochs we cannot
+#   distinguish "MetaOptimize is not robust" from "100 epochs was not enough budget
+#   for the arm that has to grow its own step size first".
+#
+#   That is an unfalsifiable verdict, and shipping one would be worse than shipping
+#   no verdict.  This batch buys the discriminator.
+#
+# THE DESIGN -- the cheapest thing that answers "is the SHAPE budget-stable?"
+#   grid   alpha0 in {1e-6, 1e-5, 1e-2, 1e-1}  -- THE FOUR EXTREMES ONLY
+#   arms   A `i3a300-*` fixed-lr AdamW      B `i3b300-*` AdamW base + Adam meta, m=6
+#   seeds  {0, 1}                            -> 4 x 2 x 2 = 16 jobs
+#   budget 300 epochs (~2h/job on l4, ~3:51 worst case on 2080ti)
+#   fixed  ResNet18 / CIFAR-10 / bs 100 / AUGMENT=1 / gamma 1 / meta-stepsize 1e-3 /
+#          BETA_CLIP=-15:-2.3026 (guard ON) / --max-time 999:00:00
+#
+#   THE MIDDLE OF THE GRID IS DELIBERATELY NOT RE-RUN.  {1e-4, 3e-4, 1e-3} at 300ep
+#   would be 12 more jobs to re-measure a region the 100-epoch sweep already covers
+#   and where under-convergence is NOT differential: the startup tax is a bottom-end
+#   effect and the guard is a top-end effect.  The extremes are where a budget
+#   artefact can flip the shape; the interior is where it cannot.  Extremes-only is
+#   the whole point of the control, not a compromise on it.
+#
+# WHY THESE ARE NEW ARMS AND NOT "MORE SEEDS"
+#   The run-name prefixes are `i3a300-` / `i3b300-`, which do NOT match
+#   `startswith("i3a-")` / `startswith("i3b-")`.  This is deliberate: the reducer's
+#   only epoch filter is `epochs_done >= 100`, so a 300-epoch row named `i3a-*`
+#   would be silently POOLED into the 100-epoch cell and would corrupt the very
+#   comparison this batch exists to make.  `analysis/idea3_robustness.py` also now
+#   filters each arm on `epochs_done` explicitly -- belt and braces.
+#
+# WHY gpu-short IS DROPPED (and this is the one deviation from "all five partitions")
+#   `gpu-short` caps at 4:00:00.  The slowest measured 300-epoch-equivalent rate in
+#   this campaign is `bg600-meta-s1` on gpu-2080ti-11g: 7:41:51 for 600 epochs, i.e.
+#   ~3:51 for 300 -- OVER the cap once startup is counted.  A 300-epoch arm on
+#   gpu-short is a coin-flip on a silent truncation, and `train.py`'s own truncation
+#   break makes truncation quiet.  The four long partitions all allow 7 days; this
+#   batch uses --time=08:30:00, exactly what `bg300-*` used and completed under.
+#
+# ARM A IS STILL A GENUINELY FIXED LR AT 300 EPOCHS -- VERIFIED, NOT ASSUMED
+#   COS_WARMUP=0, COS_TOTAL=100000000, checked against the real scheduler object out
+#   to 150,000 steps (= 300 epochs):
+#     step      0  1.000000000000e-3   rel dev 0
+#     step  50000  9.999993831499e-4   rel dev 6.17e-7   (reproduces the c45 check)
+#     step 150000  9.999944483578e-4   rel dev 5.55e-6
+#   Constant to 5.6e-6 relative over the full 300-epoch run.  No warmup ramp.
+#
+# ACCOUNT BALANCE -- same rule as c45, split by SEED and never by arm.
+#   CORRECTIONS 10 lost a whole generalisation claim to arm being confounded with
+#   account.  Here: cluster_a runs seed 0 of BOTH arms (8 jobs), cluster_b runs seed 1 of
+#   BOTH arms (8 jobs).  Every cell has composition {cluster_a x1, cluster_b x1}, so
+#   account cannot confound any alpha0 contrast, the A-vs-B contrast, OR the
+#   100-vs-300 contrast.
+#
+# PRE-REGISTERED PREDICTIONS -- write the verdict against these.
+#   (B1) The SHAPE is budget-stable: on the matched 4-point sub-grid, every cell
+#        keeps its in-band / out-of-band status at 1pp and at 2pp of its own arm's
+#        sub-grid best, both arms, at 300 as at 100; the sub-grid widths are
+#        unchanged; and the A-vs-B width ORDERING is unchanged.
+#   (B2) Both arms gain roughly the horizon premium already measured on the
+#        matched-budget ladder (+0.58pp cosine, +0.24pp meta from 100 to 300), so
+#        the DELTAS are near-uniform across the sub-grid.  NOTE that ladder's meta
+#        arm is LAYERWISE (m=62) while arm B here is blk6 (m=6), so +0.24pp is
+#        indicative, not a matched prediction.
+#   (B3) Arm B's 1e-6 cell gains MORE than its 1e-2 cell -- the startup tax being
+#        refunded.  If it does, the 100-epoch sweep UNDERSTATED arm B's bottom-end
+#        robustness and the 100-epoch width is a LOWER bound on the true width.
+#
+#   THE REFUTATION THAT MATTERS, and it invalidates c45 rather than this batch:
+#   if (B1) FAILS -- any cell changes band status, or either width changes, or the
+#   ordering flips -- then THE SHAPE IS NOT BUDGET-STABLE and the 100-epoch sweep
+#   is NOT a valid basis for the robustness claim.  Do not patch it with a caveat.
+#   Say that the width must be re-measured on the full grid at 300 epochs, and
+#   report the 100-epoch numbers as budget-confounded.
+#
+# WHAT THIS BATCH STILL CANNOT SAY
+#   300 epochs is not converged either -- 600 is closer (95.15 / 93.23) and even
+#   there both arms still move.  This tests whether the SHAPE moves between two
+#   budgets, which is the falsifiable question; it does not establish the
+#   asymptotic width.  n=2 per cell, and audit 5 measured same-config same-seed
+#   spread at 0.119pp median / 0.243pp p90 (rule R7 was wrong by ~6x), so a per-cell
+#   100-vs-300 delta under ~0.3pp is NOT resolvable and must not be interpreted.
+#   `plateau` is the mean of the last 20 epochs at BOTH budgets (CORRECTIONS 11), so
+#   the window is 20% of a 100-ep run and 6.7% of a 300-ep one -- same statistic,
+#   different fraction of the run.  Sub-grid width treats 1e-5 -> 1e-2 as
+#   contiguous although the interior is unmeasured at 300ep; the reducer flags
+#   this and the number is an UPPER bound on the 300-epoch width.
+#
+# USAGE
+#   bash c46_idea3_budget_control.sh                              # dry run
+#   bash c46_idea3_budget_control.sh --submit
+#   bash c46_idea3_budget_control.sh --submit --force-fairshare   # operator override
+# =============================================================================
+set -u
+
+SUBMIT=0
+FORCE=0
+for a in "$@"; do
+  [ "$a" = "--submit" ] && SUBMIT=1
+  [ "$a" = "--force-fairshare" ] && FORCE=1
+done
+
+# ---- account detection: this script runs unchanged on both accounts ----
+case "$USER" in
+  account_a) ROOT=/cluster/account_a/metaopt; SEEDS="0" ;;
+  account_b)       ROOT=/cluster/account_b/metaopt;        SEEDS="1" ;;
+  *) echo "ABORT: unknown account '$USER' -- run this on cluster_a or cluster_b"; exit 1 ;;
+esac
+RUNNER=$ROOT/jobs/run_cifar.sh
+OUT=$ROOT/runs/i3
+# gpu-short OMITTED on purpose: it caps at 4:00:00 and a 300-epoch run on a 2080ti
+# takes ~3:51.  The other four partitions all allow 7 days.  See header.
+PARTS=gpu-l4-24g,gpu-2080ti-11g,gpu-mig-40g,gpu-a100-80g
+TLIM=08:30:00        # what bg300-* used and completed under (slowest 02:00:43)
+
+[ -x "$RUNNER" ] || [ -f "$RUNNER" ] || { echo "ABORT: runner not found at $RUNNER"; exit 1; }
+
+# ---- guards ----
+FS=$(sshare -U -n -o FairShare 2>/dev/null | tr -d ' ' | head -1)
+PEND=$(squeue -h -u "$USER" -t PENDING | wc -l)
+NJOBS=8
+echo "guard: account=$USER FairShare=$FS pending=$PEND adding=$NJOBS (cap 40)"
+if [ "$SUBMIT" = "1" ]; then
+  if [ "$FORCE" = "1" ]; then
+    echo "guard: FairShare floor OVERRIDDEN by operator (--force-fairshare)."
+  else
+    awk -v f="$FS" 'BEGIN{exit !(f>=0.35)}' || { echo "ABORT: FairShare $FS below the 0.35 floor (use --force-fairshare to override)"; exit 1; }
+  fi
+  [ $((PEND + NJOBS)) -le 40 ] || { echo "ABORT: $PEND pending + $NJOBS would exceed the 40 cap"; exit 1; }
+fi
+
+mkdir -p "$OUT"
+n=0
+
+# --- Arm A: plain AdamW, FIXED lr.  COS_WARMUP=0 + COS_TOTAL=1e8 == no schedule. ---
+# Exports NONE of HIER/LAM/ETA_RATIO -- `LAM=na` kills the job (48 jobs lost to this).
+armA () {  # armA <lr> <tok> <seed>
+  local lr=$1 tok=$2 s=$3
+  local name="i3a300-${tok}-s${s}"
+  n=$((n+1))
+  local cmd=(sbatch --job-name="$name" --partition="$PARTS" --time="$TLIM"
+    --export=ALL,AUGMENT=1,COS_TOTAL=100000000,COS_WARMUP=0
+    "$RUNNER"
+    --optimizer AdamW --alpha0 "$lr" --seed "$s"
+    --num-epochs 300 --NN-name ResNet18 --dataset CIFAR10 --batch-size 100
+    --max-time 999:00:00 --gamma 1
+    --save-directory "$OUT" --run-name "$name")
+  if [ "$SUBMIT" = "1" ]; then "${cmd[@]}"; else printf '%s\n' "${cmd[*]}"; fi
+}
+
+# --- Arm B: MetaOptimize, AdamW base + Adam meta, m=6, guard ON.  Byte-matched to
+#     `i3b-*` in every argument except --num-epochs/--seed/--run-name. ---
+armB () {  # armB <a0> <tok> <seed>
+  local a0=$1 tok=$2 s=$3
+  local name="i3b300-${tok}-s${s}"
+  n=$((n+1))
+  local cmd=(sbatch --job-name="$name" --partition="$PARTS" --time="$TLIM"
+    --export=ALL,AUGMENT=1,BETA_CLIP=-15:-2.3026
+    "$RUNNER"
+    --optimizer HF
+    --alg-base AdamW --normalizer-param-base 0.999 --momentum-param-base 0.9 --weight-decay-base 0.1
+    --alg-meta Adam  --normalizer-param-meta 0.999 --momentum-param-meta 0.9 --weight-decay-meta 0
+    --meta-stepsize 1e-3 --gamma 1
+    --NN-name ResNet18 --dataset CIFAR10 --num-epochs 300 --batch-size 100
+    --max-time 999:00:00 --alpha0 "$a0" --stepsize-groups resnet18_blocks --seed "$s"
+    --save-directory "$OUT" --run-name "$name")
+  if [ "$SUBMIT" = "1" ]; then "${cmd[@]}"; else printf '%s\n' "${cmd[*]}"; fi
+}
+
+# THE EXTREMES ONLY.  The interior {1e-4, 3e-4, 1e-3} is covered by c45 at 100ep
+# and is not where a budget artefact can flip the shape.  See header.
+GRID_VAL=(1e-6 1e-5 1e-2 1e-1)
+GRID_TOK=(1e6  1e5  1e2  1e1)
+
+for s in $SEEDS; do
+  for i in 0 1 2 3; do
+    armA "${GRID_VAL[$i]}" "${GRID_TOK[$i]}" "$s"
+    armB "${GRID_VAL[$i]}" "${GRID_TOK[$i]}" "$s"
+  done
+done
+
+echo "---- $n jobs on $USER ($( [ "$SUBMIT" = 1 ] && echo SUBMITTED || echo 'dry run, nothing submitted' )) ----"
+echo "reduce with:  python3 analysis/idea3_robustness.py results/all_runs.csv"
+echo "NOTE: run_cifar.sh writes .out to the ROOT of \$ROOT/runs, not to $OUT."
+echo "NOTE: read these at epochs_done >= 300, NOT >= 100 -- the reducer does this per arm."

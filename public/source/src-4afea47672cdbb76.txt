@@ -1,0 +1,315 @@
+#!/bin/bash
+# =============================================================================
+# cTD1_tensor_dominate.sh -- `ctd1`, THE TENSOR-LEVEL TEST OF H-DOMINATE AT THE
+#   STANDARD CIFAR-100 CELL.  ONE SUBMISSION, 6 JOBS (scalar x3 + layerwise x3
+#   companion), 100 EPOCHS, SEEDS {18,19,20}, PROBE=100, PROBE_TENSOR=1.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here
+# touches the other account, nothing is submitted to `cluster_a`, and every guard
+# and scancel line below is filtered on the `ctd1-` prefix alone.
+#
+# REGISTERED SCORER: analysis/cTD1_tensor_dominate_score.py, git-committed
+# BEFORE this batch is submitted (STANDING RULE 21; the proof is the commit
+# time against the earliest sacct Submit, stated in CORRECTIONS with the
+# margin).  The hypothesis, every bar, the named carrier set, the branch map
+# and the floor band are frozen there; --selftest re-derives the floor band
+# from the corpus with `ctd1-` rows EXCLUDED.
+#
+# THE DOCUMENTED SCORER INVOCATION -- no second argument to forget:
+#     python3 analysis/cTD1_tensor_dominate_score.py <runsdir>
+#
+# -----------------------------------------------------------------------------
+# THE QUESTION (H-DOMINATE, tensor level)
+# -----------------------------------------------------------------------------
+# The scalar arm at this cell descends to the -15 floor and reads ~22.7 pp
+# test / ~22.9 pp train.  H-DOMINATE says the single beta's sign is carried by
+# a minority of large-|term| tensors voting DOWN against the tensor-count
+# majority.  The scalar probe cannot answer: block_product reduces the 62
+# per-tensor inner products to ONE number before _probe runs, and _probe runs
+# AFTER base_update has overwritten h_condenced.  patches/patch_probe_tensor.py
+# (OPT-IN via PROBE_TENSOR=1, proved inert by tests/test_probe_tensor.py)
+# captures the 62 terms between block_product and base_update, keeps the
+# per-tensor EMA the Lion sign actually consumes, and appends them to the
+# existing probe record.
+#
+# WHY A LAYERWISE COMPANION (3 more jobs, ~2.5 GPU-h).  CORRECTIONS 177
+# showed the per-tensor signs under LAYERWISE dynamics are not the per-tensor
+# signs under SCALAR dynamics (the layer4 convs went UP under layerwise while
+# scalar's beta went DOWN).  With the same logging on both arms in ONE batch,
+# prediction (4) -- carriers' signs opposite across dynamics -- becomes a
+# within-batch measurement at matched seed and step, not a cross-batch
+# inference from 177.  The companion also validates the capture on the live
+# GPU where the harness's own z IS per-tensor: z_tensor must equal z[0]
+# elementwise and m_tensor must equal momentum_meta[0] elementwise.
+#
+# RULE 20.  Every value below is ONE shell token of [A-Za-z0-9_.,:/-].
+# analysis/argsline_guard.py IS NOT EDITED.  BETA_CLIP, PROBE and PROBE_TENSOR
+# are ENVIRONMENT variables; the first two are audited from the runner's ENV
+# line, PROBE_TENSOR from the `PROBE_TENSOR: on` line the patch prints into
+# every .out (the runner is NOT edited to add it).
+#
+# PARTITIONS: composed by bin/_lib_guards.sh's slurm_parts_for_wall
+# (CORRECTIONS 178) -- gpu-short is included at WALL=03:00:00 and the
+# source-time hook aborts if PARTS/WALL disagree.
+#
+# USAGE   bash bin/cTD1_tensor_dominate.sh            # dry run, submits nothing
+#         bash bin/cTD1_tensor_dominate.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/ctd1
+CIF=${CIFAR10_DIR:-$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10}
+HFLIVE="$CIF/Optimizers/HF.py"
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="18 19 20"
+MST=1e-3
+A0=1e-6
+G_SC='scalar'
+G_LAY='layerwise'
+WALL=03:00:00
+# The composer lives in _lib_guards.sh.  Source it once here (PARTS is still
+# unset, so its source-time hook is skipped), compose PARTS from WALL, and the
+# second source just before the sbatch loop re-checks the pair and aborts on
+# disagreement (CORRECTIONS 178).
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+echo "=============================================================="
+echo " ctd1 -- H-DOMINATE, TENSOR LEVEL, STANDARD CIFAR-100 CELL"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C"
+echo " ms=$MST alpha0=$A0  horizon $EPOCHS epochs; seeds $SEEDS"
+echo " arms: sc=$G_SC (PRIMARY)   lay=$G_LAY (COMPANION)"
+echo " 2 arms x 3 seeds = 6 jobs, ONE submission"
+echo " partitions $PARTS   walltime $WALL"
+echo " scorer: analysis/cTD1_tensor_dominate_score.py (registered before any run exists)"
+echo " DOCUMENTED INVOCATION: python3 analysis/cTD1_tensor_dominate_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0: the corpus ----------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+[ -f "$CSVP" ] || guard_fail "guard 0: no CSV at $CSVP"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines)"
+
+# ---- guard 1: the registered scorer exists, is committed, and selftests -----
+SC="$REPO/analysis/cTD1_tensor_dominate_score.py"
+[ -f "$SC" ] || guard_fail "guard 1a: missing $SC"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  DIRTY=$(git -C "$REPO" status --porcelain -- \
+      analysis/cTD1_tensor_dominate_score.py bin/cTD1_tensor_dominate.sh \
+      patches/patch_probe_tensor.py tests/test_probe_tensor.py 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer, patch, test AND this script are committed (RULE 21)" \
+                  || guard_fail "guard 1b: uncommitted -- RULE 21 requires them committed BEFORE any run exists: $DIRTY"
+  DEL=$(git -C "$REPO" diff HEAD --numstat -- analysis/ 2>/dev/null | awk '$2+0>0{print}')
+  [ -z "$DEL" ] && echo "guard 1b2: no uncommitted DELETIONS under analysis/ (RULE 16)" \
+               || guard_fail "guard 1b2: analysis/ has uncommitted deletions: $DEL"
+else
+  echo "guard 1b: NOTE -- no git repo at $REPO on this host; RULE 21 is verified on"
+  echo "          the committing host by wall clock against the earliest sacct Submit."
+fi
+python3 "$SC" --selftest >/tmp/ctd1_selftest.$$ 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' /tmp/ctd1_selftest.$$) checks, $(grep -c '^  FAIL' /tmp/ctd1_selftest.$$) failures)" \
+  || { guard_fail "guard 1c: scorer selftest FAILED"; tail -40 /tmp/ctd1_selftest.$$; }
+echo "guard 1c: scorer sha256 $( (sha256sum "$SC" 2>/dev/null || shasum -a 256 "$SC") | awk '{print $1}')"
+
+# ---- guard 2: RULE 21 premise -- no run of this batch may exist yet ---------
+grep -q '^ctd1-' "$CSVP" && guard_fail "guard 2: ctd1-* already in the CSV" \
+                         || echo "guard 2: no ctd1-* name collision in the corpus"
+if [ -d "$WS/runs" ]; then
+  NOUT=$(ls "$WS/runs"/ctd1-*.out 2>/dev/null | wc -l | tr -d ' ')
+  [ "${NOUT:-0}" = 0 ] && echo "guard 2b: no ctd1-*.out on disk" \
+                       || guard_fail "guard 2b: $NOUT ctd1-*.out files already exist"
+fi
+NDUP=$(python3 - "$CSVP" "$NET" <<'PYEOF'
+import sys, csv
+n = 0
+for r in csv.DictReader(open(sys.argv[1])):
+    if r.get("network") == sys.argv[2] and str(r.get("seed")) in ("18", "19", "20"):
+        n += 1
+print(n)
+PYEOF
+)
+[ "${NDUP:-1}" = 0 ] && echo "guard 2c: ZERO $NET rows anywhere carry seed 18, 19 or 20" \
+                     || guard_fail "guard 2c: $NDUP $NET rows already carry seed 18/19/20"
+
+# ---- guard 3: the CIFAR-100 data is staged on THIS account ------------------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python present under $CIF/data" \
+  || guard_fail "guard 3: CIFAR-100 is not staged at $CIF/data/cifar-100-python"
+
+# ---- guard 4: THE LIVE SOURCE CARRIES THE PATCH, AND THE PATCH IS PROVED INERT
+mkdir -p "$SAVE"
+[ -f "$HFLIVE" ] || guard_fail "guard 4: no live HF.py at $HFLIVE"
+NPT=$(grep -c 'PATCH_PROBE_TENSOR' "$HFLIVE" 2>/dev/null); NPT=${NPT:-0}
+[ "$NPT" = 3 ] && echo "guard 4a: live HF.py carries PATCH_PROBE_TENSOR (3 markers)" \
+               || guard_fail "guard 4a: live HF.py has $NPT PATCH_PROBE_TENSOR markers, the patch inserts exactly 3"
+PRE="$HFLIVE.pre_probe_tensor"
+[ -f "$PRE" ] && echo "guard 4b: pre-patch backup present: $PRE" \
+              || guard_fail "guard 4b: no pre-patch backup at $PRE"
+python3 "$REPO/tests/test_probe_tensor.py" --pre "$PRE" --post "$HFLIVE" --structural-only \
+   >/tmp/ctd1_struct.$$ 2>&1 && echo "guard 4c: structural inertness R0 PASSES on the live file" \
+   || { guard_fail "guard 4c: structural inertness R0 FAILED on the live file"; tail -20 /tmp/ctd1_struct.$$; }
+ILOG="$SAVE/inertness_test.log"
+if [ -f "$ILOG" ] && grep -q '^ALL PASS$' "$ILOG"; then
+  echo "guard 4d: full CPU inertness test (R0-R5) recorded ALL PASS in $ILOG"
+  echo "          tested post sha256 $(grep -m1 '^POST_SHA256' "$ILOG" | awk '{print $2}')"
+  HFSHA_NOW=$( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')
+  grep -q "^POST_SHA256 $HFSHA_NOW" "$ILOG" \
+    && echo "guard 4e: the live HF.py is byte-identical to the file the test passed on" \
+    || guard_fail "guard 4e: live HF.py sha256 $HFSHA_NOW is NOT the file the inertness test passed on"
+else
+  guard_fail "guard 4d: no ALL PASS inertness log at $ILOG -- run tests/test_probe_tensor.py on the cluster first and tee it there"
+fi
+
+# ---- guard 4f: the live model and the update rule, quoted off the live source
+python3 - "$CIF" <<'PYEOF' || guard_fail "guard 4f: live-source / live-model check FAILED"
+import sys, os, inspect, re
+cif = sys.argv[1]
+sys.path.insert(0, cif); os.chdir(cif)
+from build_network import build_network
+from Optimizers.HF import HF
+bad = 0
+net = build_network("ResNet18_c100", "cpu")
+names = [n for n, _ in net.named_parameters()]
+tot = sum(int(p.numel()) for _, p in net.named_parameters())
+print("guard 4f: live ResNet18_c100 -- %d parameter tensors, %d parameters" % (len(names), tot))
+if len(names) != 62 or tot != 11220132:
+    print("!!! guard 4f: live model is %d / %d, the batch assumes 62 / 11220132" % (len(names), tot)); bad += 1
+for nm in ("layer4.0.conv2.weight", "layer4.1.conv2.weight", "linear.weight"):
+    if nm not in names:
+        print("!!! guard 4f: named carrier %s is not a live parameter name" % nm); bad += 1
+src = inspect.getsource(HF.Lion_meta_update)
+m = re.search(r"torch\.sign\(self\.args_meta\['Lion_beta2'\]\*self\.momentum_meta\[i\]\s*\+\s*"
+              r"\(1-self\.args_meta\['Lion_beta2'\]\)\*HtT_gradft\[i\]\)", src)
+print("guard 4f: Lion_meta_update's sign argument is b2*momentum_meta + (1-b2)*z: %s" % bool(m))
+if not m: bad += 1
+sbp = inspect.getsource(HF.block_product)
+after = sbp.split("stepsize_type == 'scalar'", 1)[1]
+print("guard 4f: block_product's scalar branch falls through to the unnormalised sum: %s"
+      % ("return [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]" in after))
+if "return [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]" not in after: bad += 1
+sst = inspect.getsource(HF.step)
+i_bp = sst.find("HtT_gradft = self.block_product(self.h_condenced, g)")
+i_pt = sst.find("self._pt_capture(self.h_condenced, g, HtT_gradft)")
+i_bu = sst.find("self.base_update(net,g)")
+print("guard 4f: capture sits after block_product and before base_update: %s" % (0 <= i_bp < i_pt < i_bu))
+if not (0 <= i_bp < i_pt < i_bu): bad += 1
+raise SystemExit(1 if bad else 0)
+PYEOF
+
+# ---- guard 4g: provenance -----------------------------------------------------
+PROV="$SAVE/PROVENANCE.txt"
+HFSHA=$( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')
+PRESHA=$( [ -f "$PRE" ] && (sha256sum "$PRE" 2>/dev/null || shasum -a 256 "$PRE") | awk '{print $1}')
+{ echo "HF_SHA256 $HFSHA"; echo "HF_PRE_PATCH_SHA256 ${PRESHA:-none}";
+  echo "PATCH_PROBE_TENSOR_MARKERS $NPT";
+  echo "SUBMIT_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+  echo "SPECS scalar layerwise"; echo "SEEDS $SEEDS"; echo "PROBE $PROBE PROBE_TENSOR $PT"; } > "$PROV"
+echo "guard 4g: live HF.py sha256 $HFSHA (pre-patch ${PRESHA:-none}); provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions -----------------------------
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding 6"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+for P in $(echo "$PARTS" | tr ',' ' '); do
+  TL=$(sinfo -h -p "$P" -o '%l' 2>/dev/null | head -1)
+  R=$(squeue -h -p "$P" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+  D=$(squeue -h -p "$P" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+  echo "guard 5b: $P timelimit $TL   running $R   pending $D"
+done
+
+# ---- guard 8: the scorer's default probe root is the launcher's SAVE --------
+python3 - "$SC" "$WS/runs" "$SAVE" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT probe resolution cannot reach the launcher's PROBE_DIR root"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("ctd1", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+runsdir, save = sys.argv[2], sys.argv[3]
+p = m.resolve_probe_root(runsdir)
+print("guard 8: `%s <runsdir>` resolves the probe root to %s" % (os.path.basename(sys.argv[1]), p))
+ok = p is not None and os.path.realpath(p) == os.path.realpath(save)
+if not ok:
+    print("!!! guard 8: resolved %r, launcher writes probes under %r" % (p, save))
+raise SystemExit(0 if ok else 1)
+PYEOF
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, guard each line under RULE 20, then submit --------------------
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH \
+        gamma=$GAMMA dataset=$DSET NN-name=$NET weight-decay-meta=0 \
+        meta-stepsize=$MST alpha0=$A0)
+
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in sc lay; do
+    case $ARM in
+      sc)  G=$G_SC ;;
+      lay) G=$G_LAY ;;
+    esac
+    RN="ctd1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    if guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1; then :; else
+      echo "!!! RULE 20 PRE-CHECK FAILED for $RN"
+      guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1))
+    fi
+    if ! guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1; then
+      echo "!!! RULE 20: an axis does not round-trip for $RN"
+      guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN"; BAD=$((BAD+1))
+    fi
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = 6 ] || { echo "!!! composed $N lines, the design says 6"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'ctd1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "ctd1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- ctd1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "ctd1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no ctd1 job started inside the window.  Re-check with:"
+       echo "         export METAOPT_WS=$WS"
+       echo "         python3 $REPO/analysis/argsline_guard.py $WS/runs --name ctd1- --batch-consistency" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^ctd1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "ENV AUDIT (BETA_CLIP and PROBE ride the runner's ENV line; PROBE_TENSOR rides the patch's own line):"
+  echo "    grep -h '^ENV:' $WS/runs/ctd1-*.out | sed 's/ PROBE_DIR=[^ ]*//' | sort | uniq -c   # ONE line, x6"
+  echo "    grep -h '^PROBE_TENSOR:' $WS/runs/ctd1-*.out | sed 's/ dir=.*//' | sort | uniq -c   # TWO lines (type=scalar x3, type=layerwise x3)"
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH:"
+  echo "    python3 $REPO/analysis/cTD1_tensor_dominate_score.py $WS/runs"
+fi

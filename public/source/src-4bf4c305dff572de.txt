@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Execute the PROBE5 block AS SHIPPED, lifted verbatim out of the live HF.py.
+
+Rule 4: the batch's structural check #2 requires `neg_counts.json` to exist with
+n_records == 2000.  A patch that silently fails to write it returns an
+uninformative null after burning 8 jobs, and cycle 47 found exactly such a bug
+(np.save appending '.npy' to a path that lacked it).  So the block is not read --
+it is RUN, on the bytes that will actually execute, against a stub `self`.
+
+This does NOT test the science.  It tests three things a static read cannot:
+  1. every name in the block resolves in `_probe`'s real scope (`os`, `json`, torch)
+  2. the atomic write produces the file at the intended path, not path + '.npy'
+  3. the counts accumulated equal the counts written, and the marginal p_b it
+     implies matches the time-mean of frac_neg -- which is structural check #3
+
+Usage:  python3 tests/test_probe5_block.py [path/to/HF.py]
+"""
+import json
+import os
+import sys
+import tempfile
+
+import torch
+
+DEFAULT_HF = ("/cluster/account_b/metaopt/MetaOptimize/codes/Supervised_tasks/"
+              "MetaOptimize/cifar10/Optimizers/HF.py")
+
+
+def extract_block(src):
+    """Lift the PROBE5 block out of _probe, from its marker to the line before `zm =`."""
+    start = src.index("        # --- PATCH_PROBE5:")
+    end = src.index("        zm = zall.mean()", start)
+    block = src[start:end]
+    # the block sits at 8-space method indent; dedent to module level to exec it
+    return "".join(ln[8:] if ln.startswith("        ") else ln
+                   for ln in block.splitlines(keepends=True))
+
+
+class Stub:
+    stepsize_type = "layerwise"
+
+    def __init__(self, d):
+        self._probe_dir = d
+
+
+def main(hf_path):
+    src = open(hf_path).read()
+    assert "PATCH_PROBE5" in src, "PATCH_PROBE5 not applied"
+    assert "PATCH_PROBE5_FIX" in src, "PATCH_PROBE5_FIX not applied"
+    block = extract_block(src)
+    code = compile(block, "<probe5-block>", "exec")
+
+    ok = fail = 0
+
+    def chk(name, got, want):
+        nonlocal ok, fail
+        if got == want:
+            ok += 1
+        else:
+            fail += 1
+            print(f"  FAIL {name}: got {got!r} want {want!r}")
+
+    torch.manual_seed(0)
+    n_tot = 64
+    n_records = 25
+    write_every = 5
+
+    with tempfile.TemporaryDirectory() as d:
+        self_ = Stub(d)
+        os.environ["PROBE5"] = "1"
+        os.environ["PROBE5_WRITE_EVERY"] = str(write_every)
+
+        # heterogeneous coordinates: each has its own persistent sign preference,
+        # which is the whole point of the patch
+        p = torch.rand(n_tot) * 0.8 + 0.1
+        expect_neg = torch.zeros(n_tot)
+        frac_neg_series = []
+        for _ in range(n_records):
+            zall = torch.where(torch.rand(n_tot) < p, -1.0, 1.0)
+            expect_neg += (zall < 0).float()
+            frac_neg_series.append(float((zall < 0).sum()) / n_tot)
+            # the block's real scope provides these names; `json`/`os` come from
+            # _probe's own `import json, os` at line 335, replicated here
+            exec(code, {"os": os, "json": json, "torch": torch},
+                 {"self": self_, "zall": zall, "n_tot": n_tot})
+
+        # 1. the file exists at the INTENDED path
+        files = sorted(os.listdir(d))
+        chk("neg_counts.npy written at intended path", "neg_counts.npy" in files, True)
+        chk("no stray .npy.tmp.npy (the cycle-47 bug)",
+            [f for f in files if f.endswith(".tmp") or f.endswith(".tmp.npy")], [])
+        chk("neg_counts.json written", "neg_counts.json" in files, True)
+
+        # 2. contents match what was accumulated
+        import numpy as np
+        got = np.load(os.path.join(d, "neg_counts.npy"))
+        chk("counts length", got.shape, (n_tot,))
+        chk("counts exact", np.array_equal(got, expect_neg.numpy()), True)
+
+        meta = json.load(open(os.path.join(d, "neg_counts.json")))
+        chk("n_records == last multiple of write_every", meta["n_records"],
+            (n_records // write_every) * write_every)
+        chk("n_tot recorded", meta["n_tot"], n_tot)
+        chk("stepsize_type recorded", meta["stepsize_type"], "layerwise")
+
+        # 3. structural check #3 of the batch: sum(neg)/(n_rec*n_tot) == time-mean frac_neg
+        nrec = meta["n_records"]
+        lhs = float(got.sum()) / (nrec * n_tot)
+        rhs = sum(frac_neg_series[:nrec]) / nrec
+        chk("sum(neg)/(n_rec*n_tot) == mean(frac_neg)", abs(lhs - rhs) < 1e-9, True)
+
+        # 4. the gate really is a gate -- PROBE5 unset must write nothing
+        with tempfile.TemporaryDirectory() as d2:
+            os.environ["PROBE5"] = ""
+            s2 = Stub(d2)
+            exec(code, {"os": os, "json": json, "torch": torch},
+                 {"self": s2, "zall": torch.ones(n_tot), "n_tot": n_tot})
+            chk("PROBE5 unset writes nothing", os.listdir(d2), [])
+
+    print(f"test_probe5_block: {ok}/{ok + fail} PASS")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HF))

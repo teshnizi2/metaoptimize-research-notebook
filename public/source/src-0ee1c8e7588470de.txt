@@ -1,0 +1,177 @@
+"""PATCH_REDNORM -- an OPT-IN, PER-TENSOR-NORMALISED group reduction, so that the
+one mechanism the harness itself hands you -- the UNNORMALISED SUM inside
+`HF.block_product` -- can be INTERVENED ON instead of only observed.
+
+-------------------------------------------------------------------------------
+WHY, AND WHY *THIS* NORMALISATION AND NOT THE OBVIOUS ONE
+-------------------------------------------------------------------------------
+The meta-signal for a group G is, on the live source (`block_product`, the
+`scalar` and `blockwise` branches),
+
+    z_G = sum_{i in G} <h_condenced[i], g[i]>            -- an UNNORMALISED SUM
+
+and `Lion_meta_update` consumes it as
+
+    beta <- (1 - ms*wd)*beta - ms * torch.sign(b2*momentum_meta + (1-b2)*z)
+    momentum_meta <- mom*momentum_meta + (1-mom)*z       -- zero-initialised
+
+so |dbeta| is EXACTLY `meta_stepsize` and the MAGNITUDE of z is discarded.  Only
+its SIGN survives.
+
+THAT KILLS THE OBVIOUS INTERVENTION.  `momentum_meta` is a zero-initialised
+LINEAR recursion in z, so dividing a group's reduction by ANY positive per-group
+constant c_G -- its tensor count, its parameter count, anything fixed in time --
+divides the whole sign() argument by c_G and leaves the sign, and therefore the
+entire beta trajectory, UNCHANGED.  `analysis/cX1_reduction_noop_proof.py`
+drives the LIVE `Lion_meta_update` with a z-history and its rescaled twin and
+shows the two beta trajectories are BITWISE IDENTICAL at c up to 6.3e6.
+"NORMALISE THE GROUP REDUCTION" IS A NULL BY CONSTRUCTION ON THIS OPTIMIZER.
+
+The only reduction intervention that can change anything is one that changes the
+RELATIVE WEIGHT OF THE TENSORS WITHIN a group, i.e. a normalisation applied PER
+TENSOR BEFORE the group sum.  That is what this patch adds:
+
+    z_G = sum_{i in G} <h_condenced[i], g[i]> / numel(i)
+
+Each tensor contributes its per-COORDINATE MEAN instead of its TOTAL, so a
+2,359,296-parameter convolution and a 512-parameter BatchNorm scale enter the
+group's sign on equal terms.  This is DELIBERATELY NOT the true meta-gradient --
+the chain rule gives the unnormalised sum -- so the patched reduction is a
+MECHANISM PROBE, not a proposed better optimizer, and nothing here claims
+otherwise.
+
+CONSEQUENCE THAT MUST BE STATED WITH THE PATCH: per-tensor normalisation is
+ITSELF a per-group constant, hence ITSELF INERT, for every granularity whose
+groups hold exactly ONE tensor -- `layerwise`, `nodewise`, `weightwise`,
+`nodewise1d`, `chunk<K>`, `permnode<S>`.  It can only bite where a group holds
+two or more tensors: `scalar` (m = 1, all 62 tensors) and `blockwise` (which is
+what `[a,b]` and `sets:` specs become).  A {scalar, layerwise} x {standard,
+normalised} design therefore has THREE distinct cells, not four, and the
+layerwise pair is identical BY CONSTRUCTION, not by measurement.
+
+-------------------------------------------------------------------------------
+WHAT IT ADDS
+-------------------------------------------------------------------------------
+    --stepsize-groups tn:<any existing spec>
+
+`tn:` is stripped at the very top of `init_meta`, sets `self._rednorm = True`,
+and the REMAINDER is routed and parsed by the pre-existing code, unchanged.  So
+`tn:scalar` is `scalar`, `tn:sets:1-49/50-62` is `sets:1-49/50-62`, `tn:[49,13]`
+is `[49,13]` -- same groups, same `stepsize_type`, same `beta` shape, same
+`_probe` branch, same everything -- differing ONLY in that the two multi-tensor
+reduction branches divide each tensor's inner product by that tensor's `numel`
+before summing.
+
+`self.param_numels` is NOT introduced here: it already exists, set at the end of
+`init_meta` for every granularity, and `block_product` is only ever called from
+`step()`, long after `init_meta` returns.
+
+-------------------------------------------------------------------------------
+INERTNESS
+-------------------------------------------------------------------------------
+THREE insertions, every one of them ADDITIVE, and NO existing line is edited:
+  1. one guarded prefix-strip at the top of `init_meta` that sets
+     `self._rednorm`.  Every pre-existing spec fails `startswith('tn:')` and
+     `self._rednorm` is set to `False`, which is the state every prior run was
+     in implicitly;
+  2. a guarded early return inside `block_product`'s `scalar` branch;
+  3. a guarded early return inside `block_product`'s `blockwise` branch.
+With `self._rednorm` False, (2) and (3) fall through to the ORIGINAL expressions
+byte-unchanged, so every existing spec and every prior run is bit-unaffected.
+`tests/test_rednorm.py` proves this the way `tests/test_namesets.py` does: by
+deleting the inserted regions from the patched file and checking the result is
+the pre-patch file BYTE FOR BYTE, and by re-parsing and re-composing every spec
+in the corpus's own `granularity` column through both files.
+
+The guard reads `getattr(self, '_rednorm', False)` rather than `self._rednorm`
+so that an HF object built by any path that bypasses `init_meta` cannot raise.
+
+ROUTING.  `init_meta` routes a spec to `blockwise` unless it is in the exact
+list ['scalar','layerwise','nodewise','weightwise','nodewise1d'] or matches
+`^chunk(\\d+)$` / `^permnode(\\d+)$`.  Because `tn:` is stripped BEFORE any of
+those tests run, `tn:X` routes exactly as `X` does -- no new granularity, no new
+`stepsize_type`, no new beta shape.  The patch asserts that the routing list is
+still the one described before it writes.
+
+RULE 20.  `tn:` adds only `t`, `n` and `:` to a spec, all already inside the
+`[A-Za-z0-9_.,:/-]` class the corpus's `sets:` specs use, so the spec stays ONE
+shell token that `analysis/argsline_guard.py` tokenises AS-IS.  That file IS NOT
+EDITED and needs no change.
+
+WHAT THIS PATCH DOES NOT DO.  It adds no granularity, no hyperparameter, no
+environment variable; it does not touch the meta-update, the clamp, the probe,
+the schedule, the hierarchical pools, `beta_to_alpha`, or `base_update`.
+"""
+import os, re, sys
+
+P = os.environ.get(
+    "HF_PATH",
+    "/cluster/account_a/metaopt/MetaOptimize/codes/Supervised_tasks/"
+    "MetaOptimize/cifar10/Optimizers/HF.py")
+src = open(P).read()
+
+if "PATCH_REDNORM" in src:
+    print("ALREADY_PATCHED")
+    sys.exit(0)
+
+# --- 0. the assumptions this patch rests on, checked BEFORE anything is written ----
+assert "def block_product(self, u, v):" in src, "block_product is not where expected"
+assert "def Lion_meta_update(self,HtT_gradft):" in src, "Lion_meta_update is missing"
+assert "self.param_numels = [int(np.prod(list(p_size)))" in src, \
+    "init_meta no longer builds self.param_numels"
+m = re.search(r"stepsize_groups\s+in\s+\[([^\]]*)\]", src)
+assert m, "could not find init_meta's exact-match routing list"
+named = [x.strip().strip("'\"") for x in m.group(1).split(",")]
+assert set(named) == {"scalar", "layerwise", "nodewise", "weightwise", "nodewise1d"}, \
+    "init_meta's routing list is not the one this patch was written against: %r" % named
+assert not any(n.startswith("tn:") for n in named), "a `tn:` spec collides with a name"
+assert "'tn:'" not in src, "unexpected pre-existing tn: handling"
+
+# --- 1. the prefix strip, at the very top of init_meta ----------------------------
+a1 = ("    def init_meta(self, stepsize_groups, net_param_names_and_size, alpha0):\n"
+      "        # --- PATCH_CHUNKWISE: `chunk<K>` = contiguous chunks of K weights ---\n")
+assert src.count(a1) == 1, "anchor 1 count=%d -- refusing to patch" % src.count(a1)
+n1 = ("    def init_meta(self, stepsize_groups, net_param_names_and_size, alpha0):\n"
+      "        # --- PATCH_REDNORM: `tn:<spec>` = <spec>, with the per-group reduction\n"
+      "        # weighted 1/numel PER TENSOR.  The prefix is stripped HERE, before any\n"
+      "        # routing test runs, so `tn:X` routes and parses EXACTLY as `X` does.\n"
+      "        # Every pre-existing spec fails the test and gets _rednorm = False,\n"
+      "        # which is the state every prior run was in implicitly. ---\n"
+      "        self._rednorm = bool(isinstance(stepsize_groups, str)\n"
+      "                             and stepsize_groups.startswith('tn:'))\n"
+      "        if self._rednorm:\n"
+      "            stepsize_groups = stepsize_groups[3:]\n"
+      "        # --- end PATCH_REDNORM ---\n"
+      "        # --- PATCH_CHUNKWISE: `chunk<K>` = contiguous chunks of K weights ---\n")
+src = src.replace(a1, n1, 1)
+
+# --- 2. the scalar reduction ------------------------------------------------------
+a2 = ("        if self.stepsize_type == 'scalar':\n"
+      "            return [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]\n")
+assert src.count(a2) == 1, "anchor 2 count=%d -- refusing to patch" % src.count(a2)
+n2 = ("        if self.stepsize_type == 'scalar':\n"
+      "            # --- PATCH_REDNORM ---\n"
+      "            if getattr(self, '_rednorm', False):\n"
+      "                return [sum([(u_*v_).sum()/_n for u_,v_,_n\n"
+      "                             in zip(u,v,self.param_numels)])]\n"
+      "            # --- end PATCH_REDNORM ---\n"
+      "            return [sum([(u_*v_).sum() for u_,v_ in zip(u,v)])]\n")
+src = src.replace(a2, n2, 1)
+
+# --- 3. the blockwise reduction ---------------------------------------------------
+a3 = ("        if self.stepsize_type == 'blockwise':\n"
+      "            return [torch.tensor([sum([(u[i]*v[i]).sum() for i in group_indices])"
+      " for group_indices in self.param_groups_indices])]\n")
+assert src.count(a3) == 1, "anchor 3 count=%d -- refusing to patch" % src.count(a3)
+n3 = ("        if self.stepsize_type == 'blockwise':\n"
+      "            # --- PATCH_REDNORM ---\n"
+      "            if getattr(self, '_rednorm', False):\n"
+      "                return [torch.tensor([sum([(u[i]*v[i]).sum()/self.param_numels[i]"
+      " for i in group_indices]) for group_indices in self.param_groups_indices])]\n"
+      "            # --- end PATCH_REDNORM ---\n"
+      "            return [torch.tensor([sum([(u[i]*v[i]).sum() for i in group_indices])"
+      " for group_indices in self.param_groups_indices])]\n")
+src = src.replace(a3, n3, 1)
+
+open(P, "w").write(src)
+print("PATCHED PATCH_REDNORM ->", P)
