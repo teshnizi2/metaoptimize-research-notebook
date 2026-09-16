@@ -55,7 +55,7 @@ export function Overview() {
         {outcomeOrder.map(outcome => <span key={outcome} className={`segment ${outcome}`} style={{flexGrow: counts[outcome]}} hidden={counts[outcome] === 0} aria-hidden="true"/>)}
       </div>
       <nav className="home-outcome-counts" aria-label="Research outcome filters">
-        {outcomeOrder.map(outcome => <Link to={`/experiments?outcome=${outcome}`} key={outcome}>
+        {outcomeOrder.map(outcome => <Link to={`/experiments?outcome=${outcome}`} key={outcome} style={{flexGrow: counts[outcome]}}>
           <span><i className={`outcome-dot ${outcome}`} aria-hidden="true"/>{outcomeLabels[outcome]}</span>
           <strong>{counts[outcome]}</strong>
         </Link>)}
