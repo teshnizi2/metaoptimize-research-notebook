@@ -46,6 +46,7 @@ APPENDED_IDS = [register_model.partition_id(line) for line in range(register_mod
 LANDED_IDS = [register_model.partition_id(line) for line in range(register_model.LANDED_FIRST_ROW, register_model.LANDED_LAST_ROW + 1)]
 CGN3_IDS = [register_model.partition_id(line) for line in range(register_model.CGN3_FIRST_ROW, register_model.CGN3_LAST_ROW + 1)]
 CVT23_IDS = [register_model.partition_id(line) for line in range(register_model.CVT23_FIRST_ROW, register_model.CVT23_LAST_ROW + 1)]
+CVT45_IDS = [register_model.partition_id(line) for line in range(register_model.CVT45_FIRST_ROW, register_model.CVT45_LAST_ROW + 1)]
 REGISTER_CSV = "complete_experiment_register.csv"
 RUN_INVENTORY_CSV = "complete_run_inventory.csv"
 # Summary tables derived from the register are regenerated from it, like the register table.
@@ -95,7 +96,7 @@ PHASE_LINKS = [
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
 PHASE_STARTS = ["2026-08-18", "2026-08-20", "2026-08-24", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-14"]
-EXPECTED_STATS = {"experiments": 158, "researchQuestions": 140, "methodChecks": 18, "runs": 3019, "figures": 54, "areas": 10}
+EXPECTED_STATS = {"experiments": 160, "researchQuestions": 142, "methodChecks": 18, "runs": 3049, "figures": 54, "areas": 10}
 CVK2_RUNS = 27
 
 
@@ -542,8 +543,9 @@ def make_runs(inventory, experiments, evidence, public, workspace, intervened=No
                 raise ValueError(f"Intervention list names another run for job {job_id}")
             params["intervention"] = f"{listed['arm']}: {listed['intervention']}"
             params["interventionWitness"] = listed["witness"]
+            kind = "step-size hold" if listed["intervention"].startswith("BETA_HOLD=") else "vote-weight"
             params["interventionNote"] = (f"Not a plain {listed['looks_like']} measurement: the inventory carries that arm's cell key because no column records the "
-                                          f"vote-weight intervention. Listed in {register_model.INTERVENTIONS_TSV} ({listed['registered_at']}); drop before pooling runs by cell.")
+                                          f"{kind} intervention. Listed in {register_model.INTERVENTIONS_TSV} ({listed['registered_at']}); drop before pooling runs by cell.")
         if row.get("collapsed") == "1":
             params["accuracyOutcome"] = "collapse flagged in inventory; separate from process completion"
         run = {
@@ -598,7 +600,7 @@ def make_activity(timeline, snapshot_date, experiments, run_count):
         })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, and the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}, and the {len(CVT45_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT45_FIRST_ROW}-{register_model.CVT45_LAST_ROW} at {register_model.CVT45_COMMIT[:7]}), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -741,6 +743,14 @@ def validate(data, runs, public):
         verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"cvt3/cvt2 row has no research phase: line {line}")
         linked = [run for run in runs if eid in run["experimentIds"]]
         verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"cvt3/cvt2 row runs not linked: {eid}")
+    for line, (rule, section, batches, figures, _, _) in register_model.CVT45_ROWS.items():
+        eid = register_model.partition_id(line)
+        row = by_id.get(eid, {})
+        verify(row.get("section") == section and row.get("area") == register_model.AREAS[section] and row.get("outcome") == register_model.RULE_OUTCOME[rule], f"cvt4/cvt5 MASTER-TABLE row missing or remapped: line {line}")
+        verify(row.get("batches") == batches and set(figures) <= set(row.get("figureIds", [])), f"cvt4/cvt5 row links: line {line}")
+        verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"cvt4/cvt5 row has no research phase: line {line}")
+        linked = [run for run in runs if eid in run["experimentIds"]]
+        verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"cvt4/cvt5 row runs not linked: {eid}")
     for eid, spec in register_model.CVT23_AMENDMENTS.items():
         row = by_id.get(eid, {})
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment-{spec['number']}"), {})
@@ -754,7 +764,7 @@ def validate(data, runs, public):
         if spec["retire"]:
             retired = spec["retire"][0]
             verify(all(retired not in w["detail"] for w in data["warnings"] if w["experimentId"] == eid) and retired not in row.get("scope", ""), f"Retired wording still published: {eid}")
-    for eid, spec in {**register_model.LANDED_INTERVENTIONS, **register_model.CVT23_INTERVENTIONS}.items():
+    for eid, spec in {**register_model.LANDED_INTERVENTIONS, **register_model.CVT23_INTERVENTIONS, **register_model.CVT45_INTERVENTIONS}.items():
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-intervention"), {})
         verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []), f"Intervention warning missing: {eid}")
         marked = [run for run in runs if run["batch"] == spec["batch"] and "intervention" in run["parameters"]]
@@ -861,10 +871,10 @@ def export(workspace, public, snapshot_date, audit_path=None, run_inventory=None
     commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
     input_paths = [table_root / REGISTER_CSV, run_inventory, table_root / "complete_figure_index.csv"]
     # The pinned MASTER-TABLE bytes and the mapping module are inputs too.
-    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + register_model.AMENDMENT_MASTER_TABLE_SHA256 + register_model.LANDED_MASTER_TABLE_SHA256 + register_model.INTERVENTIONS_TSV_SHA256 + register_model.CGN3_MASTER_TABLE_SHA256 + register_model.CVT23_MASTER_TABLE_SHA256 + register_model.CVT23_INTERVENTIONS_TSV_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
+    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + register_model.AMENDMENT_MASTER_TABLE_SHA256 + register_model.LANDED_MASTER_TABLE_SHA256 + register_model.INTERVENTIONS_TSV_SHA256 + register_model.CGN3_MASTER_TABLE_SHA256 + register_model.CVT23_MASTER_TABLE_SHA256 + register_model.CVT23_INTERVENTIONS_TSV_SHA256 + register_model.CVT45_MASTER_TABLE_SHA256 + register_model.CVT45_INTERVENTIONS_TSV_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
     data = {
         "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "researchQuestions": sum(e["kind"] == "research" for e in experiments), "methodChecks": sum(e["kind"] == "method-check" for e in experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"},
-                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256, "amendmentCommit": register_model.AMENDMENT_COMMIT, "amendmentMasterTableSha256": register_model.AMENDMENT_MASTER_TABLE_SHA256, "landedRowsCommit": register_model.LANDED_COMMIT, "landedMasterTableSha256": register_model.LANDED_MASTER_TABLE_SHA256, "cgn3LandingCommit": register_model.CGN3_COMMIT, "cgn3LandingMasterTableSha256": register_model.CGN3_MASTER_TABLE_SHA256, "cvt23LandingCommit": register_model.CVT23_COMMIT, "cvt23LandingMasterTableSha256": register_model.CVT23_MASTER_TABLE_SHA256}},
+                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256, "amendmentCommit": register_model.AMENDMENT_COMMIT, "amendmentMasterTableSha256": register_model.AMENDMENT_MASTER_TABLE_SHA256, "landedRowsCommit": register_model.LANDED_COMMIT, "landedMasterTableSha256": register_model.LANDED_MASTER_TABLE_SHA256, "cgn3LandingCommit": register_model.CGN3_COMMIT, "cgn3LandingMasterTableSha256": register_model.CGN3_MASTER_TABLE_SHA256, "cvt23LandingCommit": register_model.CVT23_COMMIT, "cvt23LandingMasterTableSha256": register_model.CVT23_MASTER_TABLE_SHA256, "cvt45LandingCommit": register_model.CVT45_COMMIT, "cvt45LandingMasterTableSha256": register_model.CVT45_MASTER_TABLE_SHA256}},
         "areas": areas, "experiments": experiments, "figures": figures, "sources": sources,
         "tables": tables, "warnings": warnings, "activity": activity,
         "latest": {"experimentId": "CVK2", "peakSet": cvk["peak_cuts"], "predictedCut": cvk["predicted_peak_cut"], "bestCut": cvk["best_mean_cut"], "bar": cvk["peak_bar_pp"], "cells": [{key: row[key] for key in ["arm", "cut", "mean", "sem", "n"]} for row in cvk["cells"]]},
@@ -895,7 +905,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--public-dir", type=Path, default=PORTAL / "public")
-    parser.add_argument("--as-of", default="2026-09-16", help="Documented publication-snapshot date, YYYY-MM-DD")
+    parser.add_argument("--as-of", default="2026-09-17", help="Documented publication-snapshot date, YYYY-MM-DD")
     parser.add_argument("--check", action="store_true", help="Validate existing public JSON and links without regenerating assets")
     parser.add_argument("--audit", type=Path, help="Where to write the export audit receipt (default: <workspace>/work/portal_data_audit.json)")
     parser.add_argument("--run-inventory", type=Path, help="Run inventory CSV to publish instead of <workspace>/outputs/tables/complete_run_inventory.csv (an extended copy kept outside a read-only workspace)")

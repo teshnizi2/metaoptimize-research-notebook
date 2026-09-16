@@ -51,8 +51,14 @@ mapping is reviewable in one place and never applied ad hoc:
    and MT216 without moving an outcome. Their intervened arms are named from the same exclusion list,
    which may only have grown by appended rows since the cvt1 pin.
 
+8. The rows appended at the cvt4 and cvt5 landings (MASTER-TABLE lines 222-223 at campaign commit
+   643264c, CORRECTIONS 240-241) are imported by ``CVT45_ROWS``. The pinned file may differ from the
+   cvt3/cvt2 pin only on header lines 3 and 5; no existing row was amended. Their intervened arms (cvt4's
+   step-size holds, cvt5's vote weights) are named from the same exclusion list, grown by appended rows only.
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
-``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221);
+``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221,
+then MT222-MT223);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -189,8 +195,10 @@ ADDED_PHASES = [{
     "next_question": "Identity versus magnitude remains unresolved on every network",
     # MT212-MT217 (CORRECTIONS 217-226), MT218, the cvt1 landing of 16 Sep (CORRECTIONS 227 launch, 230 landing),
     # MT219, the cgn3 landing of 16 Sep (CORRECTIONS 228 launch, 231 landing), and MT220-MT221, the cvt3 and
-    # cvt2 landings of 16 Sep (CORRECTIONS 232 / 233 registration and launch, 235 / 236 landing).
-    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 221 + 1)],
+    # cvt2 landings of 16 Sep (CORRECTIONS 232 / 233 registration and launch, 235 / 236 landing), and MT222-MT223,
+    # the cvt4 and cvt5 batches registered and launched on 16 Sep (CORRECTIONS 237 / 238) and landed at campaign
+    # commit 643264c (CORRECTIONS 240 / 241; 2026-09-17 00:10 +0200, 16 Sep 22:10 UTC).
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 223 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
 }]
 
@@ -319,18 +327,19 @@ def landed_master_table(repo: Path) -> list[str]:
 
 def intervened_runs(repo: Path) -> dict[str, dict]:
     """job_id -> the campaign's exclusion row for runs whose CSV cell key hides a harness intervention."""
-    first = subprocess.check_output(["git", "-C", str(repo), "show", f"{LANDED_COMMIT}:{INTERVENTIONS_TSV}"])
-    if hashlib.sha256(first).hexdigest() != INTERVENTIONS_TSV_SHA256:
-        raise ValueError(f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:12]} does not match the pinned bytes")
-    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT23_COMMIT}:{INTERVENTIONS_TSV}"])
-    if hashlib.sha256(raw).hexdigest() != CVT23_INTERVENTIONS_TSV_SHA256:
-        raise ValueError(f"{INTERVENTIONS_TSV} at {CVT23_COMMIT[:12]} does not match the pinned bytes")
-    if not raw.startswith(first):
-        raise ValueError(f"{INTERVENTIONS_TSV} changed rows listed at {LANDED_COMMIT[:7]}; it may only grow by appended rows")
+    raw, previous = b"", None
+    # Each pin must be a byte prefix of the next: the list may only grow by appended rows.
+    for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256)]:
+        pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
+        if hashlib.sha256(pinned).hexdigest() != expected:
+            raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
+        if not pinned.startswith(raw):
+            raise ValueError(f"{INTERVENTIONS_TSV} changed rows listed at {previous[:7]}; it may only grow by appended rows")
+        raw, previous = pinned, commit
     body = [line for line in raw.decode("utf-8").splitlines() if line and not line.startswith("#")]
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
-    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS}.items():
+    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS}.items():
         mine = [row for row in rows if row["batch"] == spec["batch"]]
         arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
         if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
@@ -612,6 +621,85 @@ def apply_cvt23_amendments(rows: list[dict], repo: Path) -> list[dict]:
     return amended
 
 
+# ---------------------------------------------------------------------------
+# 8. The cvt4 and cvt5 landings (CORRECTIONS 240-241): two appended rows, no row amended.
+# ---------------------------------------------------------------------------
+# Campaign commit 643264c (cycle 152, CORRECTIONS 240 + 241) appended the cvt4 and cvt5 landings as lines 222
+# and 223, recounted header line 3 and amended the bottom-line paragraph (line 5) in place, superseded clauses
+# kept. Nothing else may differ from the cvt3/cvt2 pin, and no line may move. Line 5 feeds no record; it is
+# published only in the MASTER-TABLE source copy. No existing row was amended, so no earlier record changes.
+CVT45_COMMIT = "643264c8e4056710b29b437cab34c74f3f81c37b"
+CVT45_MASTER_TABLE_SHA256 = "3c1363e3be150813efdfa74662c2d7e17e3ef3c99c3a0ff6b1e2ba477ddd77b6"
+CVT45_FIRST_ROW, CVT45_LAST_ROW = 222, 223
+CVT45_EDITED_LINES = {3, 5}
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# Both Goal met, as MT219 (cgn3): the registered branch answers the question, the tested account is in band on
+# every registered band, the positive control reproduces and G-BITE passes on every run. The bounds of 240.4 and
+# 241.4 are descriptive limits and stamps, not registered bands the result missed, and neither row corrects an
+# earlier claim, so no Corrected badge.
+# cvt4 (240.3): OWN-STEP-MAGNITUDE (237.5, the brief's account) hits all 9 bands -- HOLDLOW 5.73 pp and HOLDHEAD
+# 4.93 pp inside AT-HEAD, HOLDSHARED 2.30 pp and HOLDHIGH 2.57 pp inside AT-K01 -- and the next-closest account
+# (OWN-STEP-GRADED) misses HOLDHIGH by 8.87 pp.
+# cvt5 (241.3): the tested EQUILIBRIUM + FREEZE-HOLDS account (238.5) hits all 8 bands (4 arms x 2 horizons),
+# every other account misses one by >= 6.92 pp, no branch bar is near (closest DROP13, 4.58 pp) and the
+# registration stated no prior. The scorer's printed RESCUE-SURVIVES licence mentions an exact clamp "at ~96-100"
+# that this batch did not show (241.7(3)); no gate or token reads it, so it stays a limit in the scope.
+CVT45_ROWS = {
+    222: ("met", 9, ["cvt4"], ["page-19"], None, "OWN-STEP-MAGNITUDE: with layer4.1.bn2.weight's vote out of the complement's sum in every held arm, its own step size held large (HOLDHIGH, MUTE's measured trajectory replayed) stalls the arm at k01 (11.13 vs k01 11.69) and held at the floor from init keeps HEAD's level (HOLDLOW 65.46 vs HEAD 64.73); P_HIGH +53.61 pp = +94.55 SE, the registered account hits all 9 of its bands, and the replayed HEAD trajectory reproduces HEAD (P_CTL +0.07 pp). Bounded: HOLDHIGH's unforced complement collapsed too (pinned at epoch 40.4, HEAD's at 97.8-99.6), so a direct stall is not separated from one through the complement, and there is no time gate or dose curve."),
+    223: ("met", 9, ["cvt5"], ["page-19"], None, "K-DEPENDENT-EQUILIBRIUM + RESCUE-SURVIVES + K33-HOLDS-PINNED: at 300 epochs K13 holds 15.95 pp above K33 (+23.04 SE) and moved +0.42 pp from its own 100-epoch level, so cvt2's GRADED (MT221) is not a delay; HEAD's PlainNet rescue survives its complement's magnitude pin (RHO 1.0012, level frozen for 236 post-pin epochs); K33 stays pinned; the tested EQUILIBRIUM + FREEZE-HOLDS account hits all 8 registered bands and no branch bar is near. Bounded: the level-holds and frozen-at-pin stamps sit only 0.96-1.34 pp inside READ_BAR, K13's step size hovers near the floor rather than freezing, and its level settled (epoch 105) before its pin (~160)."),
+}
+CVT45_BEARS_ON = {222: ["MT218", "MT220"], 223: ["MT221", "MT218"]}  # cvt4 varies the step size cvt1 / cvt3 left shared; cvt5 runs cvt2's K13 / K33 and HEAD to 300 epochs
+CVT45_INTERVENTIONS_TSV_SHA256 = "f8455571b0f1e1ce246aedb89a0dbfda50b485bfea28496cc29f29524e7c96dd"
+CVT45_INTERVENTIONS = {
+    "MT222": {
+        "batch": "cvt4", "arms": {"HOLDLOW": 3, "HOLDSHARED": 3, "HOLDHIGH": 3, "HOLDHEAD": 3},
+        "title": "HOLDLOW, HOLDSHARED, HOLDHIGH and HOLDHEAD are step-size hold interventions, not plain HEAD arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT45_COMMIT[:7]}; CORRECTIONS 237, 239 and 240",
+        "note": ("The four held arms ran cvt1's tree plus the opt-in PATCH_BETAHOLD (BETA_HOLD=<tensor>:<mode>), on HEAD's grouping "
+                 "({50} [52,1]). The patch overwrites the held group's beta (layer4.1.bn2.weight's log step size) after every meta "
+                 "update and its clamp, and at init; the held group's momentum is dead state. HOLDLOW = the -15 floor from init; "
+                 "HOLDSHARED = the complement's live beta (cvt1's MUTE in exact arithmetic); HOLDHIGH = an exogenous max-rate replay "
+                 "of MUTE's measured shared trajectory (tri:9428: peak -4.39 at epoch 18.9, clamp at 40.1); HOLDHEAD = a replay of "
+                 "HEAD's own median trajectory for tensor 50 (tri:5041, the hold's positive control). BETA_HOLD rides only the run's "
+                 "own BETA_HOLD: witness line, so the run inventory writes all 12 rows with HEAD's cell key: seed for seed they differ "
+                 "from HEAD only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT plain HEAD measurements. "
+                 "The 12 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them before pooling runs by cell. The k01 and HEAD "
+                 "arms print BETA_HOLD: off and VOTE_W: off and are ordinary measurements of their cells."),
+    },
+    "MT223": {
+        "batch": "cvt5", "arms": {"K13": 3, "K33": 3},
+        "title": "K13 and K33 are vote-weight interventions, not plain HEAD arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT45_COMMIT[:7]}; CORRECTIONS 238 and 241",
+        "note": ("K13 and K33 ran cvt1's unchanged PATCH_VOTEWEIGHT tree on HEAD's grouping ({50} [52,1]) with the twin "
+                 "layer4.1.bn1.weight's term multiplied by K = 13 or 33 (fixed K, sign kept) inside the complement's unnormalised "
+                 "shared meta-gradient sum, before the sign: cvt2's K13 and K33 strings byte for byte, run to 300 epochs. VOTE_W rides "
+                 "only the run's own VOTE_W: witness line, so the run inventory writes all 6 rows with HEAD's cell key: seed for seed "
+                 "they differ from HEAD only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT plain HEAD "
+                 "measurements. The 6 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them before pooling runs by cell. The "
+                 "k01 and HEAD arms print VOTE_W: off and are ordinary 300-epoch measurements of their cells, kept out of 100-epoch "
+                 "cells by epochs_requested."),
+    },
+}
+
+
+def cvt45_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvt4 + cvt5 landing; only header lines 3 and 5 and two appended rows may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT45_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != CVT45_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {CVT45_COMMIT[:12]} does not match the pinned cvt4/cvt5-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = cvt23_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != CVT45_LAST_ROW or len(before) != CVT45_FIRST_ROW - 1 or changed != CVT45_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {CVT45_COMMIT[:7]} moved a line or edited lines other than {sorted(CVT45_EDITED_LINES)}: {sorted(changed)}")
+    return lines
+
+
+def cvt45_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 222 (cvt4) and 223 (cvt5) and attach their intervention notes."""
+    return with_interventions(appended_rows(lines, CVT45_ROWS, CVT45_FIRST_ROW, CVT45_LAST_ROW, CVT45_COMMIT), CVT45_INTERVENTIONS)
+
+
 def amended_master_table(repo: Path) -> list[str]:
     """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
     raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
@@ -679,9 +767,13 @@ def partition_id(line: int) -> str:
 
 
 def clean(text: str) -> str:
-    """Markdown emphasis and code marks off; wording and numbers unchanged."""
+    """Markdown emphasis and code marks off, backslash escapes made literal; wording and numbers unchanged."""
+    # A backslash-escaped punctuation mark (S\*, a\_b, \|) is the literal character. Hold it out of the
+    # emphasis and code rules below, which would otherwise pair its star with another one, then drop the backslash.
+    text = re.sub(r"\\([!-/:-@\[-`{-~])", lambda match: f"\0{ord(match[1])}\0", text)
     text = text.replace("**", "").replace("`", "")
     text = re.sub(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])", r"\1", text)
+    text = re.sub(r"\0(\d+)\0", lambda match: chr(int(match[1])), text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -758,7 +850,7 @@ def landed_rows(lines: list[str]) -> list[dict]:
 
 
 def with_interventions(rows: list[dict], interventions: dict) -> list[dict]:
-    """Attach each record's intervention note (the arms whose CSV cell key hides a vote-weight patch)."""
+    """Attach each record's intervention note (the arms whose CSV cell key hides a vote-weight or step-size-hold patch)."""
     for row in rows:
         spec = interventions.get(row["id"])
         if spec:
@@ -827,7 +919,9 @@ def remap_base_row(row: dict) -> dict:
 
 
 def load_register(workspace: Path, repo: Path) -> list[dict]:
-    """The published register: every row below, with the pinned in-place row amendments applied (229, then 231, then 234/236)."""
+    """The published register: every row below, with the pinned in-place row amendments applied (229, then 231, then 234/236).
+
+    The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row, so it adds no amendment step."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
     return apply_cvt23_amendments(register, Path(repo))
 
@@ -842,7 +936,7 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
     added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
              + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo)))
-             + cvt23_rows(cvt23_master_table(Path(repo))))
+             + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

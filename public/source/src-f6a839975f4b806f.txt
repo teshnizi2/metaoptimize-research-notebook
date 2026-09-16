@@ -1,0 +1,1997 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cVT5_plainhorizon_score.py -- THE REGISTERED SCORER FOR `cvt5`:
+#   PLAINNET AT 300 EPOCHS -- IS cvt2's `GRADED` A DELAY, AND DOES HEAD's RESCUE
+#   SURVIVE ITS OWN COMPLEMENT PIN?  (CORRECTIONS 238)
+#   ONE SUBMISSION, 12 JOBS (4 arms x 3 seeds), 300 EPOCHS (the 100-epoch control
+#   READ IN-RUN), SEEDS {93,94,95}, PlainNet18_c100 / CIFAR-100, PROBE=100,
+#   PROBE_TENSOR=1 ON EVERY ARM, from cvt1's ISOLATED tree $WS/harness_cvt1
+#   (PATCH_PLAINNET + PATCH_VOTEWEIGHT), UNCHANGED -- NO NEW HARNESS CODE.
+#
+# Committed BEFORE any cvt5 run exists (STANDING RULE 21).  RUN IT UNEDITED
+# (RULE 16).  The documented invocation takes ONE argument:
+#
+#     python3 analysis/cVT5_plainhorizon_score.py <runsdir>
+#     python3 analysis/cVT5_plainhorizon_score.py --selftest [--runsdir <runsdir>] [--csv <csv>]
+#
+# =============================================================================
+# FROZEN BARS (O2) -- READ THIS FIRST
+# =============================================================================
+# Every bar, sigma, tolerance, horizon and threshold score() uses is a LITERAL
+# here.  score() opens the corpus ONLY through read_corpus() (which calls
+# corpus_exclusions.filter_rows, OPERATIONS.md s36) and ONLY to print a row
+# count.  The ONE data-dependent term that can enter a bar is SIGMA_INBATCH,
+# through compose_sigma(), a max() with the frozen floor taking ONE argument; it
+# can widen READ_BAR (stamp-level comparisons) and never narrow it, and no
+# BRANCH bar reads it.  --selftest proves it on synthetic runs against the real
+# corpus, the real corpus + INVENTED rows at THIS batch's own cells
+# (PlainNet18_c100 `scalar` and HEAD's `sets:` string at 100 AND 300 epochs) and
+# at the ResNet18_c100 772-epoch cell the frozen sigma came from, invented rows
+# only, and no corpus.
+#
+# =============================================================================
+# THE QUESTION (CORRECTIONS 230, 235, 236)
+# =============================================================================
+# On PlainNet18_c100, isolating layer4.1.bn2.weight (idx 50) rescues the scalar
+# collapse (HEAD ~64.4-64.8 vs k01 ~11.5-11.9, four batches).  cvt2 injected the
+# bn1 twin's term (idx 47) x K into HEAD's rescued complement and returned
+# GRADED: K13 52.35, K33 35.59, K152 34.34.  236.4(1) bounded it: GRADED rests on
+# K13 alone, and at epoch 100 K13's TEST was still RISING (+0.016..+0.028 pp/ep)
+# while its complement had NOT pinned and was still DESCENDING (beta -12.02 /
+# -12.31 / -12.14, ~-0.04 per epoch).  K33 held its collapse, but its complement
+# left the exact clamp after first touching it (pinned-from 38.4 / 85.8 / 97.4).
+# And HEAD's own complement pins late (exact clamp from ~96-100).  Nothing on
+# PlainNet has run past 100 epochs.
+#   (a) K13: does its complement pin and its level fall toward K33's
+#       (GRADED-WAS-A-DELAY) or hold (K-DEPENDENT-EQUILIBRIUM)?
+#   (b) HEAD: does the rescue survive its own complement pin
+#       (RESCUE-SURVIVES / -ATTENUATES / -COLLAPSES)?
+#   (c) K33: does the stricter reading (off the exact clamp after ~38) resolve?
+#
+# =============================================================================
+# THE HORIZON, DERIVED (analysis/cvt5_registration_derivations.py H1-H3; the
+# selftest RE-RUNS it on the host's cvt2 / cvt3 records and requires equality)
+# =============================================================================
+# K13's complement (cvt2, seeds 87/88/89): beta@100 -12.0238 / -12.3059 / -12.1418;
+# OLS slope over the last 50 records -0.008819 / -0.006427 / -0.007919 per record;
+# window slopes per epoch 20-40 / 40-60 / 60-80 / 80-100: -0.167 -0.058 -0.035 -0.038;
+# -0.159 -0.063 -0.045 -0.054; -0.164 -0.062 -0.039 -0.050 -- it DECELERATED and then
+# roughly held.  The r <= 2 (beta <= -15 + ln 2) pin epoch under five families:
+#     tail-linear (last 50 / 100 records)          137.1 - 162.3
+#     linear, epochs >= 50 / 40 / 30               134.1 - 159.3
+#     beta = a + c sqrt(t), epochs >= 30           152.3 - 167.0
+#     beta = a + c ln(t),   epochs >= 30           193.5 - 223.5
+#   HOLDOUT (fit 30-80, predict 95-100; predicted - actual): linear -0.589 / -0.294 /
+#   -0.408 (every seed: linear predicts a FASTER descent than occurred), sqrt -0.283 /
+#   +0.023 / -0.095, ln -0.009 / +0.307 / +0.184.  No family wins on every seed.
+#   PIN_BOUND_R2 = 223.5 (s87, ln) -- the LATEST r <= 2 epoch over every family and seed.
+#   (Exact clamp: tail-linear latest 183.8; the ln family puts it at 238.8-283.3.  The gate
+#   is magnitude, so the exact-clamp epoch enters no token.)
+#   E_MIN = max(ceil(PIN_BOUND_R2 + W_POST 64.2), ceil(PIN_BOUND_R2 / (1 - TAIL_FRAC 0.25)))
+#         = max(288, 298) = 298: cgn3's post-pin window, AND the gate's last-quarter
+#         window [0.75 E, E] starting after the latest predicted pin.
+#   E = 300 = E_MIN rounded up to the next multiple of 10 (+2 epochs, +0.16 GPU-h).
+#   HEAD's complement by MAGNITUDE pins far earlier than the exact clamp: first r <= 2
+#   at 62.2-65.8 (cvt2 + cvt3, 6 runs; 0 later records above r 2, max r 1.95; exact
+#   clamp from 96.4-99.8).  So the in-run 100-epoch control is already 34.2+ epochs
+#   post-pin, and E = 300 leaves >= 234.2 post-pin epochs (>= W_MAX 213.0).
+#   A K13 complement that never pins in 300 epochs is a live outcome (the ln family is
+#   the best holdout on s87 and a stationary vote would never pin): it is registered
+#   as the INFORMATIVE stamp UNRESOLVED-NOT-PINNED, never a void.
+#
+# THE 100-EPOCH CONTROL IS IN THE SAME RUNS (cgn3 / cvh1 method).  cvt1's tree's
+# train.py (sha 3fea309e... == the live train.py) uses num_epochs only at the
+# argparse declaration (line 42) and `for epoch in range(args.num_epochs)` (line
+# 135); no scheduler, total step count, warmup or environ read; --max-time
+# 999:00:00 keeps its time break from firing.  HF.py's PATCH_SCHED under
+# SCHED=none with SCHED_TOTAL unset returns exactly 1.0; PATCH_VOTEWEIGHT reads no
+# step counter.  The launcher's guards 4h / 4h2 / 4h3 prove this before launch.
+#
+# PRICE AND WALL.  PlainNet at this cell, sacct over cvt1 + cvt2 + cvt3 (49 runs on the
+# L4 / A100-MIG / A100 node set the 7-day partitions use; [HOST_3c1b003035]'s two 2080 Ti runs
+# excluded because 2080 Ti is not in those partitions): 2146-2836 s per 100 epochs,
+# 0.006838265 GPU-h per run-epoch.  12 x 300 = 24.62 GPU-h EXPECTED (all 51 runs'
+# rate: 25.68).  WITHOUT k01: 18.46.  E 250 / 288 / 298 / 350 / 400 -> 20.51 / 23.63 /
+# 24.45 / 28.72 / 32.82.  WALL 05:00:00: 300 epochs at the worst measured rate (2836 s /
+# 100 ep) = 2.363 h, so 5 h is 2.12x it, no checkpointing.  5 h > gpu-short's 4:00:00,
+# so _lib_guards.sh's composer drops gpu-short (and the 2080 Ti nodes) by arithmetic.
+# HARD BOUND 12 x 5 h = 60 GPU-h.
+#
+# WHY k01 IS IN BATCH.  (b)'s RHO = D_HEAD@300 / D_HEAD@100 needs the floor AT 300 in
+# the same batch; the PlainNet scalar arm has never run past 100 epochs (its pin at
+# ~36 predicts a frozen floor, but cgn3's GN scalar arm drifted +0.40 pp over 330
+# epochs and a prediction is not a measurement).  Cost of k01: +6.15 GPU-h.
+#
+# =============================================================================
+# THE ARMS -- every string BYTE-IDENTICAL to cvt2's (selftest reads cVT2's tables)
+# =============================================================================
+#   k01   scalar                                VOTE_W unset                    the floor, IN BATCH
+#   HEAD  sets:1-49,51-53/layer4.1.bn2.weight   VOTE_W unset                    the rescue (K = 1)
+#   K13   HEAD's string                         VOTE_W=layer4.1.bn1.weight:13
+#   K33   HEAD's string                         VOTE_W=layer4.1.bn1.weight:33   (K13's reference plateau)
+# K33 is the in-batch plateau reference: in cvt2 K33 and K152 were within 1.25 pp
+# and K33 pinned with K152 (236.4(3)); K691 / K2000 are not re-run.
+#
+# =============================================================================
+# THE NOISE FLOOR -- FROZEN, derived THROUGH corpus_exclusions.filter_rows
+# =============================================================================
+# results/all_runs.csv at 3,019 rows (sha a8bd1136...), CORPUS-EXCLUSIONS.tsv (sha
+# aeb82070...) dropping 33 listed rows; pooled within-cell SD of plateau5 at the
+# standard cell (15 CELLKEYS; superseded / collapsed / incomplete dropped):
+#   SIGMA_PLAIN_100  0.45826358375406856  PlainNet18_c100 100 ep (df 41, 7 cells)
+#                    (UNFILTERED it reads 10.284487566977527, df 74 -- the trap)
+#   SIGMA_R18ALL_100 0.694442846939599    ResNet18_c100 100 ep, every granularity (df 209)
+#   SIGMA_R250       0.4099341410519505   ResNet18_c100 250 ep (df 8)
+#   SIGMA_R772       0.8475179908088943   ResNet18_c100 772 ep (df 37)
+#   SIGMA_VGG328     0.2493103821878793   VGG11_bn_c100 328 ep (df 8)
+#   SIGMA_GN430      0.45031544499384     ResNet18_gn_c100 430 ep (df 8)
+#   SIGMA_PRIOR := max = 0.8475179908088943 (a long-horizon floor; no PlainNet row
+#   exists past 100 epochs, so that extrapolation is disclosed).
+#   SE_PRIOR 0.691996 = SIGMA_PRIOR * sqrt(2/3);  READ_BAR_PRIOR 1.383992 = 2 SE.
+#   SIGMA_USED = max(SIGMA_PRIOR, SIGMA_INBATCH over arm x horizon, df 16).
+#
+# =============================================================================
+# THE STATISTICS (all IN BATCH; @100 and @300 IN RUN; plateau5 from each run's
+# own .out -- epochs 95..99 and 295..299; TRAIN beside TEST everywhere)
+# =============================================================================
+#   D_HEAD_h = HEAD_h - k01_h.   PRIMARY (b)  RHO = D_HEAD_300 / D_HEAD_100.
+#   PRIMARY (a)  G13_300 = K13_300 - K33_300 and DROP13 = K13_300 - K13_100.
+#   Both primaries are bounded in NEITHER direction.
+#
+# =============================================================================
+# THE BARS, FROZEN (pp; SE at the prior 0.691996 in brackets)
+# =============================================================================
+#   GAP_MIN       20.0 [28.90]  D_HEAD_100 >= 20 (positive control)
+#   K01_MAX       20.0          k01_100 <= 20
+#   SHAPE_GAP     15.0 [21.68]  HEAD_100 - K33_100 >= 15 (the premise: K33 collapsed)
+#   MATCH_BAR      5.0 [ 7.23]  "at" a level -- cvt2's bar, carried unchanged
+#   NULL_BAR       2.0          a floor-band reading (a LOCATION)
+#   DIVERGED_BAR   5.0          within-arm seed range
+#   REFUTE_BAR     5.0 [ 7.23]  D_HEAD_300 <= 5 -> RESCUE-COLLAPSES (cgn3's)
+#   SUPPORT_BAR   15.0 [21.68]  with SURVIVE_FRAC 0.80 -> RESCUE-SURVIVES (cgn3's / cvh1's)
+#   ATTEN_MILD     0.50         RHO >= 0.50 sub-stamps ATTENUATE-MILD, else -SEVERE
+#   FLOOR_MIN 15.0 / CEIL_MAX 90.0   max arm mean at 100 -> HARNESS-UNSOUND
+#   READ_BAR = 2 x SE_USED (stamp-level comparisons only)
+#   pin gate: PIN_RATIO_MAX 2.0, FREE_RATIO_MIN 10.0, TAIL_FRAC 0.25, POST_MIN_WINDOW 15
+#   G-BITE: BITE_TOL 1e-4; INFORM 1e-2; >= 50 informative records on K13 / K33;
+#           1,500 records on every run.
+#
+# =============================================================================
+# HARNESS GATES (-> HARNESS-UNSOUND, rc 1) and G-BITE (-> PATCH-NOT-VERIFIED, rc 1)
+# =============================================================================
+#   G-ARGS   every run's OWN ARGS line: its spec, PlainNet18_c100, CIFAR100, 300 ep, the
+#            fixed HF flags, its seed and run-name; no flag repeated.
+#   G-ENV    one distinct ENV line (PROBE_DIR stripped) == cvt1's == cvt2's; one
+#            `PROBE_TENSOR: on every=100 type=<arm's> tensors=53` per run.
+#   G-VOTEW  exactly one `VOTE_W` line per run == WITNESS[arm].
+#   G-STRUCT PARTITION-MANIFEST.txt BYTE-IDENTICAL to synthetic_manifest_text().
+#   G-PROV   MODE submit; build_network == POST_SHA; HF == HF_POST_SHA; RUNNER ==
+#            RUNNER_SHA; SCORER == this file.
+#   G-BITE   per run, 1,500 parseable records; per group z_agg == sum w_i z_tensor_i and
+#            mom_pre == sum w_i m_tensor_i; K13 / K33 >= 50 informative records, the
+#            unweighted sum matching none.  Runs BEFORE any level is read.
+#
+# =============================================================================
+# THE BRANCH MAP (first match wins)  FINAL: <A> | <B> | <C> | stamps
+# =============================================================================
+#   INCOMPLETE (rc 2) / HARNESS-UNSOUND / PATCH-NOT-VERIFIED (rc 1)
+#   UNRESOLVED-DIVERGED        an arm's seed range at 100 > 5            (voids A, B, C)
+#   SCALAR-NOT-COLLAPSED       k01_100 > 20                              (voids A, B, C)
+#   POSITIVE-CONTROL-FAILED    D_HEAD_100 < 20                           (voids A, B, C)
+#   -- A (K13), decide_a():
+#     K13-PREMISE-NOT-REPLICATED  HEAD_100 - K33_100 < 15, or K13_100 not BETWEEN
+#                                 (HEAD_100 - K13_100 <= 5 or K13_100 - K33_100 <= 5)
+#     UNRESOLVED-K33-DIVERGED     K33's seed range at 300 > 5 (the reference moved apart)
+#     UNRESOLVED-K13-SPLIT        K13's seed range at 300 > 5 (seeds went different ways;
+#                                 per-seed tokens printed, NOT averaged)
+#     K13-BELOW-K33               G13_300 < -5 (unregistered; stop)
+#     GRADED-WAS-A-DELAY          G13_300 <= 5: K13 reached K33's plateau
+#     K13-ABOVE-HEAD              K13_300 - HEAD_300 > 5 (unregistered; stop)
+#     K13-RECOVERS-TO-HEAD        DROP13 >= +5 and HEAD_300 - K13_300 <= 5: the collapse
+#                                 was transient
+#     K-DEPENDENT-EQUILIBRIUM     DROP13 >= -5 (holds, or rises without reaching HEAD)
+#     GRADED-PARTLY-A-DELAY       otherwise (falls > 5, stays > 5 above K33)
+#   -- B (HEAD), decide_b() (cgn3's map):
+#     UNRESOLVED-HEAD-DIVERGED    HEAD's or k01's seed range at 300 > 5
+#     RESCUE-COLLAPSES            D_HEAD_300 <= 5
+#     RESCUE-SURVIVES             RHO >= 0.80 and D_HEAD_300 >= 15
+#     RESCUE-ATTENUATES           otherwise (+ ATTENUATE-MILD / -SEVERE)
+#   -- C (K33), decide_c(), a registered token that cannot move A or B:
+#     K33-SPLIT-AT-300            K33's seed range at 300 > 5
+#     K33-REOPENS                 any seed's max r after epoch 100 >= 10, or
+#                                 K33_300 - K33_100 >= +5
+#     K33-HOLDS-PINNED            K33's complement PINNED (>= 2 of 3 seeds) AND every seed's
+#                                 max r after epoch 100 <= 2 AND -5 < K33_300 - K33_100 < +5
+#                                 (the stricter reading's excursions stay inside the magnitude
+#                                 pin and the level holds)
+#     K33-UNRESOLVED              otherwise
+#
+# STAMPS (never the branch): unconditional HARNESS-CLEAN, PATCH-BITES,
+#   ONE-NETWORK-PLAINNET, HORIZON-300, NO-TIME-GATE, ONE-CELL-ONLY, SIGMA-PRIOR-FROZEN /
+#   SIGMA-INBATCH.  Conditional: RHO:x; ATTENUATE-MILD/-SEVERE; TRAIN-AGREES-A/-DISAGREES-A,
+#   TRAIN-AGREES-B/-DISAGREES-B; K13-LEVEL-FALLS/-HOLDS/-RISES and HEAD-LEVEL-*, K33-LEVEL-*
+#   (@300 - @100 against READ_BAR); THE PIN GATE (cvh1's magnitude form, AFTER the
+#   primaries): K13-COMPLEMENT-PINNED/-NEITHER/-FREE, and if PINNED K13-PIN-EPOCH:x,
+#   K13-POST-PIN-WINDOW:x, K13-WINDOW-MEETS-W100/-WINDOW-SHORT, K13-PIN-INSIDE-BOUND/
+#   -PIN-AFTER-BOUND, K13-FROZEN-AT-PIN/-DECAYS-AFTER-PIN/-IMPROVES-AFTER-PIN or
+#   K13-POST-PIN-UNMEASURED; otherwise UNRESOLVED-NOT-PINNED (INFORMATIVE) and
+#   K13-POST-PIN-UNMEASURED; the same HEAD-* set (HEAD-COMPLEMENT-*, HEAD-PIN-EPOCH,
+#   HEAD-POST-PIN-WINDOW, HEAD-FROZEN-AT-PIN ...); K33-COMPLEMENT-*,
+#   K33-MAXR-POST100:x, K33-EXACT-CLAMP-CONTINUOUS / -EXCURSIONS; K01-<class>;
+#   FLOOR-HOLDS / FLOOR-DRIFTS; FLOOR-READINGS-ARE-BOUNDS.
+#
+# plateau5 is PRIMARY (the raw .out); the CSV `plateau` column is read NOWHERE;
+# best_test NOWHERE.  The descriptive readout after FINAL cannot move it.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import importlib.util
+import inspect
+import io
+import json
+import math
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import corpus_exclusions  # noqa: E402  (OPERATIONS.md section 36: every corpus reader filters first)
+
+# ---- the batch design, LITERAL.  The launcher's guard 4c' proves it agrees. --
+PREFIX = "cvt5"
+NET = "PlainNet18_c100"
+PARENT = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 300
+CTRL_EPOCHS = 100
+BATCH = 100
+SEEDS = (93, 94, 95)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+HEAD_SPEC = "sets:1-49,51-53/layer4.1.bn2.weight"
+ARMS = ("k01", "HEAD", "K13", "K33")
+LADDER = ("K13", "K33")
+SPEC = {
+    "k01": "scalar",
+    "HEAD": "sets:1-49,51-53/layer4.1.bn2.weight",
+    "K13": "sets:1-49,51-53/layer4.1.bn2.weight",
+    "K33": "sets:1-49,51-53/layer4.1.bn2.weight",
+}
+VOTEW = {
+    "k01": "",
+    "HEAD": "",
+    "K13": "layer4.1.bn1.weight:13",
+    "K33": "layer4.1.bn1.weight:33",
+}
+WITNESS = {
+    "k01": "VOTE_W: off",
+    "HEAD": "VOTE_W: off",
+    "K13": "VOTE_W: on type=blockwise items=47:layer4.1.bn1.weight:w=13.0:group=0:groupsize=52",
+    "K33": "VOTE_W: on type=blockwise items=47:layer4.1.bn1.weight:w=33.0:group=0:groupsize=52",
+}
+WEIGHTS = {"k01": {}, "HEAD": {}, "K13": {47: 13.0}, "K33": {47: 33.0}}   # 1-based
+PT_TYPE = dict((a, "scalar" if a == "k01" else "blockwise") for a in ARMS)
+
+# ---- the horizon's derivation, FROZEN (analysis/cvt5_registration_derivations.py H1-H3) --
+PIN_BOUND_R2 = 223.5
+PIN_BOUND_EXACT_TAIL = 183.8
+W_POST = 64.2
+W_MAX = 213.0
+TAIL_FRAC = 0.25
+E_POST = 288
+E_TAIL = 298
+E_MIN = 298
+HEAD_FIRST_R2_MAX = 65.8
+DERIV_SEEDS_CVT2 = (87, 88, 89)
+DERIV_SEEDS_CVT3 = (84, 85, 86)
+GPUH_PER_RUN_EPOCH = 0.006838265306122449     # sacct cvt1+cvt2+cvt3, 49 runs off [HOST_3c1b003035]
+GPUH_PER_RUN_EPOCH_ALL51 = 0.00713442265795207
+WORST_S_PER_100 = 2836                       # cvt1-MUTE-s79, [HOST_7ad9659165] (gpu-a100-80g's node set)
+WALL_S = 5 * 3600
+
+# ---- the live model this batch assumes (re-derived by name and numel) ---------
+NTENS = 53
+TOTPAR = 11046308
+PARENT_NTENS = 62
+N_BATCHNORM = 17
+IDX_HEAD = 50
+IDX_TWIN = 47
+NAME_HEAD = "layer4.1.bn2.weight"
+NAME_TWIN = "layer4.1.bn1.weight"
+BN512_IDX = (41, 44, 47, 50)
+BN512_NAMES = ("layer4.0.bn1.weight", "layer4.0.bn2.weight", "layer4.1.bn1.weight", "layer4.1.bn2.weight")
+SHORTCUT_9 = tuple("layer%d.0.shortcut.%s" % (s, k) for s in (2, 3, 4) for k in ("0.weight", "1.weight", "1.bias"))
+HEAD_SIZES = [52, 1]
+HEAD_PARAMS = [TOTPAR - 512, 512]
+PRE_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+POST_SHA = "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b"
+HF_PRE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+HF_POST_SHA = "3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52"
+RUNNER_SHA = "d389e8a5f3d85ce7dd4b7640fbcfa2d9075f36eb79c90fe2a7c21727d77c97c3"
+TRAIN_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+LADDER_LOG_SHA = "0703a161cae3d0bb220976ff9d4b06fa762888f90c5d78a2978c3e9a32cc728c"
+
+# ---- the noise floor, FROZEN (O2), derived THROUGH corpus_exclusions.filter_rows --
+SIGMA_VARIANTS = {                       # name: (value, network, epochs_requested, df)
+    "SIGMA_PLAIN_100": (0.45826358375406856, "PlainNet18_c100", 100, 41),
+    "SIGMA_R18ALL_100": (0.694442846939599, "ResNet18_c100", 100, 209),
+    "SIGMA_R250": (0.4099341410519505, "ResNet18_c100", 250, 8),
+    "SIGMA_R772": (0.8475179908088943, "ResNet18_c100", 772, 37),
+    "SIGMA_VGG328": (0.2493103821878793, "VGG11_bn_c100", 328, 8),
+    "SIGMA_GN430": (0.45031544499384, "ResNet18_gn_c100", 430, 8),
+}
+SIGMA_PLAIN_UNFILTERED = 10.284487566977527   # the trap: NOT used (selftest C shows it)
+SIGMA_PRIOR = 0.8475179908088943             # = max over SIGMA_VARIANTS
+SE_PRIOR = 0.691996                          # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+READ_BAR_PRIOR = 1.383992
+REG_CORPUS_SHA256 = "a8bd1136a1431d7cd927b6769a513d0813d487e191790a24e347253baba08676"
+REG_CORPUS_ROWS = 3019
+REG_EXCLUSIONS_SHA256 = "aeb82070350bfd6dd230877ea98bea30f9e15537a30789b3a7e9a603bc22461f"
+REG_EXCLUDED_ROWS = 33
+
+# ---- the bars, FROZEN ----------------------------------------------------------
+GAP_MIN = 20.0
+K01_MAX = 20.0
+SHAPE_GAP = 15.0
+MATCH_BAR = 5.0
+NULL_BAR = 2.0
+DIVERGED_BAR = 5.0
+REFUTE_BAR = 5.0
+SUPPORT_BAR = 15.0
+SURVIVE_FRAC = 0.80
+ATTEN_MILD_FRAC = 0.50
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+PIN_RATIO_MAX = 2.0
+FREE_RATIO_MIN = 10.0
+POST_MIN_WINDOW = 15.0
+BETA_LO = -15.0
+EXACT_EPS = 1e-3
+BITE_TOL = 1e-4
+INFORM = 1e-2
+MIN_INFORMATIVE = 50
+STEPS_PER_EPOCH = 50000 // BATCH                    # 500
+REC_PER_EPOCH = STEPS_PER_EPOCH // PROBE             # 5
+N_RECORDS = EPOCHS * REC_PER_EPOCH                   # 1500
+META_STEPS = EPOCHS * STEPS_PER_EPOCH                # 150000
+
+# ---- frozen references, BETWEEN-BATCH, NON-GATING ------------------------------
+R_CVT2 = {"k01": 11.4767, "HEAD": 64.4187, "K13": 52.3493, "K33": 35.5933}
+R_CVT3 = {"k01": 11.5720, "HEAD": 64.5960}
+K01_REF = R_CVT2["k01"]
+
+# ---- the floor table: predicted level intervals per account (UNSURE) ----------
+# (lo, hi) at 100 epochs (in-run) and at 300.  @100 bands are cvt2's measured levels +- (every account).
+B100 = {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (48.0, 56.0), "K33": (30.0, 42.0)}
+ACCOUNTS = {
+    "DELAY+FREEZE-HOLDS": {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (30.0, 42.0), "K33": (30.0, 42.0)},
+    "EQUILIBRIUM+FREEZE-HOLDS": {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (48.0, 58.0), "K33": (30.0, 42.0)},
+    "PARTIAL-DELAY+FREEZE-HOLDS": {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (40.0, 46.0), "K33": (30.0, 42.0)},
+    "TRANSIENT+FREEZE-HOLDS": {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (60.0, 70.0), "K33": (30.0, 42.0)},
+    "POST-PIN-DECAY": {"k01": (8.0, 16.0), "HEAD": (36.0, 50.0), "K13": (30.0, 42.0), "K33": (22.0, 34.0)},
+    "DELAYED-COLLAPSE": {"k01": (8.0, 16.0), "HEAD": (10.0, 20.0), "K13": (10.0, 20.0), "K33": (10.0, 20.0)},
+}
+ACCOUNT_B100 = {"BROKEN-PATCH": {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (56.0, 72.0), "K33": (56.0, 72.0)}}
+ACCOUNTS_E_BROKEN = {"k01": (8.0, 16.0), "HEAD": (56.0, 72.0), "K13": (56.0, 72.0), "K33": (56.0, 72.0)}
+EXPECTED = {
+    "DELAY+FREEZE-HOLDS": ("GRADED-WAS-A-DELAY", "RESCUE-SURVIVES"),
+    "EQUILIBRIUM+FREEZE-HOLDS": ("K-DEPENDENT-EQUILIBRIUM", "RESCUE-SURVIVES"),
+    "PARTIAL-DELAY+FREEZE-HOLDS": ("GRADED-PARTLY-A-DELAY", "RESCUE-SURVIVES"),
+    "TRANSIENT+FREEZE-HOLDS": ("K13-RECOVERS-TO-HEAD", "RESCUE-SURVIVES"),
+    "POST-PIN-DECAY": ("GRADED-PARTLY-A-DELAY", "RESCUE-ATTENUATES"),
+    "DELAYED-COLLAPSE": ("GRADED-WAS-A-DELAY", "RESCUE-COLLAPSES"),
+    "BROKEN-PATCH": ("K13-PREMISE-NOT-REPLICATED", "RESCUE-SURVIVES"),
+}
+FLOOR_ACCOUNTS = ("DELAYED-COLLAPSE",)          # the ONE account that puts non-anchor arms at the floor (bounds)
+TESTED_ACCOUNTS = ("DELAY+FREEZE-HOLDS", "EQUILIBRIUM+FREEZE-HOLDS")
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize",
+            "alpha0", "gamma", "augment", "beta_clip", "batch_size",
+            "epochs_requested", "hier", "lam", "eta_ratio"]
+
+DEFAULT_CSV = os.path.join(os.path.dirname(_HERE), "results", "all_runs.csv")
+DERIV_PY = os.path.join(_HERE, "cvt5_registration_derivations.py")
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,"
+                     r"\s*Test Accuracy:\s*([0-9.]+)")
+OUT_RE = re.compile(r"^cvt5-(k01|HEAD|K13|K33)-s(\d+)-(\d+)\.out$")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise|blockwise) tensors=%d "
+                   % (PROBE, NTENS))
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =============================================================================
+# O2: the ONLY composition of sigma.  ONE argument.  NO corpus.
+# =============================================================================
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+# =============================================================================
+# the frozen manifest (no torch).  guard 4d proves the LIVE manifest identical.
+# =============================================================================
+def r18_tensors(plain):
+    t = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [(pre + "conv1.weight", w * cin * 9, "Conv2d"), (pre + "bn1.weight", w, "BatchNorm2d"),
+                  (pre + "bn1.bias", w, "BatchNorm2d"), (pre + "conv2.weight", w * w * 9, "Conv2d"),
+                  (pre + "bn2.weight", w, "BatchNorm2d"), (pre + "bn2.bias", w, "BatchNorm2d")]
+            if not plain and (stride != 1 or cin != w):
+                t += [(pre + "shortcut.0.weight", w * cin, "Conv2d"), (pre + "shortcut.1.weight", w, "BatchNorm2d"),
+                      (pre + "shortcut.1.bias", w, "BatchNorm2d")]
+        inp = w
+    return t + [("linear.weight", 512 * 100, "Linear"), ("linear.bias", 100, "Linear")]
+
+
+def parse_sets(spec, names):
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def arm_groups(arm, names):
+    if SPEC[arm] == "scalar":
+        return [list(range(1, len(names) + 1))]
+    return parse_sets(SPEC[arm], names)
+
+
+def synthetic_manifest_text():
+    t = r18_tensors(True)
+    names = [n for n, _q, _o in t]
+    numel = [q_ for _n, q_, _o in t]
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+             "NORM BatchNorm2d %d GroupNorm 0" % N_BATCHNORM, "PARENT %s %d" % (PARENT, PARENT_NTENS),
+             "PARENT_REMOVED %s" % " ".join(SHORTCUT_9),
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "CTRL_EPOCHS %d" % CTRL_EPOCHS, "META_STEPS %d" % META_STEPS]
+    for i, (n, q_, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q_, o))
+    lines.append("W512 %s" % ",".join("%d:%s" % x for x in zip(BN512_IDX, BN512_NAMES)))
+    for a in ARMS:
+        g = arm_groups(a, names)
+        if SPEC[a] == "scalar":
+            lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        else:
+            lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                         % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                            ",".join(str(sum(numel[i - 1] for i in x)) for x in g),
+                            " ".join(names[i - 1] for i in g[1])))
+        lines.append("VOTEW %s %s" % (a, VOTEW[a] if VOTEW[a] else "off"))
+        lines.append("WITNESS %s %s" % (a, WITNESS[a]))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def window(eps, end, k):
+    tail = [eps.get(e) for e in range(end - 5, end)]
+    if all(x is not None for x in tail):
+        return mean([x[k] for x in tail])
+    return None
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "vw": [ln for ln in lines if ln.startswith("VOTE_W")]}
+    rec["p100"], rec["t100"] = window(eps, CTRL_EPOCHS, 1), window(eps, CTRL_EPOCHS, 0)
+    rec["pE"], rec["tE"] = window(eps, EPOCHS, 1), window(eps, EPOCHS, 0)
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["pE"] is not None and rec["p100"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    """(arm, seed) -> the run.  The highest INTEGER job id among COMPLETE runs wins."""
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s"
+                         % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def tail_slope(eps, lo, hi):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# corpus readers -- --selftest and a NON-GATING row-count disclosure ONLY.
+# EVERY reader goes through corpus_exclusions.filter_rows FIRST (OPERATIONS.md s36).
+# =============================================================================
+def read_corpus_raw(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    return list(csv.DictReader(open(csvpath)))
+
+
+def read_corpus(csvpath):
+    raw = read_corpus_raw(csvpath)
+    if raw is None:
+        return None
+    return [r for r in corpus_exclusions.filter_rows(raw) if not r.get("run", "").startswith(PREFIX + "-")]
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r, ep):
+    return (r.get("epochs_requested") == str(ep)
+            and r.get("augment") == AUG and r.get("beta_clip") == CLIP
+            and r.get("meta_stepsize") == MST and r.get("alpha0") == A0
+            and r.get("batch_size") == str(BATCH))
+
+
+def pooled_sigma(rows, net, ep):
+    cells = {}
+    for r in rows:
+        if usable(r) and std_cell(r, ep) and r.get("network") == net and r.get("dataset") == DSET:
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+# =============================================================================
+# probe records
+# =============================================================================
+def load_probe(runsdir, arm, seed, prefix=PREFIX):
+    for base in (os.path.join(runsdir, prefix), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (prefix, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            return recs
+    return None
+
+
+def bite_check(arm, recs):
+    """G-BITE for ONE run.  -> (ok, detail dict).  Pure function of the records."""
+    names = [n for n, _q, _o in r18_tensors(True)]
+    groups = arm_groups(arm, names)
+    W = WEIGHTS[arm]
+    d = {"n": 0, "bad_rec": 0, "bad_z": 0, "bad_m": 0, "worst_z": 0.0, "worst_m": 0.0,
+         "informative": 0, "unweighted_match_on_informative": 0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    for r in recs:
+        ok = (r is not None and isinstance(r.get("z_tensor"), list) and len(r["z_tensor"]) == NTENS
+              and isinstance(r.get("m_tensor"), list) and len(r["m_tensor"]) == NTENS
+              and isinstance(r.get("z_agg"), list) and len(r["z_agg"]) == 1 and isinstance(r["z_agg"][0], list)
+              and len(r["z_agg"][0]) == len(groups)
+              and isinstance(r.get("mom_pre"), list) and len(r["mom_pre"]) == 1 and isinstance(r["mom_pre"][0], list)
+              and len(r["mom_pre"][0]) == len(groups)
+              and isinstance(r.get("beta"), list) and len(r["beta"]) == len(groups)
+              and isinstance(r.get("step"), int))
+        if not ok:
+            d["bad_rec"] += 1
+            continue
+        try:
+            zt = [float(x) for x in r["z_tensor"]]
+            mt = [float(x) for x in r["m_tensor"]]
+            za = [float(x) for x in r["z_agg"][0]]
+            ma = [float(x) for x in r["mom_pre"][0]]
+            bb = [float(x) for x in r["beta"]]
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in zt + mt + za + ma + bb):
+            d["bad_rec"] += 1
+            continue
+        d["n"] += 1
+        ez = em = 0.0
+        informative = False
+        um = True
+        for g, zg, mg in zip(groups, za, ma):
+            sz = sum(abs(W.get(i, 1.0) * zt[i - 1]) for i in g) + 1e-30
+            sm = sum(abs(W.get(i, 1.0) * mt[i - 1]) for i in g) + 1e-30
+            wz = sum(W.get(i, 1.0) * zt[i - 1] for i in g)
+            wm = sum(W.get(i, 1.0) * mt[i - 1] for i in g)
+            uz = sum(zt[i - 1] for i in g)
+            ez = max(ez, abs(wz - zg) / sz)
+            em = max(em, abs(wm - mg) / sm)
+            if W and abs(wz - uz) / sz > INFORM:
+                informative = True
+                um = um and abs(uz - zg) / sz <= BITE_TOL
+        d["worst_z"], d["worst_m"] = max(d["worst_z"], ez), max(d["worst_m"], em)
+        d["bad_z"] += ez > BITE_TOL
+        d["bad_m"] += em > BITE_TOL
+        if informative:
+            d["informative"] += 1
+            d["unweighted_match_on_informative"] += um
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] == N_RECORDS
+          and d["bad_z"] == 0 and d["bad_m"] == 0)
+    if W:
+        ok = ok and d["informative"] >= MIN_INFORMATIVE and d["unweighted_match_on_informative"] == 0
+    return ok, d
+
+
+# =============================================================================
+# THE PIN GATE -- cvh1's step-size MAGNITUDE form (carried from cgn3); pure functions
+# =============================================================================
+def classify(med_r):
+    if med_r is None or med_r != med_r:
+        return "UNMEASURED"
+    if med_r <= PIN_RATIO_MAX:
+        return "PINNED"
+    if med_r >= FREE_RATIO_MIN:
+        return "FREE"
+    return "NEITHER"
+
+
+def arm_class(classes):
+    for k in ("PINNED", "FREE"):
+        if sum(1 for c in classes if c == k) >= 2:
+            return k
+    return "NEITHER"
+
+
+def group_stats(recs, k=0):
+    """step-size-magnitude statistics of ONE group's beta trajectory (records in step order)."""
+    b = [(r["step"] / float(STEPS_PER_EPOCH), float(r["beta"][k])) for r in recs
+         if isinstance(r, dict) and isinstance(r.get("beta"), list) and len(r["beta"]) > k]
+    if not b:
+        return None
+    n = len(b)
+    tail = [v for _e, v in b[-max(1, int(n * TAIL_FRAC)):]]
+    lr2 = BETA_LO + math.log(PIN_RATIO_MAX)
+    f2 = next((e for e, v in b if v <= lr2), None)
+    pf = None
+    for i in range(n):
+        if all(v <= BETA_LO + EXACT_EPS for _e, v in b[i:]):
+            pf = b[i][0]
+            break
+    post100 = [v for e, v in b if e >= CTRL_EPOCHS]
+    return {"n": n, "terminal": b[-1][1], "med_r": statistics.median([math.exp(v - BETA_LO) for v in tail]),
+            "first_r2": f2, "pinned_from": pf,
+            "max_r_post100": max(math.exp(v - BETA_LO) for v in post100) if post100 else None,
+            "off_exact_post100": sum(1 for v in post100 if v > BETA_LO + EXACT_EPS),
+            "above_r2_after_first": (sum(1 for e, v in b if f2 is not None and e >= f2 and v > lr2)
+                                     if f2 is not None else None),
+            "at": dict((int(round(e)), v) for e, v in b if abs(e - round(e)) < 1e-9)}
+
+
+def three_way(delta, lo_tag, mid_tag, hi_tag, bar):
+    if delta is None:
+        return "UNMEASURED"
+    if delta <= -bar:
+        return lo_tag
+    if delta >= bar:
+        return hi_tag
+    return mid_tag
+
+
+# =============================================================================
+# THE BRANCH MAP -- pure functions of in-batch means and in-batch flags
+# =============================================================================
+def decide_global(M100, div100):
+    if div100:
+        return "UNRESOLVED-DIVERGED"
+    if M100["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M100["HEAD"] - M100["k01"] < GAP_MIN:
+        return "POSITIVE-CONTROL-FAILED"
+    return None
+
+
+def decide_a(M100, ME, div_k13_E=False, div_k33_E=False):
+    """(a) K13 at 300 against K33 at 300 and against its own 100-epoch level."""
+    if (M100["HEAD"] - M100["K33"] < SHAPE_GAP or M100["HEAD"] - M100["K13"] <= MATCH_BAR
+            or M100["K13"] - M100["K33"] <= MATCH_BAR):
+        return "K13-PREMISE-NOT-REPLICATED"
+    if div_k33_E:
+        return "UNRESOLVED-K33-DIVERGED"
+    if div_k13_E:
+        return "UNRESOLVED-K13-SPLIT"
+    g = ME["K13"] - ME["K33"]
+    drop = ME["K13"] - M100["K13"]
+    if g < -MATCH_BAR:
+        return "K13-BELOW-K33"
+    if g <= MATCH_BAR:
+        return "GRADED-WAS-A-DELAY"
+    if ME["K13"] - ME["HEAD"] > MATCH_BAR:
+        return "K13-ABOVE-HEAD"
+    if drop >= MATCH_BAR and ME["HEAD"] - ME["K13"] <= MATCH_BAR:
+        return "K13-RECOVERS-TO-HEAD"
+    if drop >= -MATCH_BAR:
+        return "K-DEPENDENT-EQUILIBRIUM"
+    return "GRADED-PARTLY-A-DELAY"
+
+
+def decide_b(M100, ME, div_head_E=False):
+    """(b) HEAD's rescue at 300 against its in-run 100-epoch size (cgn3's map). -> (branch, rho)."""
+    d100 = M100["HEAD"] - M100["k01"]
+    dE = ME["HEAD"] - ME["k01"]
+    rho = dE / d100 if abs(d100) > 1e-12 else None
+    if div_head_E:
+        return "UNRESOLVED-HEAD-DIVERGED", rho
+    if dE <= REFUTE_BAR:
+        return "RESCUE-COLLAPSES", rho
+    if rho is not None and rho >= SURVIVE_FRAC and dE >= SUPPORT_BAR:
+        return "RESCUE-SURVIVES", rho
+    return "RESCUE-ATTENUATES", rho
+
+
+def decide_c(M100, ME, k33_classes, k33_maxr_post100, div_k33_E=False):
+    """(c) K33 at long horizon.  k33_classes / k33_maxr_post100: per seed."""
+    if div_k33_E:
+        return "K33-SPLIT-AT-300"
+    rise = ME["K33"] - M100["K33"]
+    if any(x is not None and x >= FREE_RATIO_MIN for x in k33_maxr_post100) or rise >= MATCH_BAR:
+        return "K33-REOPENS"
+    if (arm_class(k33_classes) == "PINNED" and all(x is not None and x <= PIN_RATIO_MAX for x in k33_maxr_post100)
+            and -MATCH_BAR < rise < MATCH_BAR):
+        return "K33-HOLDS-PINNED"
+    return "K33-UNRESOLVED"
+
+
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or the max arm mean is under %.0f / over %.0f pp).  A statement" % (FLOOR_MIN, CEIL_MAX),
+                        "about the harness only.  Nothing else is licensed."],
+    "PATCH-NOT-VERIFIED": [
+        "G-BITE failed: on at least one run the probe records do not show the registered weight in the complement's",
+        "sum (or show a weight where none was registered, the WRONG K, or are missing / short / unreadable).",
+        "This is the BROKEN-PATCH null or an unreadable witness.  NO level is read."],
+    "UNRESOLVED-DIVERGED": ["An arm is bimodal at 100 epochs.  A bimodal arm is reported, not averaged.  No branch."],
+    "SCALAR-NOT-COLLAPSED": ["k01 did not collapse in batch at 100 epochs (> %.0f pp).  Nothing is licensed." % K01_MAX],
+    "POSITIVE-CONTROL-FAILED": ["HEAD did not lift the scalar arm by %.0f pp at 100 epochs in batch.  Nothing is licensed." % GAP_MIN],
+    # ---- (a)
+    "K13-PREMISE-NOT-REPLICATED": [
+        "(a) cvt2's premise did not reproduce in the in-run 100-epoch control: K33 is not >= %.0f pp below HEAD, or" % SHAPE_GAP,
+        "K13 is not BETWEEN (more than %.0f pp from both HEAD and K33).  No delay / equilibrium sentence is licensed." % MATCH_BAR,
+        "(The BROKEN-PATCH null predicts exactly this; G-BITE passing excludes it.)"],
+    "UNRESOLVED-K33-DIVERGED": ["(a) K33, the reference plateau, is bimodal at 300 epochs.  No (a) sentence."],
+    "UNRESOLVED-K13-SPLIT": [
+        "(a) K13's seeds went different ways by 300 epochs (range > %.0f pp).  REPORTED PER SEED, NOT AVERAGED." % DIVERGED_BAR,
+        "At most: K13's long-horizon level is not determined by K at this cell (a threshold-edge arm).  No delay /",
+        "equilibrium sentence for the arm."],
+    "K13-BELOW-K33": ["(a) K13 ends > %.0f pp BELOW K33.  Unregistered under every account.  Report and stop." % MATCH_BAR],
+    "GRADED-WAS-A-DELAY": [
+        "(a) GRADED WAS A DELAY.  By 300 epochs K13 sits within %.0f pp of K33's plateau (in batch, in run): cvt2's" % MATCH_BAR,
+        "partial K13 level at 100 epochs was a late collapse, not a K-dependent level.  At long horizon the ladder",
+        "collapses at every K >= 13 and 236's GRADED is a 100-epoch statement.  READ WITH THE PIN STAMP:",
+        "K13-COMPLEMENT-PINNED says the fall accompanied the complement's own collapse; UNRESOLVED-NOT-PINNED says",
+        "the level fell while the complement's step size had not collapsed (mechanism UNSURE).",
+        "NOT licensed: a knee's location (one rung below 33), any network but PlainNet, any K between 1 and 13."],
+    "K13-ABOVE-HEAD": ["(a) K13 ends > %.0f pp ABOVE HEAD.  Unregistered.  Report and stop." % MATCH_BAR],
+    "K13-RECOVERS-TO-HEAD": [
+        "(a) THE K13 COLLAPSE WAS TRANSIENT: K13 rose by >= %.0f pp after epoch 100 and ends within %.0f pp of HEAD." % (MATCH_BAR, MATCH_BAR),
+        "cvt2's GRADED was a slow recovery seen at 100 epochs.  NOT licensed: that the twin's vote is harmless at",
+        "K13 in general, or anything about K33."],
+    "K-DEPENDENT-EQUILIBRIUM": [
+        "(a) K-DEPENDENT EQUILIBRIUM (of the LEVEL).  At 300 epochs K13 is still more than %.0f pp above K33's plateau" % MATCH_BAR,
+        "and has not fallen by more than %.0f pp from its in-run 100-epoch level: GRADED is NOT a delay at this" % MATCH_BAR,
+        "horizon; the partial level is K-dependent.  WHAT 'EQUILIBRIUM' MEANS DEPENDS ON THE PIN STAMP:",
+        "K13-COMPLEMENT-PINNED (+ K13-FROZEN-AT-PIN) = the level held through the complement's own collapse, so the",
+        "level is not a step-size equilibrium -- it was set before the pin (as 231.4(1) found on GN);",
+        "UNRESOLVED-NOT-PINNED = the complement's step size also never collapsed in 300 epochs, the stronger",
+        "'vote equilibrium' reading (still descriptive: no record-level equilibrium test is registered).",
+        "NOT licensed: persistence past 300 epochs; a decay slower than %.0f pp per 200 epochs; any other K." % MATCH_BAR],
+    "GRADED-PARTLY-A-DELAY": [
+        "(a) PARTLY A DELAY.  K13 fell by more than %.0f pp after epoch 100 but still sits more than %.0f pp above" % (MATCH_BAR, MATCH_BAR),
+        "K33's plateau at 300.  Neither 'delay' nor 'equilibrium' is licensed; the 100-epoch GRADED overstated the",
+        "long-horizon K13 level.  Whether K13 keeps falling past 300 is untested."],
+    # ---- (b)
+    "UNRESOLVED-HEAD-DIVERGED": ["(b) HEAD or k01 is bimodal at 300 epochs.  No persistence sentence."],
+    "RESCUE-COLLAPSES": [
+        "(b) HEAD's PlainNet rescue is a DELAYED COLLAPSE: D_HEAD@300 <= %.0f pp.  Every PlainNet rescue statement" % REFUTE_BAR,
+        "(cpl2, cvt1, cvt2, cvt3) is a <= 100-epoch statement.  Read with HEAD-DECAYS-AFTER-PIN."],
+    "RESCUE-SURVIVES": [
+        "(b) HEAD's PlainNet rescue PERSISTS to 300 epochs (RHO >= %.2f, D_HEAD@300 >= %.0f pp), with the 100-epoch" % (SURVIVE_FRAC, SUPPORT_BAR),
+        "control read from the same runs.  With HEAD-COMPLEMENT-PINNED + HEAD-FROZEN-AT-PIN it is cvh1's / cgn3's",
+        "sentence on PlainNet: the rescue's level survives its own complement's freeze (by magnitude at ~64 epochs,",
+        "the exact clamp at ~96-100), a regime, not a delayed collapse -- the fourth network.",
+        "NOT licensed: persistence past 300; a decay slower than READ_BAR over the post-pin window; the ceiling (no kL)."],
+    "RESCUE-ATTENUATES": [
+        "(b) HEAD keeps part of its 100-epoch rescue at 300 (D_HEAD@300 > %.0f, and RHO < %.2f or D_HEAD@300 < %.0f)." % (REFUTE_BAR, SURVIVE_FRAC, SUPPORT_BAR),
+        "Neither 'rescue' nor 'collapse' is licensed; ATTENUATE-MILD / -SEVERE gives the size."],
+    # ---- (c)
+    "K33-SPLIT-AT-300": ["(c) K33's seeds split by 300 epochs.  Reported per seed."],
+    "K33-REOPENS": [
+        "(c) K33's collapse RE-OPENS at long horizon: a seed's complement step size returned to >= %.0f x the floor after" % FREE_RATIO_MIN,
+        "epoch 100, or K33's level rose by >= %.0f pp.  The stricter reading of 236 was right: K33 was not a settled" % MATCH_BAR,
+        "plateau at 100 epochs, and cvt2's K33 AT-PLATEAU-like level is a 100-epoch statement."],
+    "K33-HOLDS-PINNED": [
+        "(c) THE STRICTER READING RESOLVES AS PINNED.  Over epochs 100-300 K33's complement stays inside the magnitude pin",
+        "(r <= %.0f on every record of every seed; PINNED by the gate) and its level moves by less than %.0f pp: the" % (PIN_RATIO_MAX, MATCH_BAR),
+        "exact-clamp departures 236 saw are excursions within r <= 2 (as HEAD's own complement shows after its pin),",
+        "not a re-opening.  NOT licensed: that exact-clamp dwell means anything for the level."],
+    "K33-UNRESOLVED": ["(c) K33 neither clearly holds nor re-opens (e.g. r between 2 and 10, or a NEITHER class).  Descriptive only."],
+}
+
+
+def pin_stamps(tag, gs, runs_arm, E_level, se_readbar):
+    """the cgn3 pin-stamp set for ONE arm's group 0.  gs: per-seed group_stats; runs_arm: per-seed runs."""
+    out = []
+    classes = [classify(g["med_r"]) if g else "UNMEASURED" for g in gs]
+    cls = arm_class(classes)
+    out.append("%s-COMPLEMENT-%s" % (tag, cls))
+    if cls == "PINNED":
+        pins = [g["first_r2"] for g, c in zip(gs, classes) if c == "PINNED" and g["first_r2"] is not None]
+        latest = max(pins)
+        win = EPOCHS - latest
+        out.append("%s-PIN-EPOCH:%.1f" % (tag, mean(pins)))
+        out.append("%s-POST-PIN-WINDOW:%.1f" % (tag, win))
+        out.append("%s-WINDOW-MEETS-W100" % tag if win >= W_POST else "%s-WINDOW-SHORT" % tag)
+        if tag == "K13":
+            out.append("K13-PIN-INSIDE-BOUND" if latest <= PIN_BOUND_R2 else "K13-PIN-AFTER-BOUND")
+        if win >= POST_MIN_WINDOW:
+            e0 = int(math.ceil(latest)) + 5
+            post = mean([mean([r["eps"][e][1] for e in range(e0, e0 + 5)]) for r in runs_arm])
+            out.append(three_way(E_level - post, "%s-DECAYS-AFTER-PIN" % tag, "%s-FROZEN-AT-PIN" % tag,
+                                 "%s-IMPROVES-AFTER-PIN" % tag, se_readbar))
+        else:
+            out.append("%s-POST-PIN-UNMEASURED" % tag)
+    else:
+        if tag == "K13":
+            out.append("UNRESOLVED-NOT-PINNED")
+        out.append("%s-POST-PIN-UNMEASURED" % tag)
+    return out, classes, cls
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    nall = len(ARMS) * len(SEEDS)
+    print("=" * 78)
+    print(" cvt5 -- PLAINNET AT %d EPOCHS: IS GRADED A DELAY, AND DOES HEAD SURVIVE ITS OWN PIN?" % EPOCHS)
+    print(" %s / %s   %d epochs (in-run control at %d)   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (NET, DSET, EPOCHS, CTRL_EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-5s %-38s VOTE_W=%s" % (a, SPEC[a], VOTEW[a] or "(unset)"))
+    print(" PRIMARY (a): K13@%d vs K33@%d and vs K13@%d.   PRIMARY (b): RHO = D_HEAD@%d / D_HEAD@%d.   (c) K33 at %d."
+          % (EPOCHS, EPOCHS, CTRL_EPOCHS, EPOCHS, CTRL_EPOCHS, EPOCHS))
+    print("          plateau5 = mean TEST over epochs %d..%d and %d..%d of each run's own .out."
+          % (CTRL_EPOCHS - 5, CTRL_EPOCHS - 1, EPOCHS - 5, EPOCHS - 1))
+    print(" BARS ARE FROZEN LITERALS (O2); the corpus cannot move them.  The pin gate runs AFTER the primaries.")
+    print("=" * 78)
+    rows = read_corpus(csvpath)
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)"
+          % ("not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)))
+
+    runs, rnotes = read_runs(runsdir)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback" % (nall, EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s"
+                  % (r["n_epochs"], r["run_done"], r["traceback"])))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (nall - len(missing), nall, ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "momentum-param-base": "0.99", "weight-decay-base": "0.1",
+                    "alg-meta": "Lion", "momentum-param-meta": "0.99", "Lion-beta2-meta": "0.9",
+                    "weight-decay-meta": "0", "dataset": DSET, "NN-name": NET, "batch-size": str(BATCH),
+                    "max-time": "999:00:00", "gamma": "1", "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s)}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad])
+                 if (dup or bad) else "")
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "G-ENV one distinct ENV line, one per run", "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is cvt1's (== cvt2's), byte for byte (PROBE_DIR stripped)")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0])
+             or PT_RE.match(r["pt"][0]).group(1) != PT_TYPE[a]]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`"
+         % (PROBE, NTENS), "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    print("\nG-VOTEW   every run printed exactly ONE VOTE_W line, == its arm's registered witness")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            hchk(r["vw"] == [WITNESS[a]], "G-VOTEW %s-s%d" % (a, s),
+                 "" if r["vw"] == [WITNESS[a]] else "got %r" % (r["vw"][:2],))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(),
+             "G-STRUCT byte-identical to synthetic_manifest_text() (53 tensors, EPOCHS %d, CTRL_EPOCHS %d, the VOTE_W table)"
+             % (EPOCHS, CTRL_EPOCHS), "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == POST_SHA,
+             "G-PROV build_network.py sha256 == POST_SHA %s..." % POST_SHA[:12], str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        hchk(prov.get("HF_SHA256") == HF_POST_SHA,
+             "G-PROV HF.py sha256 == HF_POST_SHA %s... (cvt1's PATCH_VOTEWEIGHT tree)" % HF_POST_SHA[:12],
+             str(prov.get("HF_SHA256"))[:16])
+        hchk(prov.get("RUNNER_SHA256") == RUNNER_SHA,
+             "G-PROV RUNNER_SHA256 == run_cifar_cvt1.sh %s..." % RUNNER_SHA[:12], str(prov.get("RUNNER_SHA256"))[:16])
+        hchk(prov.get("TRAIN_SHA256") == TRAIN_SHA,
+             "G-PROV TRAIN_SHA256 == the train.py guard 4h proved (%s...)" % TRAIN_SHA[:12], str(prov.get("TRAIN_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer's sha256 %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN at %d and %d, IN BATCH, IN RUN; tail slopes are descriptive" % (CTRL_EPOCHS, EPOCHS))
+    V100 = dict((a, [runs[(a, s)]["p100"] for s in SEEDS]) for a in ARMS)
+    VE = dict((a, [runs[(a, s)]["pE"] for s in SEEDS]) for a in ARMS)
+    T100 = dict((a, [runs[(a, s)]["t100"] for s in SEEDS]) for a in ARMS)
+    TE = dict((a, [runs[(a, s)]["tE"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        sl1 = [tail_slope(runs[(a, s)]["eps"], 80, 99) for s in SEEDS]
+        slE = [tail_slope(runs[(a, s)]["eps"], EPOCHS - 20, EPOCHS - 1) for s in SEEDS]
+        print("  %-5s TEST @%d %.4f (sd %s, range %.4f)  @%d %.4f (sd %s, range %.4f)   TRAIN @%d %.4f  @%d %.4f"
+              % (a, CTRL_EPOCHS, mean(V100[a]), fmt(sd(V100[a])), max(V100[a]) - min(V100[a]),
+                 EPOCHS, mean(VE[a]), fmt(sd(VE[a])), max(VE[a]) - min(VE[a]), CTRL_EPOCHS, mean(T100[a]), EPOCHS, mean(TE[a])))
+        print("        seeds @%d: %s" % (CTRL_EPOCHS, ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, V100[a], T100[a]))))
+        print("        seeds @%d: %s" % (EPOCHS, ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, VE[a], TE[a]))))
+        print("        TEST OLS slope pp/ep, epochs 80-99: %s;  epochs %d-%d: %s"
+              % ("/".join(fmt(x, 4) for x in sl1), EPOCHS - 20, EPOCHS - 1, "/".join(fmt(x, 4) for x in slE)))
+    M100 = dict((a, mean(V100[a])) for a in ARMS)
+    ME = dict((a, mean(VE[a])) for a in ARMS)
+    MT100 = dict((a, mean(T100[a])) for a in ARMS)
+    MTE = dict((a, mean(TE[a])) for a in ARMS)
+    hi = max(M100.values())
+    print("\nG-FLOOR / G-CEIL (max arm mean at %d)" % CTRL_EPOCHS)
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(max(list(M100.values()) + list(ME.values())) <= CEIL_MAX, "G-CEIL max arm mean (either horizon) <= %.2f pp" % CEIL_MAX)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (
+            len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    the registered weight reached the complement's sum -- read from the runs' OWN probe records")
+    print("  per record, per group: z_agg == sum_i w_i z_tensor_i and mom_pre == sum_i w_i m_tensor_i (rel %.0e);" % BITE_TOL)
+    print("  K13 / K33: >= %d records where weighted and unweighted sums differ by > %.0e, the unweighted matching none."
+          % (MIN_INFORMATIVE, INFORM))
+    print("  Controls (k01, HEAD): weights 1 everywhere.  %d records per run." % N_RECORDS)
+    bite_fail = []
+    PROBES = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = load_probe(runsdir, a, s)
+            ok, d = bite_check(a, recs)
+            print("  %-4s G-BITE %-5s s%d  records %s  bad %d  worst z %.1e m %.1e  informative %d  unweighted-match %d%s"
+                  % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), d["bad_rec"],
+                     d["worst_z"], d["worst_m"], d["informative"], d["unweighted_match_on_informative"],
+                     ("  (%s)" % d["why"]) if "why" in d else ""))
+            if not ok:
+                bite_fail.append("%s-s%d" % (a, s))
+            PROBES[(a, s)] = recs
+    if bite_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | G-BITE failed on %s" % ",".join(bite_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch over arm x horizon) -- nothing from the corpus")
+    ss = 0.0
+    df = 0
+    for a in ARMS:
+        for v in (V100[a], VE[a]):
+            m = mean(v)
+            ss += sum((x - m) ** 2 for x in v)
+            df += len(v) - 1
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    read_bar = 2.0 * se
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+    print("  READ_BAR             %.6f  = 2 SE (stamp-level comparisons only)" % read_bar)
+
+    print("\nCONTRASTS (every one WITHIN batch; @%d and @%d IN RUN; TRAIN beside TEST)" % (CTRL_EPOCHS, EPOCHS))
+    D100 = M100["HEAD"] - M100["k01"]
+    DE = ME["HEAD"] - ME["k01"]
+    print("  KEY      D_HEAD@%d = %+.4f pp = %+.2f SE (TRAIN %+.4f)   D_HEAD@%d = %+.4f pp = %+.2f SE (TRAIN %+.4f)"
+          % (CTRL_EPOCHS, D100, D100 / se, MT100["HEAD"] - MT100["k01"], EPOCHS, DE, DE / se, MTE["HEAD"] - MTE["k01"]))
+    print("  PREMISE  @%d: HEAD - K13 %+.4f | K13 - K33 %+.4f | HEAD - K33 %+.4f  (cvt2: +12.0693 / +16.7560 / +28.8253)"
+          % (CTRL_EPOCHS, M100["HEAD"] - M100["K13"], M100["K13"] - M100["K33"], M100["HEAD"] - M100["K33"]))
+    G13 = ME["K13"] - ME["K33"]
+    DROP13 = ME["K13"] - M100["K13"]
+    print("  PRIMARY  (a) G13@%d = K13 - K33 = %+.4f pp = %+.2f SE (TRAIN %+.4f)   [@%d %+.4f]"
+          % (EPOCHS, G13, G13 / se, MTE["K13"] - MTE["K33"], CTRL_EPOCHS, M100["K13"] - M100["K33"]))
+    print("  PRIMARY  (a) DROP13 = K13@%d - K13@%d = %+.4f pp = %+.2f SE (TRAIN %+.4f);  HEAD@%d - K13@%d %+.4f"
+          % (EPOCHS, CTRL_EPOCHS, DROP13, DROP13 / se, MTE["K13"] - MT100["K13"], EPOCHS, EPOCHS, ME["HEAD"] - ME["K13"]))
+    RHO = DE / D100 if abs(D100) > 1e-12 else None
+    print("  PRIMARY  (b) RHO = D_HEAD@%d / D_HEAD@%d = %s   (SURVIVE needs RHO >= %.2f AND D_HEAD@%d >= %.1f; COLLAPSE <= %.1f)"
+          % (EPOCHS, CTRL_EPOCHS, fmt(RHO), SURVIVE_FRAC, EPOCHS, SUPPORT_BAR, REFUTE_BAR))
+    for s, i in zip(SEEDS, range(3)):
+        d1 = V100["HEAD"][i] - V100["k01"][i]
+        d2 = VE["HEAD"][i] - VE["k01"][i]
+        print("           seed %d paired (descriptive): D_HEAD %+.4f -> %+.4f rho %s | K13 %+.4f -> %+.4f (drop %+.4f) | K13 - K33 @%d %+.4f"
+              % (s, d1, d2, fmt(d2 / d1 if abs(d1) > 1e-12 else None), V100["K13"][i], VE["K13"][i],
+                 VE["K13"][i] - V100["K13"][i], EPOCHS, VE["K13"][i] - VE["K33"][i]))
+    print("  KEY      K33@%d - K33@%d %+.4f | HEAD@%d - HEAD@%d %+.4f | k01@%d - k01@%d %+.4f"
+          % (EPOCHS, CTRL_EPOCHS, ME["K33"] - M100["K33"], EPOCHS, CTRL_EPOCHS, ME["HEAD"] - M100["HEAD"],
+             EPOCHS, CTRL_EPOCHS, ME["k01"] - M100["k01"]))
+    print("  bars: GAP_MIN %.1f | SHAPE_GAP %.1f | MATCH %.1f pp (%.2f SE) | REFUTE %.1f | SUPPORT %.1f | SURVIVE %.2f | NULL %.1f"
+          % (GAP_MIN, SHAPE_GAP, MATCH_BAR, MATCH_BAR / se, REFUTE_BAR, SUPPORT_BAR, SURVIVE_FRAC, NULL_BAR))
+
+    print("\nG-DIVERGE (branch conditions, not harness gates)")
+    div100 = [a for a in ARMS if max(V100[a]) - min(V100[a]) > DIVERGED_BAR]
+    divE = [a for a in ARMS if max(VE[a]) - min(VE[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range @%d <= %.1f pp%s" % ("PASS" if not div100 else "FAIL", CTRL_EPOCHS, DIVERGED_BAR,
+                                                        "" if not div100 else "  diverged: %s" % div100))
+    print("  %s every arm's seed range @%d <= %.1f pp%s" % ("PASS" if not divE else "NOTE", EPOCHS, DIVERGED_BAR,
+                                                        "" if not divE else "  diverged: %s (per-branch, below)" % divE))
+
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "ONE-NETWORK-PLAINNET", "HORIZON-%d" % EPOCHS, "NO-TIME-GATE", "ONE-CELL-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    g = decide_global(M100, bool(div100))
+    if g is not None:
+        if div100:
+            stamps.append("DIVERGED-%s" % "-".join(div100))
+        final = "FINAL: %s | %s" % (g, " | ".join(stamps))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE[g]:
+            print("  " + ln)
+        return 0, final
+
+    A = decide_a(M100, ME, "K13" in divE, "K33" in divE)
+    B, rho = decide_b(M100, ME, "HEAD" in divE or "k01" in divE)
+    A_tr = decide_a(MT100, MTE, False, False)
+    B_tr, rho_tr = decide_b(MT100, MTE, False)
+    print("\nBRANCHES (decided by the level primaries alone, BEFORE any pin statistic is read)")
+    print("  (a) %s   (TRAIN, same map: %s)" % (A, A_tr))
+    print("  (b) %s   RHO %s   (TRAIN, same map: %s, RHO %s)" % (B, fmt(rho), B_tr, fmt(rho_tr)))
+    stamps.append("RHO:%s" % fmt(rho))
+    if B == "RESCUE-ATTENUATES":
+        stamps.append("ATTENUATE-MILD" if (rho is not None and rho >= ATTEN_MILD_FRAC) else "ATTENUATE-SEVERE")
+    stamps.append("TRAIN-AGREES-A" if A_tr == A else "TRAIN-DISAGREES-A")
+    stamps.append("TRAIN-AGREES-B" if B_tr == B else "TRAIN-DISAGREES-B")
+    stamps.append(three_way(DROP13, "K13-LEVEL-FALLS", "K13-LEVEL-HOLDS", "K13-LEVEL-RISES", read_bar))
+    stamps.append(three_way(ME["HEAD"] - M100["HEAD"], "HEAD-LEVEL-FALLS", "HEAD-LEVEL-HOLDS", "HEAD-LEVEL-RISES", read_bar))
+    stamps.append(three_way(ME["K33"] - M100["K33"], "K33-LEVEL-FALLS", "K33-LEVEL-HOLDS", "K33-LEVEL-RISES", read_bar))
+    if A == "UNRESOLVED-K13-SPLIT":
+        for s, i in zip(SEEDS, range(3)):
+            one100 = dict((a, V100[a][i]) for a in ARMS)
+            oneE = dict((a, VE[a][i]) for a in ARMS)
+            stamps.append("K13-s%d:%s" % (s, decide_a(one100, oneE, False, False)))
+
+    # ---- the pin gate, AFTER the primaries, as stamps --------------------------
+    print("\nPIN GATE  step-size MAGNITUDE over the last quarter of records, r = exp(beta + 15) (cvh1's form; stamps only)")
+    GS = {}
+    for a in ARMS:
+        GS[a] = [group_stats(PROBES[(a, s)], 0) for s in SEEDS]
+        for s, gst in zip(SEEDS, GS[a]):
+            print("  %-5s s%d group0 median r %.4f -> %-8s first r<=2 %s  exact-clamp from %s  max r after ep %d %s  "
+                  "off-exact records after ep %d %d  terminal %.4f"
+                  % (a, s, gst["med_r"], classify(gst["med_r"]),
+                     "never" if gst["first_r2"] is None else "%.1f" % gst["first_r2"],
+                     "never" if gst["pinned_from"] is None else "%.1f" % gst["pinned_from"],
+                     CTRL_EPOCHS, fmt(gst["max_r_post100"]), CTRL_EPOCHS, gst["off_exact_post100"], gst["terminal"]))
+    k13_st, _c13, _k13cls = pin_stamps("K13", GS["K13"], [runs[("K13", s)] for s in SEEDS], ME["K13"], read_bar)
+    head_st, _ch, _hcls = pin_stamps("HEAD", GS["HEAD"], [runs[("HEAD", s)] for s in SEEDS], ME["HEAD"], read_bar)
+    stamps += k13_st + head_st
+    k33_classes = [classify(x["med_r"]) for x in GS["K33"]]
+    k33_maxr = [x["max_r_post100"] for x in GS["K33"]]
+    C = decide_c(M100, ME, k33_classes, k33_maxr, "K33" in divE)
+    stamps.append("K33-COMPLEMENT-%s" % arm_class(k33_classes))
+    stamps.append("K33-MAXR-POST100:%.4f" % max(x for x in k33_maxr if x is not None))
+    n_off = [x["off_exact_post100"] for x in GS["K33"]]
+    stamps.append("K33-EXACT-CLAMP-EXCURSIONS" if sum(1 for n in n_off if n > 0) >= 2 else "K33-EXACT-CLAMP-CONTINUOUS")
+    k01_cls = arm_class([classify(x["med_r"]) for x in GS["k01"]])
+    stamps.append("K01-%s" % k01_cls)
+    stamps.append("FLOOR-HOLDS" if abs(ME["k01"] - M100["k01"]) < read_bar else "FLOOR-DRIFTS")
+    if any(ME[a] - ME["k01"] <= NULL_BAR for a in ("HEAD",) + LADDER):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    print("  (c) %s   K33 classes %s, max r after epoch %d %s, off-exact records after epoch %d %s"
+          % (C, k33_classes, CTRL_EPOCHS, ["%.4f" % x for x in k33_maxr], CTRL_EPOCHS, n_off))
+
+    final = "FINAL: %s | %s | %s | %s" % (A, B, C, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cvt5 bar or contrast):")
+    print("  cvt2 {87,88,89} @100: %s" % "  ".join("%s %.4f" % (a, R_CVT2[a]) for a in ARMS))
+    print("  cvt5 {93,94,95} @100: %s" % "  ".join("%s %.4f" % (a, M100[a]) for a in ARMS))
+    try:
+        descriptive_readout(runs, PROBES)
+    except Exception as ex:                      # a disclosure must never crash the scorer
+        print("  (descriptive readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for tok in (A, B, C):
+        for ln in LICENSE[tok]:
+            print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Anything about ResNet18_c100 (BN or GN) or VGG11_bn_c100: one network, one cell.")
+    print("  * Any K other than 13 and 33 at long horizon; K152 / K691 / K2000 were not re-run.")
+    print("  * Anything past %d epochs; dose vs onset (no time gate); any between-batch contrast." % EPOCHS)
+    print("  * Point agreement for any floor-band reading (FLOOR-READINGS-ARE-BOUNDS).")
+    return 0, final
+
+
+def descriptive_readout(runs, probes):
+    print("\nDESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) from the raw .out")
+    ep_list = (29, 49, 99, 149, 199, 249, EPOCHS - 1)
+    for a in ARMS:
+        cells = []
+        for e in ep_list:
+            te = [runs[(a, s)]["eps"][e][1] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            tr = [runs[(a, s)]["eps"][e][0] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            cells.append("%d:%s(%s)" % (e, fmt(mean(te), 2), fmt(mean(tr), 2)))
+        print("  %-5s %s" % (a, "  ".join(cells)))
+    print("\nDESCRIPTIVE, NON-GATING -- arm-mean group-0 beta at epochs 50/100/150/200/250/%d, and group-1 (idx 50) pinned-from" % (EPOCHS - 1))
+    for a in ARMS:
+        cells = []
+        for e in (50, 100, 150, 200, 250, EPOCHS - 1):
+            v = [group_stats(probes[(a, s)], 0)["at"].get(e) for s in SEEDS]
+            v = [x for x in v if x is not None]
+            cells.append("%d:%s" % (e, fmt(mean(v), 3)))
+        g1 = ""
+        if PT_TYPE[a] == "blockwise":
+            g1 = "  g1 pinned-from %s" % "/".join(fmt(group_stats(probes[(a, s)], 1)["pinned_from"], 1) for s in SEEDS)
+        print("  %-5s %s%s" % (a, "  ".join(cells), g1))
+    print("\nDESCRIPTIVE, NON-GATING -- K13's complement Lion direction DOWN fraction (b2*mom_pre + (1-b2)*z_agg > 0) by 50-epoch window")
+    for s in SEEDS:
+        cells = []
+        for lo in range(0, EPOCHS, 50):
+            sel = [r for r in probes[("K13", s)] if lo <= r["step"] / float(STEPS_PER_EPOCH) < lo + 50]
+            dn = sum(1 for r in sel if r.get("pt_b2", 0.9) * r["mom_pre"][0][0] + (1 - r.get("pt_b2", 0.9)) * r["z_agg"][0][0] > 0)
+            cells.append("%d-%d:%s" % (lo, lo + 50, fmt(dn / float(len(sel)) if sel else None, 3)))
+        print("  K13 s%d %s" % (s, "  ".join(cells)))
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().
+# EVERY NUMBER IS INVENTED; evidence of nothing.
+# =============================================================================
+_E_ENV = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+          "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+          "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 PROBE_DIR=/x/probe EB_RHO=na EB_LOG=0")
+_E_100 = {"k01": 11.5, "HEAD": 64.4, "K13": 52.3, "K33": 35.6}
+_E_E = {"k01": 11.6, "HEAD": 64.6, "K13": 53.0, "K33": 35.7}      # EQUILIBRIUM + SURVIVES-like
+
+
+def _e_write(d, arm, s, jid, l100, lE, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, vw=None, epochs_flag=None):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs %s --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cvt5 --run-name %s"
+            % (NET, epochs_flag or str(EPOCHS), spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env,
+             "NVIDIA L4, 23034 MiB", "",
+             WITNESS[arm] if vw is None else vw,
+             "Files already downloaded and verified", "Files already downloaded and verified",
+             "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 "
+             "Lion_beta2=0.9 dir=/x" % (PT_TYPE[arm], NTENS)]
+    if vw == "":
+        lines.remove("")
+    for e in range(n_ep):
+        if e < CTRL_EPOCHS - 5:
+            te = l100 * (1 - math.exp(-(e + 1) / 12.0))
+        elif e < CTRL_EPOCHS:
+            te = l100
+        elif e < 200:
+            te = l100 + (lE - l100) * (e - CTRL_EPOCHS + 1) / 100.0
+        else:
+            te = lE
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.9, te + 15.0), te))
+    if run_done:
+        lines += ["141  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _beta_profile(kind, k):
+    """group-0 beta at record k (5 records / epoch).  Invented shapes for the pin stamps."""
+    e = k / float(REC_PER_EPOCH)
+    if kind == "pin36":
+        return max(-15.0, -5.0 - 10.0 * e / 36.0)
+    if kind == "pin64":
+        return max(-15.0, -5.0 - 10.0 * e / 64.0)
+    if kind == "pin160":
+        return max(-15.0, -5.0 - 10.0 * e / 160.0)
+    if kind == "pin280":
+        return max(-15.0, -5.0 - 10.0 * e / 280.0)
+    if kind == "hover":                         # never pins: r ~ 20
+        return max(-12.0, -5.0 - 7.0 * e / 60.0)
+    if kind == "neither":                       # r ~ 5
+        return max(-13.4, -5.0 - 8.4 * e / 60.0)
+    if kind == "pin38exc":                      # pinned from 38, excursions inside r <= 2 every 13th record
+        b = max(-15.0, -5.0 - 10.0 * e / 38.0)
+        return -14.5 if (e > 40 and k % 13 == 0) else b
+    if kind == "reopen":                        # pinned at 38, re-opens to r ~ 150 after epoch 150
+        return -10.0 if e >= 150 else max(-15.0, -5.0 - 10.0 * e / 38.0)
+    raise ValueError(kind)
+
+
+_E_PROFILE = {"k01": "pin36", "HEAD": "pin64", "K13": "pin160", "K33": "pin38exc"}
+
+
+def _e_probe_records(arm, weights=None, n=N_RECORDS, seed=0, profile=None):
+    """synthetic PROBE_TENSOR records consistent with `weights` (default: the arm's own)."""
+    import random
+    rnd = random.Random(1000 + seed)
+    W = WEIGHTS[arm] if weights is None else weights
+    names = [nm for nm, _q, _o in r18_tensors(True)]
+    groups = arm_groups(arm, names)
+    kind = profile or _E_PROFILE[arm]
+    out = []
+    for k in range(n):
+        zt = [round(rnd.uniform(-1e-4, 1e-4), 9) for _ in range(NTENS)]
+        mt = [round(rnd.uniform(-1e-4, 1e-4), 9) for _ in range(NTENS)]
+        zt[IDX_HEAD - 1] = 5e-2 * (1 + 0.1 * rnd.random())
+        mt[IDX_HEAD - 1] = 4e-2
+        zt[IDX_TWIN - 1] = 1e-4 * (1 + 0.1 * rnd.random())
+        mt[IDX_TWIN - 1] = 8e-5
+        za = [sum(W.get(i, 1.0) * zt[i - 1] for i in g) for g in groups]
+        ma = [sum(W.get(i, 1.0) * mt[i - 1] for i in g) for g in groups]
+        b0 = _beta_profile(kind, k)
+        beta = [b0] if len(groups) == 1 else [b0, max(-15.0, -5.0 - 10.0 * (k / 5.0) / 22.0)]
+        out.append({"step": 100 * k, "beta": beta, "pt_b2": 0.9, "pt_mp": 0.99,
+                    "z_tensor": zt, "m_tensor": mt, "z_agg": [za], "mom_pre": [ma]})
+    return out
+
+
+def _e_write_probe(path, recs):
+    os.makedirs(path, exist_ok=True)
+    with open(os.path.join(path, "probe.jsonl"), "w") as f:
+        for r in recs:
+            f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            _e_write_probe(os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s)), _e_probe_records(a, seed=s))
+
+
+def _e_prov(d, mode="submit", bn=POST_SHA, hf=HF_POST_SHA, runner=RUNNER_SHA, train=TRAIN_SHA, scorer=None):
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nBUILD_NETWORK_SHA256 %s\nHF_SHA256 %s\nRUNNER_SHA256 %s\nTRAIN_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (mode, bn, hf, runner, train, scorer or file_sha(os.path.abspath(__file__))))
+
+
+def _e_build(d, template, l100=None, lE=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None,
+             env_break=None, spec_break=None, vw_break=None, manifest=None, prov=None,
+             probe_break=None, probe_drop=None, epochs_break=None, short=None):
+    L1 = dict(_E_100, **(l100 or {}))
+    LE = dict(_E_E, **(lE or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(
+        manifest if manifest is not None else synthetic_manifest_text())
+    _e_prov(d, **(prov or {}))
+    jid = 9800000
+    pb = dict(probe_break or {})
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                _e_write_probe(os.path.join(d, PREFIX, pname), pb[(a, s)])
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            l1, le = (over or {}).get((a, s), (L1[a] + jit[i], LE[a] + jit[i]))
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = SPEC["k01"] if spec_break == (a, s) else None
+            vw = vw_break[1] if vw_break and vw_break[0] == (a, s) else None
+            ef = "100" if epochs_break == (a, s) else None
+            _e_write(d, a, s, jid, l1, le, env=env, spec=spec, vw=vw, epochs_flag=ef,
+                     n_ep=(250 if short == (a, s) else EPOCHS))
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, l1, le, n_ep=140, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0,
+            "gamma": "1", "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH),
+            "hier": "none", "lam": "na", "eta_ratio": "na",
+            "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    spec = [(NET, "scalar", "100", 1.0), (NET, "scalar", "100", 70.0), (NET, "scalar", "300", 2.0), (NET, "scalar", "300", 80.0),
+            (NET, HEAD_SPEC, "100", 2.0), (NET, HEAD_SPEC, "100", 90.0), (NET, HEAD_SPEC, "300", 5.0), (NET, HEAD_SPEC, "300", 95.0),
+            (PARENT, "scalar", "772", 2.0), (PARENT, "scalar", "772", 60.0), (PARENT, "layerwise", "772", 30.0),
+            (PARENT, "layerwise", "772", 95.0), (PARENT, "scalar", "100", 3.0), (PARENT, "scalar", "100", 70.0)]
+    for i, (net, gran, ep, v) in enumerate(spec):
+        inv.append(dict(base, network=net, granularity=gran, epochs_requested=ep, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _bar_lines(out):
+    return [ln for ln in out.splitlines()
+            if ln.startswith("  SIGMA_USED") or ln.startswith("  SE_ARM_DIFF") or ln.startswith("  READ_BAR")
+            or ln.startswith("  bars:") or ln.startswith("  PRIMARY") or ln.startswith("  (a)") or ln.startswith("  (b)")]
+
+
+def _dict_from_scorer(fname, key, var="SPEC"):
+    p = os.path.join(_HERE, fname)
+    if not os.path.exists(p):
+        return None
+    import ast
+    m = re.search(r"^%s = (\{.*?^\})" % var, open(p).read(), re.S | re.M)
+    if not m:
+        return None
+    return ast.literal_eval(m.group(1)).get(key)
+
+
+def _load_deriv():
+    if not os.path.exists(DERIV_PY):
+        return None
+    sp = importlib.util.spec_from_file_location("cvt5deriv", DERIV_PY)
+    mod = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(mod)
+    return mod
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cVT5 --selftest: design, the horizon's derivation, frozen manifest, frozen bars (O2), the floor read THROUGH")
+    print("corpus_exclusions.filter_rows, the floor table, the REAL score() on synthetic 300-epoch runs (with synthetic")
+    print("probe records for G-BITE and the pin gate), the corpus-invariance proof and the documented invocation.\n")
+
+    print("A. ARITHMETIC, REGEX, DESIGN, THE HORIZON, PRICE AND WALL")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6 and abs(2 * SE_PRIOR - READ_BAR_PRIOR) < 2e-6,
+        "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3); READ_BAR_PRIOR = 2 SE", "%.6f" % (SIGMA_PRIOR * math.sqrt(2 / 3)))
+    chk(SIGMA_PRIOR == max(v[0] for v in SIGMA_VARIANTS.values()), "SIGMA_PRIOR = max over the six frozen variants (R772)")
+    chk(list(inspect.signature(compose_sigma).parameters) == ["sigma_in"],
+        "compose_sigma() takes ONE argument, the in-batch sigma -- NO corpus")
+    bad = [s for s in (0.0, 0.2, 0.5, SIGMA_PRIOR, 0.9, 1.5, 4.0) if compose_sigma(s)[1] != max(SIGMA_PRIOR, s)]
+    chk(not bad, "SIGMA_USED == max(frozen floor, in-batch) over 7 in-batch values")
+    src = inspect.getsource(score)
+    chk("pooled_sigma" not in src and src.count("read_corpus(") == 1,
+        "score() calls no corpus statistic; its single read_corpus() feeds a row-count print only")
+    chk(list(inspect.signature(decide_a).parameters) == ["M100", "ME", "div_k13_E", "div_k33_E"]
+        and list(inspect.signature(decide_b).parameters) == ["M100", "ME", "div_head_E"]
+        and list(inspect.signature(decide_global).parameters) == ["M100", "div100"],
+        "decide_global / decide_a / decide_b are functions of in-batch means and in-batch flags only")
+    dsrc = inspect.getsource(decide_a) + inspect.getsource(decide_b) + inspect.getsource(decide_global)
+    chk("load_probe" not in dsrc and "group_stats" not in dsrc and "read_bar" not in dsrc and "sigma" not in dsrc.lower(),
+        "no branch reads a probe record, a pin statistic or sigma: READ_BAR moves stamps only")
+    chk(src.index("G-BITE failed on") < src.index("decide_a(M100, ME"),
+        "G-BITE is decided BEFORE any branch: a patch that did not bite cannot reach a level reading")
+    chk(src.index("decide_a(M100, ME") < src.index("PIN GATE") < src.index("pin_stamps(\"K13\""),
+        "the pin gate runs AFTER both primaries are decided (cgn3/cvh1 order; a pin can never void a primary)")
+    chk(src.index("final = \"FINAL: %s | %s | %s | %s\"") < src.index("descriptive_readout(runs, PROBES)"),
+        "the descriptive readout runs AFTER the FINAL line is composed")
+    chk(GAP_MIN > SHAPE_GAP >= 3 * MATCH_BAR > NULL_BAR > 0 and REFUTE_BAR == MATCH_BAR and SUPPORT_BAR == SHAPE_GAP,
+        "bar ordering: GAP_MIN > SHAPE_GAP >= 3 MATCH > NULL; REFUTE == MATCH; SUPPORT == SHAPE_GAP")
+    chk(MATCH_BAR >= 5 * SE_PRIOR, "MATCH_BAR is >= 5 SE at the frozen prior", "%.2f SE" % (MATCH_BAR / SE_PRIOR))
+    chk(EPTR_RE.search("Epoch 299, Train Accuracy: 83.61 %, Test Accuracy: 64.44 %") is not None,
+        "epoch-line regex matches the harness's print")
+    chk(all(OUT_RE.match("cvt5-%s-s93-1234567.out" % a) for a in ARMS)
+        and OUT_RE.match("cvt2-K13-s87-1.out") is None and OUT_RE.match("cvt5-K152-s93-1.out") is None
+        and OUT_RE.match("cvt4-HEAD-s90-1.out") is None,
+        "run-file regex matches cvt5's four arms ONLY (not cvt2's, not cvt4's)")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=53 x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=62 x") is None,
+        "PROBE_TENSOR regex accepts 53 tensors and REJECTS a 62-tensor ResNet line")
+    chk(set(SPEC) == set(ARMS) == set(VOTEW) == set(WITNESS) == set(WEIGHTS) == set(PT_TYPE) and len(ARMS) == 4,
+        "four arms; SPEC, VOTEW, WITNESS, WEIGHTS and PT_TYPE cover exactly them")
+    for tab, var in ((SPEC, "SPEC"), (VOTEW, "VOTEW"), (WITNESS, "WITNESS")):
+        theirs = [_dict_from_scorer("cVT2_injectladder_score.py", a, var) for a in ARMS]
+        if any(t is None for t in theirs):
+            skip("cVT2 scorer not reachable -- %s byte-identity not checked here" % var)
+        else:
+            chk(theirs == [tab[a] for a in ARMS], "%s for k01 / HEAD / K13 / K33 BYTE-IDENTICAL to cVT2_injectladder_score.py's" % var)
+    chk(WEIGHTS["K13"] == {IDX_TWIN: 13.0} and WEIGHTS["K33"] == {IDX_TWIN: 33.0} and not WEIGHTS["k01"] and not WEIGHTS["HEAD"],
+        "WEIGHTS agree with VOTEW (twin idx 47 at 13 and 33; controls unweighted)")
+    e_post = int(math.ceil(PIN_BOUND_R2 + W_POST))
+    e_tail = int(math.ceil(PIN_BOUND_R2 / (1.0 - TAIL_FRAC)))
+    chk(e_post == E_POST == 288 and e_tail == E_TAIL == 298 and max(e_post, e_tail) == E_MIN
+        and EPOCHS == int(math.ceil(E_MIN / 10.0) * 10) == 300,
+        "E = ceil10(max(ceil(PIN_BOUND_R2 + W_POST), ceil(PIN_BOUND_R2 / 0.75))) = ceil10(max(288, 298)) = 300")
+    chk(EPOCHS * (1 - TAIL_FRAC) >= PIN_BOUND_R2 and EPOCHS - PIN_BOUND_R2 >= W_POST and EPOCHS - HEAD_FIRST_R2_MAX >= W_MAX,
+        "at E the gate's last quarter starts after PIN_BOUND_R2 (%.0f >= %.1f); K13 window >= W_POST; HEAD window %.1f >= W_MAX"
+        % (EPOCHS * (1 - TAIL_FRAC), PIN_BOUND_R2, EPOCHS - HEAD_FIRST_R2_MAX))
+    chk(N_RECORDS == 1500 and META_STEPS == 150000 and REC_PER_EPOCH == 5, "1,500 probe records and 150,000 meta-steps per run")
+    cost = GPUH_PER_RUN_EPOCH * 12 * EPOCHS
+    chk(abs(cost - 24.6178) < 1e-3 and abs(GPUH_PER_RUN_EPOCH * 9 * EPOCHS - 18.4633) < 1e-3,
+        "price: 12 x 300 x %.9f = %.2f GPU-h expected (without k01 %.2f)" % (GPUH_PER_RUN_EPOCH, cost, GPUH_PER_RUN_EPOCH * 9 * EPOCHS))
+    worst_h = WORST_S_PER_100 * EPOCHS / 100.0 / 3600.0
+    chk(WALL_S / (WORST_S_PER_100 * EPOCHS / 100.0) >= 2.0 and WALL_S > 4 * 3600 and 12 * WALL_S / 3600 == 60,
+        "WALL 05:00:00 = %.2fx the worst measured run (%.3f h at 300 ep); > gpu-short's 4 h; hard bound 60 GPU-h"
+        % (WALL_S / (WORST_S_PER_100 * EPOCHS / 100.0), worst_h))
+    chk(len(set(SEEDS)) == 3 and SEEDS == (93, 94, 95), "seeds {93,94,95} (pre-assigned)")
+
+    print("\nA2. THE HORIZON RE-DERIVED FROM cvt2 / cvt3's RECORDS ON THIS HOST (analysis/cvt5_registration_derivations.py)")
+    have = runsdir and all(os.path.isdir(os.path.join(runsdir, b, "probe_%s-%s-s%d" % (b, a, s)))
+                           for b, a, s in (("cvt2", "K13", 87), ("cvt2", "K33", 89), ("cvt3", "HEAD", 86)))
+    dmod = _load_deriv()
+    if dmod is None:
+        chk(False, "analysis/cvt5_registration_derivations.py present")
+    elif not have:
+        note("cvt2 / cvt3 probe records not under %s -- the horizon's derivation is recorded at 238.2" % runsdir)
+    else:
+        res = dmod.derive(runsdir, quiet=True)
+        chk(res["PIN_BOUND_R2"] == PIN_BOUND_R2 and res["PIN_BOUND_EXACT_TAIL"] == PIN_BOUND_EXACT_TAIL
+            and res["E_POST"] == E_POST and res["E_TAIL"] == E_TAIL and res["E_MIN"] == E_MIN and res["E"] == EPOCHS
+            and res["HEAD_FIRST_R2_MAX"] == HEAD_FIRST_R2_MAX and res["PIN_BOUND_R2_WHO"] == "s87 ln ep>=30",
+            "the horizon re-derived from cvt2/cvt3's probe records on this host: PIN_BOUND_R2 %.1f (%s), exact tail %.1f, "
+            "E_MIN %d, E %d, HEAD first r<=2 max %.1f" % (res["PIN_BOUND_R2"], res["PIN_BOUND_R2_WHO"], res["PIN_BOUND_EXACT_TAIL"],
+                                                        res["E_MIN"], res["E"], res["HEAD_FIRST_R2_MAX"]))
+        k33 = res["k33"]
+        chk(sorted(k33) == [87, 88, 89] and [k33[s][1] for s in (87, 88, 89)] == [38.4, 85.8, 97.4]
+            and all(k33[s][3] == 0 and k33[s][2] <= PIN_RATIO_MAX for s in k33),
+            "K33 premise re-derived: exact-clamp pinned-from 38.4 / 85.8 / 97.4 (236.4(3)), yet 0 records above r 2 after "
+            "the first r <= 2 and max r %s" % "/".join("%.4f" % k33[s][2] for s in (87, 88, 89)))
+        chk(all(d["first_r2"] is None and d["med_r"] >= FREE_RATIO_MIN for d in res["k13"].values()),
+            "K13 premise re-derived: no cvt2 K13 complement reached r <= 2 by epoch 100 (FREE by the gate at 100)")
+        for s, d in sorted(res["k13"].items()):
+            gs = group_stats(load_probe(runsdir, "K13", s, "cvt2"), 0)
+            chk(classify(gs["med_r"]) == "FREE" and abs(gs["terminal"] - d["terminal"]) < 1e-12,
+                "this scorer's group_stats() on cvt2 K13 s%d agrees with the derivation (terminal %.4f, median r %.3f, FREE)"
+                % (s, gs["terminal"], gs["med_r"]))
+        for s in (87, 88, 89):
+            gs = group_stats(load_probe(runsdir, "HEAD", s, "cvt2"), 0)
+            chk(classify(gs["med_r"]) == "PINNED" and gs["first_r2"] is not None and gs["first_r2"] <= HEAD_FIRST_R2_MAX,
+                "this scorer's pin gate on cvt2 HEAD s%d: PINNED, first r <= 2 at %.1f" % (s, gs["first_r2"]))
+
+    print("\nB. THE FROZEN MANIFEST AND THE SPEC STRINGS (PlainNet indices)")
+    t = r18_tensors(True)
+    pt = r18_tensors(False)
+    names = [n for n, _q, _o in t]
+    numel = [q_ for _n, q_, _o in t]
+    chk(len(t) == NTENS and sum(numel) == TOTPAR, "PlainNet18_c100: %d tensors, %d parameters" % (NTENS, TOTPAR))
+    chk(len(pt) == PARENT_NTENS and [n for n, _q, _o in pt if n not in names] == list(SHORTCUT_9),
+        "PlainNet == ResNet18_c100 minus EXACTLY the 9 shortcut tensors")
+    chk(names[IDX_HEAD - 1] == NAME_HEAD and names[IDX_TWIN - 1] == NAME_TWIN
+        and numel[IDX_HEAD - 1] == numel[IDX_TWIN - 1] == 512,
+        "idx 50 = layer4.1.bn2.weight, idx 47 = layer4.1.bn1.weight, both numel 512 (by NAME)")
+    g = parse_sets(HEAD_SPEC, names)
+    chk(len(g) == 2 and [len(x) for x in g] == HEAD_SIZES and g[1] == [IDX_HEAD]
+        and [sum(numel[i - 1] for i in x) for x in g] == HEAD_PARAMS and sorted(g[0] + g[1]) == list(range(1, NTENS + 1))
+        and IDX_TWIN in g[0], "HEAD / K13 / K33: a partition of 1..53, [52,1], isolates 50, the twin 47 in the complement")
+    c2man = os.path.join(runsdir, "cvt2", "PARTITION-MANIFEST.txt") if runsdir else ""
+    if c2man and os.path.exists(c2man):
+        mine = synthetic_manifest_text().splitlines()
+        theirs = open(c2man).read().splitlines()
+        tens_ok = [l for l in mine if l.startswith("TENSOR ") or l.startswith("W512 ")] == \
+                  [l for l in theirs if l.startswith("TENSOR ") or l.startswith("W512 ")]
+        arm_ok = all(l in theirs for l in mine if l.split(" ")[0] in ("ARMSPEC", "VOTEW", "WITNESS"))
+        chk(tens_ok and arm_ok, "every TENSOR / W512 line equals cvt2's LIVE manifest, and every ARMSPEC / VOTEW / WITNESS line is one of cvt2's")
+    else:
+        note("cvt2's manifest not under %s -- guard 4d compares the live manifest instead" % runsdir)
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(),
+            "B the LIVE manifest guard 4 wrote is BYTE-IDENTICAL to synthetic_manifest_text()")
+    else:
+        note("no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+
+    print("\nC. CORPUS PREMISES AND THE NOISE FLOOR -- read THROUGH corpus_exclusions.filter_rows (OPERATIONS.md s36)")
+    raw = read_corpus_raw(csvpath)
+    if raw is None:
+        skip("corpus premises -- %s not readable" % csvpath)
+    else:
+        sha = file_sha(csvpath)
+        reg = sha == REG_CORPUS_SHA256
+        ex_path = corpus_exclusions.DEFAULT_TSV
+        ex_sha = file_sha(ex_path) if os.path.exists(ex_path) else None
+        rows = read_corpus(csvpath)
+        note("corpus %d raw rows, %d after filter_rows and %s- dropped, sha %s... -- %s" % (
+            len(raw), len(rows), PREFIX, sha[:12],
+            "THE REGISTRATION CORPUS" if reg else "not the registration corpus: drift is NOTED, never failed"))
+        chk(inspect.getsource(read_corpus).count("corpus_exclusions.filter_rows") == 1,
+            "read_corpus() -- the ONLY reader every corpus statistic here uses -- calls corpus_exclusions.filter_rows")
+        if reg:
+            chk(len(raw) == REG_CORPUS_ROWS and ex_sha == REG_EXCLUSIONS_SHA256
+                and len(raw) - len(corpus_exclusions.filter_rows(raw)) == REG_EXCLUDED_ROWS,
+                "registration corpus: %d rows, CORPUS-EXCLUSIONS.tsv at its sha, %d rows dropped by filter_rows"
+                % (REG_CORPUS_ROWS, REG_EXCLUDED_ROWS))
+        for nm, (frozen, net, ep, fdf) in SIGMA_VARIANTS.items():
+            fil = pooled_sigma(rows, net, ep)
+            print("       %-17s filtered %s  df %s  cells %s" % (nm, fmt(fil[0], 12), fil[1], fil[2]))
+            if reg:
+                chk(fil[0] is not None and abs(fil[0] - frozen) < 1e-12 and fil[1] == fdf,
+                    "%s re-derives THROUGH filter_rows == frozen %.17g (df %d)" % (nm, frozen, fdf))
+            else:
+                note("%s filtered %s vs frozen %.17g -- feeds no bar (O2)" % (nm, fmt(fil[0], 12), frozen))
+        naive = pooled_sigma([r for r in raw if not r.get("run", "").startswith(PREFIX + "-")], NET, 100)
+        print("       SIGMA_PLAIN_100 NAIVE (unfiltered) %s  df %s" % (fmt(naive[0], 12), naive[1]))
+        if reg:
+            chk(naive[0] is not None and abs(naive[0] - SIGMA_PLAIN_UNFILTERED) < 1e-12
+                and naive[0] > 5 * SIGMA_VARIANTS["SIGMA_PLAIN_100"][0],
+                "the UNFILTERED PlainNet sigma is %.6f -- NOT the frozen literal (the trap filter_rows closes)" % naive[0])
+        n_pl = sorted({r["run"].split("-")[0] for r in raw if r.get("network") == NET})
+        chk(set(n_pl) <= {"cpl1", "cpl2", "cvt1", "cvt2", "cvt3"}, "%s appears ONLY in cpl1/cpl2/cvt1/cvt2/cvt3 rows" % NET, str(n_pl))
+        chk(not any(r.get("network") == NET and r.get("epochs_requested") != "100" for r in raw),
+            "no PlainNet row has ever run past 100 epochs (the long-horizon floor is borrowed, disclosed)")
+        chk(not any(r.get("seed") in ("93", "94", "95") for r in raw), "ZERO corpus rows carry seed 93, 94 or 95")
+        chk(os.path.exists(ex_path) and not any(e["batch"] == PREFIX for e in corpus_exclusions.load(ex_path)),
+            "CORPUS-EXCLUSIONS.tsv lists no cvt5 row yet")
+        note("THE CSV HAS NO VOTE_W COLUMN: at ingest the 6 cvt5 K13/K33 rows carry HEAD's cell key -- the landing track "
+             "must append them to results/CORPUS-EXCLUSIONS.tsv in the SAME commit (s36); k01/HEAD print VOTE_W: off")
+
+    print("\nD. THE FLOOR TABLE (164.6).  k01 is the ANCHOR.  Levels UNSURE.")
+    floor_top = B100["k01"][1] + NULL_BAR + 1.0
+    for acc in list(ACCOUNTS) + ["BROKEN-PATCH"]:
+        p100 = ACCOUNT_B100.get(acc, B100)
+        pE = ACCOUNTS.get(acc, ACCOUNTS_E_BROKEN)
+        print("  %-28s" % acc)
+        for a in ARMS:
+            print("      %-5s @100 %4.0f-%-4.0f  @300 %4.0f-%-4.0f  above chance %+5.1f  below ceiling %5.1f  %s"
+                  % (a, p100[a][0], p100[a][1], pE[a][0], pE[a][1], pE[a][0] - CHANCE, 100 - pE[a][1],
+                     "ANCHOR (a LOCATION)" if a == "k01" else ("off the floor band by %+.1f pp" % (pE[a][0] - floor_top))))
+        lo_non = min(min(p100[a][0], pE[a][0]) for a in ARMS if a != "k01")
+        if acc in FLOOR_ACCOUNTS:
+            chk(lo_non < floor_top, "%-28s DECLARED floor account: non-anchor arms predicted at the floor; such readings are "
+                                    "BOUNDS (FLOOR-READINGS-ARE-BOUNDS)" % acc)
+        else:
+            chk(lo_non >= floor_top, "%-28s FLOOR GATE: no non-anchor arm predicted at the floor (lowest %.0f >= %.1f)"
+                % (acc, lo_non, floor_top))
+        chk(max(max(p100[a][1], pE[a][1]) for a in ARMS) <= 100 - 25, "%-28s every predicted level >= 25 pp under the ceiling" % acc)
+        m100 = dict((a, (p100[a][0] + p100[a][1]) / 2.0) for a in ARMS)
+        mE = dict((a, (pE[a][0] + pE[a][1]) / 2.0) for a in ARMS)
+        ga = decide_global(m100, False)
+        A_ = decide_a(m100, mE)
+        B_, _r = decide_b(m100, mE)
+        chk(ga is None and (A_, B_) == EXPECTED[acc], "%-28s midpoints land in %s | %s" % (acc, EXPECTED[acc][0], EXPECTED[acc][1]),
+            "%s | %s | %s" % (ga, A_, B_))
+    chk(len(set(EXPECTED.values())) == len(EXPECTED), "the seven accounts land in seven DIFFERENT (A, B) outcomes at their midpoints")
+    for acc in TESTED_ACCOUNTS:
+        pE = ACCOUNTS[acc]
+        chk(min(pE[a][0] for a in ARMS if a != "k01") - B100["k01"][1] >= 14.0,
+            "%s (a tested account): every non-anchor arm >= 14 pp above the k01 band at both horizons" % acc)
+    rho_lo = (ACCOUNTS["DELAYED-COLLAPSE"]["HEAD"][0] - ACCOUNTS["DELAYED-COLLAPSE"]["k01"][1]) / (B100["HEAD"][1] - B100["k01"][0])
+    chk(rho_lo < 0 and (ACCOUNTS["EQUILIBRIUM+FREEZE-HOLDS"]["K13"][1] - ACCOUNTS["EQUILIBRIUM+FREEZE-HOLDS"]["K33"][0]) > 25,
+        "both primaries are predicted-reachable on BOTH sides (RHO < 0 inside DELAYED-COLLAPSE's bands; G13 up to +28)")
+
+    print("\nE. THE REAL score() ON SYNTHETIC 300-EPOCH RUNS (invented numbers; evidence of nothing)")
+    tmp = tempfile.mkdtemp(prefix="cvt5_selftest_")
+    template = os.path.join(tmp, "_probe_template")
+    _e_probe_template(template)
+    gnman = synthetic_manifest_text().replace("PlainNet18_c100", "ResNet18_gn_c100")
+    k13_hover = dict((("K13", s), _e_probe_records("K13", seed=s, profile="hover")) for s in SEEDS)
+    k13_neither = dict((("K13", s), _e_probe_records("K13", seed=s, profile="neither")) for s in SEEDS)
+    k13_late = dict((("K13", s), _e_probe_records("K13", seed=s, profile="pin280")) for s in SEEDS)
+    k33_reopen = {("K33", 94): _e_probe_records("K33", seed=94, profile="reopen")}
+    k33_clean = dict((("K33", s), _e_probe_records("K33", seed=s, profile="pin36")) for s in SEEDS)
+    unweighted_k33 = _e_probe_records("K33", weights={}, seed=94)
+    weighted_k01 = _e_probe_records("k01", weights={47: 13.0}, seed=93)
+    weighted_head = _e_probe_records("HEAD", weights={47: 33.0}, seed=95)
+    wrong_k = _e_probe_records("K13", weights={47: 33.0}, seed=94)
+    garbled = _e_probe_records("K13", seed=95)[:1499] + ["{not json"]
+    short_probe = _e_probe_records("HEAD", n=500, seed=93)
+    cases = [
+        # label, l100 over, lE over, kw, want prefix
+        ("EQUILIBRIUM + SURVIVES (pinned)", {}, {}, {}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES | K33-HOLDS-PINNED"),
+        ("DELAY + SURVIVES", {}, {"K13": 37.0}, {}, "GRADED-WAS-A-DELAY | RESCUE-SURVIVES | K33-HOLDS-PINNED"),
+        ("PARTLY A DELAY", {}, {"K13": 43.0}, {}, "GRADED-PARTLY-A-DELAY | RESCUE-SURVIVES"),
+        ("K13 recovers to HEAD", {}, {"K13": 62.0}, {}, "K13-RECOVERS-TO-HEAD | RESCUE-SURVIVES"),
+        ("K13 rises, not to HEAD", {}, {"K13": 58.0}, {}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("HEAD attenuates", {}, {"HEAD": 45.0, "K13": 44.0, "K33": 30.0}, {}, "GRADED-PARTLY-A-DELAY | RESCUE-ATTENUATES"),
+        ("HEAD collapses", {}, {"HEAD": 15.0, "K13": 14.0, "K33": 13.0}, {}, "GRADED-WAS-A-DELAY | RESCUE-COLLAPSES"),
+        ("RHO below 0", {}, {"HEAD": 8.0, "K13": 9.0, "K33": 8.5}, {}, "GRADED-WAS-A-DELAY | RESCUE-COLLAPSES"),
+        ("HEAD rises (RHO > 1)", {}, {"HEAD": 70.0}, {}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("K13 below K33", {}, {"K13": 29.0}, {}, "K13-BELOW-K33 | RESCUE-SURVIVES"),
+        ("K13 above HEAD", {}, {"K13": 71.0}, {}, "K13-ABOVE-HEAD | RESCUE-SURVIVES"),
+        ("premise: K13 at HEAD at 100", {"K13": 62.0}, {}, {}, "K13-PREMISE-NOT-REPLICATED | RESCUE-SURVIVES"),
+        ("premise: K13 at K33 at 100", {"K13": 39.0}, {}, {}, "K13-PREMISE-NOT-REPLICATED | RESCUE-SURVIVES"),
+        ("premise: K33 not collapsed", {"K33": 50.0, "K13": 57.0}, {}, {}, "K13-PREMISE-NOT-REPLICATED"),
+        ("BROKEN-PATCH levels", {"K13": 64.0, "K33": 63.8}, {"K13": 64.2, "K33": 64.0}, {}, "K13-PREMISE-NOT-REPLICATED"),
+        ("K13 split at 300", {}, {}, {"over": {("K13", 95): (52.3, 36.0)}}, "UNRESOLVED-K13-SPLIT | RESCUE-SURVIVES"),
+        ("K33 diverged at 300", {}, {}, {"over": {("K33", 94): (35.6, 50.0)}}, "UNRESOLVED-K33-DIVERGED | RESCUE-SURVIVES | K33-SPLIT-AT-300"),
+        ("HEAD diverged at 300", {}, {}, {"over": {("HEAD", 93): (64.4, 50.0)}}, "K-DEPENDENT-EQUILIBRIUM | UNRESOLVED-HEAD-DIVERGED"),
+        ("diverged at 100", {}, {}, {"over": {("K33", 94): (45.0, 35.7)}}, "UNRESOLVED-DIVERGED"),
+        ("scalar not collapsed", {"k01": 30.0}, {"k01": 30.0}, {}, "SCALAR-NOT-COLLAPSED"),
+        ("positive control fails", {"HEAD": 25.0, "K13": 25.0, "K33": 25.0}, {"HEAD": 25.0}, {}, "POSITIVE-CONTROL-FAILED"),
+        ("near-bar DELAY just inside", {}, {"K13": 35.7 + MATCH_BAR - 0.05}, {}, "GRADED-WAS-A-DELAY"),
+        ("near-bar DELAY just outside", {}, {"K13": 35.7 + MATCH_BAR + 0.05}, {}, "GRADED-PARTLY-A-DELAY"),
+        ("near-bar DROP just inside", {}, {"K13": 52.3 - MATCH_BAR + 0.05}, {}, "K-DEPENDENT-EQUILIBRIUM"),
+        ("near-bar DROP just outside", {}, {"K13": 52.3 - MATCH_BAR - 0.05}, {}, "GRADED-PARTLY-A-DELAY"),
+        ("near-bar SURVIVE just inside", {}, {"HEAD": 11.6 + SURVIVE_FRAC * 52.9 + 0.1}, {}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("near-bar SURVIVE just outside", {}, {"HEAD": 11.6 + SURVIVE_FRAC * 52.9 - 0.1, "K13": 47.0}, {}, "GRADED-PARTLY-A-DELAY | RESCUE-ATTENUATES"),
+        ("near-bar REFUTE just inside", {}, {"HEAD": 11.6 + REFUTE_BAR - 0.05, "K13": 16.0, "K33": 15.0}, {}, "GRADED-WAS-A-DELAY | RESCUE-COLLAPSES"),
+        ("near-bar REFUTE just outside", {}, {"HEAD": 11.6 + REFUTE_BAR + 0.05, "K13": 16.0, "K33": 15.0}, {}, "GRADED-WAS-A-DELAY | RESCUE-ATTENUATES"),
+        ("pin: K13 never pins (hover, FREE)", {}, {}, {"probe_break": k13_hover}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("pin: K13 NEITHER", {}, {}, {"probe_break": k13_neither}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("pin: K13 pins after the bound", {}, {}, {"probe_break": k13_late}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES"),
+        ("pin: K33 re-opens on one seed", {}, {}, {"probe_break": k33_reopen}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES | K33-REOPENS"),
+        ("level: K33 rises by 5", {}, {"K33": 41.0}, {}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES | K33-REOPENS"),
+        ("pin: K33 continuous clamp", {}, {}, {"probe_break": k33_clean}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES | K33-HOLDS-PINNED"),
+        ("harness: every arm tiny", {"k01": 3.0, "HEAD": 3.0, "K13": 3.0, "K33": 3.0}, {"k01": 3.0, "HEAD": 3.0, "K13": 3.0, "K33": 3.0}, {}, "HARNESS-UNSOUND"),
+        ("harness: AUGMENT=0 on one run", {}, {}, {"env_break": ("K33", 95)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS spec scalar on K13", {}, {}, {"spec_break": ("K13", 94)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS --num-epochs 100 on HEAD", {}, {}, {"epochs_break": ("HEAD", 93)}, "HARNESS-UNSOUND"),
+        ("harness: K13 printed VOTE_W off", {}, {}, {"vw_break": (("K13", 93), WITNESS["k01"])}, "HARNESS-UNSOUND"),
+        ("harness: K33 printed K13's witness", {}, {}, {"vw_break": (("K33", 95), WITNESS["K13"])}, "HARNESS-UNSOUND"),
+        ("harness: HEAD printed an on-line", {}, {}, {"vw_break": (("HEAD", 94), WITNESS["K33"])}, "HARNESS-UNSOUND"),
+        ("harness: no VOTE_W line (unpatched tree)", {}, {}, {"vw_break": (("k01", 95), "")}, "HARNESS-UNSOUND"),
+        ("harness: manifest names another net", {}, {}, {"manifest": gnman}, "HARNESS-UNSOUND"),
+        ("harness: cvt2's 100-epoch manifest", {}, {}, {"manifest": synthetic_manifest_text().replace("EPOCHS 300\nCTRL_EPOCHS 100\nMETA_STEPS 150000", "EPOCHS 100\nMETA_STEPS 50000")}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the unpatched HF", {}, {}, {"prov": {"hf": HF_PRE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the live build_network", {}, {}, {"prov": {"bn": PRE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another runner", {}, {}, {"prov": {"runner": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another train.py", {}, {}, {"prov": {"train": "1" * 64}}, "HARNESS-UNSOUND"),
+        ("harness: provenance dry-run", {}, {}, {"prov": {"mode": "dry-run"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another scorer", {}, {}, {"prov": {"scorer": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("BROKEN PATCH: K33's z is the UNWEIGHTED sum", {"K13": 64.0, "K33": 63.8}, {}, {"probe_break": {("K33", 94): unweighted_k33}}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN PATCH: k01's z carries a weight", {}, {}, {"probe_break": {("k01", 93): weighted_k01}}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN PATCH: HEAD's z carries x33", {}, {}, {"probe_break": {("HEAD", 95): weighted_head}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG K: K13's records carry x33", {}, {}, {"probe_break": {("K13", 94): wrong_k}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a K13 file garbled", {}, {}, {"probe_break": {("K13", 95): garbled}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a K33 probe dir missing", {}, {}, {"probe_drop": ("K33", 93)}, "PATCH-NOT-VERIFIED"),
+        ("probe: a HEAD file short (500 records, a 100-epoch run's)", {}, {}, {"probe_break": {("HEAD", 93): short_probe}}, "PATCH-NOT-VERIFIED"),
+        ("a DROPPED run", {}, {}, {"drop": ("K13", 94)}, "INCOMPLETE"),
+        ("a run cut at 250 epochs", {}, {}, {"short": ("HEAD", 95)}, "INCOMPLETE"),
+        ("a TRUNCATED higher-jid resubmission", {}, {}, {"shadow": ("K33", 93)}, "K-DEPENDENT-EQUILIBRIUM | RESCUE-SURVIVES | K33-HOLDS-PINNED"),
+    ]
+    results = {}
+    for lab, l1, le, kw, want in cases:
+        d = os.path.join(tmp, re.sub(r"\W+", "_", lab))
+        os.makedirs(d)
+        _e_build(d, template, l100=l1, lE=le, **kw)
+        rc, fin, out = _e_score(d, csvpath)
+        results[lab] = (rc, fin, out, d)
+        chk(fin.startswith("FINAL: %s" % want), "E %-50s -> %s" % (lab, want), fin[:120])
+    rc, fin, out, dpath = results["EQUILIBRIUM + SURVIVES (pinned)"]
+    toks = fin[len("FINAL: "):].split(" | ")
+    chk(rc == 0 and "HARNESS-CLEAN" in toks and "PATCH-BITES" in toks and "HORIZON-300" in toks and "NO-TIME-GATE" in toks
+        and "K13-COMPLEMENT-PINNED" in toks and "K13-PIN-EPOCH:149.0" in toks and "K13-POST-PIN-WINDOW:151.0" in toks
+        and "K13-WINDOW-MEETS-W100" in toks and "K13-PIN-INSIDE-BOUND" in toks and "K13-FROZEN-AT-PIN" in toks
+        and "HEAD-COMPLEMENT-PINNED" in toks and "HEAD-PIN-EPOCH:59.6" in toks and "HEAD-FROZEN-AT-PIN" in toks
+        and "K33-COMPLEMENT-PINNED" in toks and "K33-EXACT-CLAMP-EXCURSIONS" in toks and "K01-PINNED" in toks
+        and "FLOOR-HOLDS" in toks and "TRAIN-AGREES-A" in toks and "TRAIN-AGREES-B" in toks and "UNRESOLVED-NOT-PINNED" not in toks,
+        "E the base case exits 0 with the unconditional stamps and the full K13 / HEAD / K33 pin-stamp sets", fin[:400])
+    for lab, must, mustnot in (("pin: K13 never pins (hover, FREE)", ("K13-COMPLEMENT-FREE", "UNRESOLVED-NOT-PINNED", "K13-POST-PIN-UNMEASURED"), ("K13-PIN-EPOCH",)),
+                               ("pin: K13 NEITHER", ("K13-COMPLEMENT-NEITHER", "UNRESOLVED-NOT-PINNED"), ("K13-COMPLEMENT-PINNED",)),
+                               ("pin: K13 pins after the bound", ("K13-COMPLEMENT-PINNED", "K13-PIN-AFTER-BOUND", "K13-WINDOW-SHORT"), ("K13-PIN-INSIDE-BOUND",)),
+                               ("pin: K33 continuous clamp", ("K33-EXACT-CLAMP-CONTINUOUS",), ("K33-EXACT-CLAMP-EXCURSIONS",)),
+                               ("DELAY + SURVIVES", ("K13-LEVEL-FALLS",), ()),
+                               ("K13 rises, not to HEAD", ("K13-LEVEL-RISES",), ()),
+                               ("HEAD attenuates", ("ATTENUATE-MILD", "HEAD-LEVEL-FALLS", "HEAD-DECAYS-AFTER-PIN"), ()),
+                               ("HEAD collapses", ("FLOOR-READINGS-ARE-BOUNDS",), ()),
+                               ("K13 split at 300", ("K13-s95:GRADED-WAS-A-DELAY", "K13-s93:K-DEPENDENT-EQUILIBRIUM"), ())):
+        tk = results[lab][1][len("FINAL: "):].split(" | ")
+        chk(all(m in tk for m in must) and not any(any(t.startswith(x) for t in tk) for x in mustnot),
+            "E %-38s stamps %s" % (lab, ", ".join(must)), results[lab][1][:300])
+    pin_same = all(results[lb][1][len("FINAL: "):].split(" | ")[:3] == toks[:3]
+                   for lb in ("pin: K13 never pins (hover, FREE)", "pin: K13 NEITHER", "pin: K13 pins after the bound"))
+    chk(pin_same, "E the pin state NEVER moves (a), (b) or (c): three pin profiles, one set of branches")
+    chk(results["BROKEN PATCH: K33's z is the UNWEIGHTED sum"][0] == 1 and results["WRONG K: K13's records carry x33"][0] == 1,
+        "E the BROKEN-PATCH null and a WRONG-K run exit 1 and reach NO level branch")
+    chk(results["a DROPPED run"][0] == 2 and results["a run cut at 250 epochs"][0] == 2, "E a DROPPED run and a 250-epoch run exit 2 (INCOMPLETE)")
+    chk(results["harness: AUGMENT=0 on one run"][0] == 1, "E a harness failure exits 1")
+    chk(results["a TRUNCATED higher-jid resubmission"][1] == results["EQUILIBRIUM + SURVIVES (pinned)"][1],
+        "E a truncated higher-jid resubmission does not shadow a complete run")
+    chk("G-BITE K33   s93  records 1500  bad 0" in out and "unweighted-match 0" in out,
+        "E G-BITE reads 1,500 records per run and counts informative records on K13 / K33")
+    chk("DOWN fraction" in out and "g1 pinned-from" in out, "E the descriptive readout runs (after FINAL)")
+
+    print("\n   O2 INVARIANCE: the SAME synthetic runs against four corpora")
+    variants = _e_csv_variants(csvpath if csvpath and os.path.exists(csvpath) else None, tmp)
+    for case in ("EQUILIBRIUM + SURVIVES (pinned)", "DELAY + SURVIVES", "near-bar SURVIVE just inside"):
+        ref_fin, ref_bars = None, None
+        dd = results[case][3]
+        for lab in ("real", "real+invented", "minimal-invented", "no-corpus"):
+            if lab not in variants:
+                skip("O2 %s corpus not available on this host" % lab)
+                continue
+            rc, fin, out = _e_score(dd, variants[lab])
+            bars = _bar_lines(out)
+            if ref_fin is None:
+                ref_fin, ref_bars = fin, bars
+            chk(fin == ref_fin and bars == ref_bars and len(bars) >= 9,
+                "O2 %-30s %-17s FINAL and SIGMA/SE/READ_BAR/bars/PRIMARY/branch lines are IDENTICAL" % (case, lab), fin[:44])
+    if "real+invented" in variants:
+        a_ = pooled_sigma(read_corpus(variants["real"]), NET, 100)[0]
+        b_ = pooled_sigma(read_corpus(variants["real+invented"]), NET, 100)[0]
+        c_ = pooled_sigma(read_corpus(variants["real+invented"]), NET, 300)[0]
+        chk(a_ is not None and b_ is not None and b_ > 5 * a_ and c_ is not None and c_ > 5 * SIGMA_PRIOR,
+            "O2 non-vacuity: the invented rows MOVE the filtered PlainNet sigma at 100 (%.4f -> %.4f) and CREATE one at 300 (%.4f); FINAL did not move"
+            % (a_ or 0, b_ or 0, c_ or 0))
+
+    print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION, as a subprocess")
+    me = os.path.abspath(__file__)
+    try:
+        p = subprocess.run([sys.executable, me, dpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 0 and fl and fl[-1] == results["EQUILIBRIUM + SURVIVES (pinned)"][1],
+            "`python3 %s <runsdir>` exits 0 with the in-process FINAL line" % os.path.basename(me), "rc %d" % p.returncode)
+        p = subprocess.run([sys.executable, me, results["a DROPPED run"][3]], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 2 and fl and fl[-1].startswith("FINAL: INCOMPLETE"),
+            "... and on a dropped run exits 2 with FINAL: INCOMPLETE", "rc %d" % p.returncode)
+    except Exception as e:
+        chk(False, "subprocess invocation", "%s: %s" % (type(e).__name__, e))
+
+    print("\nF. THE BRANCH MAP IS TOTAL -- 6,000 random in-batch draws, every outcome registered")
+    import random
+    rnd = random.Random(20260916)
+    seen = set()
+    for _ in range(6000):
+        m100 = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        mE = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        if rnd.random() < 0.6:
+            m100.update({"k01": rnd.uniform(8, 16), "HEAD": rnd.uniform(56, 72), "K13": rnd.uniform(45, 56), "K33": rnd.uniform(30, 40)})
+            mE.update({"k01": rnd.uniform(8, 16), "HEAD": rnd.uniform(5, 75), "K13": rnd.uniform(20, 75), "K33": rnd.uniform(20, 45)})
+        gl = decide_global(m100, rnd.random() < 0.03)
+        if gl:
+            seen.add(gl)
+            continue
+        seen.add(decide_a(m100, mE, rnd.random() < 0.03, rnd.random() < 0.03))
+        seen.add(decide_b(m100, mE, rnd.random() < 0.03)[0])
+        cl = [rnd.choice(["PINNED", "FREE", "NEITHER"]) for _s in SEEDS]
+        mr = [rnd.choice([1.5, 1.9, 5.0, 12.0]) for _s in SEEDS]
+        seen.add(decide_c(m100, mE, cl, mr, rnd.random() < 0.03))
+    chk(seen <= set(LICENSE), "every outcome the deciders return has a registered licence text", "%d distinct" % len(seen))
+    registered = set(LICENSE) - {"INCOMPLETE", "HARNESS-UNSOUND", "PATCH-NOT-VERIFIED"}
+    chk(registered <= seen, "every registered outcome is reached by the sweep", "missing %s" % sorted(registered - seen))
+
+    print("\nG. RULE 21 PREMISE: no cvt5 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cvt5-*.out under %s" % runsdir, "%d found" % len(runs))
+    if csvpath and os.path.exists(csvpath):
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in csv.DictReader(open(csvpath))), "no cvt5- row in the CSV")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cvt5 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cVT5_plainhorizon_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cvt5/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

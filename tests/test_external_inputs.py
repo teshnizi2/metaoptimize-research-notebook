@@ -22,6 +22,8 @@ WORKSPACE_OR_REPO_TESTS = {
     "test_export_research.ResearchExportTests.test_cgn3_row_comes_from_the_pinned_landing_commit",
     "test_export_research.ResearchExportTests.test_cvt23_amendments_change_wording_only",
     "test_export_research.ResearchExportTests.test_cvt23_rows_come_from_the_pinned_landing_commit",
+    "test_export_research.ResearchExportTests.test_cvt45_import_leaves_every_earlier_record_unchanged",
+    "test_export_research.ResearchExportTests.test_cvt45_rows_come_from_the_pinned_landing_commit",
     "test_export_research.ResearchExportTests.test_every_csv_is_published_without_row_or_column_truncation",
     "test_export_research.ResearchExportTests.test_goal_outcome_table_keeps_the_report_goals_with_current_counts",
     "test_export_research.ResearchExportTests.test_landed_row_comes_from_the_pinned_landing_commit",

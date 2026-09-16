@@ -42,8 +42,8 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   const rows = researchTimeline(data.activity, data.experiments);
   const phaseIds = new Set(rows.flatMap(row => row.experiments.map(entry => entry.id)));
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 79);
-  assert.equal(phaseIds.size, 78);
+  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 81);
+  assert.equal(phaseIds.size, 80);
   assert.equal(unlinked.length, 80);
   assert.ok(unlinked.every(entry => !phaseIds.has(entry.id)));
   assert.equal(phaseIds.size + unlinked.length, data.experiments.length);
@@ -51,7 +51,7 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   assert.deepEqual(filterByResearchPhase(data.experiments, data.activity, 'phase-08').map(entry => entry.id), ['CVK2']);
 });
 
-test('the 15-16 Sep phase links exactly the rows appended at MASTER-TABLE lines 212-221', async () => {
+test('the 15-16 Sep phase links exactly the rows appended at MASTER-TABLE lines 212-223', async () => {
   const { researchTimeline, filterByResearchPhase } = await helpers();
   const row = researchTimeline(data.activity, data.experiments).find(entry => entry.id === 'phase-09')!;
   assert.ok(row, 'phase-09 must be a documented research phase');
@@ -59,10 +59,10 @@ test('the 15-16 Sep phase links exactly the rows appended at MASTER-TABLE lines 
   assert.equal(row.startDate, '2026-09-15');
   assert.equal(row.period, '15-16 Sep 2026');
   assert.ok(row.test && row.observation && row.nextQuestion, 'the phase keeps the Test / Result / Next question format');
-  const ids = ['MT212', 'MT213', 'MT214', 'MT215', 'MT216', 'MT217', 'MT218', 'MT219', 'MT220', 'MT221'];
+  const ids = ['MT212', 'MT213', 'MT214', 'MT215', 'MT216', 'MT217', 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223'];
   assert.deepEqual(row.experiments.map(entry => entry.id), ids);
   assert.deepEqual(filterByResearchPhase(data.experiments, data.activity, 'phase-09').map(entry => entry.id), ids);
-  assert.deepEqual(row.counts, { success: 6, fail: 0, mixed: 4, unresolved: 0 });
+  assert.deepEqual(row.counts, { success: 8, fail: 0, mixed: 4, unresolved: 0 });
   assert.equal(row.methodChecks, 0);
   for (const id of ids) assert.deepEqual(data.experiments.find(e => e.id === id)!.eventIds, ['phase-09'], `${id} reverse link`);
   const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;

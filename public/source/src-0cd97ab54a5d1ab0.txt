@@ -15,8 +15,12 @@ From the command line:
     python3 analysis/corpus_exclusions.py --check [--runs <dir> ...]
 
   --check  every listed (run, job_id) is present EXACTLY once in results/all_runs.csv; no key is listed
-           twice; with --runs, the run's own raw .out carries exactly the listed witness line, and every
-           OTHER .out of a listed batch carries `VOTE_W: off` (so the list is complete for that batch);
+           twice; with --runs, the run's own raw .out carries exactly the listed witness line (of the
+           intervention kind the witness names: VOTE_W or BETA_HOLD, see KINDS), and every OTHER .out of a
+           listed batch carries that kind's `off` line (so the list is complete for that batch);
+           COMPLETENESS (CORRECTIONS 239): every .out found under --runs that is a CSV row and prints an ON
+           line of any kind is listed, with a witness of that kind (ON runs not yet in the CSV are counted,
+           not required; logs not under --runs are not read, and without --runs no log is read at all);
            then prints the noise-floor demonstration: the registered cvt1 sigmas (227.6) re-derived on
            the current corpus three ways -- as 227 did (every `cvt1-` row dropped), as a future
            registration should (only the listed rows dropped), and naively (nothing dropped).
@@ -88,6 +92,33 @@ def _pooled(rows, net):
     return (math.sqrt(ss / df) if df else float("nan")), df, nc
 
 
+# ---- --check only: the registered intervention KINDS (CORRECTIONS 239) -------------------------------------
+# One entry per harness intervention the ARGS line cannot carry: the prefix of the witness line its patched tree
+# prints on EVERY run, and the exact line it prints when off.  A listed row's kind is the entry its `witness`
+# starts with (`<prefix>:`).  A future kind is one line here.  load / keys / is_excluded / filter_rows ignore it.
+KINDS = [
+    ("VOTE_W", "VOTE_W: off"),        # patches/patch_voteweight.py, CORRECTIONS 227 (cvt1, cvt2, cvt3, cvt5)
+    ("BETA_HOLD", "BETA_HOLD: off"),  # patches/patch_betahold.py, CORRECTIONS 237 (cvt4)
+]
+
+
+def kind_of(witness):
+    for k, _off in KINDS:
+        if witness.startswith(k + ":"):
+            return k
+    return None
+
+
+def witness_lines(path):
+    """-> {prefix: [every line starting with it, in order]} for one raw .out."""
+    got = dict((k, []) for k, _off in KINDS)
+    for ln in open(path, errors="replace"):
+        for k, _off in KINDS:
+            if ln.startswith(k):
+                got[k].append(ln.rstrip("\n"))
+    return got
+
+
 def check(runs_dirs):
     bad = []
     ents = load()
@@ -112,23 +143,57 @@ def check(runs_dirs):
                         outs.setdefault(fn, os.path.join(root, fn))
         batches = set(e["batch"] for e in ents)
         listed = dict(("%s-%s.out" % (e["run"], e["job_id"]), e) for e in ents)
+        bkinds = {}
+        for e in ents:
+            if kind_of(e["witness"]) is None:
+                bad.append("%s/%s witness %r names no registered intervention kind (KINDS)"
+                           % (e["run"], e["job_id"], e["witness"][:60]))
+            else:
+                bkinds.setdefault(e["batch"], set()).add(kind_of(e["witness"]))
+        wl = {}
         n_w = n_off = 0
         for fn, p in sorted(outs.items()):
             if fn.split("-")[0] not in batches:
                 continue
-            vw = [ln.rstrip("\n") for ln in open(p, errors="replace") if ln.startswith("VOTE_W")]
+            wl[fn] = witness_lines(p)
             if fn in listed:
-                if vw != [listed[fn]["witness"]]:
-                    bad.append("%s witness %r != listed" % (fn, vw))
+                kd = kind_of(listed[fn]["witness"])
+                if kd is not None and wl[fn][kd] != [listed[fn]["witness"]]:
+                    bad.append("%s witness %r != listed" % (fn, wl[fn][kd]))
                 n_w += 1
             else:
-                if vw != ["VOTE_W: off"]:
-                    bad.append("%s is NOT listed but its witness is %r" % (fn, vw))
+                for kd, off in KINDS:
+                    if kd in bkinds.get(fn.split("-")[0], ()) and wl[fn][kd] != [off]:
+                        bad.append("%s is NOT listed but its witness is %r" % (fn, wl[fn][kd]))
                 n_off += 1
         if n_w != len(ents):
             bad.append("found %d of %d listed .out files" % (n_w, len(ents)))
-        print("  raw .out witness: %d listed runs carry their listed line; %d unlisted runs of the same batch print `VOTE_W: off`"
-              % (n_w, n_off))
+        print("  raw .out witness: %d listed runs carry their listed line; %d unlisted runs of the same batch print %s"
+              % (n_w, n_off, " / ".join("`%s`" % off for kd, off in KINDS if any(kd in s for s in bkinds.values()))))
+        # COMPLETENESS (CORRECTIONS 239): every .out found that is a CSV row and prints an ON line of any kind is
+        # listed with a witness of that kind.  A run not yet in the CSV is counted, not required (listing it would
+        # fail the present-exactly-once check above); a corpus row whose .out is not under --runs is not seen.
+        nb = len(bad)
+        n_on = n_csv = 0
+        for fn, p in sorted(outs.items()):
+            got = wl[fn] if fn in wl else witness_lines(p)
+            on = [kd for kd, off in KINDS if any(ln != off for ln in got[kd])]
+            if not on:
+                continue
+            n_on += 1
+            run, _sep, jid = fn[:-len(".out")].rpartition("-")
+            if (run, jid) not in cnt:
+                continue
+            n_csv += 1
+            for kd in on:
+                if fn not in listed:
+                    bad.append("%s is a CSV row printing an ON %s line but is NOT listed" % (fn, kd))
+                elif kind_of(listed[fn]["witness"]) != kd:
+                    bad.append("%s prints an ON %s line but is listed with a %s witness"
+                               % (fn, kd, kind_of(listed[fn]["witness"])))
+        print("  completeness (%s): %d .out files print an ON line; %d are CSV rows, every one listed with its kind: %s;"
+              " %d not in the CSV (not ingested, not required)"
+              % (" / ".join(kd for kd, _off in KINDS), n_on, n_csv, len(bad) == nb, n_on - n_csv))
     print("\nnoise-floor demonstration (227.6's definitions; cell = 15 CELLKEYS; complete, unsuperseded, std cell)")
     k = set(ks)
     variants = [("as 227 registered it: every cvt1- row dropped", [r for r in rows if not r["run"].startswith("cvt1-")]),

@@ -24,14 +24,15 @@ WORKSPACE, REPO, DATA_AUDIT = _WORKSPACE.path, _REPO.path, _AUDIT.path
 # (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
 RUN_INVENTORY = _INVENTORY.path
 CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
-RUNS = 3019
-LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12, "cvt3": 15, "cvt2": 21}
+RUNS = 3049
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12, "cvt3": 15, "cvt2": 21, "cvt4": 18, "cvt5": 12}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
 LANDED_IDS = ["MT218"]
 CGN3_IDS = ["MT219"]
 CVT23_IDS = ["MT220", "MT221"]
+CVT45_IDS = ["MT222", "MT223"]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -75,19 +76,44 @@ class ResearchExportTests(unittest.TestCase):
         import register_model
         return register_model
 
+    def test_clean_turns_markdown_escapes_into_literal_characters(self):
+        # MASTER-TABLE row 215 writes the selected cells as S\* and M\*. The escape must not leak into the notebook text,
+        # and an escaped star must not be read as an emphasis mark (that used to eat the stars between two S\* marks).
+        clean = self.model().clean
+        self.assertEqual(clean(r"PRIMARY `GAP_END` = plateau5(S\*) - plateau5(M\*) = 65.0573"), "PRIMARY GAP_END = plateau5(S*) - plateau5(M*) = 65.0573")
+        self.assertEqual(clean(r"18-19 for M\* against 80 for S\*). Selection: S\* and M\* are both max-of-5"),
+                         "18-19 for M* against 80 for S*). Selection: S* and M* are both max-of-5")
+        self.assertEqual(clean(r"AUC rung but **-2.3489 pp at S\***, hence"), "AUC rung but -2.3489 pp at S*, hence")
+        self.assertEqual(clean(r"CEIL-\* / a\_b / `\| LOWER-BOUND`"), "CEIL-* / a_b / | LOWER-BOUND")
+        self.assertEqual(clean("an *emphasised* word and 2 * 3"), "an emphasised word and 2 * 3")
+
+    def test_published_text_carries_no_markdown_escapes(self):
+        def strings(value, path):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    yield from strings(item, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    yield from strings(item, f"{path}[{index}]")
+            elif isinstance(value, str):
+                yield path, value
+        for name, value in [("research.json", self.research()), ("runs.json", self.runs())]:
+            hits = [(path, text[max(0, m.start() - 30):m.end() + 10]) for path, text in strings(value, name) for m in re.finditer(r"\\[*_|`]", text)]
+            self.assertEqual(hits, [], name)
+
     def test_complete_register_and_area_counts(self):
         data = self.research()
-        self.assertEqual(len(data["experiments"]), 158)
-        self.assertEqual(len({e["id"] for e in data["experiments"]}), 158)
+        self.assertEqual(len(data["experiments"]), 160)
+        self.assertEqual(len({e["id"] for e in data["experiments"]}), 160)
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 158)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 158, "researchQuestions": 140, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 160)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 160, "researchQuestions": 142, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
     @needs(_WORKSPACE)
     def test_register_ids_are_the_campaign_register_plus_the_imported_master_table_rows(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS) | set(CVT23_IDS))
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS) | set(CVT23_IDS) | set(CVT45_IDS))
 
     def test_published_runs_have_unique_identifiers_and_logs(self):
         runs = self.runs()
@@ -318,7 +344,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual(len(phases), 9)
         self.assertTrue(all("Documented phase" in event["detail"] for event in phases))
         self.assertTrue(any(e["kind"] == "completed-experiment" and e["date"] == "2026-09-14" for e in data["activity"]))
-        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == data["meta"]["asOf"] == "2026-09-16" for e in data["activity"]))
+        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == data["meta"]["asOf"] == "2026-09-17" for e in data["activity"]))
         self.assertTrue(all("date" not in run for run in self.runs()))
 
     def test_records_without_dated_phases_have_snapshot_import_provenance(self):
@@ -431,7 +457,7 @@ class ResearchExportTests(unittest.TestCase):
         data, runs = self.research(), self.runs()
         by_id = {e["id"]: e for e in data["experiments"]}
         phase = next(e for e in data["activity"] if e["id"] == "phase-09")
-        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS + CGN3_IDS + CVT23_IDS))
+        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS + CGN3_IDS + CVT23_IDS + CVT45_IDS))
         self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
         figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
         batches = dict(zip(APPENDED_IDS, LANDED_BATCH_RUNS))
@@ -537,8 +563,8 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
             self.assertEqual(int(row["method_checks"]), len(records) - len(research))
             self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
-        self.assertEqual(sum(int(r["records"]) for r in areas), 158)
-        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [47, 41, 29, 23, 18])
+        self.assertEqual(sum(int(r["records"]) for r in areas), 160)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [49, 41, 29, 23, 18])
 
     @needs(_WORKSPACE, _AUDIT)
     def test_goal_outcome_table_keeps_the_report_goals_with_current_counts(self):
@@ -579,7 +605,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_register_table_receipt_records_the_regeneration(self):
         audit = json.loads(DATA_AUDIT.read_text())
         receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
-        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (158, 20, "scripts/register_model.py register"))
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (160, 20, "scripts/register_model.py register"))
 
     # ---- MASTER-TABLE line 219 and the in-place amendments of rows 213 and 218 (campaign commit e3a43da, CORRECTIONS 231: cgn3) ----
     @needs(_REPO)
@@ -647,7 +673,8 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual([json.loads(r["intervention"])["arms"] for r in rows],
                          [{"MUTE50": 3, "MUTEDOWN": 3, "MUTECTL": 3}, {"K13": 3, "K33": 3, "K152": 3, "K691": 3, "K2000": 3}])
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(sorted(r["batch"] for r in intervened.values()), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15))
+        # The list has since grown by cvt4 and cvt5 (test_cvt45_rows_come_from_the_pinned_landing_commit).
+        self.assertEqual(sorted(r["batch"] for r in intervened.values() if r["batch"] in {"cvt1", "cvt2", "cvt3"}), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15))
         with self.assertRaisesRegex(ValueError, "does not match the pinned cvt3/cvt2-landing bytes"):
             pinned = model.CVT23_COMMIT
             try:
@@ -687,6 +714,58 @@ class ResearchExportTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 234 amendment"):
             model.apply_cvt23_amendments(drifted, REPO)
 
+
+    # ---- MASTER-TABLE lines 222-223 (campaign commit 643264c, CORRECTIONS 240-241: cvt4, cvt5); no row amended ----
+    @needs(_REPO)
+    def test_cvt45_rows_come_from_the_pinned_landing_commit(self):
+        model = self.model()
+        lines, before = model.cvt45_master_table(REPO), model.cvt23_master_table(REPO)
+        self.assertEqual(len(lines), 223)
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {3, 5})
+        rows = model.cvt45_rows(lines)
+        self.assertEqual([(r["id"], r["section"], r["outcome"], json.loads(r["batches"]), r["mapping_rule"], json.loads(r["figure_ids"]), r["corrected"]) for r in rows],
+                         [("MT222", "9", "success", ["cvt4"], "met", ["page-19"], ""), ("MT223", "9", "success", ["cvt5"], "met", ["page-19"], "")])
+        self.assertTrue(rows[0]["reason"].startswith("Verdict: OWN-STEP-MAGNITUDE + HARNESS-CLEAN + PATCH-BITES + HOLD-FROM-INIT + "))
+        self.assertIn("+ TRAIN-AGREES Goal met: OWN-STEP-MAGNITUDE: ", rows[0]["reason"])
+        self.assertTrue(rows[1]["reason"].startswith("Verdict: K-DEPENDENT-EQUILIBRIUM + RESCUE-SURVIVES + K33-HOLDS-PINNED + HARNESS-CLEAN + "))
+        self.assertIn("+ K01-PINNED + FLOOR-HOLDS Goal met: K-DEPENDENT-EQUILIBRIUM + RESCUE-SURVIVES + K33-HOLDS-PINNED: ", rows[1]["reason"])
+        self.assertEqual([json.loads(r["intervention"])["arms"] for r in rows],
+                         [{"HOLDLOW": 3, "HOLDSHARED": 3, "HOLDHIGH": 3, "HOLDHEAD": 3}, {"K13": 3, "K33": 3}])
+        intervened = model.intervened_runs(REPO)
+        self.assertEqual(sorted(r["batch"] for r in intervened.values()), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15 + ["cvt4"] * 12 + ["cvt5"] * 6))
+        self.assertTrue(all(r["intervention"].startswith("BETA_HOLD=") for r in intervened.values() if r["batch"] == "cvt4"))
+        with self.assertRaisesRegex(ValueError, "does not match the pinned cvt4/cvt5-landing bytes"):
+            pinned = model.CVT45_COMMIT
+            try:
+                model.CVT45_COMMIT = model.CVT23_COMMIT
+                model.cvt45_master_table(REPO)
+            finally:
+                model.CVT45_COMMIT = pinned
+        with self.assertRaisesRegex(ValueError, "exactly lines 222-223"):
+            model.appended_rows(lines[:-1], model.CVT45_ROWS, 222, 223, model.CVT45_COMMIT)
+        with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
+            pinned = model.CVT45_INTERVENTIONS_TSV_SHA256
+            try:
+                model.CVT45_INTERVENTIONS_TSV_SHA256 = model.CVT23_INTERVENTIONS_TSV_SHA256
+                model.intervened_runs(REPO)
+            finally:
+                model.CVT45_INTERVENTIONS_TSV_SHA256 = pinned
+        data, runs = self.research(), self.runs()
+        by_id = {e["id"]: e for e in data["experiments"]}
+        marked = {r["jobId"] for r in runs if "intervention" in r["parameters"]}
+        self.assertEqual(marked, set(intervened))
+        for eid, batch in [("MT222", "cvt4"), ("MT223", "cvt5")]:
+            self.assertEqual(sorted(by_id[eid]["runIds"]), sorted(r["id"] for r in runs if r["batch"] == batch))
+            self.assertIn(f"warning-{eid}-intervention", by_id[eid]["warningIds"])
+
+    @needs(_WORKSPACE, _REPO)
+    def test_cvt45_import_leaves_every_earlier_record_unchanged(self):
+        model = self.model()
+        register = model.load_register(WORKSPACE, REPO)
+        self.assertEqual([r["id"] for r in register[-2:]], ["MT222", "MT223"])
+        earlier = [r for r in register if r["id"] not in {"MT222", "MT223"}]
+        self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt4", "cvt5"} for r in earlier))
+        self.assertFalse(any("CORRECTIONS 240" in r.get("sources", "") or "CORRECTIONS 241" in r.get("sources", "") for r in earlier))
 
 if __name__ == "__main__":
     unittest.main()

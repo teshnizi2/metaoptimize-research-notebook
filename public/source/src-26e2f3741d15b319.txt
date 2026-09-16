@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""cvt4 REGISTRATION-TIME DERIVATIONS (CORRECTIONS 237).  Reads ONLY landed probe records of cvt1, cvt2 and
+cvt3 (k01, MUTE / MUTE50 and HEAD arms) and the corpus through analysis/corpus_exclusions.filter_rows.  The
+integers it prints (the two replay peaks P_HIGH and P_HEAD) and the noise floor are copied into
+analysis/cVT4_betahold_score.py as LITERALS; that scorer's selftest re-runs derive_P() on the host's records
+and requires equality.  Nothing here reads a cvt4 run.
+
+THE QUESTION.  236.7 (descriptive, UNSURE): the records point at idx 50's OWN LARGE STEP SIZE as what stalls
+the scalar arm.  cvt4 holds ONE group's beta -- layer4.1.bn2.weight's, in HEAD's grouping, so its vote stays
+OUT of the complement's sum -- while every other part of the meta-update runs unchanged (PATCH_BETAHOLD).
+
+THE SHAPE FACT THIS RESTS ON (S1).  Every landed shared-beta trajectory of k01 (9 runs) and of MUTE / MUTE50
+(6 runs), and HEAD's ISOLATED beta[1] (9 runs), is a MAX-RATE TRIANGLE: from b0 = float32(log 1e-6) beta rises
+by exactly ms = 1e-3 per meta update (Lion's maximum rate) to a peak, then falls by exactly ms per update to
+the -15 clamp, and stays there.  Measured: max |record - own triangle| <= 0.12 log units on all 24 (<= 13 %
+in step size).  So ONE integer -- the number of up-moves P -- replays a measured trajectory to that fidelity.
+
+THE HOLD SCHEDULE (the patch's `tri:<P>` mode; update n = number of completed meta updates, n = 0 at init):
+    u(0) = 0;  u(n) = min(n - 1, P) - max(0, n - 1 - P)   (n >= 1)
+    v(n) = float32( min(hi, max(lo, b0 + ms * u(n))) ),   lo = -15, hi = -2.3026
+  The first meta update of every run is a no-op (h = 0 so z = 0 and sign(0) = 0), hence n - 1.  A probe record
+  with `step` s is written after update n = s + 2, so the record's beta[1] must equal v(s + 2) and its
+  beta_pre[1] must equal v(s + 1).
+
+RULE P (written here, before any cvt4 run).  For a source set of runs, take each run's PEAK record value of the
+trajectory (max over its 500 records); P = round((median over runs of the peak value - b0) / ms).
+  P_HIGH  source: MUTE's shared beta[0] -- cvt1 MUTE s78/79/80 and cvt3 MUTE50 s84/85/86 (6 runs).  WHY MUTE and
+          not k01: HOLDSHARED (50's beta := the complement's live beta, its vote out of the sum) is, in exact
+          arithmetic, the MUTE arm (S3), so MUTE's measured shared trajectory is the step size HOLDSHARED is
+          predicted to hand 50.  Replaying it EXOGENOUSLY in HOLDHIGH matches the magnitude and removes only
+          the coupling -- HOLDHIGH vs HOLDSHARED is then a magnitude-matched test of coupling.  k01's trajectory
+          (peak epoch 17, 1/3 of MUTE's step size over epochs 15-30) is what 50 got WITH its vote in the sum,
+          a state no vote-out arm reaches; it is printed for reference and not run (a dose rung, deferred).
+          A FIXED value was rejected: a constant large beta from step 0 is large from the first step and for
+          all 100 epochs, when every landed trajectory starts at 1e-6 and pins by epoch 21-41 -- it would
+          confound magnitude with onset and duration, and no failing arm ever had it.
+  P_HEAD  source: HEAD's isolated beta[1] -- cvt1 HEAD s78-80, cvt2 HEAD s87-89, cvt3 HEAD s84-86 (9 runs).
+          HOLDHEAD replays HEAD's OWN 50-trajectory exogenously: the positive control of the hold mechanism
+          (does an exogenous, non-responsive step size on 50 by itself break the rescue?).
+
+Sections:
+  S1  per source run: peak value / epoch, pin epoch, max |dev| from its OWN max-rate triangle, r(15-30)
+  S2  RULE P -> P_HIGH, P_HEAD (and k01's for reference); the schedules' peak / pin epochs; each schedule's
+      max |dev| against every source run; r = exp(beta + 15) over epochs 15-30 and 30-40, schedule vs runs
+  S3  HOLDSHARED == MUTE in exact arithmetic (the argument, printed) + what that does to VOTE-REMOVAL's prior
+  S4  G-BITE non-vacuity on landed records: an UNHELD 50 cannot pass the schedule gate -- on every HEAD run,
+      min over EVERY integer P of max |beta[1] - v_P(s+2)|, max |beta[1] - beta[0]|, max |beta[1] - (-15)|,
+      each >> the gate tolerance 1e-5; and the Lion recomputation of every landed HEAD record (both groups)
+      from its own beta_pre / mom_pre / z_agg reproduces the recorded beta (the gate's other half)
+  S5  descriptive, NON-GATING priors: on HEAD's and MUTE's records, how often the held value would differ from
+      the value Lion writes (the override is "active") -- a counterfactual on landed trajectories
+  S6  the noise floor, 227.6's definitions, read through corpus_exclusions.filter_rows (OPERATIONS 36)
+
+  python3 analysis/cvt4_registration_derivations.py <runs dir holding cvt1/ cvt2/ cvt3/> [<all_runs.csv>]
+"""
+import csv
+import json
+import math
+import os
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+MS = 1e-3
+LO, HI = -15.0, -2.3026
+B2 = 0.9
+STEPS_PER_EPOCH = 500
+N_RECORDS = 500
+BH_TOL = 1e-5
+SRC_MUTE = (("cvt1", "MUTE", (78, 79, 80)), ("cvt3", "MUTE50", (84, 85, 86)))
+SRC_HEAD = (("cvt1", "HEAD", (78, 79, 80)), ("cvt2", "HEAD", (87, 88, 89)), ("cvt3", "HEAD", (84, 85, 86)))
+SRC_K01 = (("cvt1", "k01", (78, 79, 80)), ("cvt2", "k01", (87, 88, 89)), ("cvt3", "k01", (84, 85, 86)))
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+B0 = f32(math.log(1e-6))       # torch.log(torch.tensor(1e-6)) is float32
+
+
+def u_of(n, P):
+    if n <= 0:
+        return 0
+    return min(n - 1, P) - max(0, n - 1 - P)
+
+
+def v_of(n, P, b0=B0):
+    """the patch's tri schedule, as float32"""
+    return f32(min(HI, max(LO, b0 + MS * u_of(n, P))))
+
+
+def load(runs, batch, arm, seed):
+    p = os.path.join(runs, batch, "probe_%s-%s-s%d" % (batch, arm, seed), "probe.jsonl")
+    return [json.loads(ln) for ln in open(p) if ln.strip()]
+
+
+def traj(recs, g):
+    return [(r["step"], float(r["beta"][g])) for r in recs]
+
+
+def peak(tr):
+    return max(tr, key=lambda sv: sv[1])
+
+
+def pin_epoch(tr):
+    at = [v <= LO + 1e-4 for _s, v in tr]
+    for k in range(len(tr)):
+        if all(at[k:]):
+            return tr[k][0] / float(STEPS_PER_EPOCH)
+    return None
+
+
+def own_triangle_dev(tr):
+    s_pk, b_pk = peak(tr)
+    n_pk = s_pk + 2
+    dev = 0.0
+    for s, b in tr:
+        n = s + 2
+        v = B0 + MS * (n - 1) if n <= n_pk else b_pk - MS * (n - n_pk)
+        dev = max(dev, abs(b - max(LO, min(HI, v))))
+    return dev
+
+
+def r_window(tr, lo, hi):
+    v = [math.exp(b + 15.0) for s, b in tr if lo <= s / float(STEPS_PER_EPOCH) < hi]
+    return sum(v) / len(v)
+
+
+def sched_traj(P):
+    return [(100 * k, v_of(100 * k + 2, P)) for k in range(N_RECORDS)]
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def source_runs(runs, src, g):
+    out = []
+    for batch, arm, seeds in src:
+        for s in seeds:
+            out.append(("%s-%s-s%d" % (batch, arm, s), traj(load(runs, batch, arm, s), g)))
+    return out
+
+
+def derive_P(runs):
+    """RULE P.  -> {"HIGH": P, "HEAD": P, "K01": P}"""
+    out = {}
+    for key, src, g in (("HIGH", SRC_MUTE, 0), ("HEAD", SRC_HEAD, 1), ("K01", SRC_K01, 0)):
+        pk = median([peak(tr)[1] for _n, tr in source_runs(runs, src, g)])
+        out[key] = int(round((pk - B0) / MS))
+    return out
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    L = B2 * mom_pre + (1 - B2) * z
+    s = (L > 0) - (L < 0)
+    return max(LO, min(HI, beta_pre - MS * s)), s
+
+
+def min_over_P_maxdev(tr):
+    best, bestP = None, None
+    for P in range(0, 50001):
+        d = 0.0
+        for s, b in tr:
+            d = max(d, abs(b - v_of(s + 2, P)))
+            if best is not None and d >= best:
+                break
+        if best is None or d < best:
+            best, bestP = d, P
+    return best, bestP
+
+
+# ---- S6: the noise floor (227.6's definitions) -------------------------------------------------
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+
+def pooled_sigma(rows, net):
+    cells = {}
+    for r in rows:
+        if not (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                and (r.get("plateau5") or "").strip()):
+            continue
+        if not (r.get("granularity") is not None and r.get("epochs_requested") == "100" and r.get("augment") == "1"
+                and r.get("beta_clip") == "-15:-2.3026" and r.get("meta_stepsize") == "1e-3"
+                and r.get("alpha0") == "1e-6" and r.get("batch_size") == "100"
+                and r.get("network") == net and r.get("dataset") == "CIFAR100"):
+            continue
+        cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = sum(v) / len(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+def floor(csvpath):
+    sys.path.insert(0, HERE)
+    import corpus_exclusions as CE
+    sys.path.pop(0)
+    naive = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith("cvt4-")]
+    filt = CE.filter_rows(naive)
+    return {"rows": len(naive), "rows_filtered": len(filt),
+            "R18ALL": pooled_sigma(filt, "ResNet18_c100"), "PLAIN": pooled_sigma(filt, "PlainNet18_c100"),
+            "R18ALL_naive": pooled_sigma(naive, "ResNet18_c100"), "PLAIN_naive": pooled_sigma(naive, "PlainNet18_c100")}
+
+
+def main():
+    runs = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(HERE)), "runs_cluster_b")
+    csvpath = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(HERE), "results", "all_runs.csv")
+    print("cvt4 registration derivations (CORRECTIONS 237)")
+    print("  runs %s" % runs)
+    print("  b0 = float32(log 1e-6) = %r ; ms = %r ; clamp [%r, %r]" % (B0, MS, LO, HI))
+
+    print("\nS1  THE SHAPE: every source trajectory against its OWN max-rate triangle")
+    srcs = (("k01 shared beta[0]", SRC_K01, 0), ("MUTE shared beta[0]", SRC_MUTE, 0), ("HEAD isolated beta[1]", SRC_HEAD, 1))
+    worst = 0.0
+    for lab, src, g in srcs:
+        print("  %s" % lab)
+        for name, tr in source_runs(runs, src, g):
+            s_pk, b_pk = peak(tr)
+            d = own_triangle_dev(tr)
+            worst = max(worst, d)
+            pe = pin_epoch(tr)
+            print("    %-16s peak %.6f @ epoch %5.1f  pinned-from %s  max|dev| own triangle %.4f  r(15-30) %9.1f  r(30-40) %8.1f"
+                  % (name, b_pk, s_pk / 500.0, "never" if pe is None else "%.1f" % pe, d, r_window(tr, 15, 30), r_window(tr, 30, 40)))
+    print("  WORST max|dev| over all 24 source trajectories: %.4f log units (x%.3f in step size)" % (worst, math.exp(worst)))
+
+    print("\nS2  RULE P")
+    P = derive_P(runs)
+    for key, src, g in (("HIGH", SRC_MUTE, 0), ("HEAD", SRC_HEAD, 1), ("K01", SRC_K01, 0)):
+        pks = [peak(tr)[1] for _n, tr in source_runs(runs, src, g)]
+        tr_s = sched_traj(P[key])
+        spk = peak(tr_s)
+        print("  P_%-4s = round((median peak %.6f - b0) / ms) = %d   [peaks %s]"
+              % (key, median(pks), P[key], " ".join("%.3f" % x for x in pks)))
+        print("          schedule: peak %.6f after update %d (epoch %.2f); first at the clamp after update %d (epoch %.2f)"
+              % (v_of(P[key] + 1, P[key]), P[key] + 1, (P[key] + 1) / 500.0,
+                 P[key] + 1 + int(math.ceil((B0 + MS * P[key] - LO) / MS - 1e-9)),
+                 (P[key] + 1 + int(math.ceil((B0 + MS * P[key] - LO) / MS - 1e-9))) / 500.0))
+        print("          schedule r(15-30) %.1f  r(30-40) %.1f ; record-level peak %.6f @ epoch %.1f ; pinned-from %s"
+              % (r_window(tr_s, 15, 30), r_window(tr_s, 30, 40), spk[1], spk[0] / 500.0, pin_epoch(tr_s)))
+        for name, tr in source_runs(runs, src, g):
+            d = max(abs(b - v_of(s + 2, P[key])) for s, b in tr)
+            print("          vs %-16s max|record - v(s+2)| %.4f   r(15-30) run %9.1f" % (name, d, r_window(tr, 15, 30)))
+    print("  REGISTERED: P_HIGH %d (HOLDHIGH), P_HEAD %d (HOLDHEAD).  P_K01 %d is printed only (no k01-replay arm)."
+          % (P["HIGH"], P["HEAD"], P["K01"]))
+
+    print("\nS3  HOLDSHARED IS THE MUTE ARM IN EXACT ARITHMETIC (declared)")
+    for ln in (
+        "  MUTE (scalar, VOTE_W=layer4.1.bn2.weight:0): ONE beta b; z = sum_{i != 50} z_i (+ 0 * z_50, exactly +0.0);",
+        "    b <- clamp(b - ms sign(b2 m + (1-b2) z)); every tensor, 50 included, steps with exp(b).",
+        "  HOLDSHARED (HEAD's grouping, BETA_HOLD=layer4.1.bn2.weight:shared): group 0 = the 52 others, so",
+        "    z_0 = sum_{i != 50} z_i and m_0 is its EMA -- the same recursion as MUTE's b; beta[1] := beta[0] after",
+        "    every update and at init, so 50 also steps with exp(b).  z_50's own group-1 update is computed and",
+        "    overwritten; its momentum is dead state (never read into an applied beta; the hold never releases).",
+        "  => the two arms follow the same equations from the same initial state.  They differ only in float",
+        "    paths (python sum over 53 vs 52 terms with an exact +0.0; np.exp on a 0-d vs a 2-vector; beta on",
+        "    GPU vs CPU), which is what the real-run test measures (RR4).",
+        "  CONSEQUENCE FOR THE ACCOUNTS: MUTE sat at k01 in two batches (cvt1 10.99, cvt3 11.29).  VOTE-REMOVAL",
+        "    ('HOLDSHARED rescues like HEAD') therefore contradicts two landed batches under an arithmetic",
+        "    identity; its prior is ~0 and a HOLDSHARED rescue would first mean the two float paths diverge.",
+        "    HOLDSHARED is NOT the decisive arm -- MUTE already decided 'vote out, shared step size'.  What it adds",
+        "    here: the in-batch, in-grouping anchor that HOLDHIGH (same magnitude, uncoupled) is compared to."):
+        print(ln)
+
+    print("\nS4  G-BITE NON-VACUITY on landed HEAD records (tolerance of the schedule gate: %.0e)" % BH_TOL)
+    mm = [0, 0]
+    nrec = 0
+    for name, _tr in source_runs(runs, SRC_HEAD, 1):
+        batch, arm, s = name.split("-")
+        recs = load(runs, batch, arm, int(s[1:]))
+        tr1 = traj(recs, 1)
+        tr0 = traj(recs, 0)
+        best, bestP = min_over_P_maxdev(tr1)
+        dsh = max(abs(b1 - b0) for (_s, b1), (_t, b0) in zip(tr1, tr0))
+        dfl = max(abs(b1 - LO) for _s, b1 in tr1)
+        for r in recs:
+            nrec += 1
+            for g in (0, 1):
+                nat, _sg = lion_natural(r["beta_pre"][0][g], r["mom_pre"][0][g], r["z_agg"][0][g])
+                mm[g] += abs(nat - r["beta"][g]) > BH_TOL
+        print("  %-14s unheld beta[1]: min over ALL P of max|beta1 - v_P| %.4f (best P %d); max|beta1 - beta0| %.4f; max|beta1 + 15| %.4f"
+              % (name, best, bestP, dsh, dfl))
+    print("  Lion recomputation from each record's own beta_pre / mom_pre / z_agg == recorded beta: mismatches g0 %d, g1 %d of %d records"
+          % (mm[0], mm[1], nrec))
+
+    print("\nS5  DESCRIPTIVE PRIORS (NON-GATING): records on which the held value != the value Lion writes")
+    for name, _tr in source_runs(runs, SRC_HEAD, 1):
+        batch, arm, s = name.split("-")
+        recs = load(runs, batch, arm, int(s[1:]))
+        act = {"floor": 0, "tri_HIGH": 0, "tri_HEAD": 0}
+        up = 0
+        for r in recs:
+            L = B2 * r["mom_pre"][0][1] + (1 - B2) * r["z_agg"][0][1]
+            sgn = (L > 0) - (L < 0)
+            up += sgn < 0
+            n = r["step"] + 2
+            nat_floor = max(LO, min(HI, LO - MS * sgn))
+            act["floor"] += nat_floor != LO
+            for key in ("HIGH", "HEAD"):
+                vprev, vnow = v_of(n - 1, P[key]), v_of(n, P[key])
+                nat = f32(max(LO, min(HI, vprev - MS * sgn)))
+                act["tri_" + key] += abs(nat - vnow) > BH_TOL
+        print("  %-14s 50 votes UP on %3d/500 records | active if held: floor %3d  tri(P_HIGH) %3d  tri(P_HEAD) %3d"
+              % (name, up, act["floor"], act["tri_HIGH"], act["tri_HEAD"]))
+    for name, _tr in source_runs(runs, SRC_MUTE, 0):
+        batch, arm, s = name.split("-")
+        recs = load(runs, batch, arm, int(s[1:]))
+        dis = 0
+        for r in recs:
+            L50 = B2 * r["m_tensor"][49] + (1 - B2) * r["z_tensor"][49]
+            Ls = B2 * r["mom_pre"][0][0] + (1 - B2) * r["z_agg"][0][0]
+            s50, ss = (L50 > 0) - (L50 < 0), (Ls > 0) - (Ls < 0)
+            bp = r["beta_pre"][0][0]
+            dis += abs(max(LO, min(HI, bp - MS * s50)) - max(LO, min(HI, bp - MS * ss))) > BH_TOL
+        print("  %-14s (the HOLDSHARED trajectory) records where 50's own Lion value != the shared value: %3d/500" % (name, dis))
+
+    print("\nS6  THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36)")
+    if os.path.exists(csvpath):
+        import hashlib
+        F = floor(csvpath)
+        print("  corpus %s  sha %s  %d rows (cvt4- excluded: none exist), %d after filter_rows"
+              % (csvpath, hashlib.sha256(open(csvpath, "rb").read()).hexdigest(), F["rows"], F["rows_filtered"]))
+        for k in ("R18ALL", "PLAIN"):
+            sf, sn = F[k], F[k + "_naive"]
+            print("  SIGMA_%-7s FILTERED %r (df %d, %d cells)   NAIVE %r (df %d, %d cells)" % (k, sf[0], sf[1], sf[2], sn[0], sn[1], sn[2]))
+        print("  SIGMA_PRIOR = max(filtered pair) = %r ; SE_PRIOR = %.6f" % (max(F["R18ALL"][0], F["PLAIN"][0]),
+                                                                          max(F["R18ALL"][0], F["PLAIN"][0]) * math.sqrt(2 / 3.0)))
+    else:
+        print("  corpus not readable at %s" % csvpath)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
