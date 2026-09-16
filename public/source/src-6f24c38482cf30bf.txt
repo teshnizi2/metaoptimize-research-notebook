@@ -1,0 +1,150 @@
+#!/bin/bash
+# =============================================================================
+# cPL1_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `cpl1` HARNESS TREE.
+#   (CORRECTIONS 215.)  Touches NO existing file.  Submits nothing.
+#
+# WHY AN ISOLATED TREE AND NOT THE LIVE ONE.  `cpl1` needs one new network name,
+# `PlainNet18_c100` (patches/patch_plainnet.py -- ONE region appended at end of
+# build_network.py).  That append alone is live-safe for the VGG launchers:
+# measured on cluster_b at registration, tests/test_vggbn2.py passes 68 / 0 on a
+# PATCH_PLAINNET-patched copy of the live file, because its V0 truncates at
+# PATCH_VGGBN's region B and removes the append with it.  BUT the concurrent
+# `cgn1` registration (patches/patch_resnet_gn_c100.py) inserts a region MID-FILE,
+# and on ONE shared tree the two patches cannot both keep their byte-identity
+# proofs: whichever lands second breaks the first's (PATCH_PLAINNET's P0 needs
+# nothing inserted above its marker after its backup; PATCH_RESNET_GN_C100's R0
+# needs nothing added anywhere after its backup).  cgn1 therefore runs from
+# $WS/harness_cgn1 (bin/cGN1_stage_harness.sh), and cpl1 does the same here.  The
+# live tree stays byte-untouched and the two trees cannot collide.
+#
+# WHAT IT BUILDS (under $METAOPT_WS, every path new and cpl1-namespaced):
+#   harness_cpl1/cifar10/                a copy of the live harness's *.py files
+#                                        (train.py, load_data.py, tin_data.py,
+#                                        build_network.py, Optimizers/*.py),
+#                                        byte-identical to the live tree
+#   harness_cpl1/cifar10/Optimizers/HF.py.pre_probe_tensor
+#                                        the live backup the PROBE_TENSOR inertness
+#                                        tests need (guards 4b/4c/4e), byte-identical
+#   harness_cpl1/cifar10/data  ->        SYMLINK to the live tree's data/ (no copy)
+#   harness_cpl1/cifar10/build_network.py.pre_plainnet
+#                                        the pinned pre-patch bytes (PRE_SHA), written
+#                                        by the patch itself before it appends
+#   harness_cpl1/cifar10/build_network.py  = pre + the ONE appended region (POST_SHA)
+#   jobs/run_cifar_cpl1.sh               jobs/run_cifar.sh with EXACTLY ONE line
+#                                        changed: the `cd` into the harness
+#   harness_cpl1/STAGE-MANIFEST.txt      sha256 of every staged file
+#
+# THE PINNED FILES.  The patch was proved against the live build_network.py of
+# 2026-09-15, sha256 PRE_SHA below; applying it gives POST_SHA (deterministic).
+# If the live file has moved since (another track's patch), point CPL1_PRE_SRC at
+# a file carrying exactly those bytes; the sha is checked either way.
+#
+# USAGE
+#   bash bin/cPL1_stage_harness.sh            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cPL1_stage_harness.sh --stage    # build it (refuses if it exists)
+# =============================================================================
+set -u
+MODE=verify; [ "${1:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HROOT=$WS/harness_cpl1
+DEST=$HROOT/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+RUNNER=$WS/jobs/run_cifar_cpl1.sh
+PATCH=$REPO/patches/patch_plainnet.py
+PRE_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+POST_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+PRE_SRC=${CPL1_PRE_SRC:-$LIVE/build_network.py}
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+# the harness source files that are COPIED (data, backups, __pycache__ and
+# .DS_Store are not harness sources); HF.py.pre_probe_tensor is copied separately
+live_py() { (cd "$LIVE" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cPL1_stage_harness: mode=$MODE  WS=$WS"
+echo "  live tree   $LIVE"
+echo "  cpl1 tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  [ -f "$PATCH" ] || { echo "!!! no patch at $PATCH"; exit 2; }
+  [ "$(sha "$PRE_SRC")" = "$PRE_SHA" ] || { echo "!!! $PRE_SRC sha $(sha "$PRE_SRC") != pinned $PRE_SHA"; echo "!!! set CPL1_PRE_SRC to a file with the pinned bytes"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(live_py); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$LIVE/$f" "$DEST/$f" || exit 2
+  done
+  cp -p "$LIVE/Optimizers/HF.py.pre_probe_tensor" "$DEST/Optimizers/HF.py.pre_probe_tensor" || exit 2
+  cp -p "$PRE_SRC" "$DEST/build_network.py" || exit 2
+  ln -s "$LIVE/data" "$DEST/data" || exit 2
+  # the patch writes build_network.py.pre_plainnet (the pre bytes) BEFORE it appends
+  BUILD_NET_PATH="$DEST/build_network.py" python3 "$PATCH" || { echo "!!! patch failed"; exit 2; }
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "LIVE $LIVE"; echo "DEST $DEST"
+    echo "PRE_SRC $PRE_SRC"; echo "PATCH_SHA256 $(sha "$PATCH")"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+# ---------------------------------------------------------------- VERIFY ------
+[ -d "$DEST" ] || { echo "!!! no cpl1 tree at $DEST -- run with --stage"; exit 2; }
+# V-a: every live harness .py has a byte-identical copy, EXCEPT build_network.py
+N=0
+for f in $(live_py); do
+  [ "$f" = "./build_network.py" ] && continue
+  if [ ! -f "$DEST/$f" ]; then bad "V-a $f missing from the cpl1 tree"; continue; fi
+  [ "$(sha "$LIVE/$f")" = "$(sha "$DEST/$f")" ] && N=$((N+1)) || bad "V-a $f differs from the LIVE tree (re-stage)"
+done
+echo "V-a: $N live harness .py files byte-identical in the cpl1 tree (build_network.py excepted)"
+EXTRA=$(cd "$DEST" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do [ -f "$LIVE/$f" ] || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no .py in the cpl1 tree that the live tree lacks" || bad "V-a2 extra .py in the cpl1 tree: $EXTRA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_probe_tensor")" = "$(sha "$LIVE/Optimizers/HF.py.pre_probe_tensor")" ] \
+  && echo "V-a3: Optimizers/HF.py.pre_probe_tensor byte-identical to the live backup" \
+  || bad "V-a3 HF.py.pre_probe_tensor missing or differs from the live backup"
+# V-b: the pre snapshot is the pinned bytes; build_network.py is the pinned post
+[ "$(sha "$DEST/build_network.py.pre_plainnet")" = "$PRE_SHA" ] && echo "V-b: pre snapshot sha == pinned $PRE_SHA" || bad "V-b pre snapshot sha != pinned"
+[ "$(sha "$DEST/build_network.py")" = "$POST_SHA" ] && echo "V-b2: cpl1 build_network.py sha == pinned post $POST_SHA" \
+  || bad "V-b2 cpl1 build_network.py sha $(sha "$DEST/build_network.py") != pinned post $POST_SHA"
+LSHA=$(sha "$LIVE/build_network.py")
+[ "$LSHA" = "$PRE_SHA" ] && echo "V-b3: the LIVE build_network.py is still the pinned pre (untouched)" \
+  || echo "V-b3: NOTE -- the LIVE build_network.py has moved since registration ($LSHA); the cpl1 tree keeps the pinned pre. Not a failure: V-a still binds every OTHER harness file."
+grep -q PATCH_PLAINNET "$LIVE/build_network.py" \
+  && echo "V-b4: NOTE -- the LIVE build_network.py carries PATCH_PLAINNET; the registered route never puts it there (it is VGG-safe, but it breaks PATCH_RESNET_GN_C100's R0 if that patch is also applied live)" \
+  || echo "V-b4: the LIVE build_network.py carries NO PATCH_PLAINNET marker"
+# V-c: data is a symlink to the live data
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink)" || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-100-python" ] && echo "V-c2: CIFAR-100 visible through the symlink" || bad "V-c2 cifar-100-python not visible"
+# V-d: the runner differs from run_cifar.sh in EXACTLY the cd line
+if [ -f "$RUNNER" ]; then
+  D=$(diff "$RUNNER_SRC" "$RUNNER" | grep -c '^[<>]')
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST"; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST"
+  else
+    bad "V-d the runner diff is not exactly the cd line:"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+else
+  bad "V-d no runner at $RUNNER"
+fi
+# V-e: the tree's build_network.py still passes the patch's own suite and the VGG suite
+if python3 "$REPO/tests/test_plainnet.py" --pre "$DEST/build_network.py.pre_plainnet" --post "$DEST/build_network.py" \
+     --hf "$DEST/Optimizers/HF.py" --csv "$REPO/results/all_runs.csv" >/tmp/cpl1_stage_tp.$$ 2>&1; then
+  echo "V-e: tests/test_plainnet.py passes on the cpl1 tree ($(grep -c '^  PASS' /tmp/cpl1_stage_tp.$$) PASS)"
+else
+  bad "V-e tests/test_plainnet.py FAILS on the cpl1 tree"; grep '^  FAIL' /tmp/cpl1_stage_tp.$$ | head
+fi
+rm -f /tmp/cpl1_stage_tp.$$
+[ "$FAIL" = 0 ] && { echo "cPL1_stage_harness: VERIFIED"; exit 0; } || { echo "cPL1_stage_harness: NOT CONSISTENT"; exit 2; }

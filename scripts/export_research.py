@@ -42,6 +42,10 @@ ID_RE = re.compile(r"\b(?:MT\d{3}|CVK2)\b")
 OUTCOMES = set(register_model.OUTCOMES)  # "Corrected" is a badge, never an outcome.
 KINDS = set(register_model.KINDS)
 PARTITION_IDS = [register_model.partition_id(line) for line in range(register_model.FIRST_ROW, register_model.LAST_ROW + 1)]
+APPENDED_IDS = [register_model.partition_id(line) for line in range(register_model.APPENDED_FIRST_ROW, register_model.APPENDED_LAST_ROW + 1)]
+REGISTER_CSV = "complete_experiment_register.csv"
+# The published register lists every record of the notebook register, not the 111-row campaign export.
+REGISTER_COLUMNS = ["id", "kind", "outcome", "outcome_label", "corrected", "correction_note", "section", "area", "goal", "comparison", "why", "result", "reason", "scope", "batches", "sources", "original_question", "register_page", "mapping_rule", "master_table_line"]
 PORTFOLIO_LINKS = {
     "alpha0_robustness": ["MT047", "MT048", "MT049", "MT051"],
     "alpha0_300_extremes": ["MT050"],
@@ -80,6 +84,7 @@ PHASE_LINKS = [
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
 PHASE_STARTS = ["2026-08-18", "2026-08-20", "2026-08-24", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-14"]
+EXPECTED_STATS = {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10}
 
 
 def read_csv(path):
@@ -251,6 +256,20 @@ def attach_latest_warnings(experiments, warnings, evidence):
         experiment["warningIds"].append(row["id"])
 
 
+def register_csv_rows(register):
+    """The published register table: one row per record, four-way outcome, kind and Corrected badge as columns."""
+    rows = [REGISTER_COLUMNS]
+    for row in register:
+        correction = json.loads(row["correction"]) if row["correction"] else {}
+        sources = [{key: value for key, value in source.items() if key != "rowText"} if isinstance(source, dict) else source for source in json.loads(row.get("sources") or "[]")]
+        values = {**row, "kind": row["kind"], "outcome": row["outcome"],
+                  "outcome_label": register_model.OUTCOME_LABELS.get(row["outcome"], "Method check (no research outcome)"),
+                  "corrected": "Corrected" if row["corrected"] == "1" else "", "correction_note": correction.get("note") or "",
+                  "sources": json.dumps(sources, ensure_ascii=False), "master_table_line": row.get("master_table_line", "")}
+        rows.append([str(values.get(column) or "") for column in REGISTER_COLUMNS])
+    return rows
+
+
 def table_contexts(table_root, experiments):
     ids = {e["id"] for e in experiments}
     contexts = {}
@@ -278,6 +297,9 @@ def table_contexts(table_root, experiments):
         if path.name.startswith("cvk2_"):
             linked = ["CVK2"]
             scope = "Completed CVK2 / cvk1: VGG11_bn, CIFAR-100, 100 epochs, nine arms × three seeds 55–57. Validity checks passed; the carrier-cut prediction remains unresolved."
+        elif rel == REGISTER_CSV:
+            linked = sorted(ids)
+            scope = f"Complete notebook register, regenerated from scripts/register_model.py: all {len(experiments)} records, each with its kind (research question or method check), its four-way outcome (Goal met, Goal missed, Mixed, Open; blank for method checks) and the Corrected badge in its own column. The campaign's 111-row export with the retired 'correction' outcome is an input, not this table."
         elif path.name in TOP_TABLE_LINKS:
             linked = TOP_TABLE_LINKS[path.name]
             scope = "Supporting numeric table for the linked experiments; each row's batch, horizon, metric, and uncertainty must be retained."
@@ -295,7 +317,7 @@ def table_contexts(table_root, experiments):
     return contexts
 
 
-def publish_tables(workspace, public, experiments):
+def publish_tables(workspace, public, experiments, register):
     root = workspace / "outputs/tables"
     contexts = table_contexts(root, experiments)
     tables, receipts = [], []
@@ -303,8 +325,11 @@ def publish_tables(workspace, public, experiments):
         rel = original.relative_to(root)
         destination = public / "assets/tables" / rel
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with original.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.reader(handle))
+        if rel.as_posix() == REGISTER_CSV:
+            rows = register_csv_rows(register)
+        else:
+            with original.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
         with destination.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerows([[sanitize_text(cell, workspace) for cell in row] for row in rows])
@@ -323,7 +348,7 @@ def publish_tables(workspace, public, experiments):
                         raise ValueError(f"Numeric value changed during sanitization: {rel}")
         context = contexts[rel.as_posix()]
         tables.append({"id": stable_id("table-", rel.as_posix()), **context, "href": "/assets/tables/" + rel.as_posix(), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0})
-        receipts.append({"file": rel.as_posix(), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0, "numeric_cells_preserved": numeric_cells, "original_sha256": digest(original), "public_sha256": digest(destination)})
+        receipts.append({"file": rel.as_posix(), **({"regenerated": "scripts/register_model.py register"} if rel.as_posix() == REGISTER_CSV else {}), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0, "numeric_cells_preserved": numeric_cells, "original_sha256": digest(original), "public_sha256": digest(destination)})
     return tables, receipts
 
 
@@ -461,9 +486,15 @@ def make_activity(timeline, snapshot_date, experiments):
             "detail": f"Documented phase: {phase} 2026. Test: {row['test']}. Result: {row['observed_result']}. Next question: {row['next_question']}. Date marks the start of the documented phase window, not individual run launch dates.",
             "experimentIds": PHASE_LINKS[index],
         })
+    for phase in register_model.ADDED_PHASES:
+        activity.append({
+            "id": phase["id"], "date": phase["date"], "kind": "research-phase", "title": phase["title"],
+            "detail": f"Documented phase: {phase['period']} 2026. Test: {phase['test']}. Result: {phase['observed_result']}. Next question: {phase['next_question']}. Date marks the start of the documented phase window, not individual run launch dates.",
+            "experimentIds": list(phase["experimentIds"]),
+        })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]}), the 2,863-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}), the 2,863-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -557,13 +588,13 @@ def validate(data, runs, public):
         if not value:
             errors.append(message)
 
-    expected = {"experiments": 148, "researchQuestions": 130, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10}
+    expected = EXPECTED_STATS
     verify(data["meta"]["stats"] == expected, "Incorrect snapshot totals")
-    verify(len(data["experiments"]) == 148, "Experiment count")
+    verify(len(data["experiments"]) == expected["experiments"], "Experiment count")
     verify(len(runs) == 2863 and len({r["id"] for r in runs}) == 2863, "Run count or duplicate identifiers")
     verify({f["id"] for f in data["figures"]} == {f"page-{p}" for p in range(1, 55)}, "Figure page coverage")
     verify(len(data["tables"]) == 201, "CSV table coverage")
-    verify(sum(a["count"] for a in data["areas"]) == 148, "Area totals")
+    verify(sum(a["count"] for a in data["areas"]) == expected["experiments"], "Area totals")
     by_id = {e["id"]: e for e in data["experiments"]}
     for eid, (kind, outcome, _) in register_model.CORRECTION_REMAP.items():
         row = by_id.get(eid, {})
@@ -573,6 +604,16 @@ def validate(data, runs, public):
         row = by_id.get(eid, {})
         verify(row.get("section") == register_model.SECTION and row.get("area") == register_model.AREA, f"Partition-audit record missing: {eid}")
         verify(eid in phase.get("experimentIds", []), f"Partition-audit record not linked to the Partition tests phase: {eid}")
+    for phase in register_model.ADDED_PHASES:
+        event = next((e for e in data["activity"] if e["id"] == phase["id"]), {})
+        verify(event.get("kind") == "research-phase" and event.get("experimentIds") == phase["experimentIds"], f"Added research phase missing: {phase['id']}")
+    for line, (rule, section, batches, figures, _, _) in register_model.APPENDED_ROWS.items():
+        row = by_id.get(register_model.partition_id(line), {})
+        verify(row.get("section") == section and row.get("area") == register_model.AREAS[section] and row.get("outcome") == register_model.RULE_OUTCOME[rule], f"Appended MASTER-TABLE row missing or remapped: line {line}")
+        verify(row.get("batches") == batches and set(figures) <= set(row.get("figureIds", [])), f"Appended row links: line {line}")
+        verify(any(e["kind"] == "research-phase" and row.get("id") in e["experimentIds"] for e in data["activity"]), f"Appended row has no research phase: line {line}")
+    register_table = next((t for t in data["tables"] if t["href"] == "/assets/tables/" + REGISTER_CSV), None)
+    verify(register_table is not None and register_table["rows"] == expected["experiments"] and register_table["columns"] == len(REGISTER_COLUMNS), "Published register table must list every record")
     catalogs = {"figureIds": {r["id"]: r for r in data["figures"]}, "tableIds": {r["id"]: r for r in data["tables"]}, "codeIds": {r["id"]: r for r in data["sources"]}, "runIds": {r["id"]: r for r in runs}, "warningIds": {r["id"]: r for r in data["warnings"]}, "eventIds": {r["id"]: r for r in data["activity"]}}
     for experiment in data["experiments"]:
         eid = experiment["id"]
@@ -636,11 +677,14 @@ def export(workspace, public, snapshot_date, audit_path=None):
     experiments, warnings = build_experiments(register, source_links)
     cvk = evidence["cvk2_evidence"]
     attach_latest_warnings(experiments, warnings, cvk)
-    tables, table_receipts = publish_tables(workspace, public, experiments)
+    tables, table_receipts = publish_tables(workspace, public, experiments, register)
     runs, log_receipts = make_runs(inventory, experiments, evidence, public, workspace)
     for figure in figures:
         if figure["id"] in register_model.FIGURE_IDS:
             figure["experimentIds"] = list(dict.fromkeys([*figure["experimentIds"], *PARTITION_IDS]))
+        appended = [row["id"] for row in register if figure["id"] in json.loads(row.get("figure_ids") or "[]")]
+        if appended:
+            figure["experimentIds"] = list(dict.fromkeys([*figure["experimentIds"], *appended]))
     activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date, experiments)
     attach_relationships(experiments, figures, tables, runs, activity)
     attach_snapshot_import(experiments, activity, snapshot_date)
@@ -649,10 +693,10 @@ def export(workspace, public, snapshot_date, audit_path=None):
     commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
     input_paths = [table_root / name for name in ["complete_experiment_register.csv", "complete_run_inventory.csv", "complete_figure_index.csv"]]
     # The pinned MASTER-TABLE bytes and the mapping module are inputs too.
-    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
+    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
     data = {
         "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "researchQuestions": sum(e["kind"] == "research" for e in experiments), "methodChecks": sum(e["kind"] == "method-check" for e in experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"},
-                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256}},
+                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256}},
         "areas": areas, "experiments": experiments, "figures": figures, "sources": sources,
         "tables": tables, "warnings": warnings, "activity": activity,
         "latest": {"experimentId": "CVK2", "peakSet": cvk["peak_cuts"], "predictedCut": cvk["predicted_peak_cut"], "bestCut": cvk["best_mean_cut"], "bar": cvk["peak_bar_pp"], "cells": [{key: row[key] for key in ["arm", "cut", "mean", "sem", "n"]} for row in cvk["cells"]]},
@@ -683,7 +727,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--public-dir", type=Path, default=PORTAL / "public")
-    parser.add_argument("--as-of", default="2026-09-15", help="Documented publication-snapshot date, YYYY-MM-DD")
+    parser.add_argument("--as-of", default="2026-09-16", help="Documented publication-snapshot date, YYYY-MM-DD")
     parser.add_argument("--check", action="store_true", help="Validate existing public JSON and links without regenerating assets")
     parser.add_argument("--audit", type=Path, help="Where to write the export audit receipt (default: <workspace>/work/portal_data_audit.json)")
     args = parser.parse_args()

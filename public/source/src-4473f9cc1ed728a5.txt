@@ -139,6 +139,11 @@ def reduce_dir(d, windows=WINDOWS):
         v_un, _ = corrected_floor(dec["v_indep"], 0.0, n_tot)
         v_co, H = corrected_floor(dec["v_indep"], hv, n_tot)
         c_un, c_co = recompute_rho(dec, v_un), recompute_rho(dec, v_co)
+        if c_un is None or c_co is None:
+            # Non-finite corrected floor: n_tot < 2 (a "scal" arm) or n_records < 2.
+            # Skip the window as for a None decompose; subscripting None crashed the
+            # whole reducer (CORRECTIONS 224, tests/test_probe5_window_degenerate.py).
+            continue
         out[lab] = dict(T=dec["T"], tau=dec["tau"], H=H,
                         rho_s_unc=c_un["rho_s"], rho_s=c_co["rho_s"],
                         rho_min=c_co["rho_min"], resolved=c_co["resolved"])

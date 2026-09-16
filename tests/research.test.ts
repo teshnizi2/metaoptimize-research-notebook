@@ -91,11 +91,11 @@ test('published records apply the approved 23-record mapping with the corrected 
 
 test('published research outcomes and method checks are counted separately',()=>{
  const counts=outcomeCounts(published.experiments),research=Object.values(counts).reduce((a,b)=>a+b,0);
- assert.deepEqual(counts,{success:40,fail:41,mixed:25,unresolved:24});
- assert.equal(research,130);
+ assert.deepEqual(counts,{success:45,fail:41,mixed:26,unresolved:24});
+ assert.equal(research,136);
  assert.equal(methodCheckCount(published.experiments),18);
  assert.equal(research+methodCheckCount(published.experiments),published.experiments.length);
- assert.equal(published.meta.stats.researchQuestions,130);
+ assert.equal(published.meta.stats.researchQuestions,136);
  assert.equal(published.meta.stats.methodChecks,18);
  for(const e of published.experiments){
   if(e.kind==='method-check')assert.equal(e.outcome,null,e.id);

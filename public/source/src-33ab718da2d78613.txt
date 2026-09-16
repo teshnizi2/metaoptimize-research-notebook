@@ -1,0 +1,147 @@
+"""PATCH_RESNET_GN_C100 -- `ResNet18_gn_c100`: `ResNet18_c100` with every BatchNorm2d
+replaced by GroupNorm(32, C), AND NOTHING ELSE CHANGED.  Patches `build_network.py`
+ONLY, and only by ONE inserted dispatch region.  **NO OPTIMISER CHANGE.
+`Optimizers/HF.py`, `train.py`, `load_data.py` ARE NOT TOUCHED.**
+
+REGISTERED FOR `cgn1` (CORRECTIONS 212).  Written 2026-09-15 against the cluster_b live
+`build_network.py` of that date, sha256
+    c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+which already carries PATCH_RESNET_GN (the `_norm2d` factory and the `norm='bn'` kwarg
+on BasicBlock / Bottleneck / ResNet), PATCH_TINYIMAGENET and PATCH_VGGBN.
+
+WHY.  Every scalar->layerwise gap the campaign owns was measured on a BatchNorm
+network, and the whole isolation line (ResNet18_c100 indices 50/53/59; VGG11_bn_c100
+`bn8.weight`) is about BatchNorm SCALES.  `cgn1` asks whether the gap exists WITHOUT
+batch statistics, at the headline cell (CIFAR-100).  The corpus's only GroupNorm net,
+`ResNet18_gn`, has a TEN-class head (11,173,962 parameters) and cannot run CIFAR-100:
+`build_network('ResNet18_gn_c100', ...)` raises ZeroDivisionError on the live tree
+(the file's own 0/0 idiom).
+
+WHAT THE PATCH ADDS -- ONE REGION, INSERTED DIRECTLY AFTER THE `ResNet18_gn` DISPATCH:
+
+    if network_name == 'ResNet18_gn_c100':
+        return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=100, norm='gn').to(device)
+
+Both keyword arguments already exist on the live `ResNet.__init__`
+(`num_classes=10, norm='bn'`), so the region adds a NAME and no code path.  Because
+PATCH_RESNET_GN kept the attribute names (`bn1`, `bn2`, `shortcut.1`), the new net's
+`named_parameters()` list is ELEMENTWISE EQUAL -- name, order, shape -- to
+`ResNet18_c100`'s: 62 tensors, 11,220,132 parameters, the (conv, norm.weight,
+norm.bias) triple at every 1-based index 1..60 (class == index mod 3), then
+`linear.weight` (100, 512) and `linear.bias` (100,).  `HF.init_meta` consumes that list
+positionally, so every step-size partition is the SAME object on both nets.
+GroupNorm/BatchNorm affine init draws no RNG, so under a fixed seed the two nets'
+INITIAL PARAMETERS are bitwise equal too.  What differs: the normaliser module (20
+GroupNorm vs 20 BatchNorm2d) and BN's 60 buffers (never parameters, never stepped).
+`tests/test_resnet_gn_c100.py` asserts every one of those facts on the built models.
+
+WHAT GroupNorm(32, C) IS, stated so it is not over-read.  32 groups of C/32 channels:
+2 / 4 / 8 / 16 channels per group at widths 64 / 128 / 256 / 512.  It removes BATCH
+STATISTICS entirely (train == eval behaviour, no running buffers), but it does NOT
+preserve per-channel scale invariance -- the departure is graded by depth, 16 channels
+to a group in layer4, which is exactly where the ResNet carriers sit.  So a GN null is
+NOT "batch statistics cause the gap" (see the scorer's branch map).
+
+WHERE TO APPLY IT.  **Not to the live tree, by default.**  The default target is the
+ISOLATED cgn1 harness tree built by `bin/cGN1_stage_harness.sh`:
+    $METAOPT_WS/harness_cgn1/cifar10/build_network.py
+Measured on a scratch copy of the live tree (CORRECTIONS 212): inserting this region
+into the LIVE `build_network.py` makes `tests/test_vggbn2.py` V0f FAIL ("deleting the
+two VGG regions reproduces --pre BYTE FOR BYTE" is no longer true once any other region
+exists), and that suite is guard 1d3 of the registered VGG launchers.  The isolated
+tree keeps the live file untouched.  Applying to the live file requires
+`CGN1_PATCH_LIVE=1` and is an operator decision, not a default.
+
+VERIFY WITHOUT TOUCHING ANY TREE:
+    BUILD_NET_PATH=<scratch copy>/build_network.py python3 patches/patch_resnet_gn_c100.py
+    python3 tests/test_resnet_gn_c100.py --pre <copy>.pre_gn_c100 --post <copy> --hf <HF.py>
+"""
+import os
+import sys
+
+WS = os.environ.get("METAOPT_WS", "/cluster/account_b/metaopt")
+LIVE = os.path.join(WS, "MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10/build_network.py")
+P = os.environ.get("BUILD_NET_PATH", os.path.join(WS, "harness_cgn1/cifar10/build_network.py"))
+
+MARK = "PATCH_RESNET_GN_C100"
+NEWNAME = "ResNet18_gn_c100"
+
+# ---- the ONE inserted region.  tests/test_resnet_gn_c100.py holds the same HEAD and
+# ---- TAIL and deletes exactly this span to prove the patch additive (R0).
+REGION_HEAD = "\n    # --- PATCH_RESNET_GN_C100: the ONLY new name."
+REGION = (
+    "\n"
+    "    # --- PATCH_RESNET_GN_C100: the ONLY new name.  ResNet18_c100 with GroupNorm(32, C)\n"
+    "    # in place of BatchNorm2d(C): same block, same depths, same 100-way head, same\n"
+    "    # parameter names/order/shapes.  Reachable only by an exact\n"
+    "    # `--NN-name ResNet18_gn_c100`, which no prior batch used. ---\n"
+    "    if network_name == 'ResNet18_gn_c100':\n"
+    "        return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=100, norm='gn').to(device)\n"
+)
+REGION_TAIL = "        return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=100, norm='gn').to(device)\n"
+ANCHOR = ("    if network_name == 'ResNet18_gn':\n"
+          "        return ResNet(BasicBlock, [2, 2, 2, 2], norm='gn').to(device)\n")
+PRE_SHA256 = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+
+PRIOR_NAMES = ("M1", "M2", "ResNet18", "ResNet18_gn", "ResNet18_c100", "ResNet10",
+               "ResNet34", "ResNet10_c100", "ResNet34_c100", "ResNet18_tin", "VGG11_bn",
+               "VGG11_bn_c100", "ResNet18_soft", "ResNet50", "ResNet101", "ResNet152")
+
+
+def patch_text(src):
+    """pure function: pre-patch text -> post-patch text.  Asserts every precondition."""
+    if MARK in src:
+        raise ValueError("%s already present" % MARK)
+    for need in ("class ResNet(nn.Module):", "def build_network(", "def _norm2d(norm, c):",
+                 "def __init__(self, block, num_blocks, num_classes=10, norm='bn'):"):
+        if need not in src:
+            raise ValueError("refusing to patch: precondition missing: %r "
+                             "(PATCH_RESNET_GN must already be applied)" % need)
+    if src.count(ANCHOR) != 1:
+        raise ValueError("anchor (the ResNet18_gn dispatch) occurs %d times, need 1"
+                         % src.count(ANCHOR))
+    if ("network_name == '%s'" % NEWNAME) in src:
+        raise ValueError("%s is already dispatched" % NEWNAME)
+    out = src.replace(ANCHOR, ANCHOR + REGION, 1)
+    # post-conditions
+    for n in PRIOR_NAMES:
+        if ("network_name == '%s'" % n) not in out:
+            raise ValueError("dispatch for %s went missing" % n)
+    if out.count("network_name == '%s'" % NEWNAME) != 1:
+        raise ValueError("new dispatch count != 1")
+    if out.count(REGION_HEAD) != 1 or out.count(REGION_TAIL) != 1:
+        raise ValueError("region markers not unique")
+    i = out.index(REGION_HEAD)
+    j = out.index(REGION_TAIL, i) + len(REGION_TAIL)
+    if out[:i] + out[j:] != src:
+        raise ValueError("deleting the region does not reproduce the input BYTE FOR BYTE")
+    compile(out, "build_network.py", "exec")
+    return out
+
+
+def main():
+    import hashlib
+    if not os.path.exists(P):
+        sys.exit("no build_network.py at %s -- stage the cgn1 tree first "
+                 "(bin/cGN1_stage_harness.sh) or set BUILD_NET_PATH" % P)
+    if (os.path.realpath(P) == os.path.realpath(LIVE)
+            and os.environ.get("CGN1_PATCH_LIVE") != "1"):
+        sys.exit("refusing to patch the LIVE tree %s: it breaks tests/test_vggbn2.py V0f "
+                 "(CORRECTIONS 212).  Set CGN1_PATCH_LIVE=1 only on an operator decision." % P)
+    src = open(P).read()
+    if MARK in src:
+        print("%s already applied to %s -- nothing to do" % (MARK, P))
+        return 0
+    sha = hashlib.sha256(src.encode()).hexdigest()
+    print("pre-patch sha256 %s (%s the registered pre %s...)"
+          % (sha, "EQUALS" if sha == PRE_SHA256 else "DIFFERS FROM", PRE_SHA256[:12]))
+    out = patch_text(src)
+    open(P, "w").write(out)
+    print("PATCHED %s -> %s" % (MARK, P))
+    print("  post-patch sha256 %s" % hashlib.sha256(out.encode()).hexdigest())
+    print("  added: dispatch for '%s' (one region, %d bytes)" % (NEWNAME, len(REGION)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

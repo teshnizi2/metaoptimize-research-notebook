@@ -1,0 +1,246 @@
+"""PATCH_PLAINNET -- `PlainNet18_c100`: ResNet18_c100 WITH ITS RESIDUAL ADDITIONS
+REMOVED, AND NOTHING ELSE CHANGED.  Patches `build_network.py` ONLY, by ONE pure
+append at END OF FILE.  **NO OPTIMISER CHANGE.  `Optimizers/HF.py` IS NOT TOUCHED.
+Neither is `train.py`, `load_data.py`, `Optimizers/build_optimizer.py` or anything
+under `analysis/`.**
+
+=============================================================================
+WHY -- THE ONE-VARIABLE RESIDUAL ABLATION THAT VGG COULD NOT BE
+=============================================================================
+CORRECTIONS 189.2 re-derived, from the live ResNet18_c100 manifest and the live
+`BasicBlock.forward`, that 187's three carriers (1-based 50 `layer4.0.bn2.weight`,
+53 `layer4.0.shortcut.1.weight`, 59 `layer4.1.bn2.weight`) are EXACTLY the 512-wide
+BatchNorm scales whose output is a SUMMAND OF A RESIDUAL ADDITION, and the two
+non-carriers (47, 56 -- the `bn1` scales) are exactly the two that are not.  On a
+ResNet that reading cannot be separated from "the deepest BN scales", because on a
+ResNet the deepest BN scales all feed adds.
+
+VGG11_bn (PATCH_VGGBN, 189) has no addition, but it differs from ResNet18 in depth,
+channel schedule and downsampling as well -- a different FAMILY, not one variable
+(189.2, 194.6; the stamp NOT-A-ONE-VARIABLE-ABLATION on every VGG verdict).
+
+THIS PATCH BUILDS THE ONE-VARIABLE OBJECT.  `PlainBlock` is `BasicBlock` with the
+line `out += self.shortcut(x)` removed.  `PlainNet18_c100` is
+`ResNet(PlainBlock, [2, 2, 2, 2], num_classes=100)` -- the SAME `ResNet` class, the
+SAME stem, the SAME four stages, the SAME strides, widths, BatchNorm layers, ReLUs,
+average pool and linear head as `ResNet18_c100`.  The only thing that differs is
+that no block adds its input back to its output.
+
+=============================================================================
+198's PRICING, HONOURED: THE SHORTCUT MODULES ARE NOT CONSTRUCTED AT ALL
+=============================================================================
+The live `BasicBlock` builds `self.shortcut = nn.Sequential()` (EMPTY, no parameter)
+unless `stride != 1 or in_planes != planes`, so ResNet18 has exactly THREE projection
+shortcuts (layer2.0, layer3.0, layer4.0), each carrying `0.weight` (1x1 conv),
+`1.weight` and `1.bias` (BatchNorm) = 9 parameter tensors.  Deleting only the
+addition would leave those 9 tensors in `named_parameters()` -- which `HF.init_meta`
+consumes POSITIONALLY -- with NO gradient path: dead tensors that would still be
+counted by `scalar`, still occupy a `layerwise` coordinate and still shift every
+`sets:` index.  So `PlainBlock` never creates `self.shortcut`.  PlainNet18_c100 has
+62 - 9 = 53 parameter tensors, and its ordered (name, shape) list is ResNet18_c100's
+with exactly those 9 entries deleted.  tests/test_plainnet.py P2 asserts that list
+equality and P4 proves, with a naive variant built in the test, that the
+add-only deletion really does leave exactly 9 tensors without a gradient.
+
+=============================================================================
+WHY THE PATCH IS ONE APPEND AT END OF FILE, AND DISPATCHES BY A WRAPPER
+=============================================================================
+Every earlier build_network patch inserted its dispatch INSIDE `build_network()`.
+That is a mid-file insertion, and it is FATAL to a registered test that already
+exists: tests/test_vggbn.py and tests/test_vggbn2.py prove PATCH_VGGBN additive by
+(V0) deleting VGG's region A, TRUNCATING THE FILE AT VGG's REGION B HEAD, and
+comparing the result with `build_network.py.pre_vggbn` byte for byte.  Any other
+insertion ABOVE VGG's region B survives that deletion and makes V0f fail on the live
+tree -- and bin/cVI1_vgg_isolate.sh / bin/cVK2_vgg_cut_ladder.sh (and any future VGG
+launcher) run that test as guard 1d3.  A mid-file PATCH_PLAINNET would therefore
+silently disable every VGG launcher on cluster_b.
+
+So this patch inserts NOTHING above end of file.  Its single region is appended
+after VGG's region B, where VGG's V0 truncation removes it along with VGG's own
+class, and VGG's V0f still reproduces `.pre_vggbn` byte for byte.  The new name is
+dispatched by REBINDING the module-level name `build_network` to a wrapper:
+
+    _build_network_pre_plainnet = build_network
+    def build_network(network_name, device):
+        if network_name == 'PlainNet18_c100':
+            return ResNet(PlainBlock, [2, 2, 2, 2], num_classes=100).to(device)
+        return _build_network_pre_plainnet(network_name, device)
+
+`train.py` does `from build_network import build_network`, which binds the name
+AFTER the module has executed to its end, i.e. to the wrapper.  Every other name --
+including every unknown name, which still reaches the original `0/0` -- is handed to
+the ORIGINAL function object unchanged, with no RNG draw and no allocation in
+between.  tests/test_plainnet.py P1 proves that on every `network` value the corpus
+has run: identical ordered named_parameters, identical shapes, identical counts,
+BITWISE-identical initial weights and buffers under a fixed seed, and an identical
+torch RNG state after the build; or an identical exception type.
+
+=============================================================================
+WHAT IT ADDS -- ONE ADDITIVE REGION, NO EXISTING LINE EDITED
+=============================================================================
+  THE REGION, appended at END OF FILE after PATCH_VGGBN's class.  It defines
+  `class PlainBlock(nn.Module)` and the dispatch wrapper.  It references nothing in
+  the file except `nn`, `F`, `_norm2d`, `ResNet` and the ORIGINAL `build_network`
+  object, and nothing in the file references it except through the rebound name.
+  Deleting the region -- from its marker line to end of file -- reproduces the
+  pre-patch file BYTE FOR BYTE; tests/test_plainnet.py P0 performs that deletion
+  itself against the `.pre_plainnet` backup this script writes.
+
+=============================================================================
+DECLARED, BEFORE ANY RUN EXISTS
+=============================================================================
+  (i)  THE THIRD CARRIER CANNOT BE ASKED ABOUT.  `layer4.0.shortcut.1.weight` does not
+       exist on PlainNet18 -- removing the addition removes the branch it lived on.
+       Only the two carriers that survive (`layer4.0.bn2.weight`,
+       `layer4.1.bn2.weight`) can be isolated.
+  (ii) INITIAL WEIGHTS ARE NOT ResNet18_c100's UNDER THE SAME SEED.  Not constructing
+       the three projection shortcuts removes their RNG draws, so every tensor built
+       after layer2.0's shortcut would have been drawn from a shifted stream.  That is
+       a CONSEQUENCE of removing the addition (198 forbids constructing the modules),
+       not a second variable; and no cross-network contrast in this campaign pairs
+       seeds anyway -- BATCH is the unit of replication.
+  (iii) TRAINABILITY AT THE CELL IS NOT ESTABLISHED by this patch.  No plain 18-layer
+       net has ever run in this corpus.  The registered scorer gates on it
+       (G-TRAINS) and licenses nothing about carriers if the net fails to train.
+
+STANDING RULE 20: the new NN-name string is a single shell token of [A-Za-z0-9_].
+
+=============================================================================
+WHERE IT IS APPLIED -- AN ISOLATED TREE, NEVER THE LIVE ONE BY DEFAULT
+=============================================================================
+The EOF append is VGG-safe on the live tree, but it is NOT safe next to the
+concurrent PATCH_RESNET_GN_C100 (cgn1), which inserts a region MID-FILE.  On one
+shared tree the two byte-identity proofs are mutually exclusive: if PATCH_PLAINNET
+lands first, cgn1's mid-file region sits above this patch's marker and P0 fails;
+if cgn1 lands first, this append follows cgn1's backup and cgn1's R0 fails.  So,
+exactly as cgn1 does ($WS/harness_cgn1), cpl1 runs from its OWN tree:
+
+    bash bin/cPL1_stage_harness.sh --stage
+        # builds $WS/harness_cpl1/cifar10 (byte-identical copies of the live harness
+        # .py files, data/ symlinked, the pinned pre-patch build_network.py), runs
+        # THIS patch there (default path below), writes jobs/run_cifar_cpl1.sh
+        # (run_cifar.sh with only its `cd` changed) and verifies all of it.
+    python3 tests/test_plainnet.py \\
+        --pre  $METAOPT_WS/harness_cpl1/cifar10/build_network.py.pre_plainnet \\
+        --post $METAOPT_WS/harness_cpl1/cifar10/build_network.py \\
+        --hf   $METAOPT_WS/harness_cpl1/cifar10/Optimizers/HF.py
+
+The default target is therefore $METAOPT_WS/harness_cpl1/cifar10/build_network.py.
+The LIVE build_network.py is REFUSED unless CPL1_PATCH_LIVE=1 (an operator
+decision, not a default).  Any other file can be named with BUILD_NET_PATH:
+    BUILD_NET_PATH=<scratch copy>/build_network.py python3 patches/patch_plainnet.py
+"""
+import os
+import sys
+
+WS = os.environ.get("METAOPT_WS", "/cluster/account_b/metaopt")
+LIVE = os.path.join(WS, "MetaOptimize", "codes", "Supervised_tasks", "MetaOptimize",
+                    "cifar10", "build_network.py")
+P = os.environ.get("BUILD_NET_PATH",
+                   os.path.join(WS, "harness_cpl1", "cifar10", "build_network.py"))
+BACKUP = P + ".pre_plainnet"
+
+if os.path.realpath(P) == os.path.realpath(LIVE) and os.environ.get("CPL1_PATCH_LIVE") != "1":
+    sys.exit("refusing to patch the LIVE tree %s: cpl1 runs from $METAOPT_WS/harness_cpl1 "
+             "(bin/cPL1_stage_harness.sh).  Set CPL1_PATCH_LIVE=1 only on an operator decision." % P)
+if not os.path.exists(P):
+    sys.exit("no build_network.py at %s -- build the cpl1 tree with bin/cPL1_stage_harness.sh "
+             "--stage, or set BUILD_NET_PATH" % P)
+
+src = open(P).read()
+
+# --- 0. idempotency.  Re-running must not double-patch. ------------------------------
+if "PATCH_PLAINNET" in src:
+    print("PATCH_PLAINNET already applied to", P, "-- nothing to do")
+    sys.exit(0)
+
+# --- 1. the anchors this patch depends on, each required EXACTLY ONCE ---------------
+ANCHORS = (
+    "def build_network(network_name, device):",
+    "class ResNet(nn.Module):",
+    "def _norm2d(norm, c):",
+    "class BasicBlock(nn.Module):",
+    # the BasicBlock forward this patch removes ONE line from -- if the live forward
+    # differs, PlainBlock would not be `BasicBlock minus the addition` and the patch
+    # must refuse rather than build a two-variable object
+    "    def forward(self, x):\n"
+    "        out = F.relu(self.bn1(self.conv1(x)))\n"
+    "        out = self.bn2(self.conv2(out))\n"
+    "        out += self.shortcut(x)\n"
+    "        out = F.relu(out)\n"
+    "        return out\n",
+)
+for a in ANCHORS:
+    n = src.count(a)
+    if a.startswith("    def forward"):
+        # BasicBlock's forward text is also carried verbatim by nothing else; Bottleneck
+        # and BasicBlock_soft differ (conv3 / softplus), so the count must be exactly 1
+        pass
+    if n != 1:
+        sys.exit("refusing to patch %s: anchor %r occurs %d times, need exactly 1"
+                 % (P, a.splitlines()[0] if "\n" in a else a, n))
+if "PlainNet18_c100" in src or "class PlainBlock" in src:
+    sys.exit("refusing to patch: %s already defines PlainNet18_c100 / PlainBlock" % P)
+if not src.endswith("\n"):
+    sys.exit("refusing to patch: %s does not end with a newline" % P)
+
+# --- 2. the backup, written BEFORE the patched file, and never overwritten with other
+# ---    bytes (a stale backup would make P0's byte-identity proof meaningless) ------
+if os.path.exists(BACKUP):
+    if open(BACKUP).read() != src:
+        sys.exit("refusing to patch: %s exists and differs from the current %s -- "
+                 "a stale backup would falsify P0.  Move it aside first." % (BACKUP, P))
+    print("backup already present and identical:", BACKUP)
+else:
+    open(BACKUP, "w").write(src)
+    print("backup written:", BACKUP)
+
+# --- 3. THE REGION, appended at END OF FILE ------------------------------------------
+REGION = '''
+
+# --- PATCH_PLAINNET -------------------------------------------------------------
+# `PlainNet18_c100` = ResNet18_c100 with every residual addition REMOVED and nothing
+# else changed: the one-variable residual ablation (CORRECTIONS 189.2 / 198).
+# PlainBlock is BasicBlock minus the line `out += self.shortcut(x)`.  The shortcut
+# MODULES are NOT CONSTRUCTED: ResNet18's three projection shortcuts carry 9
+# parameter tensors that would otherwise sit in named_parameters() -- which
+# HF.init_meta consumes positionally -- with no gradient path (198).  53 tensors.
+#
+# This region is appended at END OF FILE and inserts nothing above it, so the
+# registered VGG test's V0 (which truncates at PATCH_VGGBN's region B head) still
+# reproduces build_network.py.pre_vggbn byte for byte.  The new name is dispatched
+# by rebinding `build_network` to a wrapper; every other name -- including unknown
+# names, which still reach the original 0/0 -- goes to the ORIGINAL function object.
+class PlainBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, norm='bn'):
+        super(PlainBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = _norm2d(norm, planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3,
+                               stride=1, padding=1, bias=False)
+        self.bn2 = _norm2d(norm, planes)
+        # NO self.shortcut -- not constructed at all (see the region header).
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = F.relu(out)
+        return out
+
+
+_build_network_pre_plainnet = build_network
+
+
+def build_network(network_name, device):
+    if network_name == 'PlainNet18_c100':
+        return ResNet(PlainBlock, [2, 2, 2, 2], num_classes=100).to(device)
+    return _build_network_pre_plainnet(network_name, device)
+'''
+open(P, "w").write(src + REGION)
+print("PATCH_PLAINNET applied to", P)
+print("  ONE REGION appended at END OF FILE: class PlainBlock + the build_network wrapper")
+print("  new name: PlainNet18_c100   (53 parameter tensors; ResNet18_c100 minus 9 shortcut tensors)")
+print("  now run: python3 tests/test_plainnet.py --pre", BACKUP, "--post", P)

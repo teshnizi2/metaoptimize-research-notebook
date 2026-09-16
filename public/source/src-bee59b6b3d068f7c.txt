@@ -1,0 +1,1474 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cGN2_gn_isolation_score.py -- THE REGISTERED SCORER FOR `cgn2`:
+#   DOES THE ISOLATION TRANSFER OFF BATCHNORM?  (CORRECTIONS 221)
+#   ONE SUBMISSION, 15 JOBS (5 arms x 3 seeds), 100 EPOCHS, SEEDS {72,73,74},
+#   ResNet18_gn_c100 / CIFAR-100, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#
+# Committed BEFORE any cgn2 run exists (STANDING RULE 21).  RUN IT UNEDITED
+# (RULE 16).  The documented invocation takes ONE argument:
+#
+#     python3 analysis/cGN2_gn_isolation_score.py <runsdir>
+#
+# --manifest and --csv are OPTIONAL and DEFAULTED (the 164.2 pattern).
+#
+# =============================================================================
+# FROZEN BARS (CORRECTIONS 207/208, operator decision O2) -- READ THIS FIRST
+# =============================================================================
+# Every bar, SE multiplier, sigma and threshold score() uses is a LITERAL in
+# this file, frozen at registration.  score() NEVER reads a bar term from
+# results/all_runs.csv; it prints a corpus row count as a disclosure and
+# nothing else.  The ONLY data-dependent term that can enter a bar is
+# SIGMA_INBATCH -- this batch's own 15 runs -- through compose_sigma(), a max()
+# with the frozen floor that takes ONE argument and no corpus.  --selftest
+# section E PROVES it: the SAME synthetic runs give a byte-identical FINAL line
+# (and identical SIGMA/SE/bar/PRIMARY lines) against the real corpus, the real
+# corpus + INVENTED rows at THIS batch's own cells (ResNet18_gn_c100 scalar,
+# layerwise and all three sets: strings) and at the cells the frozen sigmas
+# came from, a corpus of invented rows only, and no corpus.
+#
+# =============================================================================
+# WHY THIS BATCH
+# =============================================================================
+# cgn1 (CORRECTIONS 217) showed the scalar->layerwise GAP exists on
+# ResNet18_gn_c100 (every BatchNorm2d(C) -> GroupNorm(32, C); SAME 62-tensor
+# list, SAME names, bitwise-identical init): D = +37.3833 pp.  It did NOT show
+# that the ISOLATION result transfers.  On ResNet18_c100 (BatchNorm) isolating
+# {50 layer4.0.bn2.weight, 53 layer4.0.shortcut.1.weight, 59 layer4.1.bn2.weight}
+# recovers the whole gap (ciso1 70.2113, cdep1 70.0440), the matched
+# carrier-free triple {47, 48, 56} recovers none (cdep1 DEPTH 23.5207 vs k01
+# 23.3520), and 50 ALONE recovers ~0.91 (ciso1 64.7500 / cdep1 64.8267).
+# 217.6 NOMINATED, AS A HYPOTHESIS, the same three GN tensors from cgn1's k01
+# records -- but from a NON-REGISTERED record set (post-peak), because the
+# registered one (pinned records) was EMPTY.  cgn2 is the intervention.
+#
+# THE SPEC STRINGS ARE BYTE-IDENTICAL TO THE BATCHNORM BATCHES' (selftest B
+# reads them out of analysis/cIS1_ciso1_isolate_score.py and
+# analysis/cDP1_cdep1_depth_score.py and asserts equality), because the GN
+# network has the same 62-tensor list and names.  The launcher's guard 4
+# RE-DERIVES every string on the LIVE GN model by NAME and NUMEL and writes the
+# manifest; guard 4d proves it byte-identical to synthetic_manifest_text().
+#   k01  scalar                                                         m=1
+#   kL   layerwise                                                      m=62
+#   ISO  sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight
+#        [59,3]  params [11218596,1536]  isolates 50, 53, 59     (= ciso1/cdep1 ISO)
+#   CTL  sets:1-46,49-55,57-62/layer4.0.bn1.weight,layer4.0.bn1.bias,layer4.1.bn1.weight
+#        [59,3]  params [11218596,1536]  isolates 47, 48, 56     (= cdep1 DEPTH)
+#        matched to ISO on cardinality 3, isolated numel 1,536, width 512,
+#        stage layer4, owner GroupNorm, group sizes; NOT on class -- 48 is a
+#        GN SHIFT (bias), exactly as in cdep1 (stamp CTL-MATCHED-ON-NUMEL-NOT-CLASS)
+#   ONE  sets:1-49,51-62/layer4.0.bn2.weight
+#        [61,1]  params [11219620,512]   isolates 50             (= ciso1/cdep1 ONE)
+#
+# =============================================================================
+# WHAT cgn1's DISCLOSED LIMITS DO TO THIS DESIGN -- REGISTERED
+# =============================================================================
+# (1) THE GN SCALAR NEVER REACHES THE CLAMP.  In cgn1 the k01 beta peaks at
+#     ~-5.7 near epoch 16 and descends to -12.30 / -11.78 / -11.55 by epoch 100;
+#     0 of 500 records at -15 on every seed.  Consequences, registered:
+#     * "AT THE FLOOR" in this file means AT THE IN-BATCH k01 LEVEL (within
+#       NULL_BAR of this batch's own scalar arm), NEVER "pinned at the clamp".
+#       The k01 anchor is a LEVEL on a slowly creeping curve (cgn1 k01 TEST OLS
+#       slope over epochs 80-99: +0.0035..+0.0231 pp/epoch), not an absorbing
+#       state.  Stamp K01-IS-A-LEVEL-NOT-A-CLAMP, unconditional.
+#     * NO GATE, NO BRANCH AND NO STAMP IN THE FINAL LINE REQUIRES OR READS A
+#       PINNED RECORD.  The per-arm beta readout (clamp fraction, pin epoch) and
+#       the post-peak nomination readout are printed AFTER the FINAL line as
+#       DESCRIPTIVE, NON-GATING text; score() cannot fail on them and they are
+#       wrapped so that a missing/garbled probe file changes nothing but that
+#       text.  The 194.5 pinned-record statistic is not used anywhere.
+#     * Every account below that needs a collapse is stated as a LEVEL
+#       ("ISO at the k01 level"), not as a clamp state.
+# (2) THE HORIZON.  cgn1's kL was still rising at +0.29..+0.34 pp/epoch over
+#     epochs 80-99, so D_GAP here is a 100-epoch snapshot.  100 EPOCHS IS
+#     CHOSEN, and why:
+#     * The primary is a WITHIN-BATCH DIFFERENCE BETWEEN TWO m=2 ARMS WITH THE
+#       SAME GROUP SIZES AT THE SAME HORIZON.  Its bars (RESCUE 10, IDENTITY 15)
+#       are 0.27 / 0.40 of cgn1's +37.38 snapshot gap and ~17 / ~25 SE: a
+#       rising kL moves the ceiling, not the sign or location of ISO - CTL.
+#     * PRICE OF LONGER (cgn1: 7.4889 GPU-h for 6 runs = 1.248 GPU-h per
+#       100-epoch GN run, 4 of 6 on 2080 Ti): 15 jobs x 100 ep ~= 18.7 GPU-h;
+#       x 150 ep ~= 28.1; x 200 ep ~= 37.4.  With cpl2 (~9.95) the pair is
+#       ~28.7 at 100 ep, ~38 at 150, ~47 at 200 -- the latter two break the
+#       operator's ~35 GPU-h envelope.
+#     * What 100 epochs CANNOT say, registered: whether an ISO rescue is a
+#       DELAY (cpl1's ISO complement pinned at epoch 60-62 and froze; on GN no
+#       pin is expected inside 100 epochs, so a delay would be INVISIBLE here)
+#       or the size of the GN gap.  Stamps HORIZON-100-ONLY and
+#       RESCUE-PERSISTENCE-NOT-TESTED, unconditional.  The tail slope (TEST
+#       OLS over epochs 80-99) of every arm is printed, descriptive only.
+#
+# =============================================================================
+# THE REGISTERED ACCOUNTS (every arm's predicted LEVEL; all UNSURE)
+# =============================================================================
+# Level anchors, FROZEN from cgn1 (between-batch, non-gating): k01 14.4340,
+# kL 51.8173.  Intervals: K01_GN 10-20, KL_GN 45-62, FREE_GN 40-62.
+#   T-IDENT   the BN isolation transfers whole: {50,53,59} carry on GN, and 50
+#             alone rescues as it did on BN (~0.9).  ISO free, CTL at k01,
+#             ONE free.                        -> IDENTITY-TRANSFERS-GN
+#   T-SET     the triple carries on GN but 50 alone does not (the PlainNet
+#             pattern: cpl1 D_ONE -0.10).  ISO free, CTL at k01, ONE at k01.
+#                                              -> IDENTITY-TRANSFERS-ONE-NULL-GN
+#   CLASS     on GN any layer4 512-wide GN triple lifts the scalar arm (the
+#             slow, non-clamp GN collapse is escaped by ANY isolation).
+#             ISO, CTL, ONE free.              -> CLASS-OPERATIVE-GN
+#   DIFFUSE   the GN scalar failure is not carried by a small set: no
+#             isolation arm leaves the k01 level.  ISO, CTL, ONE at k01.
+#                                              -> NO-RESCUE-GN
+#   H-BROKEN  content-free rival: every m=2 partition fails on GN for reasons
+#             unrelated to which tensors it isolates.  IDENTICAL predictions to
+#             DIFFUSE on every arm, so NO-RESCUE-GN NEVER confirms DIFFUSE; it
+#             stamps H-BROKEN-NOT-EXCLUDED.  Every other branch has an
+#             off-k01 m=2 arm in batch, which kills H-BROKEN IN BATCH.
+#
+# =============================================================================
+# THE NOISE FLOOR -- RE-DERIVED AT REGISTRATION WITH `cgn2-` EXCLUDED, FROZEN
+# =============================================================================
+# On results/all_runs.csv at 2,926 rows (sha 3223028d..., HEAD 7254ed4), the
+# pooled within-cell SD of plateau5 at the standard cell (100 ep, AUGMENT=1,
+# BETA_CLIP -15:-2.3026, ms 1e-3, alpha0 1e-6, batch 100; superseded /
+# collapsed / incomplete dropped; cell = the 15 design columns):
+#   SIGMA_R18ALL  0.694442846939599   ResNet18_c100/CIFAR100, every granularity
+#                                     (df 209, 46 cells, 255 members; top cell
+#                                     12.64 % of SS)
+#   SIGMA_GNC100  0.725869593430298   ResNet18_gn_c100/CIFAR100 = cgn1's own
+#                                     6 runs (df 4, 2 cells) -- GN seed noise
+#   SIGMA_PRIOR := max(the two) = 0.725869593430298          (a LITERAL)
+#   SIGMA_USED   = max(SIGMA_PRIOR, SIGMA_INBATCH)            (compose_sigma, O2)
+#   SE_ARM_DIFF  = SIGMA_USED * sqrt(2/3); at the prior 0.592670 pp.
+#
+# =============================================================================
+# THE PRIMARY STATISTIC -- BOUNDED IN NEITHER DIRECTION
+# =============================================================================
+#   DELTA_ID = plateau5(ISO) - plateau5(CTL)     both 3-seed IN-BATCH means
+# Two [59,3] partitions with the same isolated numel, differing ONLY in which
+# three tensors.  Registered: T-IDENT/T-SET +20..+52; CLASS ~0 with both arms
+# free; DIFFUSE/H-BROKEN ~0 WITH BOTH ARMS AT THE k01 LEVEL -- the one place the
+# primary sits on a SOFT bound (the k01 level is itself still moving on GN), so
+# that reading is never quoted as a point agreement (FLOOR-READINGS-ARE-BOUNDS).
+# KEY SECONDARY: D_ONE = plateau5(ONE) - plateau5(k01).
+# SECONDARIES, all in batch: D_ISO, D_CTL, D_GAP = kL - k01, D_HEAD3 = ISO - ONE;
+# RECOVERY = D_ISO/D_GAP and RECOVERY_ONE = D_ONE/D_GAP are DESCRIPTIVE ONLY.
+#
+# =============================================================================
+# THE BARS, FROZEN (pp; SE at the frozen prior 0.592670 in brackets)
+# =============================================================================
+#   RESCUE_BAR    10.0 [16.87]  an arm rescues iff D_arm >= 10.0
+#   IDENTITY_BAR  15.0 [25.31]  DELTA_ID >= 15 -> identity operative
+#   NULL_BAR       2.0 [ 3.37]  |x| <= 2 is a null ("at the k01 level")
+#   GAP_MIN       20.0          D_GAP >= 20 required before any carrier branch
+#                               (0.54 of cgn1's +37.38; below it the bars are
+#                               not reachable)
+#   DIVERGED_BAR   5.0          within-arm seed range
+#   FLOOR_MIN     15.0          max arm mean (chance 1.00) -> HARNESS-UNSOUND
+#   KL_MIN        30.0          kL mean (0.58 of cgn1's 51.82) -> GN-UNTRAINABLE
+#   CEIL_MAX      90.0          max arm mean -> HARNESS-UNSOUND
+#
+# =============================================================================
+# HARNESS GATES (any failure -> FINAL: HARNESS-UNSOUND, no branch, rc 1)
+# =============================================================================
+#   G-ARGS    every run's OWN ARGS line: exactly one; no flag repeated; NN-name
+#             ResNet18_gn_c100, dataset CIFAR100, 100 epochs, batch 100, ms
+#             1e-3, alpha0 1e-6, SGDm/Lion/HF, its seed, its run-name and the
+#             stepsize-groups string its FILE NAME's arm registers.
+#   G-ENV     one distinct ENV line (PROBE_DIR stripped), one per run, with
+#             AUGMENT=1, BETA_CLIP=-15:-2.3026, PROBE=100, HIER=none,
+#             SCHED=none; one `PROBE_TENSOR: on every=100 type=<T> tensors=62`
+#             per run, T = scalar / layerwise / blockwise by arm.
+#   G-STRUCT  the batch's PARTITION-MANIFEST.txt is BYTE-IDENTICAL to
+#             synthetic_manifest_text() (62 tensors, 11,220,132 params, every
+#             scale/shift owned by GroupNorm, GN 20 / BN 0, the three m=2 arms'
+#             sizes, params and isolated names).
+#   G-PROV    PROVENANCE.txt: MODE submit; BUILD_NETWORK_SHA256 == POST_SHA
+#             (the cgn1 isolated tree, H-PROV pin); SCORER_SHA256 == this file.
+#
+# =============================================================================
+# THE BRANCH MAP, FROZEN (decide(); first match wins)
+# =============================================================================
+#   INCOMPLETE              a run missing / short / no RUN_DONE / traceback
+#   HARNESS-UNSOUND         a harness gate failed, or max arm < 15 or > 90
+#   GN-UNTRAINABLE          kL < 30
+#   UNRESOLVED-DIVERGED     an arm's seed range > 5
+#   GAP-NOT-REPRODUCED-GN   D_GAP < 20: no carrier contrast is read
+#   NO-RESCUE-GN            no m=2 arm has D >= 10.  T-IDENT, T-SET, CLASS
+#                           REFUTED; DIFFUSE NOT distinguished from H-BROKEN.
+#   UNEXPECTED-PATTERN      ISO does not rescue, CTL or ONE does.  Stop.
+#   CONTROL-DOMINATES-GN    DELTA_ID <= -15.  Stop.
+#   IDENTITY-TRANSFERS-GN            DELTA_ID >= 15 and D_ONE >= 10
+#   IDENTITY-TRANSFERS-ONE-PARTIAL-GN DELTA_ID >= 15 and 2 < D_ONE < 10
+#   IDENTITY-TRANSFERS-ONE-NULL-GN   DELTA_ID >= 15 and D_ONE <= 2
+#   CLASS-OPERATIVE-GN      CTL rescues and |DELTA_ID| <= 2
+#   IDENTITY-ATTENUATED-GN  otherwise (ISO rescues, DELTA_ID between the bars)
+#
+# STAMPS (never the branch): HARNESS-CLEAN; K01-IS-A-LEVEL-NOT-A-CLAMP;
+#   NOMINATION-WAS-POST-PEAK-NOT-PINNED; CTL-MATCHED-ON-NUMEL-NOT-CLASS;
+#   MAGNITUDE-NOT-SEPARATED; MISTUNING-NOT-EXCLUDED; HORIZON-100-ONLY;
+#   RESCUE-PERSISTENCE-NOT-TESTED; GN32-ALSO-CHANGES-PER-CHANNEL-INVARIANCE;
+#   SIGMA-PRIOR-FROZEN / SIGMA-INBATCH; H-BROKEN-EXCLUDED / -NOT-EXCLUDED;
+#   FLOOR-READINGS-ARE-BOUNDS (an m=2 arm within NULL_BAR of k01);
+#   TRAIN-AGREES / TRAIN-DISAGREES (sign of DELTA_ID);
+#   ISO-TRACKS-KL / ISO-BELOW-KL / ISO-ABOVE-KL; CTL-AT-K01 / CTL-ABOVE-K01;
+#   ONE-AT-K01 / ONE-PARTIAL / ONE-RESCUES.
+# The BN twins (ciso1/cdep1) and cgn1's levels are printed BETWEEN-BATCH and
+# NON-GATING: the batch is the unit of replication.
+#
+# plateau5 is PRIMARY (mean TEST over epochs 95..99 of each run's own .out);
+# the CSV `plateau` column is read NOWHERE; best_test NOWHERE; TRAIN is printed
+# beside TEST at every arm and for the primary.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import inspect
+import io
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# ---- the batch design, LITERAL.  The launcher's guard 4c' proves it agrees. --
+PREFIX = "cgn2"
+NET = "ResNet18_gn_c100"
+REF_NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (72, 73, 74)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+SPEC = {
+    "k01": "scalar",
+    "kL": "layerwise",
+    "ISO": "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight",
+    "CTL": "sets:1-46,49-55,57-62/layer4.0.bn1.weight,layer4.0.bn1.bias,layer4.1.bn1.weight",
+    "ONE": "sets:1-49,51-62/layer4.0.bn2.weight",
+}
+ARMS = ("k01", "kL", "ISO", "CTL", "ONE")
+BLOCKWISE_ARMS = ("ISO", "CTL", "ONE")
+PT_TYPE = {"k01": "scalar", "kL": "layerwise", "ISO": "blockwise", "CTL": "blockwise", "ONE": "blockwise"}
+# the BatchNorm batches these strings must equal, byte for byte (selftest B)
+BN_TWIN_SOURCE = {"ISO": ("cIS1_ciso1_isolate_score.py", "ISO"),
+                  "ONE": ("cIS1_ciso1_isolate_score.py", "ONE"),
+                  "CTL": ("cDP1_cdep1_depth_score.py", "DEPTH")}
+
+# ---- the live model this batch assumes (re-derived by name and numel) ---------
+NTENS = 62
+TOTPAR = 11220132
+N_GROUPNORM = 20
+GN_GROUPS = 32
+W512_IDX = (47, 50, 53, 56, 59)
+W512_NAMES = ("layer4.0.bn1.weight", "layer4.0.bn2.weight", "layer4.0.shortcut.1.weight",
+              "layer4.1.bn1.weight", "layer4.1.bn2.weight")
+ISOLATED = {
+    "ISO": (("layer4.0.bn2.weight", 50), ("layer4.0.shortcut.1.weight", 53), ("layer4.1.bn2.weight", 59)),
+    "CTL": (("layer4.0.bn1.weight", 47), ("layer4.0.bn1.bias", 48), ("layer4.1.bn1.weight", 56)),
+    "ONE": (("layer4.0.bn2.weight", 50),),
+}
+WANT_SIZES = {"ISO": [59, 3], "CTL": [59, 3], "ONE": [61, 1]}
+WANT_PARAMS = {"ISO": [TOTPAR - 1536, 1536], "CTL": [TOTPAR - 1536, 1536], "ONE": [TOTPAR - 512, 512]}
+PRE_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+POST_SHA = "9f6e4ec97157311bb3b664509258144235319db88962b9d8c3a4484b1837c892"
+
+# ---- the noise floor, FROZEN (O2) --------------------------------------------
+SIGMA_R18ALL = 0.694442846939599      # ResNet18_c100 std cell, every granularity, df 209
+SIGMA_GNC100 = 0.725869593430298      # ResNet18_gn_c100 std cell (cgn1), df 4
+SIGMA_PRIOR = 0.725869593430298       # = max(SIGMA_R18ALL, SIGMA_GNC100)
+SE_PRIOR = 0.592670                   # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_SHA256 = "3223028d03b17c58d5451d9a9ce5ce64dfa35fff04cfba0b3044101ba4568e58"
+REG_CORPUS_ROWS = 2926
+
+# ---- the bars, FROZEN ----------------------------------------------------------
+RESCUE_BAR = 10.0
+IDENTITY_BAR = 15.0
+NULL_BAR = 2.0
+GAP_MIN = 20.0
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+KL_MIN = 30.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+
+# ---- frozen references, BETWEEN-BATCH, NON-GATING ------------------------------
+R_CGN1 = {"k01": 14.4340, "kL": 51.8173, "D": 37.3833}
+R_CISO1 = {"k01": 23.2807, "kL": 69.0273, "ISO": 70.2113, "ONE": 64.7500}
+R_CDEP1 = {"k01": 23.3520, "kL": 69.1560, "ISO": 70.0440, "ONE": 64.8267, "DEPTH": 23.5207}
+GN_PER_RUN_GPUH = 1.248               # cgn1: 7.4889 GPU-h / 6 runs (sacct)
+
+# ---- the floor table: predicted level intervals per account (UNSURE) ----------
+K01_GN = (10.0, 20.0)
+KL_GN = (45.0, 62.0)
+FREE_GN = (40.0, 62.0)
+ACCOUNTS = {
+    "T-IDENT":  {"k01": K01_GN, "kL": KL_GN, "ISO": FREE_GN, "CTL": K01_GN, "ONE": FREE_GN},
+    "T-SET":    {"k01": K01_GN, "kL": KL_GN, "ISO": FREE_GN, "CTL": K01_GN, "ONE": K01_GN},
+    "CLASS":    {"k01": K01_GN, "kL": KL_GN, "ISO": FREE_GN, "CTL": FREE_GN, "ONE": FREE_GN},
+    "DIFFUSE":  {"k01": K01_GN, "kL": KL_GN, "ISO": K01_GN, "CTL": K01_GN, "ONE": K01_GN},
+    "H-BROKEN": {"k01": K01_GN, "kL": KL_GN, "ISO": K01_GN, "CTL": K01_GN, "ONE": K01_GN},
+}
+EXPECTED_BRANCH = {"T-IDENT": "IDENTITY-TRANSFERS-GN", "T-SET": "IDENTITY-TRANSFERS-ONE-NULL-GN",
+                   "CLASS": "CLASS-OPERATIVE-GN", "DIFFUSE": "NO-RESCUE-GN", "H-BROKEN": "NO-RESCUE-GN"}
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize",
+            "alpha0", "gamma", "augment", "beta_clip", "batch_size",
+            "epochs_requested", "hier", "lam", "eta_ratio"]
+
+DEFAULT_CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "results", "all_runs.csv")
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+)\s*%,"
+                     r"\s*Test Accuracy:\s*([0-9.]+)")
+OUT_RE = re.compile(r"^cgn2-(k01|kL|ISO|CTL|ONE)-s(\d+)-(\d+)\.out$")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise|blockwise) tensors=%d "
+                   % (PROBE, NTENS))
+
+CLAMP_LO = -15.0
+STEPS_PER_EPOCH = 50000 // BATCH
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =============================================================================
+# O2: the ONLY composition of sigma.  ONE argument.  NO corpus.
+# =============================================================================
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+# =============================================================================
+# the frozen manifest, composed from ResNet-18's definition (no torch).  The
+# launcher's guard 4d proves the LIVE manifest BYTE-IDENTICAL to this text.
+# =============================================================================
+def gn_tensors():
+    out = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "GroupNorm"),
+           ("bn1.bias", 64, "GroupNorm")]
+    cin = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for bi in range(2):
+            stride2 = (li > 1 and bi == 0)
+            p = "layer%d.%d." % (li, bi)
+            a = cin if bi == 0 else w
+            out += [(p + "conv1.weight", w * a * 9, "Conv2d"), (p + "bn1.weight", w, "GroupNorm"),
+                    (p + "bn1.bias", w, "GroupNorm"), (p + "conv2.weight", w * w * 9, "Conv2d"),
+                    (p + "bn2.weight", w, "GroupNorm"), (p + "bn2.bias", w, "GroupNorm")]
+            if stride2:
+                out += [(p + "shortcut.0.weight", w * a, "Conv2d"),
+                        (p + "shortcut.1.weight", w, "GroupNorm"),
+                        (p + "shortcut.1.bias", w, "GroupNorm")]
+        cin = w
+    out += [("linear.weight", 100 * 512, "Linear"), ("linear.bias", 100, "Linear")]
+    return out
+
+
+def parse_sets(spec, names):
+    """`sets:<g>/<g>` -> list of 1-based index lists (each sorted), re-implemented
+    HERE so the registered index sets are checked without importing HF.py."""
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def synthetic_manifest_text():
+    t = gn_tensors()
+    names = [n for n, _q, _o in t]
+    numel = [q for _n, q, _o in t]
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+             "NORM GroupNorm %d BatchNorm2d 0" % N_GROUPNORM, "GN_GROUPS %d" % GN_GROUPS,
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH)]
+    for i, (n, q, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("W512 %s" % ",".join("%d:%s" % x for x in zip(W512_IDX, W512_NAMES)))
+    lines.append("ARMSPEC k01 SPEC scalar TYPE scalar M 1")
+    lines.append("ARMSPEC kL SPEC layerwise TYPE layerwise M %d" % len(t))
+    for a in BLOCKWISE_ARMS:
+        g = parse_sets(SPEC[a], names)
+        lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                     % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                        ",".join(str(sum(numel[i - 1] for i in x)) for x in g),
+                        " ".join(names[i - 1] for i in g[1])))
+        lines.append("ISOLATED %s %s" % (a, ",".join(str(i) for i in g[1])))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["plateau5"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    """(arm, seed) -> the run.  Among several files for one (arm, seed) the highest
+    INTEGER job id among COMPLETE runs wins; a truncated resubmission cannot shadow
+    a complete run.  -> (runs, notes)"""
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s"
+                         % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# corpus readers -- --selftest and a NON-GATING row-count disclosure ONLY
+# =============================================================================
+def read_corpus(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    return [r for r in csv.DictReader(open(csvpath))
+            if not r.get("run", "").startswith(PREFIX + "-")]
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r, any_gran=False):
+    return ((any_gran or r.get("granularity") in ("scalar", "layerwise"))
+            and r.get("epochs_requested") == str(EPOCHS)
+            and r.get("augment") == AUG and r.get("beta_clip") == CLIP
+            and r.get("meta_stepsize") == MST and r.get("alpha0") == A0
+            and r.get("batch_size") == str(BATCH))
+
+
+def pooled_sigma(rows, extra, any_gran=False):
+    cells = {}
+    for r in rows:
+        if usable(r) and std_cell(r, any_gran) and extra(r):
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc, nm = 0.0, 0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+        nm += len(v)
+    return (math.sqrt(ss / df) if df else None), df, nc, nm
+
+
+def net_is(net):
+    return lambda r: r.get("network") == net and r.get("dataset") == DSET
+
+
+def prefix_arm_mean(rows, prefix, gran, net):
+    v = [float(r["plateau5"]) for r in rows if r.get("run", "").startswith(prefix + "-")
+         and usable(r) and std_cell(r, True) and r.get("network") == net and r.get("granularity") == gran]
+    return (mean(v), len(v)) if v else (None, 0)
+
+
+# =============================================================================
+# DESCRIPTIVE, NON-GATING probe readouts.  Nothing here reaches decide(), a gate
+# or the FINAL line.  Pinned records are NOT required (cgn1 had none).
+# =============================================================================
+def load_probe(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r.get("beta"), list) and isinstance(r.get("step"), int):
+                    recs.append(r)
+            return recs
+    return None
+
+
+def beta_summary(recs, coord):
+    vals = [(r["step"], r["beta"][coord]) for r in recs if len(r["beta"]) > coord]
+    if not vals:
+        return None
+    at = [v <= CLAMP_LO + 1e-4 for _s, v in vals]
+    pin = None
+    for k in range(len(vals)):
+        if all(at[k:]):
+            pin = vals[k][0] / float(STEPS_PER_EPOCH)
+            break
+    pk = max(vals, key=lambda sv: sv[1])
+    return {"last": vals[-1][1], "peak": pk[1], "peak_epoch": pk[0] / float(STEPS_PER_EPOCH),
+            "frac_clamp": sum(at) / float(len(at)), "pin_epoch": pin, "n": len(vals)}
+
+
+NOM_SETS = {"50_53_59": [50, 53, 59], "47_48_56": [47, 48, 56], "50": [50], "59": [59]}
+
+
+def postpeak_nomination(recs):
+    """217.6's DISCLOSED post-peak method on k01 records (1-based sets)."""
+    ok = [r for r in recs if isinstance(r.get("m_tensor"), list) and len(r["m_tensor"]) == NTENS
+          and isinstance(r.get("z_tensor"), list) and len(r["z_tensor"]) == NTENS and len(r["beta"]) == 1]
+    if not ok:
+        return None
+    ipk = max(range(len(ok)), key=lambda i: ok[i]["beta"][0])
+    post = ok[ipk + 1:]
+    if not post:
+        return None
+    mass = [0.0] * NTENS
+    flips = dict((k, 0) for k in NOM_SETS)
+    down = 0
+    for r in post:
+        b2 = r.get("pt_b2", 0.9)
+        L = [b2 * m + (1.0 - b2) * z for m, z in zip(r["m_tensor"], r["z_tensor"])]
+        S = sum(L)
+        s0 = (S > 0) - (S < 0)
+        down += s0 > 0            # a positive L votes beta DOWN (Lion subtracts ms*sign)
+        for i, v in enumerate(L):
+            mass[i] += abs(v)
+        for k, idx in NOM_SETS.items():
+            Sr = S - sum(L[i - 1] for i in idx)
+            if ((Sr > 0) - (Sr < 0)) != s0:
+                flips[k] += 1
+    tm = sum(mass) or 1.0
+    return {"n": len(post), "share": [x / tm for x in mass],
+            "flip": dict((k, v / float(len(post))) for k, v in flips.items()),
+            "down": down / float(len(post))}
+
+
+def descriptive_probe_readout(runsdir):
+    print("\nDESCRIPTIVE, NON-GATING -- beta trajectories from the runs' own probe.jsonl")
+    print("  (the GN scalar did not reach the -15 clamp in cgn1; nothing below gates anything)")
+    any_rec = False
+    for a in ARMS:
+        for s in SEEDS:
+            recs = load_probe(runsdir, a, s)
+            if not recs:
+                continue
+            any_rec = True
+            if a == "kL":
+                last = recs[-1]["beta"]
+                print("  %-4s s%d  %d records; groups at the clamp at the last record: %d of %d; max beta %.3f"
+                      % (a, s, len(recs), sum(v <= CLAMP_LO + 1e-4 for v in last), len(last), max(last)))
+                continue
+            for coord, lab in ((0, "beta[0]" if a == "k01" else "complement beta[0]"),
+                               (1, "isolated beta[1]")):
+                if a == "k01" and coord == 1:
+                    continue
+                bs = beta_summary(recs, coord)
+                if bs:
+                    print("  %-4s s%d  %-19s last %8.3f  peak %8.3f @ep %5.1f  at-clamp frac %.3f  "
+                          "pinned-from-epoch %s" % (a, s, lab, bs["last"], bs["peak"], bs["peak_epoch"],
+                                                    bs["frac_clamp"],
+                                                    "never" if bs["pin_epoch"] is None else "%.1f" % bs["pin_epoch"]))
+    if not any_rec:
+        print("  (no probe records reachable under %s)" % runsdir)
+    print("\nDESCRIPTIVE, NON-GATING -- 217.6's POST-PEAK nomination re-run on THIS batch's k01 records")
+    print("  (a DISCLOSED deviation from 194.5's pinned-record statistic, which needs pinned records)")
+    got = False
+    for s in SEEDS:
+        recs = load_probe(runsdir, "k01", s)
+        nm = postpeak_nomination(recs) if recs else None
+        if nm is None:
+            continue
+        got = True
+        order = sorted(range(NTENS), key=lambda i: -nm["share"][i])[:4]
+        print("  k01 s%d  %d post-peak records; total votes beta DOWN on %.4f; top share %s"
+              % (s, nm["n"], nm["down"], ", ".join("idx %d %.4f" % (i + 1, nm["share"][i]) for i in order)))
+        print("          removing {50,53,59} flips %.4f | {47,48,56} %.4f | {50} %.4f | {59} %.4f"
+              % (nm["flip"]["50_53_59"], nm["flip"]["47_48_56"], nm["flip"]["50"], nm["flip"]["59"]))
+    if not got:
+        print("  (no k01 records with per-tensor terms reachable)")
+
+
+# =============================================================================
+# THE BRANCH MAP -- a pure function of the in-batch means and two flags
+# =============================================================================
+def decide(M, trains_ok=True, diverged=False):
+    D_GAP = M["kL"] - M["k01"]
+    D_ISO = M["ISO"] - M["k01"]
+    D_CTL = M["CTL"] - M["k01"]
+    D_ONE = M["ONE"] - M["k01"]
+    DELTA_ID = M["ISO"] - M["CTL"]
+    if not trains_ok:
+        return "GN-UNTRAINABLE"
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if D_GAP < GAP_MIN:
+        return "GAP-NOT-REPRODUCED-GN"
+    rI, rC, rO = D_ISO >= RESCUE_BAR, D_CTL >= RESCUE_BAR, D_ONE >= RESCUE_BAR
+    if not (rI or rC or rO):
+        return "NO-RESCUE-GN"
+    if not rI:
+        return "UNEXPECTED-PATTERN"
+    if DELTA_ID <= -IDENTITY_BAR:
+        return "CONTROL-DOMINATES-GN"
+    if DELTA_ID >= IDENTITY_BAR:
+        if rO:
+            return "IDENTITY-TRANSFERS-GN"
+        if D_ONE <= NULL_BAR:
+            return "IDENTITY-TRANSFERS-ONE-NULL-GN"
+        return "IDENTITY-TRANSFERS-ONE-PARTIAL-GN"
+    if rC and abs(DELTA_ID) <= NULL_BAR:
+        return "CLASS-OPERATIVE-GN"
+    return "IDENTITY-ATTENUATED-GN"
+
+
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement" % (FLOOR_MIN, CEIL_MAX),
+                        "about the harness, not about GroupNorm carriers.  Nothing else is licensed."],
+    "GN-UNTRAINABLE": ["kL is under %.0f pp: the GN net did not train at this cell in this batch (cgn1's" % KL_MIN,
+                       "kL was 51.82).  No carrier sentence is licensed."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch."],
+    "GAP-NOT-REPRODUCED-GN": [
+        "The in-batch gap is under %.0f pp, so the carrier bars are not reachable.  No carrier" % GAP_MIN,
+        "contrast is read.  (cgn1's +37.38 is between-batch and is not contradicted by a stamp.)"],
+    "NO-RESCUE-GN": [
+        "Neither the BN carrier triple (ISO), its matched carrier-free triple (CTL) nor 50 alone",
+        "lifts the GN scalar arm off its own k01 level.  REFUTED: T-IDENT, T-SET, CLASS -- the BN",
+        "isolation does NOT transfer to GroupNorm at this cell and horizon.  NOT DISTINGUISHED:",
+        "DIFFUSE (the GN failure is not carried by a small set) from H-BROKEN (m=2 partitions fail",
+        "on GN for content-free reasons).  217.6's post-peak nomination is NOT supported.",
+        "NOT licensed: 'the GN gap has no carriers' -- only these three sets were tried."],
+    "UNEXPECTED-PATTERN": ["ISO does not rescue but CTL or ONE does.  Unregistered.  Report and stop."],
+    "CONTROL-DOMINATES-GN": ["The carrier-free triple beats the BN carrier triple on GN.  Unexpected under",
+                             "every registered account.  Report and stop."],
+    "IDENTITY-TRANSFERS-GN": [
+        "THE BN ISOLATION TRANSFERS WHOLE TO GROUPNORM: isolating {50,53,59} lifts the GN scalar",
+        "arm, the numel-, width-, stage- and owner-matched {47,48,56} does not, and 50 alone rescues",
+        "as it did on BN.  The CARRIER SET -- not only the GAP -- does not need batch statistics.",
+        "217.6's post-peak nomination is SUPPORTED BY INTERVENTION.  ISO's rescue kills H-BROKEN in",
+        "batch.  NOT licensed: identity vs MAGNITUDE; persistence beyond 100 epochs (a GN rescue could",
+        "be a delay -- no pin occurs inside this horizon); anything about other normalisers."],
+    "IDENTITY-TRANSFERS-ONE-NULL-GN": [
+        "The triple carries on GN (ISO rescues, CTL does not) but 50 ALONE does not -- whereas on",
+        "BN 50 alone recovered ~0.91.  The SET transfers; the single-tensor decomposition does not.",
+        "217.6's triple is SUPPORTED BY INTERVENTION; what carries inside it on GN is not located",
+        "(by subtraction it involves 53 and/or 59 -- stamped, never isolated here).  H-BROKEN killed."],
+    "IDENTITY-TRANSFERS-ONE-PARTIAL-GN": [
+        "The triple carries on GN; 50 alone recovers only partially (2 < D_ONE < 10).  The set",
+        "transfers; the BN single-tensor decomposition transfers only in part."],
+    "CLASS-OPERATIVE-GN": [
+        "On GN any layer4 512-wide GN triple lifts the scalar arm -- ISO == CTL -- whereas on BN the",
+        "same-named carrier-free triple (cdep1 DEPTH) did not.  The BN IDENTITY result does NOT",
+        "transfer: on GroupNorm the isolation is a CLASS effect at this cell and horizon.  (A slow,",
+        "non-clamp GN collapse escaped by any isolation is one reading; not separated here.)"],
+    "IDENTITY-ATTENUATED-GN": [
+        "ISO rescues and beats CTL by less than %.0f pp: identity contributes on GN and is not" % IDENTITY_BAR,
+        "decisive.  Neither T-IDENT/T-SET nor CLASS is licensed."],
+}
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound, 2 incomplete."""
+    print("=" * 78)
+    print(" cgn2 -- DOES THE ISOLATION TRANSFER OFF BATCHNORM?  (ResNet18_gn_c100)")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-4s %s" % (a, SPEC[a]))
+    print(" PRIMARY: DELTA_ID = plateau5(ISO) - plateau5(CTL); KEY SECONDARY D_ONE = ONE - k01.")
+    print("          plateau5 = mean TEST over epochs %d..%d of each run's own .out." % (EPOCHS - 5, EPOCHS - 1))
+    print(" BARS ARE FROZEN LITERALS (O2); the corpus cannot move them.")
+    print("=" * 78)
+    rows = read_corpus(csvpath)
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)"
+          % ("not readable" if rows is None else "%d rows, %s- excluded" % (len(rows), PREFIX)))
+
+    runs, rnotes = read_runs(runsdir)
+
+    # ---- completeness --------------------------------------------------------
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing),
+                                                            len(ARMS) * len(SEEDS), ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    # ---- G-ARGS ----------------------------------------------------------------
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                    "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s)}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad])
+                 if (dup or bad) else "")
+
+    # ---- G-ENV -----------------------------------------------------------------
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "G-ENV one distinct ENV line, one per run", "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    for tok in ("AUGMENT=%s" % AUG, "BETA_CLIP=%s" % CLIP, "PROBE=%d" % PROBE, "HIER=none", "SCHED=none"):
+        hchk(len(envs) == 1 and (" " + tok + " ") in (envs[0] + " "), "G-ENV ENV line carries %s" % tok)
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0])
+             or PT_RE.match(r["pt"][0]).group(1) != PT_TYPE[a]]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`"
+         % (PROBE, NTENS), "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    # ---- G-STRUCT --------------------------------------------------------------
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(),
+             "G-STRUCT byte-identical to synthetic_manifest_text() (62 tensors, GN owners, 3 m=2 partitions)",
+             "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+        kv = read_kv(mp) or {}
+        for key in ("NETWORK", "NUM_PARAM_TENSORS", "TOTAL_PARAMS", "NORM", "W512"):
+            print("        %s %s" % (key, kv.get(key, "(absent)")[:110]))
+
+    # ---- G-PROV ----------------------------------------------------------------
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == POST_SHA,
+             "G-PROV build_network.py sha256 == POST_SHA %s... (the cgn1 isolated tree)" % POST_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer's sha256 %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    # ---- the levels ------------------------------------------------------------
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-4s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t),
+                 "/".join(fmt(x, 3) for x in sl)))
+        print("       seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (
+            len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    # ---- sigma (O2) ------------------------------------------------------------
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+
+    # ---- contrasts ---------------------------------------------------------------
+    D_GAP = M["kL"] - M["k01"]
+    D_ISO = M["ISO"] - M["k01"]
+    D_CTL = M["CTL"] - M["k01"]
+    D_ONE = M["ONE"] - M["k01"]
+    DELTA_ID = M["ISO"] - M["CTL"]
+    D_HEAD3 = M["ISO"] - M["ONE"]
+    DELTA_ID_TR = T["ISO"] - T["CTL"]
+    print("\nCONTRASTS (every one WITHIN batch)")
+    print("  PRIMARY  DELTA_ID = ISO - CTL = %.4f - %.4f = %+.4f pp = %+.2f SE"
+          % (M["ISO"], M["CTL"], DELTA_ID, DELTA_ID / se))
+    print("           DELTA_ID(TRAIN)             = %+.4f pp" % DELTA_ID_TR)
+    print("  KEY      D_ONE   = ONE - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+          % (D_ONE, D_ONE / se, T["ONE"] - T["k01"]))
+    print("  D_ISO    ISO - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (D_ISO, D_ISO / se, T["ISO"] - T["k01"]))
+    print("  D_CTL    CTL - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (D_CTL, D_CTL / se, T["CTL"] - T["k01"]))
+    print("  D_HEAD3  ISO - ONE = %+.4f pp = %+.2f SE" % (D_HEAD3, D_HEAD3 / se))
+    print("  D_GAP    kL  - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (D_GAP, D_GAP / se, T["kL"] - T["k01"]))
+    rec = D_ISO / D_GAP if abs(D_GAP) > 1e-9 else None
+    rec1 = D_ONE / D_GAP if abs(D_GAP) > 1e-9 else None
+    print("  DESCRIPTIVE ONLY: RECOVERY %s   RECOVERY_ONE %s" % (fmt(rec), fmt(rec1)))
+    print("  bars: RESCUE %.1f pp (%.2f SE) | IDENTITY %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | GAP_MIN %.1f"
+          % (RESCUE_BAR, RESCUE_BAR / se, IDENTITY_BAR, IDENTITY_BAR / se, NULL_BAR, NULL_BAR / se, GAP_MIN))
+
+    trains_ok = M["kL"] >= KL_MIN
+    print("\nG-TRAINS / G-DIVERGE (branch conditions, not harness gates)")
+    print("  %s kL mean %.4f >= %.1f" % ("PASS" if trains_ok else "FAIL", M["kL"], KL_MIN))
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR,
+                                                     "" if not div else "  diverged: %s" % div))
+
+    branch = decide(M, trains_ok, bool(div))
+    stamps = ["HARNESS-CLEAN", "K01-IS-A-LEVEL-NOT-A-CLAMP", "NOMINATION-WAS-POST-PEAK-NOT-PINNED",
+              "CTL-MATCHED-ON-NUMEL-NOT-CLASS", "MAGNITUDE-NOT-SEPARATED", "MISTUNING-NOT-EXCLUDED",
+              "HORIZON-100-ONLY", "RESCUE-PERSISTENCE-NOT-TESTED", "GN32-ALSO-CHANGES-PER-CHANNEL-INVARIANCE",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    stamps.append("H-BROKEN-EXCLUDED" if max(D_ISO, D_CTL, D_ONE) >= RESCUE_BAR else "H-BROKEN-NOT-EXCLUDED")
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in BLOCKWISE_ARMS):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    if branch in ("IDENTITY-TRANSFERS-ONE-NULL-GN", "IDENTITY-TRANSFERS-ONE-PARTIAL-GN"):
+        stamps.append("DECOMPOSITION-BY-SUBTRACTION")
+    stamps.append("TRAIN-AGREES" if (DELTA_ID_TR > 0) == (DELTA_ID > 0) else "TRAIN-DISAGREES")
+    if abs(M["ISO"] - M["kL"]) <= NULL_BAR:
+        stamps.append("ISO-TRACKS-KL")
+    else:
+        stamps.append("ISO-BELOW-KL" if M["ISO"] < M["kL"] else "ISO-ABOVE-KL")
+    stamps.append("CTL-AT-K01" if abs(D_CTL) <= NULL_BAR else "CTL-ABOVE-K01")
+    stamps.append("ONE-RESCUES" if D_ONE >= RESCUE_BAR else ("ONE-AT-K01" if D_ONE <= NULL_BAR else "ONE-PARTIAL"))
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cgn2 bar or contrast):")
+    print("  cgn1  {60,61,62} ResNet18_gn_c100: k01 %.4f  kL %.4f  D %+.4f"
+          % (R_CGN1["k01"], R_CGN1["kL"], R_CGN1["D"]))
+    print("  ciso1 {21,22,23} ResNet18_c100:    k01 %.4f  k62 %.4f  ISO %.4f  ONE %.4f"
+          % (R_CISO1["k01"], R_CISO1["kL"], R_CISO1["ISO"], R_CISO1["ONE"]))
+    print("  cdep1 {24,25,26} ResNet18_c100:    k01 %.4f  k62 %.4f  ISO %.4f  ONE %.4f  DEPTH(=CTL) %.4f"
+          % (R_CDEP1["k01"], R_CDEP1["kL"], R_CDEP1["ISO"], R_CDEP1["ONE"], R_CDEP1["DEPTH"]))
+    print("  cgn2  {72,73,74} ResNet18_gn_c100: k01 %.4f  kL %.4f  ISO %.4f  ONE %.4f  CTL %.4f"
+          % (M["k01"], M["kL"], M["ISO"], M["ONE"], M["CTL"]))
+
+    try:
+        descriptive_probe_readout(runsdir)
+    except Exception as ex:                      # a disclosure must never crash the scorer
+        print("  (descriptive probe readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Identity vs MAGNITUDE (188.3 / 194.6): not separable by set matching.")
+    print("  * Any statement about the clamp: the GN scalar did not pin in cgn1, and no gate reads pins.")
+    print("  * Persistence of any rescue past 100 epochs, or the size of the GN gap at convergence.")
+    print("  * RULE 11: no argmax is located on ResNet18_gn_c100; every D is at ONE cell.")
+    print("  * Any point agreement for an arm at the k01 level: such readings are BOUNDS (164.6).")
+    print("  * Other normalisers (LayerNorm, GN(C), none); GN(32) also changes per-channel invariance.")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().
+# EVERY NUMBER IS INVENTED; evidence of nothing.
+# =============================================================================
+_E_ENV = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+          "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+          "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 PROBE_DIR=/x/probe EB_RHO=na EB_LOG=0")
+_E_BASE = {"k01": 14.5, "kL": 52.0, "ISO": 50.0, "CTL": 14.9, "ONE": 48.0}   # T-IDENT-like
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, net=NET):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cgn2 --run-name %s"
+            % (net, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env,
+             "NVIDIA L4, 23034 MiB", "",
+             "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 "
+             "Lion_beta2=0.9 dir=/x" % (PT_TYPE[arm], NTENS),
+             "Files already downloaded and verified", "Files already downloaded and verified"]
+    for e in range(n_ep):
+        te = level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0))
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.9, te + 7.0), te))
+    if run_done:
+        lines += ["71  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_prov(d, mode="submit", bn=POST_SHA, scorer=None):
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nBUILD_NETWORK_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (mode, bn, scorer or file_sha(os.path.abspath(__file__))))
+
+
+def _e_build(d, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None,
+             env_break=None, spec_break=None, manifest=None, prov=None, net_break=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(
+        manifest if manifest is not None else synthetic_manifest_text())
+    _e_prov(d, **(prov or {}))
+    jid = 9800000
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = SPEC["CTL"] if spec_break == (a, s) else None
+            net = REF_NET if net_break == (a, s) else NET
+            _e_write(d, a, s, jid, L, env=env, spec=spec, net=net)
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_probe(d):
+    """synthetic k01 and ISO probe records: beta rises then falls, never pins"""
+    for s in SEEDS:
+        for arm, m in (("k01", 1), ("ISO", 2)):
+            p = os.path.join(d, PREFIX, "probe_%s-%s-s%d" % (PREFIX, arm, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for k in range(60):
+                    b = -13.8 + 0.5 * k if k < 16 else -5.8 - 0.1 * (k - 16)
+                    mt = [-1e-4] * NTENS
+                    mt[49] = 5e-2
+                    f.write(json.dumps({"step": 100 * k, "beta": [b] * m, "pt_b2": 0.9,
+                                        "m_tensor": mt, "z_tensor": [0.0] * NTENS}) + "\n")
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0,
+            "gamma": "1", "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH),
+            "epochs_requested": str(EPOCHS), "hier": "none", "lam": "na", "eta_ratio": "na",
+            "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (net, gran, v) in enumerate([(NET, "scalar", 1.0), (NET, "scalar", 70.0),
+                                        (NET, "layerwise", 2.0), (NET, "layerwise", 95.0),
+                                        (NET, SPEC["ISO"], 3.0), (NET, SPEC["ISO"], 90.0),
+                                        (NET, SPEC["CTL"], 88.0), (NET, SPEC["CTL"], 1.5),
+                                        (NET, SPEC["ONE"], 1.0), (NET, SPEC["ONE"], 85.0),
+                                        (REF_NET, "scalar", 2.0), (REF_NET, "scalar", 60.0),
+                                        (REF_NET, "layerwise", 30.0), (REF_NET, "layerwise", 95.0)]):
+        inv.append(dict(base, network=net, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _bar_lines(out):
+    return [ln for ln in out.splitlines()
+            if ln.startswith("  SIGMA_USED") or ln.startswith("  SE_ARM_DIFF")
+            or ln.startswith("  bars:") or ln.startswith("  PRIMARY")]
+
+
+def _spec_from_scorer(fname, key):
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+    if not os.path.exists(p):
+        return None
+    import ast
+    m = re.search(r"^SPEC = (\{.*?^\})", open(p).read(), re.S | re.M)
+    if not m:
+        return None
+    return ast.literal_eval(m.group(1)).get(key)
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cGN2 --selftest: design, frozen manifest, frozen bars (O2), corpus premises, the floor")
+    print("table, the REAL score() on synthetic runs, the corpus-invariance proof and the documented")
+    print("one-argument invocation.  Every corpus reader EXCLUDES `cgn2-`.\n")
+
+    print("A. ARITHMETIC, REGEX AND DESIGN")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6, "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)",
+        "%.6f" % (SIGMA_PRIOR * math.sqrt(2 / 3)))
+    chk(SIGMA_PRIOR == max(SIGMA_R18ALL, SIGMA_GNC100), "SIGMA_PRIOR = max(SIGMA_R18ALL, SIGMA_GNC100)")
+    chk(list(inspect.signature(compose_sigma).parameters) == ["sigma_in"],
+        "compose_sigma() takes ONE argument, the in-batch sigma -- NO corpus")
+    bad = [s for s in (0.0, 0.3, SIGMA_R18ALL, SIGMA_PRIOR, 0.8, 1.5, 4.0)
+           if compose_sigma(s)[1] != max(SIGMA_PRIOR, s)]
+    chk(not bad, "SIGMA_USED == max(frozen floor, in-batch) over 7 in-batch values")
+    src = inspect.getsource(score)
+    chk("pooled_sigma" not in src and "prefix_arm_mean" not in src and src.count("read_corpus") == 1,
+        "score() calls no corpus statistic; its single read_corpus() feeds a row-count print only")
+    chk(list(inspect.signature(decide).parameters) == ["M", "trains_ok", "diverged"],
+        "decide() is a function of the in-batch means and two in-batch flags only")
+    chk("load_probe" not in inspect.getsource(decide) and "pin" not in inspect.getsource(decide),
+        "decide() reads NO probe record and NO pin state (cgn1's GN scalar never pinned)")
+    chk(src.index("final = \"FINAL: %s | %s\"") < src.index("descriptive_probe_readout(runsdir)"),
+        "the probe readout runs AFTER the FINAL line is composed (it cannot move it)")
+    chk(IDENTITY_BAR > RESCUE_BAR > NULL_BAR > 0 and GAP_MIN >= 2 * RESCUE_BAR
+        and IDENTITY_BAR <= 0.75 * GAP_MIN, "bar ordering; GAP_MIN makes both bars reachable")
+    chk(RESCUE_BAR <= 0.30 * R_CGN1["D"] and IDENTITY_BAR <= 0.45 * R_CGN1["D"],
+        "the bars are <= 0.30 / 0.45 of cgn1's 100-epoch gap (reachable at this horizon)",
+        "%.3f / %.3f" % (RESCUE_BAR / R_CGN1["D"], IDENTITY_BAR / R_CGN1["D"]))
+    chk(FLOOR_MIN > CHANCE and KL_MIN < R_CGN1["kL"] - 15 and CEIL_MAX < 100.0,
+        "harness gates sit inside (chance, 100); KL_MIN >= 15 pp under cgn1's kL")
+    chk(EPTR_RE.search("Epoch 99, Train Accuracy: 60.61 %, Test Accuracy: 52.44 %") is not None,
+        "epoch-line regex matches the harness's print")
+    chk(OUT_RE.match("cgn2-ONE-s72-1234567.out") is not None and OUT_RE.match("cgn2-kL-s74-1.out") is not None
+        and OUT_RE.match("cgn1-k01-s60-1.out") is None and OUT_RE.match("cdep1-ONE-s24-1.out") is None,
+        "run-file regex matches cgn2 ONLY")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=62 x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=53 x") is None,
+        "PROBE_TENSOR regex accepts 62 tensors and REJECTS a 53-tensor PlainNet line")
+    chk(set(SPEC) == set(ARMS) and len(ARMS) == 5 and SPEC["k01"] == "scalar" and SPEC["kL"] == "layerwise",
+        "five arms; both anchors IN BATCH")
+    chk(len(set(SEEDS)) == 3 and SEEDS == (72, 73, 74), "seeds {72,73,74}")
+    cost = GN_PER_RUN_GPUH * len(ARMS) * len(SEEDS)
+    note("expected cost %.1f GPU-h at 100 ep (x1.5 = %.1f, x2 = %.1f); hard bound 3 h x 15 = 45"
+         % (cost, 1.5 * cost, 2 * cost))
+
+    print("\nB. THE FROZEN MANIFEST AND THE SPEC STRINGS")
+    t = gn_tensors()
+    names = [n for n, _q, _o in t]
+    numel = [q for _n, q, _o in t]
+    chk(len(t) == NTENS and sum(numel) == TOTPAR, "ResNet18_gn_c100: %d tensors, %d parameters" % (NTENS, TOTPAR))
+    chk(all((i % 3 == 1) == (o == "Conv2d") for i, (_n, _q, o) in enumerate(t[:60], 1))
+        and all(o == "GroupNorm" for i, (_n, _q, o) in enumerate(t[:60], 1) if i % 3 != 1),
+        "class == index mod 3 at 1..60, every scale/shift owned by GroupNorm")
+    chk(tuple((i, n) for i, (n, q, o) in enumerate(t, 1) if q == 512 and n.endswith(".weight") and o == "GroupNorm")
+        == tuple(zip(W512_IDX, W512_NAMES)), "512-wide GN scales at 47/50/53/56/59 by name")
+    for a in BLOCKWISE_ARMS:
+        g = parse_sets(SPEC[a], names)
+        iso = tuple((names[i - 1], i) for i in g[1])
+        chk(len(g) == 2 and sorted(g[0] + g[1]) == list(range(1, NTENS + 1)) and len(set(g[0] + g[1])) == NTENS
+            and [len(x) for x in g] == WANT_SIZES[a] and iso == ISOLATED[a]
+            and [sum(numel[i - 1] for i in x) for x in g] == WANT_PARAMS[a],
+            "%s: a partition of 1..%d, sizes %s, isolates %s, params %s"
+            % (a, NTENS, WANT_SIZES[a], [i for _n, i in iso], WANT_PARAMS[a]))
+        fn, key = BN_TWIN_SOURCE[a]
+        twin = _spec_from_scorer(fn, key)
+        if twin is None:
+            skip("%s: %s not reachable -- byte-identity with the BN batch not checked here" % (a, fn))
+        else:
+            chk(twin == SPEC[a], "%s is BYTE-IDENTICAL to the BatchNorm batch's %s (%s)" % (a, key, fn))
+    iso3, ctl3 = parse_sets(SPEC["ISO"], names)[1], parse_sets(SPEC["CTL"], names)[1]
+    chk(len(iso3) == len(ctl3) == 3 and all(numel[i - 1] == 512 for i in iso3 + ctl3)
+        and all(names[i - 1].startswith("layer4.") for i in iso3 + ctl3)
+        and not set(iso3) & set(ctl3), "ISO and CTL: disjoint, cardinality 3/3, numel 1536/1536, all layer4")
+    chk([names[i - 1].endswith(".bias") for i in ctl3] == [False, True, False],
+        "CTL contains ONE GN shift (48 layer4.0.bn1.bias) -- matched on numel, NOT class (stamped)")
+    chk(set(parse_sets(SPEC["ONE"], names)[1]) < set(iso3), "ONE's tensor (50) is a member of ISO's triple")
+    chk(set(iso3) == {50, 53, 59} and {47, 56} <= set(ctl3),
+        "ISO = 217.6's nominated {50,53,59}; CTL contains 217.6's matched pair {47,56}")
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(),
+            "B the LIVE manifest guard 4 wrote is BYTE-IDENTICAL to synthetic_manifest_text()")
+    else:
+        note("no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+
+    print("\nC. CORPUS PREMISES, re-derived (NOTES on drift -- under O2 no drift reaches a bar)")
+    rows = read_corpus(csvpath)
+    if rows is None:
+        skip("corpus premises -- %s not readable" % csvpath)
+    else:
+        sha = file_sha(csvpath)
+        reg = sha == REG_CORPUS_SHA256
+        note("corpus %d rows (cgn2 excluded), sha %s... -- %s" % (len(rows), sha[:12],
+             "THE REGISTRATION CORPUS" if reg else "not the registration corpus: drift is NOTED, never failed"))
+        for nm, (s, df_, nc, nm_), frozen in (
+                ("SIGMA_R18ALL", pooled_sigma(rows, net_is(REF_NET), True), SIGMA_R18ALL),
+                ("SIGMA_GNC100", pooled_sigma(rows, net_is(NET), True), SIGMA_GNC100)):
+            print("       %s live %s  df %s  cells %s  members %s" % (nm, fmt(s, 12), df_, nc, nm_))
+            if reg:
+                chk(s is not None and abs(s - frozen) < 1e-12, "%s re-derives == frozen %.15g" % (nm, frozen))
+            else:
+                note("%s live %s vs frozen %.15g -- feeds no bar (O2)" % (nm, fmt(s, 12), frozen))
+        for pre, lab, net, frozen in (("cgn1", "scalar", NET, R_CGN1["k01"]), ("cgn1", "layerwise", NET, R_CGN1["kL"]),
+                                      ("ciso1", SPEC["ISO"], REF_NET, R_CISO1["ISO"]),
+                                      ("ciso1", SPEC["ONE"], REF_NET, R_CISO1["ONE"]),
+                                      ("cdep1", SPEC["CTL"], REF_NET, R_CDEP1["DEPTH"]),
+                                      ("cdep1", "scalar", REF_NET, R_CDEP1["k01"])):
+            v, n = prefix_arm_mean(rows, pre, lab, net)
+            if v is not None and abs(v - frozen) < 5e-5:
+                chk(n == 3, "frozen reference %s %-10s re-derives == %.4f (n=3)" % (pre, lab[:10], frozen))
+            else:
+                note("frozen reference %s %s: %.4f, live %s (non-gating)" % (pre, lab[:12], frozen, fmt(v)))
+        n_gn = [r["run"] for r in rows if r.get("network") == NET]
+        chk(all(x.startswith("cgn1-") for x in n_gn), "%s appears ONLY in cgn1's rows (%d)" % (NET, len(n_gn)))
+        chk(not any(r.get("seed") in ("72", "73", "74") for r in rows), "ZERO corpus rows carry seed 72, 73 or 74")
+
+    print("\nD. THE FLOOR TABLE (164.6).  Chance %.2f pp, ceiling 100.  Levels UNSURE." % CHANCE)
+    print("   'at-k01' = predicted at the IN-BATCH k01 LEVEL (not a clamp: cgn1's GN scalar never pinned)")
+    lo_all = 100.0
+    for acc, pred in ACCOUNTS.items():
+        print("  %-9s" % acc)
+        for a in ARMS:
+            lo, hi = pred[a]
+            role = ("the in-batch floor ANCHOR" if a == "k01" else
+                    "at-k01" if pred[a] == pred["k01"] else
+                    "OFF k01 by >= %.0f pp" % (lo - pred["k01"][1]))
+            print("      %-4s %4.0f-%-4.0f  above chance %+5.1f..%+5.1f  below ceiling %5.1f..%5.1f  %s"
+                  % (a, lo, hi, lo - CHANCE, hi - CHANCE, 100 - hi, 100 - lo, role))
+            lo_all = min(lo_all, lo)
+        dlo = pred["ISO"][0] - pred["CTL"][1]
+        dhi = pred["ISO"][1] - pred["CTL"][0]
+        print("      PRIMARY DELTA_ID predicted %+.0f..%+.0f  (hard range +-%.0f)" % (dlo, dhi, 100 - CHANCE))
+        chk(dhi <= (100 - CHANCE) - 25 and dlo >= -(100 - CHANCE) + 25,
+            "%-9s DELTA_ID's predicted interval is >= 25 pp inside BOTH hard bounds (bounded in neither direction)" % acc)
+        off = [a for a in BLOCKWISE_ARMS if pred[a] != pred["k01"]]
+        if acc in ("DIFFUSE", "H-BROKEN"):
+            chk(not off, "%-9s puts every m=2 arm at k01 -- declared: NO-RESCUE cannot confirm it" % acc)
+        else:
+            chk(bool(off) and all(pred[a][0] - pred["k01"][1] >= 2 * RESCUE_BAR for a in off),
+                "%-9s has an off-k01 m=2 arm >= %.0f pp clear of k01 (kills H-BROKEN in batch)" % (acc, 2 * RESCUE_BAR),
+                ",".join(off))
+        mid = dict((a, (pred[a][0] + pred[a][1]) / 2.0) for a in ARMS)
+        chk(decide(mid) == EXPECTED_BRANCH[acc], "%-9s midpoint prediction lands in %s" % (acc, EXPECTED_BRANCH[acc]),
+            decide(mid))
+    chk(lo_all - CHANCE >= 8.0, "the LOWEST level ANY account predicts for ANY arm is >= 8 pp above chance",
+        "%.1f pp" % (lo_all - CHANCE))
+    chk(ACCOUNTS["DIFFUSE"] == ACCOUNTS["H-BROKEN"], "DIFFUSE and H-BROKEN predict IDENTICALLY on every arm (declared)")
+    chk(all(pred["kL"][0] - pred["k01"][1] >= GAP_MIN + 5 for pred in ACCOUNTS.values()),
+        "every account predicts D_GAP >= GAP_MIN + 5 (the carrier branches are reachable)")
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS (invented numbers; evidence of nothing)")
+    tmp = tempfile.mkdtemp(prefix="cgn2_selftest_")
+    bnman = synthetic_manifest_text().replace("GroupNorm", "BatchNorm2d")
+    cases = [
+        ("T-IDENT", {}, {}, "IDENTITY-TRANSFERS-GN"),
+        ("T-SET", {"ONE": 14.6}, {}, "IDENTITY-TRANSFERS-ONE-NULL-GN"),
+        ("one-partial", {"ONE": 20.0}, {}, "IDENTITY-TRANSFERS-ONE-PARTIAL-GN"),
+        ("CLASS", {"CTL": 49.5, "ONE": 45.0}, {}, "CLASS-OPERATIVE-GN"),
+        ("DIFFUSE/H-BROKEN", {"ISO": 15.0, "ONE": 14.2}, {}, "NO-RESCUE-GN"),
+        ("gap not reproduced", {"kL": 32.0, "ISO": 31.0}, {}, "GAP-NOT-REPRODUCED-GN"),
+        ("untrainable", {"k01": 14.0, "kL": 25.0, "ISO": 24.0, "CTL": 14.1, "ONE": 14.2}, {}, "GN-UNTRAINABLE"),
+        ("unexpected", {"ISO": 15.5, "CTL": 40.0}, {}, "UNEXPECTED-PATTERN"),
+        ("control dominates", {"ISO": 30.0, "CTL": 50.0}, {}, "CONTROL-DOMINATES-GN"),
+        ("identity attenuated", {"ISO": 45.0, "CTL": 36.0}, {}, "IDENTITY-ATTENUATED-GN"),
+        ("near-bar ONE just rescues", {"ONE": 14.5 + RESCUE_BAR + 0.05}, {}, "IDENTITY-TRANSFERS-GN"),
+        ("near-bar ONE just misses", {"ONE": 14.5 + RESCUE_BAR - 0.05}, {}, "IDENTITY-TRANSFERS-ONE-PARTIAL-GN"),
+        ("near-bar gap", {"kL": 14.5 + GAP_MIN - 0.05, "ISO": 33.0}, {}, "GAP-NOT-REPRODUCED-GN"),
+        ("diverged", {}, {"over": {("kL", 74): 40.0}}, "UNRESOLVED-DIVERGED"),
+        ("harness: every arm tiny", dict((a, 3.0) for a in ARMS), {}, "HARNESS-UNSOUND"),
+        ("harness: AUGMENT=0 on one run", {}, {"env_break": ("CTL", 74)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS spec != arm", {}, {"spec_break": ("ISO", 73)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS name the BN net", {}, {"net_break": ("ONE", 72)}, "HARNESS-UNSOUND"),
+        ("harness: manifest is a BN net", {}, {"manifest": bnman}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the live tree", {}, {"prov": {"bn": PRE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance dry-run", {}, {"prov": {"mode": "dry-run"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another scorer", {}, {"prov": {"scorer": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("a DROPPED run", {}, {"drop": ("ONE", 73)}, "INCOMPLETE"),
+        ("a TRUNCATED higher-jid resubmission", {}, {"shadow": ("ISO", 72)}, "IDENTITY-TRANSFERS-GN"),
+    ]
+    results = {}
+    for lab, lv, kw, want in cases:
+        d = os.path.join(tmp, re.sub(r"\W+", "_", lab))
+        os.makedirs(d)
+        _e_build(d, levels=lv, **kw)
+        rc, fin, out = _e_score(d, csvpath)
+        results[lab] = (rc, fin, out, d)
+        chk(fin.startswith("FINAL: %s |" % want), "E %-40s -> %s" % (lab, want), fin[:80])
+    rc, fin, out, dpath = results["T-IDENT"]
+    chk(rc == 0 and "HARNESS-CLEAN" in fin and "H-BROKEN-EXCLUDED" in fin and "K01-IS-A-LEVEL-NOT-A-CLAMP" in fin
+        and "HORIZON-100-ONLY" in fin and "RESCUE-PERSISTENCE-NOT-TESTED" in fin,
+        "E T-IDENT exits 0 with HARNESS-CLEAN, H-BROKEN-EXCLUDED and the unconditional stamps")
+    chk(results["a DROPPED run"][0] == 2, "E a DROPPED run exits 2 (INCOMPLETE)")
+    chk(results["harness: AUGMENT=0 on one run"][0] == 1, "E a harness failure exits 1")
+    chk(results["a TRUNCATED higher-jid resubmission"][1] == results["T-IDENT"][1],
+        "E a truncated higher-jid resubmission does not shadow a complete run")
+    chk("H-BROKEN-NOT-EXCLUDED" in results["DIFFUSE/H-BROKEN"][1]
+        and "FLOOR-READINGS-ARE-BOUNDS" in results["DIFFUSE/H-BROKEN"][1],
+        "E NO-RESCUE stamps H-BROKEN-NOT-EXCLUDED and FLOOR-READINGS-ARE-BOUNDS")
+    chk("DECOMPOSITION-BY-SUBTRACTION" in results["T-SET"][1], "E ONE-NULL stamps DECOMPOSITION-BY-SUBTRACTION")
+    d = os.path.join(tmp, "probe")
+    os.makedirs(d)
+    _e_build(d)
+    _e_probe(d)
+    rc, fin, out = _e_score(d, csvpath)
+    chk(fin == results["T-IDENT"][1] and "post-peak records" in out and "pinned-from-epoch never" in out,
+        "E never-pinned probe records: the readout runs, reports 'never', and FINAL does not move")
+    d2 = os.path.join(tmp, "probe_garbled")
+    os.makedirs(d2)
+    _e_build(d2)
+    _e_probe(d2)
+    open(os.path.join(d2, PREFIX, "probe_cgn2-k01-s72", "probe.jsonl"), "w").write("{not json\n\x00\x01\n")
+    rc, fin, out = _e_score(d2, csvpath)
+    chk(rc == 0 and fin == results["T-IDENT"][1], "E a GARBLED probe file changes nothing in FINAL or rc")
+
+    print("\n   O2 INVARIANCE: the SAME synthetic runs against four corpora")
+    variants = _e_csv_variants(csvpath if csvpath and os.path.exists(csvpath) else None, tmp)
+    for case in ("T-IDENT", "DIFFUSE/H-BROKEN"):
+        ref_fin, ref_bars = None, None
+        dd = results[case][3]
+        for lab in ("real", "real+invented", "minimal-invented", "no-corpus"):
+            if lab not in variants:
+                skip("O2 %s corpus not available on this host" % lab)
+                continue
+            rc, fin, out = _e_score(dd, variants[lab])
+            bars = _bar_lines(out)
+            if ref_fin is None:
+                ref_fin, ref_bars = fin, bars
+            chk(fin == ref_fin and bars == ref_bars and len(bars) == 4,
+                "O2 %-16s %-17s FINAL and SIGMA/SE/bars/PRIMARY lines are IDENTICAL" % (case, lab), fin[:44])
+    if "real+invented" in variants:
+        a_ = pooled_sigma(read_corpus(variants["real"]), net_is(NET), True)[0]
+        b_ = pooled_sigma(read_corpus(variants["real+invented"]), net_is(NET), True)[0]
+        chk(a_ is not None and b_ is not None and b_ > 5 * a_,
+            "O2 non-vacuity: the invented rows MOVE the live GN corpus sigma (%.4f -> %.4f) and FINAL did not move"
+            % (a_ or 0, b_ or 0))
+
+    print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION, as a subprocess")
+    me = os.path.abspath(__file__)
+    try:
+        p = subprocess.run([sys.executable, me, dpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=300)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 0 and fl and fl[-1] == results["T-IDENT"][1],
+            "`python3 %s <runsdir>` exits 0 with the in-process FINAL line" % os.path.basename(me),
+            "rc %d" % p.returncode)
+        p = subprocess.run([sys.executable, me, results["a DROPPED run"][3]], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True, timeout=300)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 2 and fl and fl[-1].startswith("FINAL: INCOMPLETE"),
+            "... and on a dropped run exits 2 with FINAL: INCOMPLETE", "rc %d" % p.returncode)
+    except Exception as e:
+        chk(False, "subprocess invocation", "%s: %s" % (type(e).__name__, e))
+
+    print("\nF. THE BRANCH MAP IS TOTAL -- 4,000 random in-batch means, every branch registered")
+    import random
+    rnd = random.Random(20260916)
+    seen = set()
+    for _ in range(4000):
+        m = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        seen.add(decide(m, rnd.random() > 0.05, rnd.random() < 0.05))
+    chk(seen <= set(LICENSE), "every branch decide() returns has a registered licence text", "%d distinct" % len(seen))
+    reached = set(r[1].split(" |")[0][len("FINAL: "):] for r in results.values())
+    chk(reached | seen == set(LICENSE), "every registered branch is reached by section E or the sweep",
+        "missing %s" % sorted(set(LICENSE) - reached - seen))
+
+    print("\nG. RULE 21 PREMISE: no cgn2 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cgn2-*.out under %s" % runsdir, "%d found" % len(runs))
+    if csvpath and os.path.exists(csvpath):
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in csv.DictReader(open(csvpath))),
+            "no cgn2- row in the CSV")
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cgn2 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cGN2_gn_isolation_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cgn2/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

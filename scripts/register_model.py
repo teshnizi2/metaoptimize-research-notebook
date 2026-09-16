@@ -18,11 +18,19 @@ mapping is reviewable in one place and never applied ad hoc:
    with a one-line reason, using ``VERDICT_RULES`` -- the rule families the
    existing register already follows (majority mapping of its 111 rows).
 
-IDs: existing IDs are never renumbered. New section-10 rows are keyed
-``MT<line>`` on their line in the pinned commit (MT175-MT211); no existing ID is
-at or above MT167. Source anchors into MASTER-TABLE are resolved by row
-content, never by line number alone, because the site's IDs were assigned from
-an uncommitted MASTER-TABLE snapshot that is one line longer from line 20 on.
+3. Rows appended to MASTER-TABLE after the partition audit (lines 212-217 at
+   campaign commit 64e4f47, CORRECTIONS 217-226) are imported the same way by
+   ``APPENDED_ROWS``: one explicit rule, research area, batches, figure page and
+   one-line reason per row, with the verdict rules of decision 2. The pinned
+   file must keep lines 1-211 identical to the partition-audit commit apart from
+   its header counts (lines 3 and 5), so no earlier record can drift.
+
+IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
+``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217);
+no ID from the original register is at or above MT167. Source anchors into
+MASTER-TABLE are resolved by row content, never by line number alone, because
+the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
+one line longer from line 20 on.
 """
 from __future__ import annotations
 
@@ -137,6 +145,46 @@ PARTITION_AUDIT = {
 }
 RULE_OUTCOME = {"met": "success", "missed": "fail", "mixed": "mixed", "open": "unresolved", "method": None}
 
+# ---------------------------------------------------------------------------
+# 3. Rows appended after the partition audit (CORRECTIONS 217-226).
+# ---------------------------------------------------------------------------
+APPENDED_COMMIT = "64e4f47caaf0fa6c9834e49ee54cd12ff45d8bc5"
+APPENDED_MASTER_TABLE_SHA256 = "4cfaa96ee4fc563baeb620afea0e08c91c5a4979d12c39f9e45025ad278b41d2"
+APPENDED_FIRST_ROW, APPENDED_LAST_ROW = 212, 217
+APPENDED_HEADER_LINES = {3, 5}  # Run/GPU-hour header and bottom line, amended in place by each landing.
+AREAS = {1: "Baseline comparisons", 9: "Mechanism and isolation"}
+# research_timeline.csv ends at 14 Sep. The notebook adds this documented phase:
+# the rows were launched 2026-09-15 (CORRECTIONS 216, commit 918c0aa) and landed
+# 2026-09-16 (CORRECTIONS 217-226, commits 2d09417-64e4f47).
+ADDED_PHASES = [{
+    "id": "phase-09", "date": "2026-09-15", "period": "15-16 Sep", "title": "Off BatchNorm, off residuals, long horizons",
+    "test": "GroupNorm and residual-free ResNet-18 isolation; VGG rescue at 328 epochs; unaugmented CIFAR-100 baseline",
+    "observed_result": "Gap and carrier set transfer to GroupNorm; one BN scale rescues without residuals; VGG rescue holds at 328 epochs; unaugmented deficit +12.18 pp",
+    "next_question": "Identity versus magnitude remains unresolved on every network",
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1)],
+    "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
+}]
+
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# Figure pages: the report PDF predates these rows, so each links the page of the
+# record it extends (ResNet isolation page 19, VGG rescue page 21, baseline page 23).
+APPENDED_ROWS = {
+    212: ("met", 9, ["cgn1"], ["page-19"], None, "GAP-REPLICATES and FULL-SIZE: the scalar-to-layerwise gap exists on GroupNorm ResNet-18 (a 100-epoch snapshot)."),
+    213: ("mixed", 9, ["cpl1"], ["page-19"], None, "HEAD-CARRIES-PLAIN: ISO rescues against its twin, but ONE stays at the floor and 189.2's literal forms missed their registered branches."),
+    214: ("met", 9, ["cvh1"], ["page-21"], None, "RESCUE-SURVIVES: rho 1.0001 at 328 epochs, and all six registered point predictions landed in band."),
+    215: ("met", 1, ["cuc1"], ["page-23"], None, "DEFICIT-HOLDS with an interior ladder: tuned SGD beats the best method cell by +12.18 pp without augmentation on CIFAR-100."),
+    216: ("met", 9, ["cgn2"], ["page-19"], None, "IDENTITY-TRANSFERS-GN: the three carriers rescue on GroupNorm, the matched set does not, and 50 alone rescues."),
+    217: ("met", 9, ["cpl2"], ["page-19"], None, "HEAD-CARRIES-ALONE-PLAIN: layer4.1.bn2.weight alone rescues, its twin does not, and D_PAIR stays inside the frozen 5.0 pp bar."),
+}
+# Earlier records these rows bear on. The export does not rewrite earlier records;
+# they are listed here so the relationship stays reviewable.
+APPENDED_BEARS_ON = {
+    215: ["MT019", "MT020"],  # closes row 19's two remaining counts (CIFAR-100, meta-side tuning)
+    214: ["MT166"],           # retires cvi1's HORIZON-100-ONLY bound for the ISO arm
+    216: ["MT162", "MT163"],  # the BatchNorm isolation and identity legs, repeated on GroupNorm
+    217: ["MT213"],           # measures cpl1's decomposition by subtraction
+}
+
 
 def partition_id(line: int) -> str:
     return f"MT{line:03d}"
@@ -156,7 +204,8 @@ def norm(text: str) -> str:
 def table_cells(line: str) -> list[str]:
     if not line.startswith("|") or not line.rstrip().endswith("|"):
         raise ValueError("Not a Markdown table row")
-    return [cell.strip() for cell in line.strip()[1:-1].split("|")]
+    # A Markdown-escaped pipe (\\|) belongs to its cell, not to the column split.
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", line.strip()[1:-1])]
 
 
 def master_table_at_commit(repo: Path, commit: str = PARTITION_AUDIT_COMMIT) -> list[str]:
@@ -202,6 +251,56 @@ def partition_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+def appended_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the appended-rows commit, checked against the partition-audit pin."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{APPENDED_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != APPENDED_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {APPENDED_COMMIT[:12]} does not match the pinned appended-row bytes")
+    lines = raw.decode("utf-8").splitlines()
+    pinned = master_table_at_commit(repo)
+    drift = [n for n in range(1, len(pinned) + 1) if n not in APPENDED_HEADER_LINES and lines[n - 1] != pinned[n - 1]]
+    if drift or len(lines) != APPENDED_LAST_ROW:
+        raise ValueError(f"MASTER-TABLE lines 1-{len(pinned)} changed outside the header, or rows were added past line {APPENDED_LAST_ROW}: {drift}")
+    return lines
+
+
+def appended_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 212-217 and apply the explicit verdict mapping."""
+    if set(APPENDED_ROWS) != set(range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1)) or len(lines) != APPENDED_LAST_ROW:
+        raise ValueError(f"The appended-row mapping must cover exactly lines {APPENDED_FIRST_ROW}-{APPENDED_LAST_ROW}")
+    rows = []
+    for line in range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1):
+        cells = table_cells(lines[line - 1])
+        if len(cells) != 7:
+            raise ValueError(f"MASTER-TABLE line {line} is not a seven-column row")
+        tested, varied, scale, result, verdict, so_what, ref = cells
+        rule, section, batches, figures, corrected, reason = APPENDED_ROWS[line]
+        # The row opens with a bracketed provenance label; the question follows it.
+        label = re.match(r"^\[([^\]]*)\]\s*", clean(tested))
+        if not label:
+            raise ValueError(f"MASTER-TABLE line {line} lost its appended-row label")
+        question = clean(tested)[label.end():]
+        tokens = [token.strip() for token in clean(verdict).split(" + ")]
+        if not reason.startswith(tokens[0]):
+            raise ValueError(f"MASTER-TABLE line {line}: the mapping reason must start with the row's first verdict token {tokens[0]}")
+        outcome = RULE_OUTCOME[rule]
+        references = [{"path": MASTER_TABLE, "line": line, "rowText": lines[line - 1]}]
+        references += [part.strip() for part in ref.split(";") if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
+        rows.append({
+            "id": partition_id(line), "section": str(section), "area": AREAS[section],
+            "goal": question, "comparison": clean(varied), "why": label[1] + ".",
+            "result": clean(result), "outcome": outcome or "",
+            "reason": f"Verdict: {' + '.join(tokens)} {VERDICT_RULES[rule].split(':')[0]}: {reason}",
+            "scope": f"{clean(scale)}. {clean(so_what)}",
+            "batches": json.dumps(batches), "sources": json.dumps(references, ensure_ascii=False),
+            "original_question": question, "register_page": "",
+            "kind": "method-check" if rule == "method" else "research", "corrected": "1" if corrected else "",
+            "correction": json.dumps({"note": corrected, "source": f"{MASTER_TABLE} line {line} at {APPENDED_COMMIT[:7]}"}, ensure_ascii=False) if corrected else "",
+            "mapping_rule": rule, "master_table_line": str(line), "figure_ids": json.dumps(figures),
+        })
+    return rows
+
+
 def remap_base_row(row: dict) -> dict:
     """Four outcomes plus the corrected badge for one row of the base register."""
     row = dict(row)
@@ -229,7 +328,7 @@ def load_register(workspace: Path, repo: Path) -> list[dict]:
     missing = set(CORRECTION_REMAP) - {row["id"] for row in base}
     if missing:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
-    added = partition_rows(master_table_at_commit(Path(repo)))
+    added = partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

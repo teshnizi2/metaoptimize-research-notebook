@@ -20,6 +20,7 @@ REPO = Path(os.environ.get("NOTEBOOK_RESEARCH_REPO", "/Users/teshnizi/Saber Opti
 DATA_AUDIT = Path(os.environ.get("NOTEBOOK_DATA_AUDIT", WORKSPACE / "work/portal_data_audit.json"))
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
+APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -66,11 +67,11 @@ class ResearchExportTests(unittest.TestCase):
     def test_complete_register_and_area_counts(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual(len(data["experiments"]), 148)
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS))
+        self.assertEqual(len(data["experiments"]), 154)
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS))
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 148)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 148, "researchQuestions": 130, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 154)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10})
 
     def test_run_inventory_keeps_all_jobs_with_unique_identifiers(self):
         runs = self.runs()
@@ -175,6 +176,8 @@ class ResearchExportTests(unittest.TestCase):
             rel = original.relative_to(WORKSPACE / "outputs/tables")
             href = "/assets/tables/" + rel.as_posix()
             self.assertIn(href, tables_by_href, str(rel))
+            if rel.as_posix() == "complete_experiment_register.csv":
+                continue  # regenerated from the notebook register; see test_register_table_lists_every_record
             with original.open(newline="") as handle:
                 rows = list(csv.reader(handle))
             with (PUBLIC / href.lstrip("/")).open(newline="") as handle:
@@ -269,10 +272,10 @@ class ResearchExportTests(unittest.TestCase):
     def test_historical_phase_dates_are_not_run_start_dates(self):
         data = self.research()
         phases = [event for event in data["activity"] if event["kind"] == "research-phase"]
-        self.assertEqual(len(phases), 8)
+        self.assertEqual(len(phases), 9)
         self.assertTrue(all("Documented phase" in event["detail"] for event in phases))
         self.assertTrue(any(e["kind"] == "completed-experiment" and e["date"] == "2026-09-14" for e in data["activity"]))
-        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == "2026-09-15" for e in data["activity"]))
+        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == data["meta"]["asOf"] == "2026-09-16" for e in data["activity"]))
         self.assertTrue(all("date" not in run for run in self.runs()))
 
     def test_records_without_dated_phases_have_snapshot_import_provenance(self):
@@ -354,6 +357,55 @@ class ResearchExportTests(unittest.TestCase):
             self.assertEqual(len(by_id[eid]["runIds"]), count, eid)
         baseline = {r["id"]: r for r in runs}
         self.assertTrue(all(r["batch"] == baseline[r["id"]]["batch"] for r in runs))
+
+    # ---- MASTER-TABLE lines 212-217 (campaign commit 64e4f47) ----
+    def test_appended_rows_come_from_the_pinned_master_table(self):
+        model = self.model()
+        rows = model.appended_rows(model.appended_master_table(REPO))
+        self.assertEqual([r["id"] for r in rows], APPENDED_IDS)
+        self.assertEqual([(r["section"], r["outcome"], json.loads(r["batches"])) for r in rows], [
+            ("9", "success", ["cgn1"]), ("9", "mixed", ["cpl1"]), ("9", "success", ["cvh1"]),
+            ("1", "success", ["cuc1"]), ("9", "success", ["cgn2"]), ("9", "success", ["cpl2"])])
+        self.assertTrue(all(r["kind"] == "research" and not r["corrected"] for r in rows))
+        self.assertTrue(all(r["reason"].startswith("Verdict: ") and model.APPENDED_ROWS[int(r["master_table_line"])][5] in r["reason"] for r in rows))
+        self.assertIn("+41.5167 pp = +67.23 SE", rows[4]["result"])
+        self.assertIn("+52.1367 pp = +91.95 SE", rows[5]["result"])
+        with self.assertRaisesRegex(ValueError, "pinned appended-row bytes"):
+            original = model.APPENDED_COMMIT
+            try:
+                model.APPENDED_COMMIT = model.PARTITION_AUDIT_COMMIT
+                model.appended_master_table(REPO)
+            finally:
+                model.APPENDED_COMMIT = original
+        with self.assertRaisesRegex(ValueError, "exactly lines 212-217"):
+            model.appended_rows(model.appended_master_table(REPO)[:-1])
+        self.assertEqual(model.table_cells(r"| a \| b | c |"), ["a | b", "c"])
+
+    def test_appended_rows_link_phase_figures_and_no_runs_yet(self):
+        data, runs = self.research(), self.runs()
+        by_id = {e["id"]: e for e in data["experiments"]}
+        phase = next(e for e in data["activity"] if e["id"] == "phase-09")
+        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS))
+        self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
+        figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
+        for eid, page in figures.items():
+            self.assertEqual(by_id[eid]["figureIds"], [page])
+            self.assertEqual(by_id[eid]["runIds"], [], "the campaign run inventory predates these batches")
+        self.assertFalse({"cgn1", "cpl1", "cvh1", "cuc1", "cgn2", "cpl2"} & {r["batch"] for r in runs})
+
+    def test_register_table_lists_every_record(self):
+        data = self.research()
+        with (PUBLIC / "assets/tables/complete_experiment_register.csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        exporter = self.exporter()
+        self.assertEqual(list(rows[0].keys()), exporter.REGISTER_COLUMNS)
+        self.assertEqual([r["id"] for r in rows], [e["id"] for e in data["experiments"]])
+        self.assertNotIn("correction", {r["outcome"] for r in rows})
+        self.assertEqual({(r["id"], r["kind"], r["outcome"] or None, r["corrected"] == "Corrected") for r in rows},
+                         {(e["id"], e["kind"], e["outcome"], e["corrected"]) for e in data["experiments"]})
+        audit = json.loads(DATA_AUDIT.read_text())
+        receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (154, 20, "scripts/register_model.py register"))
 
 
 if __name__ == "__main__":

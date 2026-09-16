@@ -21,9 +21,11 @@ test('newest-first timeline retains documented windows and every original CSV ob
   const { researchTimeline } = await helpers();
   const rows = researchTimeline(data.activity, data.experiments);
   const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;
-  assert.equal(rows.length, 8);
-  assert.deepEqual(rows.map(row => row.id), Array.from({ length: 8 }, (_, i) => `phase-0${8 - i}`));
-  rows.forEach(row => {
+  assert.equal(rows.length, 9);
+  assert.deepEqual(rows.map(row => row.id), Array.from({ length: 9 }, (_, i) => `phase-0${9 - i}`));
+  assert.equal(csv.length, 8, 'the campaign timeline CSV is published unchanged');
+  // phase-09 is added by the notebook register (scripts/register_model.py ADDED_PHASES), not by the CSV.
+  rows.filter(row => row.id !== 'phase-09').forEach(row => {
     const original = csv.find(entry => entry.phase.split('\n')[1] === row.title)!;
     assert.ok(original, `${row.title} must preserve a recorded CSV phase`);
     const [period, title] = original.phase.split('\n');
@@ -40,13 +42,31 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   const rows = researchTimeline(data.activity, data.experiments);
   const phaseIds = new Set(rows.flatMap(row => row.experiments.map(entry => entry.id)));
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 69);
-  assert.equal(phaseIds.size, 68);
+  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 75);
+  assert.equal(phaseIds.size, 74);
   assert.equal(unlinked.length, 80);
   assert.ok(unlinked.every(entry => !phaseIds.has(entry.id)));
   assert.equal(phaseIds.size + unlinked.length, data.experiments.length);
   assert.ok(rows.filter(row => row.experiments.some(entry => entry.id === 'MT098')).length === 2);
   assert.deepEqual(filterByResearchPhase(data.experiments, data.activity, 'phase-08').map(entry => entry.id), ['CVK2']);
+});
+
+test('the 15-16 Sep phase links exactly the six rows appended at MASTER-TABLE lines 212-217', async () => {
+  const { researchTimeline, filterByResearchPhase } = await helpers();
+  const row = researchTimeline(data.activity, data.experiments).find(entry => entry.id === 'phase-09')!;
+  assert.ok(row, 'phase-09 must be a documented research phase');
+  assert.equal(row.title, 'Off BatchNorm, off residuals, long horizons');
+  assert.equal(row.startDate, '2026-09-15');
+  assert.equal(row.period, '15-16 Sep 2026');
+  assert.ok(row.test && row.observation && row.nextQuestion, 'the phase keeps the Test / Result / Next question format');
+  const ids = ['MT212', 'MT213', 'MT214', 'MT215', 'MT216', 'MT217'];
+  assert.deepEqual(row.experiments.map(entry => entry.id), ids);
+  assert.deepEqual(filterByResearchPhase(data.experiments, data.activity, 'phase-09').map(entry => entry.id), ids);
+  assert.deepEqual(row.counts, { success: 5, fail: 0, mixed: 1, unresolved: 0 });
+  assert.equal(row.methodChecks, 0);
+  for (const id of ids) assert.deepEqual(data.experiments.find(e => e.id === id)!.eventIds, ['phase-09'], `${id} reverse link`);
+  const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;
+  assert.ok(csv.every(entry => !entry.phase.includes('15-16 Sep')), 'the added phase is not presented as a campaign CSV row');
 });
 
 test('current verdict counts remain separate from favorable descriptive observations', async () => {
