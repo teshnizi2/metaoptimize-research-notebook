@@ -25,6 +25,7 @@ class NotebookPackageTests(unittest.TestCase):
             "index.html": "<html></html>", "tsconfig.json": "{}", "vite.config.ts": "export default {};",
             "vercel.json": "{}", ".gitignore": "node_modules/\n",
             "src/main.tsx": "export {};", "tests/research.test.ts": "export {};",
+            "tests/fixtures/register-ids.json": "{}\n",
             "scripts/journal.mjs": "export {};", "scripts/sync-journal.mjs": "export {};",
             "scripts/sync-artifact-dates.mjs": "export {};",
             "content/journal.json": "[]\n", "public/data/journal.json": "[]\n",
@@ -51,6 +52,7 @@ class NotebookPackageTests(unittest.TestCase):
         self.assertEqual(payloads["docs/MAINTENANCE.md"], b"Portable maintenance\n")
         self.assertIn("public/source/example.txt", payloads)
         self.assertIn("content/journal.json", payloads)
+        self.assertIn("tests/fixtures/register-ids.json", payloads, "JavaScript tests read their JSON fixtures")
         self.assertEqual(meta["snapshotId"], "test-snapshot")
         forbidden = ["node_modules/", "dist/", ".vercel/", "export_research", "test_private", "superpowers/", "notebook-source.zip", ".DS_Store"]
         self.assertFalse(any(term in name for name in payloads for term in forbidden))

@@ -44,6 +44,14 @@ KINDS = set(register_model.KINDS)
 PARTITION_IDS = [register_model.partition_id(line) for line in range(register_model.FIRST_ROW, register_model.LAST_ROW + 1)]
 APPENDED_IDS = [register_model.partition_id(line) for line in range(register_model.APPENDED_FIRST_ROW, register_model.APPENDED_LAST_ROW + 1)]
 REGISTER_CSV = "complete_experiment_register.csv"
+RUN_INVENTORY_CSV = "complete_run_inventory.csv"
+# Summary tables derived from the register are regenerated from it, like the register table.
+OUTCOMES_BY_AREA_CSV = "outcomes_by_area.csv"
+GOAL_OUTCOMES_CSV = "goal_outcomes.csv"
+OUTCOME_COUNT_COLUMNS = ["research_questions", "success", "fail", "mixed", "unresolved", "method_checks", "corrected"]
+OUTCOMES_BY_AREA_COLUMNS = ["area", "records", *OUTCOME_COUNT_COLUMNS, "interpretation"]
+GOAL_OUTCOMES_COLUMNS = ["page", "title", "goal", "comparison", "why_test", "status", "scope", "sources", "file", "kind", "entry_ids", *OUTCOME_COUNT_COLUMNS]
+OUTCOME_INTERPRETATION = "Outcomes judge each stated goal; these are not method win rates or independent hypotheses. Method checks carry no research outcome, and Corrected is a badge beside the outcome."
 # The published register lists every record of the notebook register, not the 111-row campaign export.
 REGISTER_COLUMNS = ["id", "kind", "outcome", "outcome_label", "corrected", "correction_note", "section", "area", "goal", "comparison", "why", "result", "reason", "scope", "batches", "sources", "original_question", "register_page", "mapping_rule", "master_table_line"]
 PORTFOLIO_LINKS = {
@@ -84,7 +92,8 @@ PHASE_LINKS = [
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
 PHASE_STARTS = ["2026-08-18", "2026-08-20", "2026-08-24", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-14"]
-EXPECTED_STATS = {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10}
+EXPECTED_STATS = {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": 2956, "figures": 54, "areas": 10}
+CVK2_RUNS = 27
 
 
 def read_csv(path):
@@ -211,6 +220,17 @@ def warning_for(experiment):
     if outcome == "fail":
         detail += " This is a scientific verdict about the tested goal, not a runtime-failure classification."
     warnings = [{"id": f"warning-{experiment['id']}-verdict", "experimentId": experiment["id"], "severity": severity, "title": title, "detail": detail, "status": status}]
+    amendment = experiment.get("amendment")
+    if amendment:
+        labels = register_model.OUTCOME_LABELS
+        moved = amendment["previousOutcome"] != amendment["outcome"]
+        detail = amendment["reason"]
+        if moved:
+            detail += f" Outcome before the amendment: {labels[amendment['previousOutcome']]}."
+            detail += "".join(f" Previous {key}: {value}" for key, value in (amendment.get("previous") or {}).items())
+        warnings.append({"id": f"warning-{experiment['id']}-amendment", "experimentId": experiment["id"], "severity": "limitation",
+                         "title": "Outcome moved by a later result" if moved else "Wording amended by a later result", "status": "documented",
+                         "detail": detail + " Amendment record: " + amendment["source"] + "."})
     if experiment["corrected"] and experiment["kind"] == "research":
         warnings.append({"id": f"warning-{experiment['id']}-correction", "experimentId": experiment["id"], "severity": "correction",
                          "title": "A historical claim was corrected", "status": "resolved",
@@ -236,7 +256,8 @@ def build_experiments(register, source_links):
             "batches": json.loads(row["batches"]), "figureIds": [], "codeIds": linkage["codeIds"],
             "tableIds": [], "warningIds": [], "eventIds": [], "runIds": [], "sourceRefs": linkage["sourceRefs"],
         }
-        for warning in warning_for(experiment):
+        amendment = json.loads(row["amendment"]) if row.get("amendment") else None
+        for warning in warning_for({**experiment, "amendment": amendment}):
             experiment["warningIds"].append(warning["id"])
             warnings.append(warning)
         for index, missing in enumerate(linkage.get("missing", []), 1):
@@ -270,6 +291,42 @@ def register_csv_rows(register):
     return rows
 
 
+def outcome_counts(records):
+    research = [row for row in records if row["kind"] == "research"]
+    return {"research_questions": len(research), **{outcome: sum(row["outcome"] == outcome for row in research) for outcome in register_model.OUTCOMES},
+            "method_checks": sum(row["kind"] == "method-check" for row in records), "corrected": sum(bool(row["corrected"]) for row in records)}
+
+
+def outcomes_by_area_rows(experiments, areas):
+    """One row per research area, counted exactly as the homepage area table counts them."""
+    rows = [OUTCOMES_BY_AREA_COLUMNS]
+    for area in areas:
+        records = [e for e in experiments if e["area"] == area["label"]]
+        values = {"area": area["label"], "records": len(records), **outcome_counts(records), "interpretation": OUTCOME_INTERPRETATION}
+        rows.append([str(values[column]) for column in OUTCOMES_BY_AREA_COLUMNS])
+    return rows
+
+
+def goal_outcomes_rows(original_rows, figures, experiments):
+    """The report pages' goal table with each page's current record links and outcome counts."""
+    header, body = original_rows[0], original_rows[1:]
+    if header != GOAL_OUTCOMES_COLUMNS[:len(header)]:
+        raise ValueError("goal_outcomes.csv columns changed")
+    by_page = {f"page-{row[0]}": row for row in body}
+    by_id = {e["id"]: e for e in experiments}
+    rows = [GOAL_OUTCOMES_COLUMNS]
+    for figure in figures:
+        if figure["id"] not in by_page:
+            continue
+        values = dict(zip(header, by_page.pop(figure["id"])))
+        records = [by_id[eid] for eid in figure["experimentIds"]]
+        values.update(entry_ids="; ".join(figure["experimentIds"]), **outcome_counts(records))
+        rows.append([str(values[column]) for column in GOAL_OUTCOMES_COLUMNS])
+    if by_page:
+        raise ValueError(f"goal_outcomes.csv names pages without a figure: {sorted(by_page)}")
+    return rows
+
+
 def table_contexts(table_root, experiments):
     ids = {e["id"] for e in experiments}
     contexts = {}
@@ -297,6 +354,12 @@ def table_contexts(table_root, experiments):
         if path.name.startswith("cvk2_"):
             linked = ["CVK2"]
             scope = "Completed CVK2 / cvk1: VGG11_bn, CIFAR-100, 100 epochs, nine arms × three seeds 55–57. Validity checks passed; the carrier-cut prediction remains unresolved."
+        elif rel == OUTCOMES_BY_AREA_CSV:
+            linked = sorted(ids)
+            scope = f"Outcome counts by research area, regenerated from the notebook register (scripts/register_model.py): research questions and their four outcomes (success = Goal met, fail = Goal missed, mixed, unresolved = Open), method checks listed separately, and the Corrected badge counted on its own. The campaign's earlier table with a 'correction' outcome column is an input, not this table."
+        elif rel == GOAL_OUTCOMES_CSV:
+            linked = sorted(ids)
+            scope = "Report pages 2-23 with their stated goals, as in the report, plus each page's current linked records (entry_ids) and those records' four-way outcome, method-check and Corrected counts, regenerated from the notebook register. The page status column is the report's own page label, not a register outcome."
         elif rel == REGISTER_CSV:
             linked = sorted(ids)
             scope = f"Complete notebook register, regenerated from scripts/register_model.py: all {len(experiments)} records, each with its kind (research question or method check), its four-way outcome (Goal met, Goal missed, Mixed, Open; blank for method checks) and the Corrected badge in its own column. The campaign's 111-row export with the retired 'correction' outcome is an input, not this table."
@@ -317,16 +380,25 @@ def table_contexts(table_root, experiments):
     return contexts
 
 
-def publish_tables(workspace, public, experiments, register):
+def publish_tables(workspace, public, experiments, register, figures, areas, run_inventory):
     root = workspace / "outputs/tables"
     contexts = table_contexts(root, experiments)
     tables, receipts = [], []
+    regenerated = {REGISTER_CSV: "scripts/register_model.py register", OUTCOMES_BY_AREA_CSV: "scripts/register_model.py register, by area",
+                   GOAL_OUTCOMES_CSV: "report goal table with register links and outcome counts", RUN_INVENTORY_CSV: "extended run inventory"}
     for original in sorted(root.rglob("*.csv")):
         rel = original.relative_to(root)
         destination = public / "assets/tables" / rel
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if rel.as_posix() == RUN_INVENTORY_CSV:
+            original = Path(run_inventory)
         if rel.as_posix() == REGISTER_CSV:
             rows = register_csv_rows(register)
+        elif rel.as_posix() == OUTCOMES_BY_AREA_CSV:
+            rows = outcomes_by_area_rows(experiments, areas)
+        elif rel.as_posix() == GOAL_OUTCOMES_CSV:
+            with original.open(newline="", encoding="utf-8") as handle:
+                rows = goal_outcomes_rows(list(csv.reader(handle)), figures, experiments)
         else:
             with original.open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.reader(handle))
@@ -348,7 +420,7 @@ def publish_tables(workspace, public, experiments, register):
                         raise ValueError(f"Numeric value changed during sanitization: {rel}")
         context = contexts[rel.as_posix()]
         tables.append({"id": stable_id("table-", rel.as_posix()), **context, "href": "/assets/tables/" + rel.as_posix(), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0})
-        receipts.append({"file": rel.as_posix(), **({"regenerated": "scripts/register_model.py register"} if rel.as_posix() == REGISTER_CSV else {}), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0, "numeric_cells_preserved": numeric_cells, "original_sha256": digest(original), "public_sha256": digest(destination)})
+        receipts.append({"file": rel.as_posix(), **({"regenerated": regenerated[rel.as_posix()]} if rel.as_posix() in regenerated else {}), "rows": len(rows) - 1, "columns": len(rows[0]) if rows else 0, "numeric_cells_preserved": numeric_cells, "original_sha256": digest(original), "public_sha256": digest(destination)})
     return tables, receipts
 
 
@@ -476,7 +548,7 @@ def make_runs(inventory, experiments, evidence, public, workspace):
     return runs, log_receipts
 
 
-def make_activity(timeline, snapshot_date, experiments):
+def make_activity(timeline, snapshot_date, experiments, run_count):
     activity = []
     for index, row in enumerate(timeline):
         phase, _, label = row["phase"].partition("\n")
@@ -494,7 +566,7 @@ def make_activity(timeline, snapshot_date, experiments):
         })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}), the 2,863-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]}), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -560,13 +632,14 @@ def publish_report_and_figures(workspace, public, figures):
 
 
 def publish_bundle(public, tables, figures, log_receipts):
+    historical = len(log_receipts) - CVK2_RUNS
     destination = public / "assets/charts-and-tables.zip"
     paths = [(public / "assets/report.pdf", "report.pdf")]
     paths.extend((public / row["href"].lstrip("/"), row["href"].removeprefix("/assets/")) for row in [*tables, *figures])
     paths.extend((public / row["href"].lstrip("/"), row["href"].removeprefix("/assets/")) for row in log_receipts)
-    readme = """MetaOptimize public research snapshot
+    readme = f"""MetaOptimize public research snapshot
 
-Includes all 54 report pages, the report PDF, all 201 numeric CSVs, and all 2,863 sanitized raw logs (2,836 historical logs and 27 CVK2 logs). Tables keep their original rows, columns, and numeric cell strings. Raw logs retain their original line breaks and epoch accuracy lines, including incomplete and superseded runs. Private account names, local filesystem prefixes, and machine identifiers were replaced; source hashes labeled as original still identify the original private archive, not these sanitized copies. The portal run inventory records original/public SHA-256 pairs for every raw log. Use the public source catalog for original/public code and document hash pairs.
+Includes all 54 report pages, the report PDF, all 201 numeric CSVs, and all {len(log_receipts):,} sanitized raw logs ({historical:,} historical logs and {CVK2_RUNS} CVK2 logs). Tables keep their original rows, columns, and numeric cell strings. Raw logs retain their original line breaks and epoch accuracy lines, including incomplete and superseded runs. Private account names, local filesystem prefixes, and machine identifiers were replaced; source hashes labeled as original still identify the original private archive, not these sanitized copies. The portal run inventory records original/public SHA-256 pairs for every raw log. Use the public source catalog for original/public code and document hash pairs.
 
 CSV references such as repository/, archive/Account1/, archive/Account2/, and publication-workspace/ are provenance labels, not downloadable URLs. Every run inventory record has a logHref for its sanitized raw-log download. Publishing an archived log does not certify the associated scientific goal, and goal failures remain distinct from process failures.
 
@@ -591,7 +664,7 @@ def validate(data, runs, public):
     expected = EXPECTED_STATS
     verify(data["meta"]["stats"] == expected, "Incorrect snapshot totals")
     verify(len(data["experiments"]) == expected["experiments"], "Experiment count")
-    verify(len(runs) == 2863 and len({r["id"] for r in runs}) == 2863, "Run count or duplicate identifiers")
+    verify(len(runs) == expected["runs"] and len({r["id"] for r in runs}) == expected["runs"], "Run count or duplicate identifiers")
     verify({f["id"] for f in data["figures"]} == {f"page-{p}" for p in range(1, 55)}, "Figure page coverage")
     verify(len(data["tables"]) == 201, "CSV table coverage")
     verify(sum(a["count"] for a in data["areas"]) == expected["experiments"], "Area totals")
@@ -612,6 +685,21 @@ def validate(data, runs, public):
         verify(row.get("section") == section and row.get("area") == register_model.AREAS[section] and row.get("outcome") == register_model.RULE_OUTCOME[rule], f"Appended MASTER-TABLE row missing or remapped: line {line}")
         verify(row.get("batches") == batches and set(figures) <= set(row.get("figureIds", [])), f"Appended row links: line {line}")
         verify(any(e["kind"] == "research-phase" and row.get("id") in e["experimentIds"] for e in data["activity"]), f"Appended row has no research phase: line {line}")
+    for eid, (line, previous, outcome, _, batches, _, _) in register_model.ROW_AMENDMENTS.items():
+        row = by_id.get(eid, {})
+        warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment"), {})
+        verify(row.get("outcome") == outcome and set(batches) <= set(row.get("batches", [])), f"Row amendment not applied: {eid}")
+        verify(warning.get("experimentId") == eid and f"line {line} at {register_model.AMENDMENT_COMMIT[:7]}" in warning.get("detail", ""), f"Row amendment warning missing: {eid}")
+        verify(outcome == previous or register_model.OUTCOME_LABELS[previous] in warning.get("detail", ""), f"Row amendment must keep the previous outcome: {eid}")
+        for batch in batches:
+            verify(any(run["batch"] == batch and eid in run["experimentIds"] for run in runs), f"Amendment batch has no linked runs: {eid}/{batch}")
+    for line, (_, _, batches, _, _, _) in register_model.APPENDED_ROWS.items():
+        eid = register_model.partition_id(line)
+        linked = [run for run in runs if eid in run["experimentIds"]]
+        verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"Appended row runs not linked: {eid}")
+    for name, columns in [(OUTCOMES_BY_AREA_CSV, OUTCOMES_BY_AREA_COLUMNS), (GOAL_OUTCOMES_CSV, GOAL_OUTCOMES_COLUMNS)]:
+        table = next((t for t in data["tables"] if t["href"] == "/assets/tables/" + name), None)
+        verify(table is not None and table["columns"] == len(columns), f"Regenerated outcome table missing: {name}")
     register_table = next((t for t in data["tables"] if t["href"] == "/assets/tables/" + REGISTER_CSV), None)
     verify(register_table is not None and register_table["rows"] == expected["experiments"] and register_table["columns"] == len(REGISTER_COLUMNS), "Published register table must list every record")
     catalogs = {"figureIds": {r["id"]: r for r in data["figures"]}, "tableIds": {r["id"]: r for r in data["tables"]}, "codeIds": {r["id"]: r for r in data["sources"]}, "runIds": {r["id"]: r for r in runs}, "warningIds": {r["id"]: r for r in data["warnings"]}, "eventIds": {r["id"]: r for r in data["activity"]}}
@@ -648,7 +736,7 @@ def validate(data, runs, public):
             if raw_path.is_file():
                 verify(digest(raw_path) == run["parameters"].get("publicLogSha256"), f"Public raw-log hash mismatch: {run['id']}")
     cvk = next(row for row in data["experiments"] if row["id"] == "CVK2")
-    verify(cvk["outcome"] == "unresolved" and len(cvk["runIds"]) == 27, "CVK2 scope/verdict")
+    verify(cvk["outcome"] == "unresolved" and len(cvk["runIds"]) == CVK2_RUNS, "CVK2 scope/verdict")
     verify(data["latest"]["peakSet"] == [16, 19, 22] and data["latest"]["bestCut"] == 19 and data["latest"]["predictedCut"] == 22, "CVK2 registered peak set")
     verify(len(data["latest"]["cells"]) == 9 and all(c["n"] == 3 for c in data["latest"]["cells"]), "CVK2 sample counts")
     require_public(json.dumps(data, ensure_ascii=False), "research.json")
@@ -665,38 +753,40 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
-def export(workspace, public, snapshot_date, audit_path=None):
+def export(workspace, public, snapshot_date, audit_path=None, run_inventory=None):
     workspace, public = Path(workspace).resolve(), Path(public).resolve()
     sources, source_links = load_source_catalog(public)  # Fail before publishing partial data.
     evidence = read_evidence(workspace)
     table_root = workspace / "outputs/tables"
     repository_path = Path(evidence["full_portfolio_evidence"]["repository"])
     register = register_model.load_register(workspace, repository_path)
-    inventory = read_csv(table_root / "complete_run_inventory.csv")
+    # The run inventory can be an extended copy outside the (read-only) campaign workspace.
+    run_inventory = Path(run_inventory).resolve() if run_inventory else table_root / RUN_INVENTORY_CSV
+    inventory = read_csv(run_inventory)
     figures = make_figures(read_csv(table_root / "complete_figure_index.csv"))
-    experiments, warnings = build_experiments(register, source_links)
-    cvk = evidence["cvk2_evidence"]
-    attach_latest_warnings(experiments, warnings, cvk)
-    tables, table_receipts = publish_tables(workspace, public, experiments, register)
-    runs, log_receipts = make_runs(inventory, experiments, evidence, public, workspace)
     for figure in figures:
         if figure["id"] in register_model.FIGURE_IDS:
             figure["experimentIds"] = list(dict.fromkeys([*figure["experimentIds"], *PARTITION_IDS]))
         appended = [row["id"] for row in register if figure["id"] in json.loads(row.get("figure_ids") or "[]")]
         if appended:
             figure["experimentIds"] = list(dict.fromkeys([*figure["experimentIds"], *appended]))
-    activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date, experiments)
+    experiments, warnings = build_experiments(register, source_links)
+    cvk = evidence["cvk2_evidence"]
+    attach_latest_warnings(experiments, warnings, cvk)
+    areas = [{"id": section, "label": next(e["area"] for e in experiments if e["section"] == section), "count": sum(e["section"] == section for e in experiments)} for section in sorted({e["section"] for e in experiments})]
+    tables, table_receipts = publish_tables(workspace, public, experiments, register, figures, areas, run_inventory)
+    runs, log_receipts = make_runs(inventory, experiments, evidence, public, workspace)
+    activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date, experiments, len(runs))
     attach_relationships(experiments, figures, tables, runs, activity)
     attach_snapshot_import(experiments, activity, snapshot_date)
-    areas = [{"id": section, "label": next(e["area"] for e in experiments if e["section"] == section), "count": sum(e["section"] == section for e in experiments)} for section in sorted({e["section"] for e in experiments})]
     repository = Path(evidence["full_portfolio_evidence"]["repository"])
     commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
-    input_paths = [table_root / name for name in ["complete_experiment_register.csv", "complete_run_inventory.csv", "complete_figure_index.csv"]]
+    input_paths = [table_root / REGISTER_CSV, run_inventory, table_root / "complete_figure_index.csv"]
     # The pinned MASTER-TABLE bytes and the mapping module are inputs too.
-    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
+    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + register_model.AMENDMENT_MASTER_TABLE_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
     data = {
         "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "researchQuestions": sum(e["kind"] == "research" for e in experiments), "methodChecks": sum(e["kind"] == "method-check" for e in experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"},
-                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256}},
+                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256, "amendmentCommit": register_model.AMENDMENT_COMMIT, "amendmentMasterTableSha256": register_model.AMENDMENT_MASTER_TABLE_SHA256}},
         "areas": areas, "experiments": experiments, "figures": figures, "sources": sources,
         "tables": tables, "warnings": warnings, "activity": activity,
         "latest": {"experimentId": "CVK2", "peakSet": cvk["peak_cuts"], "predictedCut": cvk["predicted_peak_cut"], "bestCut": cvk["best_mean_cut"], "bar": cvk["peak_bar_pp"], "cells": [{key: row[key] for key in ["arm", "cut", "mean", "sem", "n"]} for row in cvk["cells"]]},
@@ -710,7 +800,7 @@ def export(workspace, public, snapshot_date, audit_path=None):
             require_public(path.read_text(), "public asset " + path.relative_to(public).as_posix())
     audit.update({
         "generated_at": data["meta"]["generatedAt"], "snapshot_id": data["meta"]["snapshotId"],
-        "inputs": [{"file": str(path.relative_to(workspace)), "sha256": digest(path)} for path in input_paths],
+        "inputs": [{"file": str(path.relative_to(workspace)) if path.is_relative_to(workspace) else sanitize_text(str(path), workspace), "sha256": digest(path)} for path in input_paths],
         "numeric_cells_preserved": sum(row["numeric_cells_preserved"] for row in table_receipts),
         "table_receipts": table_receipts, "figure_receipts": figure_receipts, "raw_log_receipts": log_receipts,
         "raw_logs": {"original_bytes": sum(row["original_bytes"] for row in log_receipts), "public_bytes": sum(row["public_bytes"] for row in log_receipts), "redacted_files": sum(row["redacted"] for row in log_receipts), "line_breaks_preserved": len(log_receipts), "epoch_accuracy_lines_preserved": sum(row["epoch_accuracy_lines_preserved"] for row in log_receipts)},
@@ -730,6 +820,7 @@ def main():
     parser.add_argument("--as-of", default="2026-09-16", help="Documented publication-snapshot date, YYYY-MM-DD")
     parser.add_argument("--check", action="store_true", help="Validate existing public JSON and links without regenerating assets")
     parser.add_argument("--audit", type=Path, help="Where to write the export audit receipt (default: <workspace>/work/portal_data_audit.json)")
+    parser.add_argument("--run-inventory", type=Path, help="Run inventory CSV to publish instead of <workspace>/outputs/tables/complete_run_inventory.csv (an extended copy kept outside a read-only workspace)")
     args = parser.parse_args()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.as_of):
         parser.error("--as-of must be YYYY-MM-DD")
@@ -744,7 +835,7 @@ def main():
             if bundled.is_file() and Path(sys.executable).resolve() != bundled.resolve():
                 os.execv(str(bundled), [str(bundled), str(Path(__file__).resolve()), *sys.argv[1:]])
             raise RuntimeError("Pillow and pypdf are required to verify lossless public figure assets and PDF privacy")
-        audit = export(args.workspace, args.public_dir, args.as_of, args.audit)
+        audit = export(args.workspace, args.public_dir, args.as_of, args.audit, args.run_inventory)
     print(json.dumps({key: audit[key] for key in ["status", "coverage", "tables", "sources", "warnings", "activity_events", "published_raw_logs"]}, indent=2))
 
 

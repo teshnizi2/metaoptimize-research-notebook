@@ -25,6 +25,13 @@ mapping is reviewable in one place and never applied ad hoc:
    file must keep lines 1-211 identical to the partition-audit commit apart from
    its header counts (lines 3 and 5), so no earlier record can drift.
 
+4. Rows the campaign later amends in place (CORRECTIONS 229 at commit 6e33fd8:
+   MASTER-TABLE rows 19, 162, 163, 166 and 213) are applied by ``ROW_AMENDMENTS``:
+   the pinned file may differ from the appended-rows commit only on those lines
+   and header line 3, each record states its outcome before and after with a
+   one-line reason, and an outcome may move only where the row's verdict column
+   moved (row 19, MT019: Open -> Goal met).
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
 ``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217);
 no ID from the original register is at or above MT167. Source anchors into
@@ -186,6 +193,108 @@ APPENDED_BEARS_ON = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 4. In-place amendments to existing MASTER-TABLE rows (CORRECTIONS 229).
+# ---------------------------------------------------------------------------
+# The bookkeeping pass at campaign commit 6e33fd8 edited six MASTER-TABLE lines in
+# place (header line 3 and rows 19, 162, 163, 166, 213) and moved no line. Each
+# amended row that has a record here is listed with the record's outcome before
+# and after, a one-line reason, and the note shown with the record. Only row 19's
+# verdict column changed (OPEN -> CONFIRMED, RESCOPED 229), so MT019 is the only
+# outcome change; the other four keep their outcome and gain the amendment note.
+# An outcome moved by later data is not a corrected earlier claim, so the
+# Corrected badge is not set; the previous wording is kept in a warning instead.
+AMENDMENT_COMMIT = "6e33fd8de088cae04d0ecf7805f7fd86894aeba7"
+AMENDMENT_MASTER_TABLE_SHA256 = "c2fe5c47a79daf3d29e231d32aca1968510e838add6775b1da6ed4de1e17bbf2"
+AMENDMENT_SOURCE = "docs/CORRECTIONS.md [CORRECTIONS 229]"
+AMENDMENT_MARK = "[AMENDED at cycle 152, CORRECTIONS 229"
+AMENDED_LINES = {3, 19, 162, 163, 166, 213}
+# id -> (MASTER-TABLE line, outcome before, outcome after, verdict token the amended
+#        verdict cell must start with (None: the verdict cell must be unchanged),
+#        batches added, one-line reason, replacement result/reason/scope or None)
+ROW_AMENDMENTS = {
+    "MT019": (19, "unresolved", "success", "CONFIRMED, RESCOPED 229", ["cuc1"],
+              "CONFIRMED, RESCOPED 229: cau1 (CIFAR-10, +3.6173 pp) and cuc1 (CIFAR-100, +12.1780 pp against a 5-cell meta grid) closed the two counts that kept the fairness audit Open.",
+              {"result": "Every registered fairness flaw is closed: budget and search budget (CORRECTIONS 30/44) and the parent's unaugmented setup on both datasets, where tuned SGD+momentum+cosine still beats the method by +3.6173 pp (CIFAR-10, cau1) and +12.1780 pp (CIFAR-100, cuc1).",
+               "reason": "Goal met: the deficit is not an artefact of the three audited unfairnesses (MASTER-TABLE row 19 moved OPEN -> CONFIRMED, RESCOPED at CORRECTIONS 229).",
+               "scope": "Limits that travel with the verdict: one baseline family (SGD+momentum+cosine); the paper's alpha0 1e-6 is untested on CIFAR-100 (on CIFAR-10 the paper's config m6 is 15.1160 pp behind); one granularity per batch, so meta-side tuning is bounded, not exhausted (cuc1's best cell sits at the ms-HIGH grid edge, +0.28 SE above the centre). No method-side counterweight, ResNet18 only, 100 epochs only, and the AUC reading reverses at the best baseline rung on both datasets."}),
+    "MT163": (162, "success", "success", None, [],
+              "Outcome unchanged (IDENTITY-OPERATIVE holds). 'ResNet-only' is rescoped to this batch's DEPTH control: the nominated set rescuing where a matched non-carrier set does not has since been measured on VGG (cvi1), GroupNorm (cgn2) and PlainNet (cpl2). The tensor list does not transfer, and identity vs magnitude is still not separated on any network.",
+              None),
+    "MT164": (163, "success", "success", None, [],
+              "Outcome unchanged (GAP-REPLICATES). 'No isolation arm has run on VGG' and 'bn8.weight is a hypothesis' are overtaken: cvi1 isolated bn8.weight against its twin (+31.3033 pp) and cvh1 held the rescue to 328 epochs. The gap and the isolation stay separate claims for the tensor list and for identity vs magnitude.",
+              None),
+    "MT020": (166, "success", "success", None, [],
+              "Outcome unchanged (DEFICIT-HOLDS on CIFAR-10). 'CIFAR-100 not licensed' and 'the FAIR row stays open' are answered by cuc1 (MT215, +12.1780 pp) and MT019's move to Goal met. This batch's own method side is still two alpha0 cells at one meta-stepsize.",
+              None),
+    "MT213": (213, "mixed", "mixed", None, [],
+              "Outcome unchanged (Mixed). 'By subtraction' and 'never isolated alone' are overtaken by cpl2 (MT217): layer4.1.bn2.weight alone rescues (+52.1367 pp over its twin). 'Alone' holds only against the bar (ISO minus HEAD is +3.5940 pp inside the 5.0 pp bar), HEAD's rescue is a delay, and identity vs magnitude is still open (cvt1 has not landed).",
+              None),
+}
+
+
+def amended_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != AMENDMENT_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {AMENDMENT_COMMIT[:12]} does not match the pinned amendment bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = appended_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != len(before) or changed != AMENDED_LINES:
+        raise ValueError(f"MASTER-TABLE amendments moved a line or edited lines other than {sorted(AMENDED_LINES)}: {sorted(changed)}")
+    return lines
+
+
+def apply_row_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply ROW_AMENDMENTS to the combined register, checking each against the pinned rows."""
+    lines, before = amended_master_table(repo), appended_master_table(repo)
+    by_id = {row["id"]: row for row in rows}
+    if {line for line, *_ in ROW_AMENDMENTS.values()} != AMENDED_LINES - {3}:
+        raise ValueError("Every amended MASTER-TABLE row needs exactly one record amendment")
+    amended = []
+    for row in rows:
+        if row["id"] not in ROW_AMENDMENTS:
+            amended.append(row)
+            continue
+        line, previous, outcome, token, batches, reason, replacement = ROW_AMENDMENTS[row["id"]]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if len(old) != 7 or len(new) != 7 or old[0] != new[0]:
+            raise ValueError(f"MASTER-TABLE line {line} changed its question cell or column count")
+        question = re.sub(r"^\[[^\]]*\]\s*", "", clean(new[0]))
+        if norm(row["original_question"])[:60] not in norm(question):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != previous:
+            raise ValueError(f"{row['id']} outcome drifted before its amendment: {row['outcome']} (expected {previous})")
+        if token is None:
+            if new[4] != old[4] or outcome != previous:
+                raise ValueError(f"MASTER-TABLE line {line}: an unchanged verdict cannot change the outcome")
+        elif not clean(new[4]).startswith(token) or outcome == previous:
+            raise ValueError(f"MASTER-TABLE line {line} verdict does not start with {token}")
+        if AMENDMENT_MARK not in new[5] or clean(old[5]).replace(" ", "") not in clean(new[5]).replace(" ", ""):
+            raise ValueError(f"MASTER-TABLE line {line}: the amendment must be bracketed and keep the superseded wording")
+        row = dict(row)
+        history = {key: row[key] for key in ["result", "reason", "scope"]}
+        if replacement:
+            row.update(replacement)
+        else:
+            row["scope"] = f"{row['scope']} Amended at CORRECTIONS 229: {reason}"
+        sources = json.loads(row.get("sources") or "[]")
+        # Anchors that pinned the pre-amendment row text now point at the amended row.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        row["sources"] = json.dumps([*sources, AMENDMENT_SOURCE], ensure_ascii=False)
+        row["batches"] = json.dumps(list(dict.fromkeys([*json.loads(row["batches"]), *batches])))
+        row["outcome"] = outcome
+        row["amendment"] = json.dumps({"line": line, "commit": AMENDMENT_COMMIT, "previousOutcome": previous, "outcome": outcome,
+                                       "reason": reason, "previous": history if replacement else None,
+                                       "source": f"{MASTER_TABLE} line {line} at {AMENDMENT_COMMIT[:7]}; CORRECTIONS 229"}, ensure_ascii=False)
+        amended.append(row)
+    missing = set(ROW_AMENDMENTS) - by_id.keys()
+    if missing:
+        raise ValueError(f"Row amendments name absent records: {sorted(missing)}")
+    return amended
+
+
 def partition_id(line: int) -> str:
     return f"MT{line:03d}"
 
@@ -321,7 +430,12 @@ def remap_base_row(row: dict) -> dict:
 
 
 def load_register(workspace: Path, repo: Path) -> list[dict]:
-    """Base register (four-outcome model) plus the pinned partition-audit rows."""
+    """The published register: every row below, with the pinned in-place row amendments applied."""
+    return apply_row_amendments(load_unamended_register(workspace, repo), Path(repo))
+
+
+def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
+    """Base register (four-outcome model) plus the pinned partition-audit and appended rows."""
     path = Path(workspace) / "outputs/tables/complete_experiment_register.csv"
     with path.open(newline="", encoding="utf-8") as handle:
         base = [remap_base_row(row) for row in csv.DictReader(handle)]

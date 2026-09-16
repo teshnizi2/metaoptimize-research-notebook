@@ -16,7 +16,7 @@ const partitionIds = Array.from({ length: 37 }, (_, i) => `MT${175 + i}`);
 // MASTER-TABLE lines 212-217 at campaign commit 64e4f47 (cgn1, cpl1, cvh1, cuc1, cgn2, cpl2).
 const appendedIds = Array.from({ length: 6 }, (_, i) => `MT${212 + i}`);
 const previous = JSON.parse(readFileSync(new URL('./fixtures/register-ids-2026-09-16.json', import.meta.url), 'utf8')) as {
-  experiments: { id: string; section: number; area: string; title: string; kind: string; outcome: string | null; corrected: boolean }[];
+  experiments: { id: string; section: number; area: string; title: string; kind: string; outcome: string | null; corrected: boolean; outcomeChange?: { from: string; to: string; source: string } }[];
 };
 
 test('every previously published experiment keeps its ID, title and section', () => {
@@ -63,6 +63,9 @@ test('MASTER-TABLE anchors resolve by row content, not by the old line numbers',
 
 test('all 148 records published before the lines 212-217 import keep their ID, title, area, kind and outcome', () => {
   assert.equal(previous.experiments.length, 148);
+  // Outcome changes are recorded in the fixture on purpose, never absorbed as drift.
+  assert.deepEqual(previous.experiments.filter(e => e.outcomeChange).map(e => [e.id, e.outcomeChange!.from, e.outcomeChange!.to]), [['MT019', 'unresolved', 'success']]);
+  assert.match(previous.experiments.find(e => e.id === 'MT019')!.outcomeChange!.source, /CORRECTIONS 229/);
   for (const old of previous.experiments) {
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
@@ -94,7 +97,9 @@ test('the appended MASTER-TABLE rows carry their registered verdict, area and no
   const batches = data.experiments.flatMap(e => e.batches);
   assert.equal(batches.filter(b => b === 'cau1').length, 2, 'cau1 stays on MT019 and MT020 only');
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvk1')).map(e => e.id), ['CVK2']);
-  for (const batch of Object.values(expected).map(([b]) => b)) assert.equal(data.experiments.filter(e => e.batches.includes(batch)).length, 1, batch);
+  // cuc1 closed MT019's remaining counts (CORRECTIONS 229), so it links there as cau1 does; every other batch has one record.
+  assert.deepEqual(data.experiments.filter(e => e.batches.includes('cuc1')).map(e => e.id), ['MT019', 'MT215']);
+  for (const batch of Object.values(expected).map(([b]) => b).filter(b => b !== 'cuc1')) assert.equal(data.experiments.filter(e => e.batches.includes(batch)).length, 1, batch);
 });
 
 test('journal entries still resolve to existing experiments', () => {

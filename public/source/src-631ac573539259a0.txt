@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cGN3_smoke_gen.py -- SYNTHETIC, HARNESS-FORMAT `cgn3` RUNS FOR THE SELFTEST
+#   OF analysis/cGN3_gn_horizon_score.py.  (CORRECTIONS 228)
+#
+# EVERY ACCURACY AND EVERY BETA WRITTEN BY THIS FILE IS INVENTED.  NOTHING IT
+# WRITES IS EVIDENCE ABOUT THE REAL BATCH.  It exists for ONE reason
+# (CORRECTIONS 171): a selftest must drive the REAL score() on runs that look
+# exactly like the harness's own output, to a FINAL line, including a DROPPED
+# run (which must give INCOMPLETE).
+#
+# WHAT IT WRITES under <outdir> (which MUST NOT be a real runs directory):
+#   <outdir>/cgn3-<arm>-s<seed>-<jobid>.out    NODE / ARGS / ENV / PROBE_TENSOR
+#                                              lines in the cgn1-tree runner's
+#                                              format (copied from cgn2's own
+#                                              .out files), 430 `Epoch` lines,
+#                                              `NN  minutes`, RUN_DONE
+#   <outdir>/cgn3/probe_<run>/probe.jsonl      2,150 records (PROBE=100 x 500
+#                                              meta-steps/epoch x 430 epochs)
+#   <outdir>/cgn3/probe_<run>/block_sizes.json the harness's n_b
+#   <outdir>/cgn3/probe_<run>/probe_tensor.json
+#   <outdir>/cgn3/PARTITION-MANIFEST.txt       the scorer's synthetic_manifest_text()
+#   <outdir>/cgn3/PROVENANCE.txt               MODE submit + the frozen shas
+#
+# THE ISO COMPLEMENT (beta[0]) HAS FOUR SHAPES:
+#   chatter  cgn2's descent continued linearly: -8.88 at epoch 100, first exact
+#            touch of -15.0 at epoch 340 (r <= 2 from ~312.8), then CHATTERS --
+#            38 % of records exactly on the clamp, the rest 0.001-0.050 above.
+#   pinned   the same descent, then exactly on the clamp forever.
+#   neither  descends to -13.0 by epoch 340 and stays (r = exp(2) = 7.4).
+#   free     decelerates: -8.88 at 100, -10.5 at 430 (r ~ 90): never pins.
+#
+# usage: python3 analysis/cGN3_smoke_gen.py <outdir> <scenario>
+#        python3 analysis/cGN3_smoke_gen.py --list
+# =============================================================================
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCORER = os.path.join(HERE, "cGN3_gn_horizon_score.py")
+
+PREFIX = "cgn3-"
+BATCH = "cgn3"
+SEEDS = (81, 82, 83)
+ARMS = ("k01", "kL", "ISO", "ONE")
+EPOCHS = 430
+PROBE = 100
+REC_PER_EPOCH = 5
+N_RECORDS = EPOCHS * REC_PER_EPOCH           # 2,150
+NET, DSET = "ResNet18_gn_c100", "CIFAR100"
+CLIP = "-15:-2.3026"
+BETA_LO = -15.0
+B_INIT = -13.815510557964274                 # ln(alpha0 = 1e-6)
+SAVE = "/cluster/account_b/metaopt/runs/cgn3"    # only ever printed into the synthetic lines
+POST_SHA = "9f6e4ec97157311bb3b664509258144235319db88962b9d8c3a4484b1837c892"
+
+SPEC = {
+    "k01": "scalar",
+    "kL": "layerwise",
+    "ISO": "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight",
+    "ONE": "sets:1-49,51-62/layer4.0.bn2.weight",
+}
+PT_TYPE = {"k01": "scalar", "kL": "layerwise", "ISO": "blockwise", "ONE": "blockwise"}
+ISO_IDX = (50, 53, 59)
+ONE_IDX = (50,)
+SEED_OFF = {81: -0.20, 82: 0.00, 83: 0.20}
+
+
+def _load_scorer():
+    sp = importlib.util.spec_from_file_location("cgn3_scorer_for_gen", SCORER)
+    m = importlib.util.module_from_spec(sp)
+    sp.loader.exec_module(m)
+    return m
+
+
+def tensors():
+    """(name, numel, owner) -- ResNet-18 with GroupNorm(32, C); same as the scorer's."""
+    out = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "GroupNorm"),
+           ("bn1.bias", 64, "GroupNorm")]
+    cin = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for bi in range(2):
+            stride2 = (li > 1 and bi == 0)
+            p = "layer%d.%d." % (li, bi)
+            a = cin if bi == 0 else w
+            out += [(p + "conv1.weight", w * a * 9, "Conv2d"), (p + "bn1.weight", w, "GroupNorm"),
+                    (p + "bn1.bias", w, "GroupNorm"), (p + "conv2.weight", w * w * 9, "Conv2d"),
+                    (p + "bn2.weight", w, "GroupNorm"), (p + "bn2.bias", w, "GroupNorm")]
+            if stride2:
+                out += [(p + "shortcut.0.weight", w * a, "Conv2d"),
+                        (p + "shortcut.1.weight", w, "GroupNorm"),
+                        (p + "shortcut.1.bias", w, "GroupNorm")]
+        cin = w
+    out += [("linear.weight", 100 * 512, "Linear"), ("linear.bias", 100, "Linear")]
+    return out
+
+
+NUMELS = [q for _n, q, _o in tensors()]
+NT = len(NUMELS)                              # 62
+GROUPS = {
+    "ISO": ([i for i in range(1, NT + 1) if i not in ISO_IDX], list(ISO_IDX)),
+    "ONE": ([i for i in range(1, NT + 1) if i not in ONE_IDX], list(ONE_IDX)),
+}
+KL_PINNED = (2, 3, 5, 6, 8, 9, 50, 53, 59)    # shape only
+
+# arm -> (TEST@100, TEST@E, TRAIN@100, TRAIN@E): the value every epoch of the
+# plateau windows carries, before the per-seed offset.  INVENTED.
+BASE_LEVELS = {
+    "k01": (14.10, 15.60, 16.15, 17.70),
+    "kL": (53.90, 64.00, 63.00, 80.00),
+    "ISO": (55.70, 64.50, 66.50, 76.00),
+    "ONE": (40.30, 52.00, 45.60, 58.00),
+}
+
+SCENARIOS = {
+    # the registered SURVIVE account: the complement pins (chatter) and the level holds after the pin
+    "survive_freeze": dict(iso_b0="chatter"),
+    "survive_pinned": dict(iso_b0="pinned"),
+    # the complement never reaches the floor in 430 epochs: the primary still lands;
+    # the pin stamp says UNRESOLVED-NOT-PINNED (INFORMATIVE, never voids the branch)
+    "survive_free": dict(iso_b0="free", levels={"ISO": (55.70, 70.00, 66.50, 85.00)}),
+    "survive_neither": dict(iso_b0="neither"),
+    # a DELAYED COLLAPSE: the complement pins at ~313 and ISO falls to the k01 level after it
+    "collapse": dict(iso_b0="chatter", levels={"ISO": (55.70, 18.00, 66.50, 20.00)}, ramp=360),
+    "attenuate": dict(iso_b0="chatter", levels={"ISO": (55.70, 40.00, 66.50, 50.00)}, ramp=360),
+    "no_rescue": dict(iso_b0="chatter", levels={"ISO": (20.00, 20.00, 22.00, 22.00)}),
+    # ONE's partial rescue fades while ISO's survives
+    "one_fades": dict(iso_b0="chatter", levels={"ONE": (40.30, 19.00, 45.60, 21.00)}, ramp=360),
+    # ISO - kL at E = +1.65 pp: just OVER the frozen READ_BAR (1.5566).  A scorer whose bar
+    # read a live corpus sigma > 1.0105 would stamp CEIL-TRACKS instead.
+    "near_bar": dict(iso_b0="chatter", levels={"kL": (53.90, 62.85, 63.00, 80.00)}),
+    "anchor": dict(iso_b0="chatter", levels={"kL": (40.00, 45.00, 45.00, 50.00)}),
+    "diverged": dict(iso_b0="chatter", seed_levels={("ISO", 83): (63.70, 72.50, 66.50, 76.00)}),
+    "dropped": dict(iso_b0="chatter", mutate="drop"),
+    "truncated": dict(iso_b0="chatter", mutate="truncate"),
+    "badspec": dict(iso_b0="chatter", mutate="badspec"),
+    "badprov": dict(iso_b0="chatter", mutate="badprov"),
+    "nomanifest": dict(iso_b0="chatter", mutate="nomanifest"),
+}
+
+
+def _pl(points, ep):
+    """piecewise-linear interpolation over (epoch, beta) knots"""
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if ep <= x1:
+            return y1 if x1 == x0 else y0 + (y1 - y0) * (ep - x0) / (x1 - x0)
+    return points[-1][1]
+
+
+K01_B = [(0, B_INIT), (16.4, -5.80), (100.0, -11.40), (300.0, -15.0), (1e9, -15.0)]
+ISO_B1 = [(0, B_INIT), (8.7, -9.47), (22.0, -15.0), (1e9, -15.0)]
+ONE_B0 = [(0, B_INIT), (16.4, -5.70), (100.0, -8.72), (430.0, -12.30), (1e9, -12.30)]
+ISO_B0_DESC = [(0, B_INIT), (16.4, -5.70), (100.0, -8.88), (340.0, -15.0)]
+ISO_B0_NEITHER = [(0, B_INIT), (16.4, -5.70), (100.0, -8.88), (340.0, -13.0), (1e9, -13.0)]
+ISO_B0_FREE = [(0, B_INIT), (16.4, -5.70), (100.0, -8.88), (430.0, -10.50), (1e9, -10.50)]
+KL_FREE = [(0, B_INIT), (20.0, -8.0), (1e9, -9.3)]
+KL_PIN = [(0, B_INIT), (10.0, -9.0), (30.0, -15.0), (1e9, -15.0)]
+TOUCH_REC = int(340.0 * REC_PER_EPOCH)      # 1,700
+
+
+def iso_b0(mode, i):
+    ep = i / float(REC_PER_EPOCH)
+    if mode == "free":
+        return _pl(ISO_B0_FREE, ep)
+    if mode == "neither":
+        return _pl(ISO_B0_NEITHER, ep)
+    if i < TOUCH_REC:
+        return _pl(ISO_B0_DESC, ep)
+    if mode == "pinned":
+        return BETA_LO
+    k = i - TOUCH_REC
+    if (k * 7919) % 100 < 38:
+        return BETA_LO
+    return BETA_LO + 0.001 + 0.049 * (((k * 104729) % 1000) / 1000.0)
+
+
+def betas(arm, i, mode):
+    ep = i / float(REC_PER_EPOCH)
+    if arm == "k01":
+        return [_pl(K01_B, ep)]
+    if arm == "kL":
+        return [_pl(KL_PIN if (j + 1) in KL_PINNED else KL_FREE, ep) for j in range(NT)]
+    if arm == "ISO":
+        return [iso_b0(mode, i), _pl(ISO_B1, ep)]
+    if arm == "ONE":
+        return [_pl(ONE_B0, ep), _pl(ISO_B1, ep)]
+    raise ValueError(arm)
+
+
+def acc_series(lv, off, ramp=115):
+    """(train, test) per epoch 0..EPOCHS-1.  Flat at the @100 level over epochs
+    60..ramp-1, then a 20-epoch linear move to the @E level, flat afterwards."""
+    p100, pe, t100, te = lv
+    out = []
+    for e in range(EPOCHS):
+        if e < 60:
+            f = (e + 1) / 60.0
+            ts, tr = 1.0 + (p100 - 1.0) * f, 1.0 + (t100 - 1.0) * f
+        elif e < ramp:
+            ts, tr = p100, t100
+        elif e < ramp + 20:
+            f = (e - ramp + 1) / 20.0
+            ts, tr = p100 + (pe - p100) * f, t100 + (te - t100) * f
+        else:
+            ts, tr = pe, te
+        out.append((min(100.0, tr + off), min(100.0, ts + off)))
+    return out
+
+
+def args_line(arm, seed, rn, spec=None):
+    return ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 "
+            "--dataset %s --NN-name %s --batch-size 100 --max-time 999:00:00 --gamma 1 "
+            "--meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs %d --stepsize-groups %s --seed %d "
+            "--save-directory %s --run-name %s" % (DSET, NET, EPOCHS, spec or SPEC[arm], seed, SAVE, rn))
+
+
+def env_line(rn):
+    return ("ENV: AUGMENT=1 BETA_CLIP=%s HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+            "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+            "PROBE=%d PROBE_DIR=%s/probe_%s EB_RHO=na EB_LOG=0" % (CLIP, PROBE, SAVE, rn))
+
+
+def write_out(path, arm, seed, rn, jid, series, done=True, spec=None, n_epochs=EPOCHS):
+    with open(path, "w") as fh:
+        fh.write("NODE=[HOST_e8d809bd94] | JOB=%s %d | AUGMENT=1\n" % (rn, jid))
+        fh.write(args_line(arm, seed, rn, spec=spec) + "\n")
+        fh.write(env_line(rn) + "\n")
+        fh.write("NVIDIA L4, 23034 MiB\n\n")
+        fh.write("args_base includes unnecessary attributes {'normalizer_param'} \n\n")
+        fh.write("Files already downloaded and verified\nFiles already downloaded and verified\n")
+        fh.write("PROBE_TENSOR: on every=%d type=%s tensors=%d meta_alg=Lion momentum_param=0.99 "
+                 "Lion_beta2=0.9 dir=%s/probe_%s\n" % (PROBE, PT_TYPE[arm], NT, SAVE, rn))
+        for e in range(n_epochs):
+            tr, ts = series[e]
+            fh.write("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%\n" % (e, tr, ts))
+        if done:
+            fh.write("191  minutes\nRUN_DONE\n")
+
+
+def write_probe(pdir, arm, mode):
+    os.makedirs(pdir, exist_ok=True)
+    if arm == "k01":
+        nb = [sum(NUMELS)]
+    elif arm == "kL":
+        nb = list(NUMELS)
+    else:
+        g0, g1 = GROUPS[arm]
+        nb = [sum(NUMELS[j - 1] for j in g0), sum(NUMELS[j - 1] for j in g1)]
+    json.dump({"stepsize_type": PT_TYPE[arm], "n_b": nb}, open(os.path.join(pdir, "block_sizes.json"), "w"))
+    json.dump({"PROBE_TENSOR": 1, "every": PROBE, "stepsize_type": PT_TYPE[arm], "n_tensors": NT,
+               "param_numels": list(NUMELS), "len_beta_list": 1, "meta_alg": "Lion",
+               "momentum_param": 0.99, "Lion_beta2": 0.9},
+              open(os.path.join(pdir, "probe_tensor.json"), "w"))
+    with open(os.path.join(pdir, "probe.jsonl"), "w") as fh:
+        for i in range(N_RECORDS):
+            b = betas(arm, i, mode)
+            rec = {"step": i * PROBE, "beta": b, "n_beta": len(b),
+                   "n_at_lo": sum(1 for v in b if v <= BETA_LO + 1e-9), "pt_mp": 0.99, "pt_b2": 0.9}
+            if arm in GROUPS:
+                zt = [((i * 31 + j * 17) % 9 - 4) * 0.125 for j in range(NT)]
+                mt = [((i * 13 + j * 7) % 7 - 3) * 0.25 for j in range(NT)]
+                g0, g1 = GROUPS[arm]
+                rec["z_tensor"], rec["m_tensor"] = zt, mt
+                rec["z_agg"] = [[sum(zt[j - 1] for j in g0), sum(zt[j - 1] for j in g1)]]
+                rec["mom_pre"] = [[sum(mt[j - 1] for j in g0), sum(mt[j - 1] for j in g1)]]
+            fh.write(json.dumps(rec) + "\n")
+
+
+def build(outdir, scenario):
+    """write one synthetic batch for `scenario` into outdir (created fresh)."""
+    if scenario not in SCENARIOS:
+        raise ValueError("unknown scenario %r; known: %s" % (scenario, sorted(SCENARIOS)))
+    S = _load_scorer()
+    sc = SCENARIOS[scenario]
+    if os.path.exists(outdir):
+        shutil.rmtree(outdir)
+    os.makedirs(os.path.join(outdir, BATCH))
+    levels = dict(BASE_LEVELS)
+    levels.update(sc.get("levels", {}))
+    mode = sc.get("iso_b0", "chatter")
+    ramp = sc.get("ramp", 115)
+    jid = 7300000
+    for s in SEEDS:
+        for arm in ARMS:
+            jid += 1
+            rn = "%s%s-s%d" % (PREFIX, arm, s)
+            lv = sc.get("seed_levels", {}).get((arm, s), levels[arm])
+            series = acc_series(lv, SEED_OFF[s], ramp if arm in sc.get("levels", {}) else 115)
+            done, n_ep, spec = True, EPOCHS, None
+            if sc.get("mutate") == "truncate" and (arm, s) == ("ISO", 83):
+                done, n_ep = False, 250
+            if sc.get("mutate") == "badspec" and (arm, s) == ("ONE", 81):
+                spec = SPEC["ISO"]
+            if not (sc.get("mutate") == "drop" and (arm, s) == ("ONE", 82)):
+                write_out(os.path.join(outdir, "%s-%d.out" % (rn, jid)), arm, s, rn, jid, series,
+                          done=done, spec=spec, n_epochs=n_ep)
+            write_probe(os.path.join(outdir, BATCH, "probe_" + rn), arm, mode)
+    if sc.get("mutate") != "nomanifest":
+        open(os.path.join(outdir, BATCH, "PARTITION-MANIFEST.txt"), "w").write(S.synthetic_manifest_text())
+    scorer_sha = hashlib.sha256(open(SCORER, "rb").read()).hexdigest()
+    if sc.get("mutate") == "badprov":
+        scorer_sha = "0" * 64
+    open(os.path.join(outdir, BATCH, "PROVENANCE.txt"), "w").write(
+        "MODE submit\nBUILD_NETWORK_SHA256 %s\nSCORER_SHA256 %s\n" % (POST_SHA, scorer_sha))
+    return outdir
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "--list":
+        for k in sorted(SCENARIOS):
+            print(k)
+        return 0
+    if len(argv) != 3:
+        print("usage: cGN3_smoke_gen.py <outdir> <scenario> | --list")
+        return 2
+    build(argv[1], argv[2])
+    print("wrote synthetic cgn3 scenario %r to %s (EVERY NUMBER INVENTED)" % (argv[2], argv[1]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

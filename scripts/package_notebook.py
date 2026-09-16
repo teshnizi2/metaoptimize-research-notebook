@@ -130,6 +130,9 @@ def collect_payloads(root=PORTAL):
                 add(path.relative_to(root).as_posix())
     for path in sorted((root / "tests").glob("*.test.ts")):
         add(path.relative_to(root).as_posix())
+    # The JavaScript tests read versioned JSON fixtures (published ID snapshots).
+    for path in sorted((root / "tests/fixtures").glob("*.json")):
+        add(path.relative_to(root).as_posix())
     for required in ["public/data/research.json", "public/data/runs.json", "public/data/journal.json", "public/data/artifact-dates.json"]:
         if required not in payloads:
             raise ValueError(f"Required evidence snapshot file is missing: {required}")

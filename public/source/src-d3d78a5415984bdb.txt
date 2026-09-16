@@ -1,0 +1,148 @@
+#!/bin/bash
+# =============================================================================
+# cVT1_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `cvt1` HARNESS TREE.
+#   (CORRECTIONS 227.)  Touches NO existing file.  Submits nothing.
+#
+# WHY AN ISOLATED TREE.  `cvt1` needs (i) the PlainNet18_c100 network name
+# (patches/patch_plainnet.py, as cpl1/cpl2) and (ii) PATCH_VOTEWEIGHT in HF.py
+# (patches/patch_voteweight.py).  The live shared harness carries neither and must
+# stay byte-untouched; cpl1's tree ($WS/harness_cpl1) is a REGISTERED tree two
+# landed batches ran from and is not edited either.  So cvt1 gets its own tree,
+# built the cgn1/cpl1 way, and its own runner that differs from jobs/run_cifar.sh
+# in its `cd` line only.
+#
+# WHAT IT BUILDS (under $METAOPT_WS, every path new and cvt1-namespaced):
+#   harness_cvt1/cifar10/                a copy of the live harness's *.py files,
+#                                        byte-identical except the two patched files
+#   harness_cvt1/cifar10/Optimizers/HF.py.pre_probe_tensor   the live backup, byte-identical
+#   harness_cvt1/cifar10/data  ->        SYMLINK to the live tree's data/ (no copy)
+#   harness_cvt1/cifar10/build_network.py.pre_plainnet  pinned pre bytes (PRE_SHA)
+#   harness_cvt1/cifar10/build_network.py               = cpl1's POST_SHA, bit for bit
+#   harness_cvt1/cifar10/Optimizers/HF.py.pre_voteweight  the live HF.py bytes (HF_PRE_SHA)
+#   harness_cvt1/cifar10/Optimizers/HF.py                 = HF_PRE + PATCH_VOTEWEIGHT (HF_POST_SHA)
+#   jobs/run_cifar_cvt1.sh               jobs/run_cifar.sh with EXACTLY the cd line changed
+#   harness_cvt1/STAGE-MANIFEST.txt      sha256 of every staged file
+#
+# USAGE
+#   bash bin/cVT1_stage_harness.sh            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cVT1_stage_harness.sh --stage    # build it (refuses if it exists)
+# =============================================================================
+set -u
+MODE=verify; [ "${1:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HROOT=$WS/harness_cvt1
+DEST=$HROOT/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+RUNNER=$WS/jobs/run_cifar_cvt1.sh
+PATCH_PL=$REPO/patches/patch_plainnet.py
+PATCH_VW=$REPO/patches/patch_voteweight.py
+PRE_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+POST_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+HF_PRE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_POST_SHA=3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52
+PRE_SRC=${CVT1_PRE_SRC:-$LIVE/build_network.py}
+HF_PRE_SRC=${CVT1_HF_PRE_SRC:-$LIVE/Optimizers/HF.py}
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+live_py() { (cd "$LIVE" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cVT1_stage_harness: mode=$MODE  WS=$WS"
+echo "  live tree   $LIVE"
+echo "  cvt1 tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  [ -f "$PATCH_PL" ] && [ -f "$PATCH_VW" ] || { echo "!!! a patch is missing"; exit 2; }
+  [ "$(sha "$PRE_SRC")" = "$PRE_SHA" ] || { echo "!!! $PRE_SRC sha != pinned $PRE_SHA (set CVT1_PRE_SRC)"; exit 2; }
+  [ "$(sha "$HF_PRE_SRC")" = "$HF_PRE_SHA" ] || { echo "!!! $HF_PRE_SRC sha != pinned $HF_PRE_SHA (set CVT1_HF_PRE_SRC)"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(live_py); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$LIVE/$f" "$DEST/$f" || exit 2
+  done
+  cp -p "$LIVE/Optimizers/HF.py.pre_probe_tensor" "$DEST/Optimizers/HF.py.pre_probe_tensor" || exit 2
+  cp -p "$PRE_SRC" "$DEST/build_network.py" || exit 2
+  cp -p "$HF_PRE_SRC" "$DEST/Optimizers/HF.py" || exit 2
+  ln -s "$LIVE/data" "$DEST/data" || exit 2
+  BUILD_NET_PATH="$DEST/build_network.py" python3 "$PATCH_PL" || { echo "!!! patch_plainnet failed"; exit 2; }
+  HF_PATH="$DEST/Optimizers/HF.py" python3 "$PATCH_VW" || { echo "!!! patch_voteweight failed"; exit 2; }
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "LIVE $LIVE"; echo "DEST $DEST"
+    echo "PRE_SRC $PRE_SRC"; echo "HF_PRE_SRC $HF_PRE_SRC"
+    echo "PATCH_PLAINNET_SHA256 $(sha "$PATCH_PL")"; echo "PATCH_VOTEWEIGHT_SHA256 $(sha "$PATCH_VW")"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+# ---------------------------------------------------------------- VERIFY ------
+[ -d "$DEST" ] || { echo "!!! no cvt1 tree at $DEST -- run with --stage"; exit 2; }
+N=0
+for f in $(live_py); do
+  case "$f" in ./build_network.py|./Optimizers/HF.py) continue ;; esac
+  if [ ! -f "$DEST/$f" ]; then bad "V-a $f missing from the cvt1 tree"; continue; fi
+  [ "$(sha "$LIVE/$f")" = "$(sha "$DEST/$f")" ] && N=$((N+1)) || bad "V-a $f differs from the LIVE tree (re-stage)"
+done
+echo "V-a: $N live harness .py files byte-identical in the cvt1 tree (build_network.py and Optimizers/HF.py excepted)"
+EXTRA=$(cd "$DEST" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do [ -f "$LIVE/$f" ] || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no .py in the cvt1 tree that the live tree lacks" || bad "V-a2 extra .py in the cvt1 tree: $EXTRA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_probe_tensor")" = "$(sha "$LIVE/Optimizers/HF.py.pre_probe_tensor")" ] \
+  && echo "V-a3: Optimizers/HF.py.pre_probe_tensor byte-identical to the live backup" \
+  || bad "V-a3 HF.py.pre_probe_tensor missing or differs from the live backup"
+[ "$(sha "$DEST/build_network.py.pre_plainnet")" = "$PRE_SHA" ] && echo "V-b: build_network pre snapshot sha == pinned $PRE_SHA" || bad "V-b pre snapshot sha != pinned"
+[ "$(sha "$DEST/build_network.py")" = "$POST_SHA" ] && echo "V-b2: cvt1 build_network.py sha == cpl1's pinned post $POST_SHA" \
+  || bad "V-b2 cvt1 build_network.py sha $(sha "$DEST/build_network.py") != pinned post $POST_SHA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_voteweight")" = "$HF_PRE_SHA" ] && echo "V-h: HF.py.pre_voteweight sha == pinned $HF_PRE_SHA" \
+  || bad "V-h HF.py.pre_voteweight sha != pinned $HF_PRE_SHA"
+[ "$(sha "$DEST/Optimizers/HF.py")" = "$HF_POST_SHA" ] && echo "V-h2: cvt1 HF.py sha == pinned post $HF_POST_SHA" \
+  || bad "V-h2 cvt1 HF.py sha $(sha "$DEST/Optimizers/HF.py") != pinned post $HF_POST_SHA"
+LSHA=$(sha "$LIVE/build_network.py"); LHF=$(sha "$LIVE/Optimizers/HF.py")
+[ "$LSHA" = "$PRE_SHA" ] && echo "V-b3: the LIVE build_network.py is still the pinned pre (untouched)" \
+  || echo "V-b3: NOTE -- the LIVE build_network.py has moved ($LSHA); the cvt1 tree keeps the pinned pre."
+[ "$LHF" = "$HF_PRE_SHA" ] && echo "V-h3: the LIVE HF.py is still the pinned pre (untouched)" \
+  || echo "V-h3: NOTE -- the LIVE HF.py has moved ($LHF); the cvt1 tree keeps the pinned pre."
+grep -q PATCH_VOTEWEIGHT "$LIVE/Optimizers/HF.py" && bad "V-h4 the LIVE HF.py carries PATCH_VOTEWEIGHT" \
+  || echo "V-h4: the LIVE HF.py carries NO PATCH_VOTEWEIGHT marker"
+grep -q PATCH_PLAINNET "$LIVE/build_network.py" && echo "V-b4: NOTE -- the LIVE build_network.py carries PATCH_PLAINNET" \
+  || echo "V-b4: the LIVE build_network.py carries NO PATCH_PLAINNET marker"
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink)" || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-100-python" ] && echo "V-c2: CIFAR-100 visible through the symlink" || bad "V-c2 cifar-100-python not visible"
+if [ -f "$RUNNER" ]; then
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  D=$(printf '%s\n' "$DL" | grep -c '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST"; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST"
+  else
+    bad "V-d the runner diff is not exactly the cd line:"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+else
+  bad "V-d no runner at $RUNNER"
+fi
+if python3 "$REPO/tests/test_plainnet.py" --pre "$DEST/build_network.py.pre_plainnet" --post "$DEST/build_network.py" \
+     --hf "$DEST/Optimizers/HF.py" --csv "$REPO/results/all_runs.csv" >/tmp/cvt1_stage_tp.$$ 2>&1; then
+  echo "V-e: tests/test_plainnet.py passes on the cvt1 tree ($(grep -c '^  PASS' /tmp/cvt1_stage_tp.$$) PASS)"
+else
+  bad "V-e tests/test_plainnet.py FAILS on the cvt1 tree"; grep '^  FAIL' /tmp/cvt1_stage_tp.$$ | head
+fi
+rm -f /tmp/cvt1_stage_tp.$$
+if python3 "$REPO/tests/test_voteweight.py" --pre "$DEST/Optimizers/HF.py.pre_voteweight" --post "$DEST/Optimizers/HF.py" \
+     --cifar-dir "$DEST" --structural-only >/tmp/cvt1_stage_vw.$$ 2>&1; then
+  echo "V-f: tests/test_voteweight.py V0 (structure: deleting the four regions == pre, byte for byte) passes ($(grep -c '^  PASS' /tmp/cvt1_stage_vw.$$) PASS)"
+else
+  bad "V-f tests/test_voteweight.py V0 FAILS on the cvt1 tree"; grep '^  FAIL' /tmp/cvt1_stage_vw.$$ | head
+fi
+rm -f /tmp/cvt1_stage_vw.$$
+[ "$FAIL" = 0 ] && { echo "cVT1_stage_harness: VERIFIED"; exit 0; } || { echo "cVT1_stage_harness: NOT CONSISTENT"; exit 2; }

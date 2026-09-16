@@ -71,5 +71,5 @@ test('the published register is fully represented in the general review', async 
   assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [34, { success: 12, fail: 5, mixed: 4, unresolved: 13 }, 3]);
   // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1).
   assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [40, { success: 12, fail: 12, mixed: 8, unresolved: 8 }]);
-  assert.deepEqual([rows.find(row => row.label === 'Baseline comparisons')!.total, rows.find(row => row.label === 'Baseline comparisons')!.counts], [8, { success: 6, fail: 1, mixed: 0, unresolved: 1 }]);
+  assert.deepEqual([rows.find(row => row.label === 'Baseline comparisons')!.total, rows.find(row => row.label === 'Baseline comparisons')!.counts], [8, { success: 7, fail: 1, mixed: 0, unresolved: 0 }], 'MT019 moved from Open to Goal met at CORRECTIONS 229');
 });

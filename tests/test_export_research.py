@@ -18,6 +18,12 @@ PORTAL = Path(__file__).resolve().parents[1]
 WORKSPACE = Path(os.environ.get("NOTEBOOK_WORKSPACE", PORTAL.parents[1]))
 REPO = Path(os.environ.get("NOTEBOOK_RESEARCH_REPO", "/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize"))
 DATA_AUDIT = Path(os.environ.get("NOTEBOOK_DATA_AUDIT", WORKSPACE / "work/portal_data_audit.json"))
+# The published run inventory can be an extended copy kept outside the read-only workspace
+# (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
+RUN_INVENTORY = Path(os.environ.get("NOTEBOOK_RUN_INVENTORY", WORKSPACE / "outputs/tables/complete_run_inventory.csv"))
+CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
+RUNS = 2956
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
@@ -71,14 +77,20 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS))
         self.assertEqual(len(data["areas"]), 10)
         self.assertEqual(sum(a["count"] for a in data["areas"]), 154)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": 2863, "figures": 54, "areas": 10})
+        self.assertEqual(data["meta"]["stats"], {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
     def test_run_inventory_keeps_all_jobs_with_unique_identifiers(self):
         runs = self.runs()
-        self.assertEqual(len(runs), 2863)
-        self.assertEqual(len({r["id"] for r in runs}), 2863)
-        original = csv_rows(WORKSPACE / "outputs/tables/complete_run_inventory.csv")
+        self.assertEqual(len(runs), RUNS)
+        self.assertEqual(len({r["id"] for r in runs}), RUNS)
+        original = csv_rows(RUN_INVENTORY)
         self.assertEqual({r["jobId"] for r in runs}, {r["job_id"] for r in original})
+        # The extension only appends: every campaign row is kept, in order and unchanged, ahead of the new batches.
+        campaign = csv_rows(CAMPAIGN_RUN_INVENTORY)
+        self.assertEqual(original[:len(campaign)], campaign)
+        added = original[len(campaign):]
+        self.assertEqual({batch: sum(r["run"].startswith(batch + "-") for r in added) for batch in LANDED_BATCH_RUNS}, LANDED_BATCH_RUNS)
+        self.assertEqual(len(added), sum(LANDED_BATCH_RUNS.values()))
         self.assertEqual({r["account"] for r in runs}, {"Account1", "Account2"})
         self.assertTrue(all(r["parameters"].get("logAvailability") for r in runs))
 
@@ -91,7 +103,7 @@ class ResearchExportTests(unittest.TestCase):
 
     def test_all_raw_logs_are_exact_sanitized_archives_with_hashes(self):
         runs = self.runs()
-        self.assertEqual(sum(bool(run.get("logHref")) for run in runs), 2863)
+        self.assertEqual(sum(bool(run.get("logHref")) for run in runs), RUNS)
         exporter = self.exporter()
         evidence = exporter.read_evidence(WORKSPACE)
         archived = exporter.archive_log_index(evidence)
@@ -176,8 +188,10 @@ class ResearchExportTests(unittest.TestCase):
             rel = original.relative_to(WORKSPACE / "outputs/tables")
             href = "/assets/tables/" + rel.as_posix()
             self.assertIn(href, tables_by_href, str(rel))
-            if rel.as_posix() == "complete_experiment_register.csv":
-                continue  # regenerated from the notebook register; see test_register_table_lists_every_record
+            if rel.as_posix() in {"complete_experiment_register.csv", "outcomes_by_area.csv", "goal_outcomes.csv"}:
+                continue  # regenerated from the notebook register; see the regenerated-table tests
+            if rel.as_posix() == "complete_run_inventory.csv":
+                original = RUN_INVENTORY
             with original.open(newline="") as handle:
                 rows = list(csv.reader(handle))
             with (PUBLIC / href.lstrip("/")).open(newline="") as handle:
@@ -219,7 +233,7 @@ class ResearchExportTests(unittest.TestCase):
             names = archive.namelist()
             self.assertEqual(len([n for n in names if n.startswith("figures/")]), 54)
             self.assertEqual(len([n for n in names if n.startswith("tables/") and n.endswith(".csv")]), 201)
-            self.assertEqual(len([n for n in names if n.startswith("logs/")]), 2863)
+            self.assertEqual(len([n for n in names if n.startswith("logs/")]), RUNS)
             self.assertIn("report.pdf", names)
             for name in names:
                 self.assertFalse(name.startswith("/") or ".." in Path(name).parts)
@@ -381,17 +395,101 @@ class ResearchExportTests(unittest.TestCase):
             model.appended_rows(model.appended_master_table(REPO)[:-1])
         self.assertEqual(model.table_cells(r"| a \| b | c |"), ["a | b", "c"])
 
-    def test_appended_rows_link_phase_figures_and_no_runs_yet(self):
+    def test_appended_rows_link_phase_figures_and_their_batch_runs(self):
         data, runs = self.research(), self.runs()
         by_id = {e["id"]: e for e in data["experiments"]}
         phase = next(e for e in data["activity"] if e["id"] == "phase-09")
         self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS))
         self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
         figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
+        batches = dict(zip(APPENDED_IDS, LANDED_BATCH_RUNS))
         for eid, page in figures.items():
             self.assertEqual(by_id[eid]["figureIds"], [page])
-            self.assertEqual(by_id[eid]["runIds"], [], "the campaign run inventory predates these batches")
-        self.assertFalse({"cgn1", "cpl1", "cvh1", "cuc1", "cgn2", "cpl2"} & {r["batch"] for r in runs})
+            linked = [r for r in runs if eid in r["experimentIds"]]
+            self.assertEqual(len(linked), LANDED_BATCH_RUNS[batches[eid]], eid)
+            self.assertEqual({r["batch"] for r in linked}, {batches[eid]}, eid)
+            self.assertEqual(sorted(by_id[eid]["runIds"]), sorted(r["id"] for r in linked), eid)
+        for run in runs:
+            if run["batch"] in LANDED_BATCH_RUNS:
+                self.assertEqual((run["account"], run["status"], run["dataset"]), ("Account2", "completed", "CIFAR100"), run["id"])
+                self.assertTrue(run["parameters"]["logSourceReference"].startswith("archive/Account2/runs/"), run["id"])
+                self.assertTrue(run["logHref"].startswith("/assets/logs/" + run["batch"] + "-"), run["id"])
+        # cuc1 closes MT019's remaining counts, so its runs link to MT019 as well as MT215, like cau1 to MT019 and MT020.
+        self.assertEqual({tuple(r["experimentIds"]) for r in runs if r["batch"] == "cuc1"}, {("MT019", "MT215")})
+
+    def test_row_amendments_come_from_the_pinned_bookkeeping_commit(self):
+        model = self.model()
+        lines, before = model.amended_master_table(REPO), model.appended_master_table(REPO)
+        self.assertEqual({n for n in range(1, len(lines) + 1) if lines[n - 1] != before[n - 1]}, {3, 19, 162, 163, 166, 213})
+        changes = {eid: (previous, outcome) for eid, (_, previous, outcome, *_rest) in model.ROW_AMENDMENTS.items() if previous != outcome}
+        self.assertEqual(changes, {"MT019": ("unresolved", "success")}, "only row 19's verdict column moved")
+        self.assertTrue(all(reason.strip() and len(reason) < 500 for *_, reason, _ in model.ROW_AMENDMENTS.values()))
+        data = self.research()
+        by_id = {e["id"]: e for e in data["experiments"]}
+        warnings = {w["id"]: w for w in data["warnings"]}
+        for eid, (line, previous, outcome, token, batches, reason, replacement) in model.ROW_AMENDMENTS.items():
+            record = by_id[eid]
+            self.assertEqual((record["outcome"], record["corrected"]), (outcome, eid in model.CORRECTION_REMAP), eid)
+            self.assertTrue(set(batches) <= set(record["batches"]), eid)
+            warning = warnings[f"warning-{eid}-amendment"]
+            self.assertIn(reason, warning["detail"])
+            self.assertIn(f"line {line} at 6e33fd8", warning["detail"])
+            if replacement:
+                self.assertEqual({key: record[key] for key in replacement}, replacement, eid)
+                self.assertIn("Outcome before the amendment: Open.", warning["detail"])
+            else:
+                self.assertTrue(record["scope"].endswith("Amended at CORRECTIONS 229: " + reason), eid)
+            self.assertTrue(any(ref["label"].endswith("CORRECTIONS.md section 229") for ref in record["sourceRefs"]), eid)
+        # A drifted outcome or a verdict-less outcome move stops the export instead of being applied.
+        unamended = model.load_unamended_register(WORKSPACE, REPO)
+        self.assertEqual(next(r for r in unamended if r["id"] == "MT019")["outcome"], "unresolved")
+        with self.assertRaisesRegex(ValueError, "outcome drifted"):
+            model.apply_row_amendments([dict(r, outcome="fail") if r["id"] == "MT019" else r for r in unamended], REPO)
+        original = model.ROW_AMENDMENTS["MT163"]
+        try:
+            model.ROW_AMENDMENTS["MT163"] = (original[0], "success", "fail", *original[3:])
+            with self.assertRaisesRegex(ValueError, "unchanged verdict cannot change the outcome"):
+                model.apply_row_amendments(unamended, REPO)
+        finally:
+            model.ROW_AMENDMENTS["MT163"] = original
+
+    def test_outcome_summary_tables_are_regenerated_from_the_register(self):
+        data = self.research()
+        experiments = data["experiments"]
+        with (PUBLIC / "assets/tables/outcomes_by_area.csv").open(newline="") as handle:
+            areas = list(csv.DictReader(handle))
+        self.assertEqual([r["area"] for r in areas], [a["label"] for a in data["areas"]])
+        self.assertNotIn("correction", areas[0])
+        for row in areas:
+            records = [e for e in experiments if e["area"] == row["area"]]
+            research = [e for e in records if e["kind"] == "research"]
+            self.assertEqual(int(row["records"]), len(records))
+            self.assertEqual(int(row["research_questions"]), len(research))
+            for outcome in ["success", "fail", "mixed", "unresolved"]:
+                self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
+            self.assertEqual(int(row["method_checks"]), len(records) - len(research))
+            self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
+        self.assertEqual(sum(int(r["records"]) for r in areas), 154)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [46, 41, 26, 23, 18])
+        with (PUBLIC / "assets/tables/goal_outcomes.csv").open(newline="") as handle:
+            goals = list(csv.DictReader(handle))
+        original = csv_rows(WORKSPACE / "outputs/tables/goal_outcomes.csv")
+        figures = {f["id"]: f for f in data["figures"]}
+        self.assertEqual([g["page"] for g in goals], [o["page"] for o in original])
+        by_id = {e["id"]: e for e in experiments}
+        for goal, old in zip(goals, original):
+            for column in ["title", "goal", "comparison", "why_test", "status", "file", "kind"]:
+                self.assertEqual(goal[column], old[column], (goal["page"], column))
+            linked = figures["page-" + goal["page"]]["experimentIds"]
+            self.assertEqual(goal["entry_ids"], "; ".join(linked))
+            research = [by_id[i] for i in linked if by_id[i]["kind"] == "research"]
+            self.assertEqual(int(goal["research_questions"]), len(research))
+            self.assertEqual(int(goal["unresolved"]), sum(e["outcome"] == "unresolved" for e in research))
+        page23 = next(g for g in goals if g["page"] == "23")
+        self.assertIn("MT215", page23["entry_ids"].split("; "))
+        audit = json.loads(DATA_AUDIT.read_text())
+        receipts = {r["file"]: r.get("regenerated") for r in audit["table_receipts"]}
+        self.assertTrue(receipts["outcomes_by_area.csv"] and receipts["goal_outcomes.csv"] and receipts["complete_run_inventory.csv"])
 
     def test_register_table_lists_every_record(self):
         data = self.research()
