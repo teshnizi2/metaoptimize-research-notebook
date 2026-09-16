@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft, ArrowUpRight, Braces, ChevronRight, FileSpreadsheet, FlaskConical, Image as ImageIcon, Search, Terminal, TriangleAlert, History, Download } from 'lucide-react';
 import { useResearch } from '../data';
-import { filterExperiments,outcomeCounts,outcomeLabels,outcomeOrder,resolveExperiment,compactDate,notebookWarnings,methodCheckCount,correctedCount } from '../lib/research';
+import { applySearchParamChanges } from '../lib/search-params';
+import { filterExperiments,registerFilterSelection,outcomeCounts,outcomeLabels,outcomeOrder,resolveExperiment,compactDate,notebookWarnings,methodCheckCount,correctedCount } from '../lib/research';
 import { CopyLink, CorrectedBadge, Empty, ExperimentStatus, ExperimentTable, FigureCard, PageHeading, Status, SectionTitle } from '../components/common';
 import { CutChart } from '../components/CutChart';
 import type { DataTable, Experiment, SourceFile } from '../types';
@@ -20,15 +21,15 @@ export function ExperimentsPage(){
  const counts=outcomeCounts(phaseRecords),research=outcomeOrder.reduce((n,o)=>n+counts[o],0),checks=methodCheckCount(phaseRecords),correctedTotal=correctedCount(phaseRecords);
  const records=filterExperiments(phaseRecords,{query,outcome,area,kind,corrected}).reverse();
  const [limit,setLimit]=useState(30);
- function update(changes:Record<string,string>){setParams(p=>{for(const [k,v] of Object.entries(changes))v?p.set(k,v):p.delete(k);return p});setLimit(30)}
- const all=!outcome&&!kind;
+ function update(changes:Record<string,string>){const next=applySearchParamChanges(params,changes);setParams(next.params,{replace:next.replace});setLimit(30)}
+ const selected=registerFilterSelection({outcome,kind});
  return <div className="page-enter"><PageHeading eyebrow="The complete experiment register" title="Every question has a record." description="Search the goal, compare the result, and follow the evidence."/>
   <p className="register-model-note">Research questions have one of four outcomes. Method checks audit the campaign’s own methods and are listed separately. The Corrected badge marks records whose earlier claim was corrected.</p>
   <div className="outcome-filters">
-   <button className={all?'selected':''} onClick={()=>update({outcome:'',kind:''})}>{phase==='unlinked'?'All unlinked records':phase?'All phase records':'All records'} <span>{phaseRecords.length}</span></button>
-   <button className={kind==='research'&&!outcome?'selected':''} onClick={()=>update({outcome:'',kind:'research'})}>Research questions <span>{research}</span></button>
-   {outcomeOrder.map(s=><button key={s} className={outcome===s?'selected':''} onClick={()=>update({outcome:s,kind:''})}><i className={`outcome-dot ${s}`}/>{outcomeLabels[s]}<span>{counts[s]}</span></button>)}
-   <button className={kind==='method-check'?'selected':''} onClick={()=>update({outcome:'',kind:'method-check'})}><i className="outcome-dot method-check"/>Method checks<span>{checks}</span></button>
+   <button className={selected.all?'selected':''} aria-pressed={selected.all} onClick={()=>update({outcome:'',kind:''})}>{phase==='unlinked'?'All unlinked records':phase?'All phase records':'All records'} <span>{phaseRecords.length}</span></button>
+   <button className={selected.research?'selected':''} aria-pressed={selected.research} onClick={()=>update({outcome:'',kind:'research'})}>Research questions <span>{research}</span></button>
+   {outcomeOrder.map(s=><button key={s} className={selected.outcomes[s]?'selected':''} aria-pressed={selected.outcomes[s]} onClick={()=>update({outcome:s,kind:''})}><i className={`outcome-dot ${s}`}/>{outcomeLabels[s]}<span>{counts[s]}</span></button>)}
+   <button className={selected.methodChecks?'selected':''} aria-pressed={selected.methodChecks} onClick={()=>update({outcome:'',kind:'method-check'})}><i className="outcome-dot method-check"/>Method checks<span>{checks}</span></button>
    <button className={corrected?'selected':''} aria-pressed={corrected} onClick={()=>update({corrected:corrected?'':'1',...(legacyCorrected?{outcome:''}:{})})}><i className="outcome-dot corrected"/>Corrected<span>{correctedTotal}</span></button>
   </div>
   <div className="filter-bar"><label className="search-field"><Search size={18}/><input aria-label="Search experiments" placeholder="Search goals, results, IDs or batches…" value={query} onChange={e=>update({q:e.target.value})}/></label><select aria-label="Research area" value={area} onChange={e=>update({area:e.target.value})}><option value="">All research areas</option>{data.areas.map(a=><option key={a.id}>{a.label}</option>)}</select><select className="research-phase-filter" aria-label="Research phase" value={phase} onChange={e=>update({phase:e.target.value})}><option value="">All research phases</option>{phases.map(p=><option key={p.id} value={p.id}>{p.period?.replace(/-/g,'–')||'Window not recorded'} · {p.title}</option>)}<option value="unlinked">No phase link</option></select><span className="result-count">{records.length} {records.length===1?'record':'records'} · Latest first</span></div>

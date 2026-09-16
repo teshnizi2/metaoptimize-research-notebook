@@ -3,6 +3,7 @@ import { Link, NavLink, Outlet, useLocation } from 'react-router-dom';
 import { LayoutDashboard, FlaskConical, Images, Braces, Terminal, TriangleAlert, History, Search, ArrowUpRight, Menu, X, FileDown, ChevronRight, Command, GitBranch } from 'lucide-react';
 import { useResearch, useRuns } from '../data';
 import { searchNotebook } from '../lib/research';
+import { sectionLabel } from '../lib/navigation';
 import { SnapshotDate } from './ArtifactDates';
 const navigation=[{to:'/',label:'Overview',icon:LayoutDashboard},{to:'/experiments',label:'Experiments',icon:FlaskConical},{to:'/figures',label:'Figures & tables',icon:Images},{to:'/code',label:'Source code',icon:Braces},{to:'/runs',label:'Run ledger',icon:Terminal},{to:'/warnings',label:'Warnings & limits',icon:TriangleAlert},{to:'/activity',label:'Research log',icon:History}];
 function SearchDialog({open,onClose}:{open:boolean;onClose:()=>void}){const dialog=useRef<HTMLDialogElement>(null),input=useRef<HTMLInputElement>(null);const [query,setQuery]=useState('');const data=useResearch();const {runs,error:runError}=useRuns(open);useEffect(()=>{if(open){dialog.current?.showModal();setQuery('');input.current?.focus()}else dialog.current?.close()},[open]);const q=query.trim().toLowerCase();const {experiments,sources,figures,warnings,runs:runMatches}=searchNotebook(data,q,runs||[]);return <dialog ref={dialog} className="search-dialog" aria-label="Search notebook" onCancel={onClose} onClick={e=>{if(e.target===dialog.current)onClose()}}><div className="search-dialog-inner"><div className="search-dialog-input"><Search size={22}/><input ref={input} aria-label="Search all research" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search goals, warnings, code or job IDs…"/><button className="icon-button" onClick={onClose} aria-label="Close search"><X size={20}/></button></div><div className="search-results">{!q?<div className="search-hints"><span className="eyebrow">Try a starting point</span>{['CVK2','layerwise','cVK2_vggcut_score.py','pinning'].map(v=><button key={v} className="chip" onClick={()=>setQuery(v)}>{v}<ArrowUpRight size={14}/></button>)}</div>:<>{experiments.length>0&&<><div className="search-group">Experiments</div>{experiments.map(e=><Link key={e.id} to={`/experiments/${e.id}`} onClick={onClose}><span className="mono">{e.id}</span><strong>{e.goal}</strong><ChevronRight size={16}/></Link>)}</>}{sources.length>0&&<><div className="search-group">Source files</div>{sources.map(s=><Link key={s.id} to={`/code/${s.id}`} onClick={onClose}><Braces size={17}/><strong>{s.path}</strong><ChevronRight size={16}/></Link>)}</>}{figures.length>0&&<><div className="search-group">Figures</div>{figures.map(f=><Link key={f.id} to={`/figures/${f.id}`} onClick={onClose}><Images size={17}/><strong>{f.title}</strong><ChevronRight size={16}/></Link>)}</>}{warnings.length>0&&<><div className="search-group">Warnings & limits</div>{warnings.map(w=><Link key={w.id} to={`/experiments/${w.experimentId}?tab=warnings`} onClick={onClose}><TriangleAlert size={17}/><strong>{w.experimentId} · {w.title}</strong><ChevronRight size={16}/></Link>)}</>}{runMatches.length>0&&<><div className="search-group">Run records</div>{runMatches.map(r=><Link key={r.id} to={`/runs/${r.id}`} onClick={onClose}><Terminal size={17}/><strong>Job {r.jobId} · {r.batch} · seed {r.seed}</strong><ChevronRight size={16}/></Link>)}</>}{!runs&&!runError&&<p className="small muted">Loading run IDs…</p>}{runError&&<p className="small muted">Run search unavailable. Open the Run ledger to retry.</p>}{!experiments.length&&!sources.length&&!figures.length&&!warnings.length&&!runMatches.length&&(runs||runError)&&<div className="empty-state">No records match “{query}”.</div>}</>}</div><div className="search-footer">Goals, figures, code, warnings and recorded jobs.<kbd>esc</kbd> to close</div></div></dialog>}
@@ -12,8 +13,7 @@ export function Layout() {
   useEffect(() => {
     setMenu(false);
     window.scrollTo({top: 0});
-    const section = navigation.find(n => n.to !== '/' && location.pathname.startsWith(n.to));
-    document.title = `${section?.label || 'Overview'} · MetaOptimize`;
+    document.title = `${sectionLabel(location.pathname)} · MetaOptimize`;
   }, [location.pathname]);
   useEffect(() => {
     const fn = (e: KeyboardEvent) => {
@@ -25,7 +25,7 @@ export function Layout() {
     window.addEventListener('keydown', fn);
     return () => window.removeEventListener('keydown', fn);
   }, []);
-  const active = navigation.find(n => n.to !== '/' && location.pathname.startsWith(n.to))?.label || 'Overview';
+  const active = sectionLabel(location.pathname);
 
   return <div className="app-shell">
     <a className="skip-link" href="#main-content">Skip to content</a>
