@@ -22,11 +22,12 @@ DATA_AUDIT = Path(os.environ.get("NOTEBOOK_DATA_AUDIT", WORKSPACE / "work/portal
 # (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
 RUN_INVENTORY = Path(os.environ.get("NOTEBOOK_RUN_INVENTORY", WORKSPACE / "outputs/tables/complete_run_inventory.csv"))
 CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
-RUNS = 2956
-LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15}
+RUNS = 2971
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
+LANDED_IDS = ["MT218"]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -73,11 +74,11 @@ class ResearchExportTests(unittest.TestCase):
     def test_complete_register_and_area_counts(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual(len(data["experiments"]), 154)
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS))
+        self.assertEqual(len(data["experiments"]), 155)
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS))
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 154)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 154, "researchQuestions": 136, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 155)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 155, "researchQuestions": 137, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
     def test_run_inventory_keeps_all_jobs_with_unique_identifiers(self):
         runs = self.runs()
@@ -399,7 +400,7 @@ class ResearchExportTests(unittest.TestCase):
         data, runs = self.research(), self.runs()
         by_id = {e["id"]: e for e in data["experiments"]}
         phase = next(e for e in data["activity"] if e["id"] == "phase-09")
-        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS))
+        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS))
         self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
         figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
         batches = dict(zip(APPENDED_IDS, LANDED_BATCH_RUNS))
@@ -453,6 +454,36 @@ class ResearchExportTests(unittest.TestCase):
         finally:
             model.ROW_AMENDMENTS["MT163"] = original
 
+    # ---- MASTER-TABLE line 218 (campaign commit 82867bb, CORRECTIONS 230: cvt1) ----
+    def test_landed_row_comes_from_the_pinned_landing_commit(self):
+        model = self.model()
+        lines, before = model.landed_master_table(REPO), model.amended_master_table(REPO)
+        self.assertEqual(len(lines), 218)
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {3, 19})
+        rows = model.landed_rows(lines)
+        self.assertEqual([(r["id"], r["section"], r["outcome"], json.loads(r["batches"]), r["mapping_rule"]) for r in rows],
+                         [("MT218", "9", "mixed", ["cvt1"], "mixed")])
+        self.assertTrue(rows[0]["reason"].startswith("Verdict: STEP-SIZE-NEEDED-VOTE-SUFFICES + HARNESS-CLEAN + "))
+        self.assertIn("+34.6540 pp = +61.12 SE", rows[0]["result"])
+        self.assertEqual(json.loads(rows[0]["intervention"])["arms"], {"MUTE": 3, "DOSE": 3, "INJECT": 3})
+        intervened = model.intervened_runs(REPO)
+        self.assertEqual(sorted(r["arm"] for r in intervened.values()), sorted(["MUTE", "DOSE", "INJECT"] * 3))
+        with self.assertRaisesRegex(ValueError, "does not match the pinned landed-row bytes"):
+            pinned = model.LANDED_COMMIT
+            try:
+                model.LANDED_COMMIT = model.AMENDMENT_COMMIT
+                model.landed_master_table(REPO)
+            finally:
+                model.LANDED_COMMIT = pinned
+        with self.assertRaisesRegex(ValueError, "exactly lines 218-218"):
+            model.appended_rows(lines[:-1], model.LANDED_ROWS, 218, 218, model.LANDED_COMMIT)
+        data, runs = self.research(), self.runs()
+        record = next(e for e in data["experiments"] if e["id"] == "MT218")
+        self.assertEqual(sorted(record["runIds"]), sorted(r["id"] for r in runs if r["batch"] == "cvt1"))
+        marked = {r["jobId"] for r in runs if "intervention" in r["parameters"]}
+        self.assertEqual(marked, set(intervened))
+        self.assertIn("warning-MT218-intervention", record["warningIds"])
+
     def test_outcome_summary_tables_are_regenerated_from_the_register(self):
         data = self.research()
         experiments = data["experiments"]
@@ -469,8 +500,8 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
             self.assertEqual(int(row["method_checks"]), len(records) - len(research))
             self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
-        self.assertEqual(sum(int(r["records"]) for r in areas), 154)
-        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [46, 41, 26, 23, 18])
+        self.assertEqual(sum(int(r["records"]) for r in areas), 155)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [46, 41, 27, 23, 18])
         with (PUBLIC / "assets/tables/goal_outcomes.csv").open(newline="") as handle:
             goals = list(csv.DictReader(handle))
         original = csv_rows(WORKSPACE / "outputs/tables/goal_outcomes.csv")
@@ -503,7 +534,7 @@ class ResearchExportTests(unittest.TestCase):
                          {(e["id"], e["kind"], e["outcome"], e["corrected"]) for e in data["experiments"]})
         audit = json.loads(DATA_AUDIT.read_text())
         receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
-        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (154, 20, "scripts/register_model.py register"))
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (155, 20, "scripts/register_model.py register"))
 
 
 if __name__ == "__main__":

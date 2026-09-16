@@ -49,8 +49,8 @@ test('the four other amended rows keep their outcome and carry the amendment not
 });
 
 test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw logs', () => {
-  assert.equal(runs.length, 2956);
-  assert.equal(data.meta.stats.runs, 2956);
+  assert.equal(runs.length, 2971);
+  assert.equal(data.meta.stats.runs, 2971);
   const batches: Record<string, [string, number]> = { cgn1: ['MT212', 6], cpl1: ['MT213', 15], cvh1: ['MT214', 12], cuc1: ['MT215', 30], cgn2: ['MT216', 15], cpl2: ['MT217', 15] };
   const landed = runs.filter(run => run.batch in batches);
   assert.equal(landed.length, 93);
@@ -72,6 +72,7 @@ test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw l
     assert.match(log, /NODE=\[HOST_[0-9a-f]{10}\]/, run.id);
   }
   assert.deepEqual(runs.filter(run => run.batch === 'cuc1').every(run => run.experimentIds.join() === 'MT019,MT215'), true);
-  assert.ok(!runs.some(run => /^(cvt1|cgn3)-/.test(run.parameters.runLabel)), 'cvt1 and cgn3 have not landed');
-  assert.ok(!data.experiments.some(e => e.batches.includes('cvt1') || e.batches.includes('cgn3')), 'no records for cvt1 or cgn3');
+  // cvt1 landed at CORRECTIONS 230 and is MT218 (tests/cvt1-landing.test.ts); cgn3 has not landed.
+  assert.ok(!runs.some(run => /^cgn3-/.test(run.parameters.runLabel)), 'cgn3 has not landed');
+  assert.ok(!data.experiments.some(e => e.batches.includes('cgn3')), 'no record for cgn3');
 });

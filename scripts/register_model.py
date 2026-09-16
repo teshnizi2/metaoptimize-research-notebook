@@ -32,8 +32,14 @@ mapping is reviewable in one place and never applied ad hoc:
    one-line reason, and an outcome may move only where the row's verdict column
    moved (row 19, MT019: Open -> Goal met).
 
+5. The row appended at the cvt1 landing (MASTER-TABLE line 218 at campaign commit
+   82867bb, CORRECTIONS 230) is imported by ``LANDED_ROWS`` in the same way. The pinned
+   file may differ from the amendment commit only on header line 3 and row 19's
+   verdict-cell formatting. Its intervened arms (MUTE, DOSE, INJECT) are named from the
+   campaign's hash-pinned ``results/CORPUS-EXCLUSIONS.tsv`` by ``LANDED_INTERVENTIONS``.
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
-``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217);
+``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -168,7 +174,8 @@ ADDED_PHASES = [{
     "test": "GroupNorm and residual-free ResNet-18 isolation; VGG rescue at 328 epochs; unaugmented CIFAR-100 baseline",
     "observed_result": "Gap and carrier set transfer to GroupNorm; one BN scale rescues without residuals; VGG rescue holds at 328 epochs; unaugmented deficit +12.18 pp",
     "next_question": "Identity versus magnitude remains unresolved on every network",
-    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1)],
+    # MT212-MT217 (CORRECTIONS 217-226) and MT218, the cvt1 landing of 16 Sep (CORRECTIONS 227 launch, 230 landing).
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 218 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
 }]
 
@@ -231,6 +238,88 @@ ROW_AMENDMENTS = {
               "Outcome unchanged (Mixed). 'By subtraction' and 'never isolated alone' are overtaken by cpl2 (MT217): layer4.1.bn2.weight alone rescues (+52.1367 pp over its twin). 'Alone' holds only against the bar (ISO minus HEAD is +3.5940 pp inside the 5.0 pp bar), HEAD's rescue is a delay, and identity vs magnitude is still open (cvt1 has not landed).",
               None),
 }
+
+
+# ---------------------------------------------------------------------------
+# 5. Rows appended after the amendments (CORRECTIONS 230).
+# ---------------------------------------------------------------------------
+# Campaign commit 82867bb (cycle 152, CORRECTIONS 230) appended the cvt1 landing as
+# line 218, recounted header line 3, and fixed a formatting slip in row 19's verdict
+# cell (the superseded token OPEN moved into a bold [SUPERSEDED: ...] bracket; no
+# verdict or wording change). Nothing else may differ from the amendment pin, and
+# no line may move. The row is imported with the verdict rules of decision 2.
+LANDED_COMMIT = "82867bb0880956a0563b2a5a5bc17fce67f87f1a"
+LANDED_MASTER_TABLE_SHA256 = "030b36ce3bc89d5902e50024cc85f36ab2a2898a9bc35b0af83a05f4398e30b7"
+LANDED_FIRST_ROW, LANDED_LAST_ROW = 218, 218
+LANDED_EDITED_LINES = {3, 19}
+LANDED_ROW19_TOKEN, LANDED_ROW19_BRACKET = "CONFIRMED, RESCOPED 229", "[SUPERSEDED: OPEN]"
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# Mixed, not Goal met: the returned branch answers both halves of the question, but its
+# registered account (STEP-AND-VOTE, 227.5) missed one registered band -- INJECT 30.14
+# against 8-30 -- which is "a registered expectation was defied" (VERDICT_RULES["mixed"]).
+LANDED_ROWS = {
+    218: ("mixed", 9, ["cvt1"], ["page-19"], None, "STEP-SIZE-NEEDED-VOTE-SUFFICES: muting layer4.1.bn2.weight's vote while it keeps the shared step size does not rescue (MUTE at k01), and a carrier-sized vote cast by its bn1 twin collapses HEAD's complement (P_INJECT +34.65 pp); but INJECT is a partial collapse (INJECT-PARTIAL) and misses its registered 8-30 band by 0.14 pp."),
+}
+LANDED_BEARS_ON = {218: ["MT213", "MT217"]}  # cpl1 / cpl2: the PlainNet HEAD rescue whose mechanism cvt1 intervenes on
+# The intervened arms. results/all_runs.csv has no column for the vote-weight patch, so
+# MUTE and DOSE rows carry k01's cell key and INJECT rows HEAD's; the campaign lists them in
+# results/CORPUS-EXCLUSIONS.tsv (hash-pinned below). Wording follows CORRECTIONS 230.
+INTERVENTIONS_TSV = "results/CORPUS-EXCLUSIONS.tsv"
+INTERVENTIONS_TSV_SHA256 = "31105e32a9c9c7566863330a989ef986f047ae5fa7083fb61c2b0e1af1284eb5"
+LANDED_INTERVENTIONS = {
+    "MT218": {
+        "batch": "cvt1", "arms": {"MUTE": 3, "DOSE": 3, "INJECT": 3},
+        "title": "MUTE, DOSE and INJECT are vote-weight interventions, not plain arms",
+        "note": ("MUTE, DOSE and INJECT ran PATCH_VOTEWEIGHT (VOTE_W=<tensor>:<w> multiplies one tensor's term inside the "
+                 "unnormalised shared meta-gradient sum, before the sign). MUTE = scalar grouping with layer4.1.bn2.weight's "
+                 "term x0 (it keeps the shared step size and stops voting); DOSE = the same x0.1; INJECT = HEAD's grouping "
+                 "with the twin layer4.1.bn1.weight x691 (fixed K, sign kept) inside the complement. VOTE_W rides only the "
+                 "run's own VOTE_W: witness line, so the run inventory writes MUTE and DOSE rows with k01's cell key "
+                 "(granularity scalar) and INJECT rows with HEAD's cell key: seed for seed they differ from those arms only in "
+                 "run, job_id, node, wallclock_min and the accuracy columns. They are NOT plain scalar / plain HEAD "
+                 "measurements. The 9 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them before pooling runs by "
+                 "cell. The k01 and HEAD arms print VOTE_W: off and are ordinary measurements of their cells."),
+    },
+}
+
+
+def landed_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvt1 landing; only the header, row 19's formatting and one appended row may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{LANDED_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != LANDED_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {LANDED_COMMIT[:12]} does not match the pinned landed-row bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = amended_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != LANDED_LAST_ROW or len(before) != LANDED_FIRST_ROW - 1 or changed != LANDED_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {LANDED_COMMIT[:7]} moved a line or edited lines other than {sorted(LANDED_EDITED_LINES)}: {sorted(changed)}")
+    old, new = table_cells(before[18]), table_cells(lines[18])
+    moved_at = "Moved at cycle 152"
+    if (len(new) != 7 or [c for i, c in enumerate(old) if i != 4] != [c for i, c in enumerate(new) if i != 4]
+            or not clean(new[4]).startswith(LANDED_ROW19_TOKEN) or LANDED_ROW19_BRACKET not in clean(new[4])
+            or old[4][old[4].index(moved_at):] != new[4][new[4].index(moved_at):]):
+        raise ValueError("MASTER-TABLE row 19 changed beyond its verdict-cell formatting fix")
+    return lines
+
+
+def intervened_runs(repo: Path) -> dict[str, dict]:
+    """job_id -> the campaign's exclusion row for runs whose CSV cell key hides a harness intervention."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{LANDED_COMMIT}:{INTERVENTIONS_TSV}"])
+    if hashlib.sha256(raw).hexdigest() != INTERVENTIONS_TSV_SHA256:
+        raise ValueError(f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:12]} does not match the pinned bytes")
+    body = [line for line in raw.decode("utf-8").splitlines() if line and not line.startswith("#")]
+    rows = list(csv.DictReader(body, delimiter="\t"))
+    runs = {}
+    for eid, spec in LANDED_INTERVENTIONS.items():
+        mine = [row for row in rows if row["batch"] == spec["batch"]]
+        arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
+        if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
+            raise ValueError(f"{INTERVENTIONS_TSV} does not list the registered intervened arms of {eid}: {arms}")
+        for row in mine:
+            runs[row["job_id"]] = {**row, "experimentId": eid}
+    if len(runs) != len(rows):
+        raise ValueError(f"{INTERVENTIONS_TSV} lists runs with no registered intervention record")
+    return runs
 
 
 def amended_master_table(repo: Path) -> list[str]:
@@ -373,17 +462,30 @@ def appended_master_table(repo: Path) -> list[str]:
     return lines
 
 
-def appended_rows(lines: list[str]) -> list[dict]:
-    """Parse MASTER-TABLE lines 212-217 and apply the explicit verdict mapping."""
-    if set(APPENDED_ROWS) != set(range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1)) or len(lines) != APPENDED_LAST_ROW:
-        raise ValueError(f"The appended-row mapping must cover exactly lines {APPENDED_FIRST_ROW}-{APPENDED_LAST_ROW}")
+def landed_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE line 218 (cvt1) and attach its intervention note."""
+    rows = appended_rows(lines, LANDED_ROWS, LANDED_FIRST_ROW, LANDED_LAST_ROW, LANDED_COMMIT)
+    for row in rows:
+        spec = LANDED_INTERVENTIONS.get(row["id"])
+        if spec:
+            row["intervention"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"], "arms": spec["arms"],
+                                              "source": f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:7]}; CORRECTIONS 230"}, ensure_ascii=False)
+    return rows
+
+
+def appended_rows(lines: list[str], mapping: dict | None = None, first: int = APPENDED_FIRST_ROW, last: int = APPENDED_LAST_ROW,
+                  commit: str = APPENDED_COMMIT) -> list[dict]:
+    """Parse appended MASTER-TABLE rows (default lines 212-217) and apply the explicit verdict mapping."""
+    mapping = APPENDED_ROWS if mapping is None else mapping
+    if set(mapping) != set(range(first, last + 1)) or len(lines) != last:
+        raise ValueError(f"The appended-row mapping must cover exactly lines {first}-{last}")
     rows = []
-    for line in range(APPENDED_FIRST_ROW, APPENDED_LAST_ROW + 1):
+    for line in range(first, last + 1):
         cells = table_cells(lines[line - 1])
         if len(cells) != 7:
             raise ValueError(f"MASTER-TABLE line {line} is not a seven-column row")
         tested, varied, scale, result, verdict, so_what, ref = cells
-        rule, section, batches, figures, corrected, reason = APPENDED_ROWS[line]
+        rule, section, batches, figures, corrected, reason = mapping[line]
         # The row opens with a bracketed provenance label; the question follows it.
         label = re.match(r"^\[([^\]]*)\]\s*", clean(tested))
         if not label:
@@ -404,7 +506,7 @@ def appended_rows(lines: list[str]) -> list[dict]:
             "batches": json.dumps(batches), "sources": json.dumps(references, ensure_ascii=False),
             "original_question": question, "register_page": "",
             "kind": "method-check" if rule == "method" else "research", "corrected": "1" if corrected else "",
-            "correction": json.dumps({"note": corrected, "source": f"{MASTER_TABLE} line {line} at {APPENDED_COMMIT[:7]}"}, ensure_ascii=False) if corrected else "",
+            "correction": json.dumps({"note": corrected, "source": f"{MASTER_TABLE} line {line} at {commit[:7]}"}, ensure_ascii=False) if corrected else "",
             "mapping_rule": rule, "master_table_line": str(line), "figure_ids": json.dumps(figures),
         })
     return rows
@@ -442,7 +544,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
     missing = set(CORRECTION_REMAP) - {row["id"] for row in base}
     if missing:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
-    added = partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
+    added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
+             + landed_rows(landed_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)
