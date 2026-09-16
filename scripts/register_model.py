@@ -38,8 +38,14 @@ mapping is reviewable in one place and never applied ad hoc:
    verdict-cell formatting. Its intervened arms (MUTE, DOSE, INJECT) are named from the
    campaign's hash-pinned ``results/CORPUS-EXCLUSIONS.tsv`` by ``LANDED_INTERVENTIONS``.
 
+6. The row appended at the cgn3 landing (MASTER-TABLE line 219 at campaign commit
+   e3a43da, CORRECTIONS 231) is imported by ``CGN3_ROWS``. The pinned file may differ from
+   the cvt1 pin only on header line 3 and rows 213 and 218, which CORRECTIONS 231 amended in
+   place with the superseded wording kept; ``CGN3_AMENDMENTS`` carries those amendments into
+   MT213 and MT218 without moving an outcome.
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
-``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218);
+``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -174,8 +180,9 @@ ADDED_PHASES = [{
     "test": "GroupNorm and residual-free ResNet-18 isolation; VGG rescue at 328 epochs; unaugmented CIFAR-100 baseline",
     "observed_result": "Gap and carrier set transfer to GroupNorm; one BN scale rescues without residuals; VGG rescue holds at 328 epochs; unaugmented deficit +12.18 pp",
     "next_question": "Identity versus magnitude remains unresolved on every network",
-    # MT212-MT217 (CORRECTIONS 217-226) and MT218, the cvt1 landing of 16 Sep (CORRECTIONS 227 launch, 230 landing).
-    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 218 + 1)],
+    # MT212-MT217 (CORRECTIONS 217-226), MT218, the cvt1 landing of 16 Sep (CORRECTIONS 227 launch, 230 landing),
+    # and MT219, the cgn3 landing of 16 Sep (CORRECTIONS 228 launch, 231 landing).
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 219 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
 }]
 
@@ -320,6 +327,126 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     if len(runs) != len(rows):
         raise ValueError(f"{INTERVENTIONS_TSV} lists runs with no registered intervention record")
     return runs
+
+
+# ---------------------------------------------------------------------------
+# 6. The cgn3 landing (CORRECTIONS 231): one appended row, two rows amended in place.
+# ---------------------------------------------------------------------------
+# Campaign commit e3a43da (cycle 152, CORRECTIONS 231) appended the cgn3 landing as
+# line 219, recounted header line 3, and applied the verifier's two fixes in place,
+# superseded wording kept in brackets: row 213 (cpl1, MT213) gains an UPDATE bracket
+# saying cvt1 has landed, and row 218 (cvt1, MT218) marks "every cell-pooling reader
+# drops them" as not true when written. Nothing else may differ from the landed pin,
+# and no line may move. Neither amendment touches a verdict column, so no outcome moves.
+CGN3_COMMIT = "e3a43dacf1ef91f2fe3e7bd6d9c5efb775b6ced9"
+CGN3_MASTER_TABLE_SHA256 = "22faae0797b22d17fbb6426872f02d0959e175fda1ec17503a09a79f69b63eb1"
+CGN3_FIRST_ROW, CGN3_LAST_ROW = 219, 219
+CGN3_EDITED_LINES = {3, 213, 218}
+CGN3_SOURCE = "docs/CORRECTIONS.md [CORRECTIONS 231]"
+CGN3_MARK = "CORRECTIONS 231"
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# Goal met: the registered branch RESCUE-SURVIVES answers the question, the tested
+# FREEZE-HOLDS account (228.5) is IN on every arm and on RHO (k01 14.84 in 14-22, kL 66.39
+# in 55-72, ISO 63.36 in 57-72, ONE 56.62 in 42-68, RHO 1.2235 in 0.90-1.40), the pin stamp
+# separates it from NEVER-PINS, and the scorer passes 87 gates with 0 failures. The three
+# bounds of 231.4 (the level settled before the pin; CEIL-BELOW; DIFFERS-FROM-CGN2) are
+# descriptive limits and conditional stamps, not registered bands the result missed.
+CGN3_ROWS = {
+    219: ("met", 9, ["cgn3"], ["page-19"], None, "RESCUE-SURVIVES: the GroupNorm isolation rescue holds to 430 epochs (RHO 1.2235) after its complement's step size pins, every arm lands in the tested FREEZE-HOLDS account's registered band, and ONE survives with a rising share of the kL gap (0.68 -> 0.81). Bounded: the level settled before the pin, and ISO ends 3.02 pp below kL (CEIL-BELOW)."),
+}
+CGN3_BEARS_ON = {219: ["MT216"]}  # cgn2: the 100-epoch GroupNorm isolation this horizon test extends (its ISO-above-kL was a transient)
+# id -> amendment. "cell" is the MASTER-TABLE column the campaign amended (0-based).
+# scope "cell": the record's scope takes the amended cell verbatim, superseded clause and all.
+# scope "note": the record keeps its text and gains "Amended at CORRECTIONS 231: <reason>";
+#   "retire" names wording of the notebook's own CORRECTIONS 229 note that the row now
+#   supersedes, removed from the scope and from the 229 amendment record.
+CGN3_AMENDMENTS = {
+    "MT213": {"line": 213, "outcome": "mixed", "cell": 5, "scope": "note", "retire": (" (cvt1 has not landed).", "."),
+              "reason": ("Outcome unchanged (Mixed). cvt1 landed at CORRECTIONS 230 as MT218 (STEP-SIZE-NEEDED-VOTE-SUFFICES): silencing "
+                         "layer4.1.bn2.weight's term in the shared meta-gradient sum while it keeps the shared step size does not rescue "
+                         "(MUTE 10.9860 vs k01 11.9493; the DOWN vote is re-carried by 47, 44, 41 and 38), isolating it does (HEAD 64.7940), "
+                         "and its bn1 twin's term x691 inside HEAD's complement re-pins that complement at epoch 37.6 and drops the arm to "
+                         "30.1400 (0.344 of the gap kept). Its rescue needs its own step size; magnitude is still not separated from "
+                         "identity in level.")},
+    "MT218": {"line": 218, "outcome": "mixed", "cell": 2, "scope": "cell", "retire": None,
+              "reason": ("Outcome unchanged (Mixed). The row said every cell-pooling reader drops the 9 MUTE / DOSE / INJECT rows; that was "
+                         "not true when written. No file in analysis/ imports corpus_exclusions.py, and cPL2_plainnet_head_score.py "
+                         "--selftest pools them (SIGMA_PLAIN 8.6778, df 24, against 0.4107, df 15, with the rows dropped; a NOTE that "
+                         "feeds no bar). The clause stays in the row as superseded; future noise-floor or corpus-sigma derivations must "
+                         "drop the rows with corpus_exclusions.filter_rows first.")},
+}
+
+
+def cgn3_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cgn3 landing; only the header, rows 213 and 218 and one appended row may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CGN3_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != CGN3_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {CGN3_COMMIT[:12]} does not match the pinned cgn3-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = landed_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != CGN3_LAST_ROW or len(before) != CGN3_FIRST_ROW - 1 or changed != CGN3_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {CGN3_COMMIT[:7]} moved a line or edited lines other than {sorted(CGN3_EDITED_LINES)}: {sorted(changed)}")
+    for amendment in CGN3_AMENDMENTS.values():
+        line, cell = amendment["line"], amendment["cell"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if len(new) != 7 or [c for i, c in enumerate(old) if i != cell] != [c for i, c in enumerate(new) if i != cell]:
+            raise ValueError(f"MASTER-TABLE row {line} changed outside its amended column {cell}")
+        # The superseded wording is kept: dropping the SUPERSEDED label and the new bracket gives back the old cell.
+        kept = norm(re.sub(r"\[SUPERSEDED[^:\]]*:\s*", "", new[cell]))
+        if CGN3_MARK not in new[cell] or not kept.startswith(norm(old[cell])):
+            raise ValueError(f"MASTER-TABLE row {line}: the CORRECTIONS 231 amendment must be bracketed and keep the superseded wording")
+    return lines
+
+
+def cgn3_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE line 219 (cgn3)."""
+    return appended_rows(lines, CGN3_ROWS, CGN3_FIRST_ROW, CGN3_LAST_ROW, CGN3_COMMIT)
+
+
+def apply_cgn3_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply CORRECTIONS 231's in-place amendments of rows 213 and 218 to their records."""
+    lines, before = cgn3_master_table(repo), landed_master_table(repo)
+    if {a["line"] for a in CGN3_AMENDMENTS.values()} != CGN3_EDITED_LINES - {3}:
+        raise ValueError("Every row amended at CORRECTIONS 231 needs exactly one record amendment")
+    by_id = {row["id"]: row for row in rows}
+    missing = set(CGN3_AMENDMENTS) - by_id.keys()
+    if missing:
+        raise ValueError(f"CORRECTIONS 231 amendments name absent records: {sorted(missing)}")
+    amended = []
+    for row in rows:
+        spec = CGN3_AMENDMENTS.get(row["id"])
+        if not spec:
+            amended.append(row)
+            continue
+        line = spec["line"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        question = re.sub(r"^\[[^\]]*\]\s*", "", clean(new[0]))
+        if norm(row["original_question"])[:60] not in norm(question):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != spec["outcome"]:
+            raise ValueError(f"{row['id']} outcome drifted before its CORRECTIONS 231 amendment: {row['outcome']} (expected {spec['outcome']})")
+        row = dict(row)
+        if spec["scope"] == "cell":
+            if row["scope"].count(clean(old[spec["cell"]])) != 1:
+                raise ValueError(f"{row['id']}: the amended MASTER-TABLE cell is not in the record's scope exactly once")
+            row["scope"] = row["scope"].replace(clean(old[spec["cell"]]), clean(new[spec["cell"]]))
+        else:
+            retired, replacement = spec["retire"]
+            if row["scope"].count(retired) != 1 or not row.get("amendment"):
+                raise ValueError(f"{row['id']}: the CORRECTIONS 229 wording to retire is not in the record exactly once")
+            row["scope"] = row["scope"].replace(retired, replacement) + f" Amended at CORRECTIONS 231: {spec['reason']}"
+            earlier = json.loads(row["amendment"])
+            earlier["reason"] = earlier["reason"].replace(retired, replacement)
+            row["amendment"] = json.dumps(earlier, ensure_ascii=False)
+        sources = json.loads(row.get("sources") or "[]")
+        # Anchors that pinned the row's text before CORRECTIONS 231 now point at the amended row.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        row["sources"] = json.dumps([*sources, CGN3_SOURCE], ensure_ascii=False)
+        row["later_amendment"] = json.dumps({"line": line, "commit": CGN3_COMMIT, "previousOutcome": spec["outcome"], "outcome": spec["outcome"],
+                                             "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {CGN3_COMMIT[:7]}; CORRECTIONS 231"}, ensure_ascii=False)
+        amended.append(row)
+    return amended
 
 
 def amended_master_table(repo: Path) -> list[str]:
@@ -532,8 +659,8 @@ def remap_base_row(row: dict) -> dict:
 
 
 def load_register(workspace: Path, repo: Path) -> list[dict]:
-    """The published register: every row below, with the pinned in-place row amendments applied."""
-    return apply_row_amendments(load_unamended_register(workspace, repo), Path(repo))
+    """The published register: every row below, with the pinned in-place row amendments applied (229, then 231)."""
+    return apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
 
 
 def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
@@ -545,7 +672,7 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
     if missing:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
     added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
-             + landed_rows(landed_master_table(Path(repo))))
+             + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

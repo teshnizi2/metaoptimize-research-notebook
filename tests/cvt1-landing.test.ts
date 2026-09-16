@@ -31,7 +31,7 @@ test('the record text makes the MUTE, DOSE and INJECT interventions visible', ()
   assert.match(record.comparison, /MUTE = scalar grouping with 50's term x0/);
   assert.match(record.comparison, /DOSE = the same x0\.1/);
   assert.match(record.comparison, /INJECT = HEAD's grouping with the twin 47 layer4\.1\.bn1\.weight x691/);
-  assert.match(record.scope, /The 9 MUTE \/ DOSE \/ INJECT rows carry k01's \/ HEAD's CSV cell key \(no VOTE_W column\) and are listed in results\/CORPUS-EXCLUSIONS\.tsv/);
+  assert.match(record.scope, /The 9 MUTE \/ DOSE \/ INJECT rows carry k01's \/ HEAD's CSV cell key \(no VOTE_W column\) and are listed in results\/CORPUS-EXCLUSIONS\.tsv; \[SUPERSEDED, not true when written: every cell-pooling reader drops them\.\]/);
   const warning = data.warnings.find(w => w.id === 'warning-MT218-intervention')!;
   assert.ok(warning && record.warningIds.includes(warning.id));
   assert.equal(warning.title, 'MUTE, DOSE and INJECT are vote-weight interventions, not plain arms');
@@ -41,7 +41,7 @@ test('the record text makes the MUTE, DOSE and INJECT interventions visible', ()
 });
 
 test('the 15 cvt1 runs link to MT218, and exactly the 9 intervened runs are marked with their VOTE_W witness', () => {
-  assert.equal(runs.length, 2971);
+  assert.equal(runs.length, 2983);
   const cvt1 = runs.filter(run => run.batch === 'cvt1');
   assert.equal(cvt1.length, 15);
   assert.deepEqual([...record.runIds].sort(), cvt1.map(run => run.id).sort());

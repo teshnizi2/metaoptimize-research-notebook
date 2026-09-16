@@ -4,30 +4,33 @@ import csv
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 
+from external_inputs import inputs, needs
+
 
 PORTAL = Path(__file__).resolve().parents[1]
 # A verified campaign workspace and research repository are read only. Both can be
-# supplied explicitly when the portal is checked out somewhere else.
-WORKSPACE = Path(os.environ.get("NOTEBOOK_WORKSPACE", PORTAL.parents[1]))
-REPO = Path(os.environ.get("NOTEBOOK_RESEARCH_REPO", "/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize"))
-DATA_AUDIT = Path(os.environ.get("NOTEBOOK_DATA_AUDIT", WORKSPACE / "work/portal_data_audit.json"))
+# supplied explicitly when the portal is checked out somewhere else; tests that need
+# them are skipped, with the variable named, when they are neither configured nor present
+# (tests/external_inputs.py). Everything else reads only the published snapshot.
+_WORKSPACE, _REPO, _AUDIT, _INVENTORY = inputs()
+WORKSPACE, REPO, DATA_AUDIT = _WORKSPACE.path, _REPO.path, _AUDIT.path
 # The published run inventory can be an extended copy kept outside the read-only workspace
 # (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
-RUN_INVENTORY = Path(os.environ.get("NOTEBOOK_RUN_INVENTORY", WORKSPACE / "outputs/tables/complete_run_inventory.csv"))
+RUN_INVENTORY = _INVENTORY.path
 CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
-RUNS = 2971
-LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15}
+RUNS = 2983
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
 LANDED_IDS = ["MT218"]
+CGN3_IDS = ["MT219"]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -73,13 +76,27 @@ class ResearchExportTests(unittest.TestCase):
 
     def test_complete_register_and_area_counts(self):
         data = self.research()
-        original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual(len(data["experiments"]), 155)
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS))
+        self.assertEqual(len(data["experiments"]), 156)
+        self.assertEqual(len({e["id"] for e in data["experiments"]}), 156)
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 155)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 155, "researchQuestions": 137, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 156)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 156, "researchQuestions": 138, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
+    @needs(_WORKSPACE)
+    def test_register_ids_are_the_campaign_register_plus_the_imported_master_table_rows(self):
+        data = self.research()
+        original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS))
+
+    def test_published_runs_have_unique_identifiers_and_logs(self):
+        runs = self.runs()
+        self.assertEqual(len(runs), RUNS)
+        self.assertEqual(len({r["id"] for r in runs}), RUNS)
+        self.assertEqual({r["account"] for r in runs}, {"Account1", "Account2"})
+        self.assertTrue(all(r["parameters"].get("logAvailability") for r in runs))
+        self.assertEqual({batch: sum(r["batch"] == batch for r in runs) for batch in LANDED_BATCH_RUNS}, LANDED_BATCH_RUNS)
+
+    @needs(_WORKSPACE, _INVENTORY)
     def test_run_inventory_keeps_all_jobs_with_unique_identifiers(self):
         runs = self.runs()
         self.assertEqual(len(runs), RUNS)
@@ -102,6 +119,15 @@ class ResearchExportTests(unittest.TestCase):
         for figure in figures:
             self.assertTrue((PUBLIC / figure["href"].lstrip("/")).is_file(), figure["id"])
 
+    def test_every_published_raw_log_matches_its_public_hash(self):
+        runs = self.runs()
+        self.assertEqual(sum(bool(run.get("logHref")) for run in runs), RUNS)
+        for run in runs:
+            public = (PUBLIC / run["logHref"].lstrip("/")).read_bytes()
+            self.assertEqual(run["parameters"]["publicLogSha256"], hashlib.sha256(public).hexdigest(), run["jobId"])
+            self.assertRegex(run["parameters"]["originalLogSha256"], r"^[0-9a-f]{64}$", run["jobId"])
+
+    @needs(_WORKSPACE, _AUDIT)
     def test_all_raw_logs_are_exact_sanitized_archives_with_hashes(self):
         runs = self.runs()
         self.assertEqual(sum(bool(run.get("logHref")) for run in runs), RUNS)
@@ -180,6 +206,7 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(run["status"], "completed")
                 self.assertTrue((PUBLIC / run["logHref"].lstrip("/")).is_file())
 
+    @needs(_WORKSPACE, _INVENTORY)
     def test_every_csv_is_published_without_row_or_column_truncation(self):
         data = self.research()
         originals = list((WORKSPACE / "outputs/tables").rglob("*.csv"))
@@ -310,6 +337,7 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertIn(event["id"], experiment["eventIds"])
 
     # ---- Four-outcome model and the count-matched partition audit ----
+    @needs(_WORKSPACE)
     def test_approved_correction_split_is_explicit_and_complete(self):
         model = self.model()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
@@ -342,6 +370,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual(warnings["warning-MT113-verdict"]["severity"], "correction")
         self.assertNotIn("warning-MT113-correction", warnings, "a method check's verdict warning is its correction record")
 
+    @needs(_REPO)
     def test_partition_audit_rows_come_from_the_pinned_master_table(self):
         model = self.model()
         lines = model.master_table_at_commit(REPO)
@@ -374,6 +403,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertTrue(all(r["batch"] == baseline[r["id"]]["batch"] for r in runs))
 
     # ---- MASTER-TABLE lines 212-217 (campaign commit 64e4f47) ----
+    @needs(_REPO)
     def test_appended_rows_come_from_the_pinned_master_table(self):
         model = self.model()
         rows = model.appended_rows(model.appended_master_table(REPO))
@@ -400,7 +430,7 @@ class ResearchExportTests(unittest.TestCase):
         data, runs = self.research(), self.runs()
         by_id = {e["id"]: e for e in data["experiments"]}
         phase = next(e for e in data["activity"] if e["id"] == "phase-09")
-        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS))
+        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS + CGN3_IDS))
         self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
         figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
         batches = dict(zip(APPENDED_IDS, LANDED_BATCH_RUNS))
@@ -418,6 +448,7 @@ class ResearchExportTests(unittest.TestCase):
         # cuc1 closes MT019's remaining counts, so its runs link to MT019 as well as MT215, like cau1 to MT019 and MT020.
         self.assertEqual({tuple(r["experimentIds"]) for r in runs if r["batch"] == "cuc1"}, {("MT019", "MT215")})
 
+    @needs(_WORKSPACE, _REPO)
     def test_row_amendments_come_from_the_pinned_bookkeeping_commit(self):
         model = self.model()
         lines, before = model.amended_master_table(REPO), model.appended_master_table(REPO)
@@ -433,13 +464,16 @@ class ResearchExportTests(unittest.TestCase):
             self.assertEqual((record["outcome"], record["corrected"]), (outcome, eid in model.CORRECTION_REMAP), eid)
             self.assertTrue(set(batches) <= set(record["batches"]), eid)
             warning = warnings[f"warning-{eid}-amendment"]
+            # CORRECTIONS 231 retired the closing pending-cvt1 clause of MT213's 229 note.
+            if eid in model.CGN3_AMENDMENTS and model.CGN3_AMENDMENTS[eid]["retire"]:
+                reason = reason.replace(*model.CGN3_AMENDMENTS[eid]["retire"])
             self.assertIn(reason, warning["detail"])
             self.assertIn(f"line {line} at 6e33fd8", warning["detail"])
             if replacement:
                 self.assertEqual({key: record[key] for key in replacement}, replacement, eid)
                 self.assertIn("Outcome before the amendment: Open.", warning["detail"])
             else:
-                self.assertTrue(record["scope"].endswith("Amended at CORRECTIONS 229: " + reason), eid)
+                self.assertIn("Amended at CORRECTIONS 229: " + reason, record["scope"], eid)
             self.assertTrue(any(ref["label"].endswith("CORRECTIONS.md section 229") for ref in record["sourceRefs"]), eid)
         # A drifted outcome or a verdict-less outcome move stops the export instead of being applied.
         unamended = model.load_unamended_register(WORKSPACE, REPO)
@@ -455,6 +489,7 @@ class ResearchExportTests(unittest.TestCase):
             model.ROW_AMENDMENTS["MT163"] = original
 
     # ---- MASTER-TABLE line 218 (campaign commit 82867bb, CORRECTIONS 230: cvt1) ----
+    @needs(_REPO)
     def test_landed_row_comes_from_the_pinned_landing_commit(self):
         model = self.model()
         lines, before = model.landed_master_table(REPO), model.amended_master_table(REPO)
@@ -500,8 +535,13 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
             self.assertEqual(int(row["method_checks"]), len(records) - len(research))
             self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
-        self.assertEqual(sum(int(r["records"]) for r in areas), 155)
-        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [46, 41, 27, 23, 18])
+        self.assertEqual(sum(int(r["records"]) for r in areas), 156)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [47, 41, 27, 23, 18])
+
+    @needs(_WORKSPACE, _AUDIT)
+    def test_goal_outcome_table_keeps_the_report_goals_with_current_counts(self):
+        data = self.research()
+        experiments = data["experiments"]
         with (PUBLIC / "assets/tables/goal_outcomes.csv").open(newline="") as handle:
             goals = list(csv.DictReader(handle))
         original = csv_rows(WORKSPACE / "outputs/tables/goal_outcomes.csv")
@@ -532,9 +572,61 @@ class ResearchExportTests(unittest.TestCase):
         self.assertNotIn("correction", {r["outcome"] for r in rows})
         self.assertEqual({(r["id"], r["kind"], r["outcome"] or None, r["corrected"] == "Corrected") for r in rows},
                          {(e["id"], e["kind"], e["outcome"], e["corrected"]) for e in data["experiments"]})
+
+    @needs(_AUDIT)
+    def test_register_table_receipt_records_the_regeneration(self):
         audit = json.loads(DATA_AUDIT.read_text())
         receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
-        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (155, 20, "scripts/register_model.py register"))
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (156, 20, "scripts/register_model.py register"))
+
+    # ---- MASTER-TABLE line 219 and the in-place amendments of rows 213 and 218 (campaign commit e3a43da, CORRECTIONS 231: cgn3) ----
+    @needs(_REPO)
+    def test_cgn3_row_comes_from_the_pinned_landing_commit(self):
+        model = self.model()
+        lines, before = model.cgn3_master_table(REPO), model.landed_master_table(REPO)
+        self.assertEqual(len(lines), 219)
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {3, 213, 218})
+        rows = model.cgn3_rows(lines)
+        self.assertEqual([(r["id"], r["section"], r["outcome"], json.loads(r["batches"]), r["mapping_rule"], json.loads(r["figure_ids"])) for r in rows],
+                         [("MT219", "9", "success", ["cgn3"], "met", ["page-19"])])
+        self.assertTrue(rows[0]["reason"].startswith("Verdict: RESCUE-SURVIVES + RHO:1.2235 + TRAIN-AGREES + "))
+        self.assertIn("+ ONE-CELL-ONLY Goal met: RESCUE-SURVIVES: ", rows[0]["reason"])
+        self.assertIn("= +48.5193 / +39.6573 = 1.2235", rows[0]["result"])
+        with self.assertRaisesRegex(ValueError, "does not match the pinned cgn3-landing bytes"):
+            pinned = model.CGN3_COMMIT
+            try:
+                model.CGN3_COMMIT = model.LANDED_COMMIT
+                model.cgn3_master_table(REPO)
+            finally:
+                model.CGN3_COMMIT = pinned
+        with self.assertRaisesRegex(ValueError, "exactly lines 219-219"):
+            model.appended_rows(lines[:-1], model.CGN3_ROWS, 219, 219, model.CGN3_COMMIT)
+        data, runs = self.research(), self.runs()
+        record = next(e for e in data["experiments"] if e["id"] == "MT219")
+        self.assertEqual(sorted(record["runIds"]), sorted(r["id"] for r in runs if r["batch"] == "cgn3"))
+        self.assertEqual({r["epochs"] for r in runs if r["batch"] == "cgn3"}, {430})
+
+    @needs(_WORKSPACE, _REPO)
+    def test_cgn3_amendments_change_wording_only(self):
+        model = self.model()
+        self.assertEqual(set(model.CGN3_AMENDMENTS), {"MT213", "MT218"})
+        before = {r["id"]: r for r in model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO)}
+        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        self.assertEqual(set(before), set(after))
+        for eid, row in after.items():
+            if eid not in model.CGN3_AMENDMENTS:
+                self.assertEqual(row, before[eid], eid)
+                continue
+            changed = {key for key in row if row[key] != before[eid].get(key)}
+            self.assertEqual(changed, {"scope", "sources", "later_amendment"} | ({"amendment"} if eid == "MT213" else set()), eid)
+            self.assertEqual(row["outcome"], before[eid]["outcome"], eid)
+        self.assertNotIn("cvt1 has not landed", after["MT213"]["scope"] + after["MT213"]["amendment"])
+        self.assertIn("cvt1 has not landed", before["MT213"]["scope"])
+        self.assertIn("[SUPERSEDED, not true when written: every cell-pooling reader drops them.]", after["MT218"]["scope"])
+        # A drifted outcome stops the export instead of being applied.
+        drifted = [dict(r, outcome="success") if r["id"] == "MT218" else r for r in before.values()]
+        with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 231 amendment"):
+            model.apply_cgn3_amendments(drifted, REPO)
 
 
 if __name__ == "__main__":

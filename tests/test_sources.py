@@ -3,15 +3,18 @@ import csv
 import hashlib
 import importlib.util
 import json
-import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 
+from external_inputs import inputs, needs
+
 PORTAL = Path(__file__).resolve().parents[1]
-WORKSPACE = Path(os.environ.get('NOTEBOOK_WORKSPACE', PORTAL.parents[1]))
-REPO = Path(os.environ.get('NOTEBOOK_RESEARCH_REPO', '/Users/teshnizi/Saber Optimization/alice-backup/hierarchical-metaoptimize'))
+# The published-catalog tests rebuild it from the maintainer's workspace and research repository;
+# they are skipped, with the variables named, when neither is configured nor present.
+_WORKSPACE, _REPO, _, _ = inputs()
+WORKSPACE, REPO = _WORKSPACE.path, _REPO.path
 EXPORTER = PORTAL / 'scripts/export_sources.py'
 
 
@@ -211,10 +214,11 @@ class SourceExportTests(unittest.TestCase):
     def published_rows(self):
         return self.exporter.register_rows(REPO, WORKSPACE)
 
+    @needs(_WORKSPACE, _REPO)
     def test_every_record_has_valid_document_and_code_references(self):
         rows = self.published_rows()
         index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, rows)
-        self.assertEqual(len(rows), 155)
+        self.assertEqual(len(rows), 156)
         self.assertEqual(set(links), {row['id'] for row in rows})
         by_id = {s['id']: s for s in index}
         self.assertEqual(len(by_id), len(index))
@@ -238,6 +242,7 @@ class SourceExportTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(assets[source['id']].encode()).hexdigest(), source['publicSha256'])
             self.assertEqual(len(assets[source['id']].splitlines()), source['lines'])
 
+    @needs(_WORKSPACE, _REPO)
     def test_cvk2_links_exact_registered_scorer_and_runtime_snapshot(self):
         index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, self.published_rows())
         source = next(s for s in index if s['path'] == 'analysis/cVK2_vggcut_score.py')
@@ -253,6 +258,7 @@ class SourceExportTests(unittest.TestCase):
         self.assertTrue(any(s['path'].endswith('/Optimizers/HF.py') for s in shared))
         self.assertTrue(any(s['path'].endswith('/Optimizers/build_optimizer.py') for s in shared))
 
+    @needs(_WORKSPACE, _REPO)
     def test_public_content_has_no_private_accounts_home_paths_or_credentials(self):
         index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, self.published_rows())
         payload = json.dumps(index) + json.dumps(links) + '\n'.join(assets.values())
@@ -261,6 +267,7 @@ class SourceExportTests(unittest.TestCase):
                         r'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----']:
             self.assertIsNone(re.search(pattern, payload), pattern)
 
+    @needs(_WORKSPACE, _REPO)
     def test_export_is_deterministic_and_every_href_resolves(self):
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp) / 'a', Path(tmp) / 'b'

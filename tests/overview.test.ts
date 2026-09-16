@@ -61,7 +61,7 @@ test('the published register is fully represented in the general review', async 
   const data = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8')) as ResearchData;
   const rows = areaOutcomeCounts(data.experiments, data.areas);
   assert.equal(rows.length, 10);
-  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 137);
+  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 138);
   assert.equal(rows.reduce((sum, row) => sum + row.methodChecks, 0), 18);
   for (const row of rows) {
     assert.equal(Object.values(row.counts).reduce((sum, count) => sum + count, 0), row.total);
@@ -69,7 +69,7 @@ test('the published register is fully represented in the general review', async 
   }
   const audit = rows.find(row => row.label === 'Count-matched partition audit')!;
   assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [34, { success: 12, fail: 5, mixed: 4, unresolved: 13 }, 3]);
-  // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1); line 218 (cvt1, Mixed) is a sixth mechanism row.
-  assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [41, { success: 12, fail: 12, mixed: 9, unresolved: 8 }]);
+  // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1); line 218 (cvt1, Mixed) is a sixth mechanism row and line 219 (cgn3, Goal met) a seventh.
+  assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [42, { success: 13, fail: 12, mixed: 9, unresolved: 8 }]);
   assert.deepEqual([rows.find(row => row.label === 'Baseline comparisons')!.total, rows.find(row => row.label === 'Baseline comparisons')!.counts], [8, { success: 7, fail: 1, mixed: 0, unresolved: 0 }], 'MT019 moved from Open to Goal met at CORRECTIONS 229');
 });
