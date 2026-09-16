@@ -44,8 +44,15 @@ mapping is reviewable in one place and never applied ad hoc:
    place with the superseded wording kept; ``CGN3_AMENDMENTS`` carries those amendments into
    MT213 and MT218 without moving an outcome.
 
+7. The rows appended at the cvt3 and cvt2 landings (MASTER-TABLE lines 220-221 at campaign commit
+   9c5d72a, CORRECTIONS 235-236) are imported by ``CVT23_ROWS``. The pinned file may differ from the
+   cgn3 pin only on header lines 3 and 5 and rows 213 and 216, which CORRECTIONS 234 and 236 amended
+   in place with the superseded wording kept; ``CVT23_AMENDMENTS`` carries those amendments into MT213
+   and MT216 without moving an outcome. Their intervened arms are named from the same exclusion list,
+   which may only have grown by appended rows since the cvt1 pin.
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
-``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219);
+``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -181,8 +188,9 @@ ADDED_PHASES = [{
     "observed_result": "Gap and carrier set transfer to GroupNorm; one BN scale rescues without residuals; VGG rescue holds at 328 epochs; unaugmented deficit +12.18 pp",
     "next_question": "Identity versus magnitude remains unresolved on every network",
     # MT212-MT217 (CORRECTIONS 217-226), MT218, the cvt1 landing of 16 Sep (CORRECTIONS 227 launch, 230 landing),
-    # and MT219, the cgn3 landing of 16 Sep (CORRECTIONS 228 launch, 231 landing).
-    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 219 + 1)],
+    # MT219, the cgn3 landing of 16 Sep (CORRECTIONS 228 launch, 231 landing), and MT220-MT221, the cvt3 and
+    # cvt2 landings of 16 Sep (CORRECTIONS 232 / 233 registration and launch, 235 / 236 landing).
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 221 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
 }]
 
@@ -311,13 +319,18 @@ def landed_master_table(repo: Path) -> list[str]:
 
 def intervened_runs(repo: Path) -> dict[str, dict]:
     """job_id -> the campaign's exclusion row for runs whose CSV cell key hides a harness intervention."""
-    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{LANDED_COMMIT}:{INTERVENTIONS_TSV}"])
-    if hashlib.sha256(raw).hexdigest() != INTERVENTIONS_TSV_SHA256:
+    first = subprocess.check_output(["git", "-C", str(repo), "show", f"{LANDED_COMMIT}:{INTERVENTIONS_TSV}"])
+    if hashlib.sha256(first).hexdigest() != INTERVENTIONS_TSV_SHA256:
         raise ValueError(f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:12]} does not match the pinned bytes")
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT23_COMMIT}:{INTERVENTIONS_TSV}"])
+    if hashlib.sha256(raw).hexdigest() != CVT23_INTERVENTIONS_TSV_SHA256:
+        raise ValueError(f"{INTERVENTIONS_TSV} at {CVT23_COMMIT[:12]} does not match the pinned bytes")
+    if not raw.startswith(first):
+        raise ValueError(f"{INTERVENTIONS_TSV} changed rows listed at {LANDED_COMMIT[:7]}; it may only grow by appended rows")
     body = [line for line in raw.decode("utf-8").splitlines() if line and not line.startswith("#")]
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
-    for eid, spec in LANDED_INTERVENTIONS.items():
+    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS}.items():
         mine = [row for row in rows if row["batch"] == spec["batch"]]
         arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
         if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
@@ -445,6 +458,156 @@ def apply_cgn3_amendments(rows: list[dict], repo: Path) -> list[dict]:
         row["sources"] = json.dumps([*sources, CGN3_SOURCE], ensure_ascii=False)
         row["later_amendment"] = json.dumps({"line": line, "commit": CGN3_COMMIT, "previousOutcome": spec["outcome"], "outcome": spec["outcome"],
                                              "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {CGN3_COMMIT[:7]}; CORRECTIONS 231"}, ensure_ascii=False)
+        amended.append(row)
+    return amended
+
+
+# ---------------------------------------------------------------------------
+# 7. The cvt3 and cvt2 landings (CORRECTIONS 234-236): two appended rows, two rows amended in place.
+# ---------------------------------------------------------------------------
+# Campaign commit 1ef1ba9 (CORRECTIONS 234) amended header line 5 and rescoped row 216 (cgn2, MT216) in
+# place; commit 9c5d72a (cycle 152, CORRECTIONS 235 + 236) appended the cvt3 and cvt2 landings as lines
+# 220 and 221, recounted header line 3, amended line 5 again, and corrected a wording slip in row 213
+# (cpl1, MT213) in place, superseded wording kept verbatim. Nothing else may differ from the cgn3 pin, and
+# no line may move. Line 5 (the bottom-line paragraph) feeds no record; it is published only in the
+# MASTER-TABLE source copy. Neither row amendment touches a verdict column, so no outcome moves.
+CVT23_COMMIT = "9c5d72ab54dca57f94f143d23bfe722804b6aa6e"
+CVT23_MASTER_TABLE_SHA256 = "1943409bd0692900fabf41037a9f8654b8de27cad1fcfe6b5fdca54b2b07bc85"
+CVT23_FIRST_ROW, CVT23_LAST_ROW = 220, 221
+CVT23_EDITED_LINES = {3, 5, 213, 216}
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# Both Mixed, as MT218: the returned branch answers the question, but a registered expectation was defied.
+# cvt3 (235.3): the returned branch's own account, OWN-STEP-NECESSARY (232.4), hits 5 of 6 -- MUTECTL 7.82
+# misses its 8-16 band by 0.18 pp -- and the PRIMARY P_COAL is positive only because that control fell
+# below k01. cvt2 (236.3): no registered account's outcome is GRADED | TOP-ATTENUATED, the prior stated at
+# 233.5 (TOP-FLAT) missed by 0.26 pp, and the sign-saturation derivation failed at K33.
+CVT23_ROWS = {
+    220: ("mixed", 9, ["cvt3"], ["page-19"], None, "OWN-STEP-NECESSARY: silencing layer4.1.bn2.weight and the whole 20-tensor DOWN coalition, with every tensor on one shared step size, leaves the scalar arm at k01 (MUTEDOWN 11.33 vs k01 11.57), which strengthens MT218's 'the rescue needs 50 on its own step size'; but the account misses its registered MUTECTL band by 0.18 pp, P_COAL (+3.51 pp) comes from the control falling below k01 rather than from the coalition (MUTEDOWN - MUTE50 +0.03 pp), and the DOWN vote was re-carried by the next tier, so 'no silenced set rescues' is not licensed."),
+    221: ("mixed", 9, ["cvt2"], ["page-19"], None, "GRADED + TOP-ATTENUATED: the twin's injected vote collapses HEAD's complement by degree in K (share of the HEAD gap kept 0.772 at K13 down to 0.256 at K2000), so cvt1's 0.344 residue is not a fixed floor; but no registered account predicted this pair of words, the stated TOP-FLAT prior missed by 0.26 pp, both words sit on near bars (K33 0.32 pp and TOP 0.26 pp past the 5.0 pp bar), and K13 is still rising at 100 epochs, so its level may be a delay."),
+}
+CVT23_BEARS_ON = {220: ["MT218"], 221: ["MT218"]}  # cvt1: MT220 re-tests its MUTE at the coalition level, MT221 doses its INJECT
+# id -> amendment of CORRECTIONS 234 or 236. "cell" is the amended MASTER-TABLE column (0-based); "number" the
+# CORRECTIONS entry that made it. The amended cell must differ from the cgn3 pin in one contiguous span that
+# carries the entry's mark and keeps any removed wording verbatim.
+# field "result": the record's result takes the amended cell verbatim (the rescope bracket and all).
+# field "note": the record keeps its text and gains "Amended at CORRECTIONS <number>: <reason>".
+CVT23_AMENDMENTS = {
+    "MT216": {"line": 216, "outcome": "success", "cell": 3, "number": 234, "field": "result",
+              "reason": ("Outcome unchanged (Goal met). Rescoped at CORRECTIONS 234: 'ISO sits +1.81 pp above kL' and the ISO-TRACKS-KL "
+                         "stamp held at 100 epochs only; both are kept verbatim in the result. cgn3 (MT219) ran this cell to 430 epochs: kL "
+                         "kept climbing, passes ISO for good at epoch ~174 and ends 3.02 pp above it (CEIL-BELOW), while the rescue itself "
+                         "survives (RESCUE-SURVIVES, RHO 1.2235). The ordering against layerwise does not survive; the identity transfer does.")},
+    "MT213": {"line": 213, "outcome": "mixed", "cell": 5, "number": 236, "field": "note",
+              "reason": ("Outcome unchanged (Mixed). Row 213's CORRECTIONS 231 update said a carrier-sized vote collapses a complement "
+                         "'whoever casts it'. That claimed more than was tested and was corrected in place: one other caster "
+                         "(layer4.1.bn1.weight) was run, into one complement (HEAD's), at one K in cvt1 (MT218) and at five K in cvt2 "
+                         "(MT221); whether any other tensor's term does the same is untested. The superseded wording stays in the row.")},
+}
+CVT23_INTERVENTIONS_TSV_SHA256 = "aeb82070350bfd6dd230877ea98bea30f9e15537a30789b3a7e9a603bc22461f"
+CVT23_INTERVENTIONS = {
+    "MT220": {
+        "batch": "cvt3", "arms": {"MUTE50": 3, "MUTEDOWN": 3, "MUTECTL": 3},
+        "title": "MUTE50, MUTEDOWN and MUTECTL are vote-weight interventions, not plain arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT23_COMMIT[:7]}; CORRECTIONS 232, 235 and 236",
+        "note": ("MUTE50, MUTEDOWN and MUTECTL ran cvt1's unchanged PATCH_VOTEWEIGHT tree (VOTE_W=<tensor>:<w>, one or more "
+                 "tensors separated by /, multiplies each listed tensor's term inside the unnormalised shared meta-gradient sum, "
+                 "before the sign), all on the scalar grouping. MUTE50 = layer4.1.bn2.weight's term x0 (cvt1's MUTE, replicated); "
+                 "MUTEDOWN = 50 plus RULE C's 20-tensor DOWN coalition (15 BN scales and 5 convs) x0; MUTECTL = 50 plus RULE K's "
+                 "count- and class-matched non-DOWN set (15 BN biases of the same modules and 5 smaller convs) x0, not mass-matched. "
+                 "VOTE_W rides only the run's own VOTE_W: witness line, so the run inventory writes all 9 rows with k01's cell key "
+                 "(granularity scalar): seed for seed they differ from k01 only in run, job_id, node, wallclock_min and the accuracy "
+                 "columns. They are NOT plain scalar measurements. The 9 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them "
+                 "before pooling runs by cell. The k01 and HEAD arms print VOTE_W: off and are ordinary measurements of their cells."),
+    },
+    "MT221": {
+        "batch": "cvt2", "arms": {"K13": 3, "K33": 3, "K152": 3, "K691": 3, "K2000": 3},
+        "title": "K13, K33, K152, K691 and K2000 are vote-weight interventions, not plain HEAD arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT23_COMMIT[:7]}; CORRECTIONS 233 and 236",
+        "note": ("The five ladder arms ran cvt1's unchanged PATCH_VOTEWEIGHT tree on HEAD's grouping ({50} [52,1]) with the twin "
+                 "layer4.1.bn1.weight's term multiplied by K = 13, 33, 152, 691 or 2000 (fixed K, sign kept) inside the complement's "
+                 "unnormalised shared meta-gradient sum, before the sign; K691 is cvt1's INJECT byte for byte. VOTE_W rides only the "
+                 "run's own VOTE_W: witness line, so the run inventory writes all 15 rows with HEAD's cell key: seed for seed they "
+                 "differ from HEAD only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT plain HEAD "
+                 "measurements. The 15 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them before pooling runs by cell. The "
+                 "k01 and HEAD arms print VOTE_W: off and are ordinary measurements of their cells."),
+    },
+}
+
+
+def cvt23_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvt3 + cvt2 landing; only header lines 3 and 5, rows 213 and 216 and two appended rows may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT23_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != CVT23_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {CVT23_COMMIT[:12]} does not match the pinned cvt3/cvt2-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = cgn3_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != CVT23_LAST_ROW or len(before) != CVT23_FIRST_ROW - 1 or changed != CVT23_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {CVT23_COMMIT[:7]} moved a line or edited lines other than {sorted(CVT23_EDITED_LINES)}: {sorted(changed)}")
+    for amendment in CVT23_AMENDMENTS.values():
+        line, cell = amendment["line"], amendment["cell"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if len(new) != 7 or [c for i, c in enumerate(old) if i != cell] != [c for i, c in enumerate(new) if i != cell]:
+            raise ValueError(f"MASTER-TABLE row {line} changed outside its amended column {cell}")
+        removed, added = changed_span(old[cell], new[cell])
+        # One contiguous edit that carries the entry's mark and keeps whatever it replaced, verbatim.
+        if f"CORRECTIONS {amendment['number']}" not in added or norm(removed) not in norm(added):
+            raise ValueError(f"MASTER-TABLE row {line}: the CORRECTIONS {amendment['number']} amendment must be bracketed and keep the superseded wording")
+    return lines
+
+
+def changed_span(old: str, new: str) -> tuple[str, str]:
+    """The one contiguous span in which two strings differ: (removed from old, added in new)."""
+    prefix = 0
+    while prefix < min(len(old), len(new)) and old[prefix] == new[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < min(len(old), len(new)) - prefix and old[-1 - suffix] == new[-1 - suffix]:
+        suffix += 1
+    return old[prefix:len(old) - suffix], new[prefix:len(new) - suffix]
+
+
+def cvt23_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 220 (cvt3) and 221 (cvt2) and attach their intervention notes."""
+    return with_interventions(appended_rows(lines, CVT23_ROWS, CVT23_FIRST_ROW, CVT23_LAST_ROW, CVT23_COMMIT), CVT23_INTERVENTIONS)
+
+
+def apply_cvt23_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply CORRECTIONS 234's and 236's in-place amendments of rows 216 and 213 to their records."""
+    lines, before = cvt23_master_table(repo), cgn3_master_table(repo)
+    if {a["line"] for a in CVT23_AMENDMENTS.values()} != CVT23_EDITED_LINES - {3, 5}:
+        raise ValueError("Every row amended at CORRECTIONS 234 or 236 needs exactly one record amendment")
+    missing = set(CVT23_AMENDMENTS) - {row["id"] for row in rows}
+    if missing:
+        raise ValueError(f"CORRECTIONS 234/236 amendments name absent records: {sorted(missing)}")
+    amended = []
+    for row in rows:
+        spec = CVT23_AMENDMENTS.get(row["id"])
+        if not spec:
+            amended.append(row)
+            continue
+        line, number = spec["line"], spec["number"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        question = re.sub(r"^\[[^\]]*\]\s*", "", clean(new[0]))
+        if norm(row["original_question"])[:60] not in norm(question):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != spec["outcome"]:
+            raise ValueError(f"{row['id']} outcome drifted before its CORRECTIONS {number} amendment: {row['outcome']} (expected {spec['outcome']})")
+        row = dict(row)
+        if spec["field"] == "result":
+            if row["result"] != clean(old[spec["cell"]]):
+                raise ValueError(f"{row['id']}: the record's result is not the MASTER-TABLE cell CORRECTIONS {number} amended")
+            row["result"] = clean(new[spec["cell"]])
+        else:
+            row["scope"] = f"{row['scope']} Amended at CORRECTIONS {number}: {spec['reason']}"
+        sources = json.loads(row.get("sources") or "[]")
+        # Anchors that pinned the row's text at the cgn3 landing now point at the amended row.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        row["sources"] = json.dumps([*sources, f"docs/CORRECTIONS.md [CORRECTIONS {number}]"], ensure_ascii=False)
+        further = json.loads(row.get("further_amendments") or "[]")
+        further.append({"number": number, "line": line, "commit": CVT23_COMMIT, "previousOutcome": spec["outcome"], "outcome": spec["outcome"],
+                        "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {CVT23_COMMIT[:7]}; CORRECTIONS {number}"})
+        row["further_amendments"] = json.dumps(further, ensure_ascii=False)
         amended.append(row)
     return amended
 
@@ -591,12 +754,17 @@ def appended_master_table(repo: Path) -> list[str]:
 
 def landed_rows(lines: list[str]) -> list[dict]:
     """Parse MASTER-TABLE line 218 (cvt1) and attach its intervention note."""
-    rows = appended_rows(lines, LANDED_ROWS, LANDED_FIRST_ROW, LANDED_LAST_ROW, LANDED_COMMIT)
+    return with_interventions(appended_rows(lines, LANDED_ROWS, LANDED_FIRST_ROW, LANDED_LAST_ROW, LANDED_COMMIT), LANDED_INTERVENTIONS)
+
+
+def with_interventions(rows: list[dict], interventions: dict) -> list[dict]:
+    """Attach each record's intervention note (the arms whose CSV cell key hides a vote-weight patch)."""
     for row in rows:
-        spec = LANDED_INTERVENTIONS.get(row["id"])
+        spec = interventions.get(row["id"])
         if spec:
+            source = spec.get("source") or f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:7]}; CORRECTIONS 230"
             row["intervention"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"], "arms": spec["arms"],
-                                              "source": f"{INTERVENTIONS_TSV} at {LANDED_COMMIT[:7]}; CORRECTIONS 230"}, ensure_ascii=False)
+                                              "source": source}, ensure_ascii=False)
     return rows
 
 
@@ -659,8 +827,9 @@ def remap_base_row(row: dict) -> dict:
 
 
 def load_register(workspace: Path, repo: Path) -> list[dict]:
-    """The published register: every row below, with the pinned in-place row amendments applied (229, then 231)."""
-    return apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
+    """The published register: every row below, with the pinned in-place row amendments applied (229, then 231, then 234/236)."""
+    register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
+    return apply_cvt23_amendments(register, Path(repo))
 
 
 def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
@@ -672,7 +841,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
     if missing:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
     added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
-             + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo))))
+             + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo)))
+             + cvt23_rows(cvt23_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

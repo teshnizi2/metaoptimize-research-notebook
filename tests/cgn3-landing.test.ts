@@ -18,7 +18,7 @@ const warningsOf = (id: string) => data.warnings.filter(w => w.experimentId === 
 
 test('MT219 is the cgn3 row, Goal met under the documented rules, with all 25 FINAL tokens quoted', () => {
   assert.ok(record, 'MT219 must exist');
-  assert.equal(data.experiments.at(-1)!.id, 'MT219', 'appended after every existing record');
+  assert.equal(data.experiments[155].id, 'MT219', 'appended after every record that existed before it');
   assert.deepEqual([record.section, record.area, record.kind, record.outcome, record.corrected, record.batches],
     [9, 'Mechanism and isolation', 'research', 'success', false, ['cgn3']]);
   assert.equal(FINAL.length, 25);
@@ -35,11 +35,11 @@ test('MT219 is the cgn3 row, Goal met under the documented rules, with all 25 FI
   const master = data.sources.find(s => s.path === 'docs/MASTER-TABLE.md')!;
   assert.ok(record.sourceRefs.some(ref => ref.sourceId === master.id && ref.line === 219));
   assert.deepEqual(warningsOf('MT219').map(w => w.id), ['warning-MT219-verdict']);
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.runs], [156, 138, 2983]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.runs], [158, 140, 3019]);
 });
 
 test('the 12 cgn3 runs link to MT219 as 430-epoch GroupNorm runs with sanitized raw logs', () => {
-  assert.equal(runs.length, 2983);
+  assert.equal(runs.length, 3019);
   const cgn3 = runs.filter(run => run.batch === 'cgn3');
   assert.equal(cgn3.length, 12);
   assert.deepEqual([...record.runIds].sort(), cgn3.map(run => run.id).sort());

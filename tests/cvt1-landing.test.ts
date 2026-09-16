@@ -41,7 +41,7 @@ test('the record text makes the MUTE, DOSE and INJECT interventions visible', ()
 });
 
 test('the 15 cvt1 runs link to MT218, and exactly the 9 intervened runs are marked with their VOTE_W witness', () => {
-  assert.equal(runs.length, 2983);
+  assert.equal(runs.length, 3019);
   const cvt1 = runs.filter(run => run.batch === 'cvt1');
   assert.equal(cvt1.length, 15);
   assert.deepEqual([...record.runIds].sort(), cvt1.map(run => run.id).sort());
@@ -70,5 +70,7 @@ test('the 15 cvt1 runs link to MT218, and exactly the 9 intervened runs are mark
     assert.match(log, /cluster\/Account2\/metaopt\/runs\/cvt1\/probe_cvt1-/, run.id);
     assert.match(log, /NODE=\[HOST_[0-9a-f]{10}\]/, run.id);
   }
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 9, 'no run outside cvt1 is marked');
+  assert.equal(cvt1.filter(run => run.parameters.intervention).length, 9, 'exactly the 9 cvt1 intervention runs are marked');
+  // cvt3 and cvt2 add their own 9 and 15 (tests/cvt3-cvt2-landing.test.ts); no other batch is marked.
+  assert.deepEqual([...new Set(runs.filter(run => run.parameters.intervention).map(run => run.batch))].sort(), ['cvt1', 'cvt2', 'cvt3']);
 });

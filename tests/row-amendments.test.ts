@@ -49,8 +49,8 @@ test('the four other amended rows keep their outcome and carry the amendment not
 });
 
 test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw logs', () => {
-  assert.equal(runs.length, 2983);
-  assert.equal(data.meta.stats.runs, 2983);
+  assert.equal(runs.length, 3019);
+  assert.equal(data.meta.stats.runs, 3019);
   const batches: Record<string, [string, number]> = { cgn1: ['MT212', 6], cpl1: ['MT213', 15], cvh1: ['MT214', 12], cuc1: ['MT215', 30], cgn2: ['MT216', 15], cpl2: ['MT217', 15] };
   const landed = runs.filter(run => run.batch in batches);
   assert.equal(landed.length, 93);
@@ -73,7 +73,10 @@ test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw l
   }
   assert.deepEqual(runs.filter(run => run.batch === 'cuc1').every(run => run.experimentIds.join() === 'MT019,MT215'), true);
   // cvt1 landed at CORRECTIONS 230 and is MT218 (tests/cvt1-landing.test.ts); cgn3 landed at CORRECTIONS 231 and is MT219
-  // (tests/cgn3-landing.test.ts). Each has exactly one record.
+  // (tests/cgn3-landing.test.ts); cvt3 and cvt2 landed at CORRECTIONS 235 and 236 and are MT220 and MT221
+  // (tests/cvt3-cvt2-landing.test.ts). Each has exactly one record.
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt1')).map(e => e.id), ['MT218']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cgn3')).map(e => e.id), ['MT219']);
+  assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt3')).map(e => e.id), ['MT220']);
+  assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt2')).map(e => e.id), ['MT221']);
 });

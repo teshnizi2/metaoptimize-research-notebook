@@ -218,7 +218,7 @@ class SourceExportTests(unittest.TestCase):
     def test_every_record_has_valid_document_and_code_references(self):
         rows = self.published_rows()
         index, links, audit, assets = self.exporter.build_catalog(REPO, WORKSPACE, rows)
-        self.assertEqual(len(rows), 156)
+        self.assertEqual(len(rows), 158)
         self.assertEqual(set(links), {row['id'] for row in rows})
         by_id = {s['id']: s for s in index}
         self.assertEqual(len(by_id), len(index))

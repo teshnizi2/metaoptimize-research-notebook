@@ -17,10 +17,10 @@ test('the register CSV has one row per published record and the documented colum
   assert.deepEqual(parsed.errors, []);
   assert.deepEqual(parsed.meta.fields, columns);
   assert.equal(rows.length, data.experiments.length);
-  assert.equal(rows.length, 156);
+  assert.equal(rows.length, 158);
   assert.deepEqual(rows.map(row => row.id), data.experiments.map(e => e.id));
   const table = data.tables.find(entry => entry.href === '/assets/tables/complete_experiment_register.csv')!;
-  assert.deepEqual([table.rows, table.columns], [156, columns.length], 'the table catalog reports the regenerated size');
+  assert.deepEqual([table.rows, table.columns], [158, columns.length], 'the table catalog reports the regenerated size');
 });
 
 test('every CSV row carries its four-way outcome, kind and a separate Corrected column', () => {
@@ -37,9 +37,9 @@ test('every CSV row carries its four-way outcome, kind and a separate Corrected 
     assert.equal(row.area, record.area, row.id);
   }
   const count = (key: string, value: string) => rows.filter(row => row[key] === value).length;
-  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [138, 18, 35]);
-  assert.deepEqual(['success', 'fail', 'mixed', 'unresolved'].map(outcome => count('outcome', outcome)), [47, 41, 27, 23]);
+  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [140, 18, 35]);
+  assert.deepEqual(['success', 'fail', 'mixed', 'unresolved'].map(outcome => count('outcome', outcome)), [47, 41, 29, 23]);
   assert.deepEqual(['outcome', 'outcome_label'].map(key => rows.find(row => row.id === 'MT019')![key]), ['success', 'Goal met'], 'MT019 moved from Open at CORRECTIONS 229');
-  assert.deepEqual(rows.filter(row => /^MT21[2-9]$/.test(row.id)).map(row => [row.id, row.master_table_line, row.outcome_label]),
-    [['MT212', '212', 'Goal met'], ['MT213', '213', 'Mixed'], ['MT214', '214', 'Goal met'], ['MT215', '215', 'Goal met'], ['MT216', '216', 'Goal met'], ['MT217', '217', 'Goal met'], ['MT218', '218', 'Mixed'], ['MT219', '219', 'Goal met']]);
+  assert.deepEqual(rows.filter(row => /^MT2(1[2-9]|2[01])$/.test(row.id)).map(row => [row.id, row.master_table_line, row.outcome_label]),
+    [['MT212', '212', 'Goal met'], ['MT213', '213', 'Mixed'], ['MT214', '214', 'Goal met'], ['MT215', '215', 'Goal met'], ['MT216', '216', 'Goal met'], ['MT217', '217', 'Goal met'], ['MT218', '218', 'Mixed'], ['MT219', '219', 'Goal met'], ['MT220', '220', 'Mixed'], ['MT221', '221', 'Mixed']]);
 });

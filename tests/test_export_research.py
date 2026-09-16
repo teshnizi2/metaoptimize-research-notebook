@@ -24,13 +24,14 @@ WORKSPACE, REPO, DATA_AUDIT = _WORKSPACE.path, _REPO.path, _AUDIT.path
 # (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
 RUN_INVENTORY = _INVENTORY.path
 CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
-RUNS = 2983
-LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12}
+RUNS = 3019
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12, "cvt3": 15, "cvt2": 21}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
 LANDED_IDS = ["MT218"]
 CGN3_IDS = ["MT219"]
+CVT23_IDS = ["MT220", "MT221"]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -76,17 +77,17 @@ class ResearchExportTests(unittest.TestCase):
 
     def test_complete_register_and_area_counts(self):
         data = self.research()
-        self.assertEqual(len(data["experiments"]), 156)
-        self.assertEqual(len({e["id"] for e in data["experiments"]}), 156)
+        self.assertEqual(len(data["experiments"]), 158)
+        self.assertEqual(len({e["id"] for e in data["experiments"]}), 158)
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 156)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 156, "researchQuestions": 138, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 158)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 158, "researchQuestions": 140, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
     @needs(_WORKSPACE)
     def test_register_ids_are_the_campaign_register_plus_the_imported_master_table_rows(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS))
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS) | set(CVT23_IDS))
 
     def test_published_runs_have_unique_identifiers_and_logs(self):
         runs = self.runs()
@@ -430,7 +431,7 @@ class ResearchExportTests(unittest.TestCase):
         data, runs = self.research(), self.runs()
         by_id = {e["id"]: e for e in data["experiments"]}
         phase = next(e for e in data["activity"] if e["id"] == "phase-09")
-        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS + CGN3_IDS))
+        self.assertEqual((phase["date"], phase["kind"], phase["experimentIds"]), ("2026-09-15", "research-phase", APPENDED_IDS + LANDED_IDS + CGN3_IDS + CVT23_IDS))
         self.assertTrue(phase["detail"].startswith("Documented phase: 15-16 Sep 2026. Test: "))
         figures = {"MT212": "page-19", "MT213": "page-19", "MT214": "page-21", "MT215": "page-23", "MT216": "page-19", "MT217": "page-19"}
         batches = dict(zip(APPENDED_IDS, LANDED_BATCH_RUNS))
@@ -502,7 +503,8 @@ class ResearchExportTests(unittest.TestCase):
         self.assertIn("+34.6540 pp = +61.12 SE", rows[0]["result"])
         self.assertEqual(json.loads(rows[0]["intervention"])["arms"], {"MUTE": 3, "DOSE": 3, "INJECT": 3})
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(sorted(r["arm"] for r in intervened.values()), sorted(["MUTE", "DOSE", "INJECT"] * 3))
+        # The exclusion list has since grown (cvt3, cvt2: test_cvt23_rows_come_from_the_pinned_landing_commit); cvt1's rows are unchanged.
+        self.assertEqual(sorted(r["arm"] for r in intervened.values() if r["batch"] == "cvt1"), sorted(["MUTE", "DOSE", "INJECT"] * 3))
         with self.assertRaisesRegex(ValueError, "does not match the pinned landed-row bytes"):
             pinned = model.LANDED_COMMIT
             try:
@@ -515,8 +517,8 @@ class ResearchExportTests(unittest.TestCase):
         data, runs = self.research(), self.runs()
         record = next(e for e in data["experiments"] if e["id"] == "MT218")
         self.assertEqual(sorted(record["runIds"]), sorted(r["id"] for r in runs if r["batch"] == "cvt1"))
-        marked = {r["jobId"] for r in runs if "intervention" in r["parameters"]}
-        self.assertEqual(marked, set(intervened))
+        marked = {r["jobId"] for r in runs if "intervention" in r["parameters"] and r["batch"] == "cvt1"}
+        self.assertEqual(marked, {job for job, r in intervened.items() if r["batch"] == "cvt1"})
         self.assertIn("warning-MT218-intervention", record["warningIds"])
 
     def test_outcome_summary_tables_are_regenerated_from_the_register(self):
@@ -535,8 +537,8 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
             self.assertEqual(int(row["method_checks"]), len(records) - len(research))
             self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
-        self.assertEqual(sum(int(r["records"]) for r in areas), 156)
-        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [47, 41, 27, 23, 18])
+        self.assertEqual(sum(int(r["records"]) for r in areas), 158)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [47, 41, 29, 23, 18])
 
     @needs(_WORKSPACE, _AUDIT)
     def test_goal_outcome_table_keeps_the_report_goals_with_current_counts(self):
@@ -577,7 +579,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_register_table_receipt_records_the_regeneration(self):
         audit = json.loads(DATA_AUDIT.read_text())
         receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
-        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (156, 20, "scripts/register_model.py register"))
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (158, 20, "scripts/register_model.py register"))
 
     # ---- MASTER-TABLE line 219 and the in-place amendments of rows 213 and 218 (campaign commit e3a43da, CORRECTIONS 231: cgn3) ----
     @needs(_REPO)
@@ -611,7 +613,7 @@ class ResearchExportTests(unittest.TestCase):
         model = self.model()
         self.assertEqual(set(model.CGN3_AMENDMENTS), {"MT213", "MT218"})
         before = {r["id"]: r for r in model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO)}
-        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        after = {r["id"]: r for r in model.apply_cgn3_amendments(list(before.values()), REPO)}
         self.assertEqual(set(before), set(after))
         for eid, row in after.items():
             if eid not in model.CGN3_AMENDMENTS:
@@ -627,6 +629,63 @@ class ResearchExportTests(unittest.TestCase):
         drifted = [dict(r, outcome="success") if r["id"] == "MT218" else r for r in before.values()]
         with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 231 amendment"):
             model.apply_cgn3_amendments(drifted, REPO)
+
+    # ---- MASTER-TABLE lines 220-221 and the in-place amendments of rows 213 and 216 (campaign commit 9c5d72a, CORRECTIONS 234-236: cvt3, cvt2) ----
+    @needs(_REPO)
+    def test_cvt23_rows_come_from_the_pinned_landing_commit(self):
+        model = self.model()
+        lines, before = model.cvt23_master_table(REPO), model.cgn3_master_table(REPO)
+        self.assertEqual(len(lines), 221)
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {3, 5, 213, 216})
+        rows = model.cvt23_rows(lines)
+        self.assertEqual([(r["id"], r["section"], r["outcome"], json.loads(r["batches"]), r["mapping_rule"], json.loads(r["figure_ids"])) for r in rows],
+                         [("MT220", "9", "mixed", ["cvt3"], "mixed", ["page-19"]), ("MT221", "9", "mixed", ["cvt2"], "mixed", ["page-19"])])
+        self.assertTrue(rows[0]["reason"].startswith("Verdict: OWN-STEP-NECESSARY + HARNESS-CLEAN + PATCH-BITES + "))
+        self.assertIn("+ TRAIN-AGREES Mixed: OWN-STEP-NECESSARY: ", rows[0]["reason"])
+        self.assertTrue(rows[1]["reason"].startswith("Verdict: GRADED + TOP-ATTENUATED + HARNESS-CLEAN + "))
+        self.assertIn("+ TRAIN-AGREES Mixed: GRADED + TOP-ATTENUATED: ", rows[1]["reason"])
+        self.assertEqual([json.loads(r["intervention"])["arms"] for r in rows],
+                         [{"MUTE50": 3, "MUTEDOWN": 3, "MUTECTL": 3}, {"K13": 3, "K33": 3, "K152": 3, "K691": 3, "K2000": 3}])
+        intervened = model.intervened_runs(REPO)
+        self.assertEqual(sorted(r["batch"] for r in intervened.values()), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15))
+        with self.assertRaisesRegex(ValueError, "does not match the pinned cvt3/cvt2-landing bytes"):
+            pinned = model.CVT23_COMMIT
+            try:
+                model.CVT23_COMMIT = model.CGN3_COMMIT
+                model.cvt23_master_table(REPO)
+            finally:
+                model.CVT23_COMMIT = pinned
+        with self.assertRaisesRegex(ValueError, "exactly lines 220-221"):
+            model.appended_rows(lines[:-1], model.CVT23_ROWS, 220, 221, model.CVT23_COMMIT)
+        self.assertEqual(model.changed_span("abcXdef", "abcYYdef"), ("X", "YY"))
+        data, runs = self.research(), self.runs()
+        by_id = {e["id"]: e for e in data["experiments"]}
+        marked = {r["jobId"] for r in runs if "intervention" in r["parameters"]}
+        self.assertEqual(marked, set(intervened))
+        for eid, batch in [("MT220", "cvt3"), ("MT221", "cvt2")]:
+            self.assertEqual(sorted(by_id[eid]["runIds"]), sorted(r["id"] for r in runs if r["batch"] == batch))
+            self.assertIn(f"warning-{eid}-intervention", by_id[eid]["warningIds"])
+
+    @needs(_WORKSPACE, _REPO)
+    def test_cvt23_amendments_change_wording_only(self):
+        model = self.model()
+        self.assertEqual({eid: spec["number"] for eid, spec in model.CVT23_AMENDMENTS.items()}, {"MT216": 234, "MT213": 236})
+        before = {r["id"]: r for r in model.apply_cgn3_amendments(model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO), REPO)}
+        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        self.assertEqual(set(before), set(after))
+        for eid, row in after.items():
+            if eid not in model.CVT23_AMENDMENTS:
+                self.assertEqual(row, before[eid], eid)
+                continue
+            changed = {key for key in row if row[key] != before[eid].get(key)}
+            self.assertEqual(changed, {"result" if eid == "MT216" else "scope", "sources", "further_amendments"}, eid)
+            self.assertEqual(row["outcome"], before[eid]["outcome"], eid)
+        self.assertIn("ISO sits +1.81 pp above kL", after["MT216"]["result"])
+        self.assertIn("[RESCOPED at cycle 152, CORRECTIONS 234:", after["MT216"]["result"])
+        self.assertTrue(after["MT213"]["scope"].startswith(before["MT213"]["scope"] + " Amended at CORRECTIONS 236: "))
+        drifted = [dict(r, outcome="fail") if r["id"] == "MT216" else r for r in before.values()]
+        with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 234 amendment"):
+            model.apply_cvt23_amendments(drifted, REPO)
 
 
 if __name__ == "__main__":
