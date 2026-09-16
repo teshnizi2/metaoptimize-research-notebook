@@ -242,7 +242,7 @@ def warning_for(experiment):
                          "title": "Wording amended by a later result", "status": "documented",
                          "detail": later["reason"] + " Amendment record: " + later["source"] + "."})
     for further in experiment.get("further_amendments") or []:
-        # Later in-place amendments (CORRECTIONS 234, 236) each keep their own record, keyed on the entry number.
+        # Later in-place amendments (CORRECTIONS 234, 236, 244) each keep their own record, keyed on the entry number.
         warnings.append({"id": f"warning-{experiment['id']}-amendment-{further['number']}", "experimentId": experiment["id"], "severity": "limitation",
                          "title": "Wording amended by a later result", "status": "documented",
                          "detail": further["reason"] + " Amendment record: " + further["source"] + "."})
@@ -400,7 +400,8 @@ def table_contexts(table_root, experiments):
         if path.name in ["packet_file_manifest.csv", "file_manifest.csv", "table_index.csv", "source_fingerprints.csv"]:
             scope += " Historical manifest: its recorded hashes identify original archive/packet files, not these sanitized public copies. Public source hash pairs are available in the source catalog."
         contexts[rel] = {"title": path.stem.replace("_", " ").capitalize(), "experimentIds": sorted(set(linked) & ids), "scope": scope}
-    return contexts
+    # Panel indexes copy notes with their Markdown (`lsm1`, **bold**); the notebook shows them as plain text.
+    return {rel: {**context, "title": register_model.clean(context["title"]), "scope": register_model.clean(context["scope"])} for rel, context in contexts.items()}
 
 
 def publish_tables(workspace, public, experiments, register, figures, areas, run_inventory):
@@ -751,11 +752,12 @@ def validate(data, runs, public):
         verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"cvt4/cvt5 row has no research phase: line {line}")
         linked = [run for run in runs if eid in run["experimentIds"]]
         verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"cvt4/cvt5 row runs not linked: {eid}")
-    for eid, spec in register_model.CVT23_AMENDMENTS.items():
-        row = by_id.get(eid, {})
-        warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment-{spec['number']}"), {})
-        verify(row.get("outcome") == spec["outcome"], f"CORRECTIONS {spec['number']} amendment moved an outcome: {eid}")
-        verify(warning.get("experimentId") == eid and f"line {spec['line']} at {register_model.CVT23_COMMIT[:7]}" in warning.get("detail", "") and warning.get("id") in row.get("warningIds", []), f"CORRECTIONS {spec['number']} amendment warning missing: {eid}")
+    for amendments, commit in [(register_model.CVT23_AMENDMENTS, register_model.CVT23_COMMIT), (register_model.C244_AMENDMENTS, register_model.C244_COMMIT)]:
+        for eid, spec in amendments.items():
+            row = by_id.get(eid, {})
+            warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment-{spec['number']}"), {})
+            verify(row.get("outcome") == spec["outcome"], f"CORRECTIONS {spec['number']} amendment moved an outcome: {eid}")
+            verify(warning.get("experimentId") == eid and f"line {spec['line']} at {commit[:7]}" in warning.get("detail", "") and warning.get("id") in row.get("warningIds", []), f"CORRECTIONS {spec['number']} amendment warning missing: {eid}")
     for eid, spec in register_model.CGN3_AMENDMENTS.items():
         row = by_id.get(eid, {})
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment-231"), {})

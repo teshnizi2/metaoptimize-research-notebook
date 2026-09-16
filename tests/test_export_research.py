@@ -101,6 +101,39 @@ class ResearchExportTests(unittest.TestCase):
             hits = [(path, text[max(0, m.start() - 30):m.end() + 10]) for path, text in strings(value, name) for m in re.finditer(r"\\[*_|`]", text)]
             self.assertEqual(hits, [], name)
 
+    def test_published_text_carries_no_markdown_bold_or_code_marks(self):
+        # The campaign's register export keeps MASTER-TABLE cells as Markdown, so 39 of its 111 rows reached the notebook
+        # with literal ** and backticks in their titles and scopes (and in the verdict warnings built from them), and the
+        # workspace's panel indexes did the same to 80 table scopes. Hrefs are file paths (a__b.csv), not text.
+        def strings(value, path):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if not key.lower().endswith("href"):
+                        yield from strings(item, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    yield from strings(item, f"{path}[{index}]")
+            elif isinstance(value, str):
+                yield path, value
+        for name, value in [("research.json", self.research()), ("runs.json", self.runs())]:
+            hits = [(path, text[max(0, m.start() - 30):m.end() + 12]) for path, text in strings(value, name) for m in re.finditer(r"\*\*|__|`", text)]
+            self.assertEqual(hits, [], name)
+
+    @needs(_WORKSPACE, _REPO)
+    def test_base_register_rows_are_cleaned_like_master_table_rows(self):
+        model = self.model()
+        raw = {r["id"]: r for r in csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")}
+        loaded = {r["id"]: r for r in model.load_unamended_register(WORKSPACE, REPO) if r["id"] in raw}
+        fields = ["goal", "comparison", "why", "result", "reason", "scope", "original_question"]
+        changed = sorted(eid for eid, row in loaded.items() if any(row[f] != raw[eid][f] for f in fields))
+        self.assertEqual(len(changed), 39)
+        self.assertIn("MT033", changed)
+        for eid, row in loaded.items():
+            for field in fields:
+                self.assertEqual(row[field], model.clean(raw[eid][field]), f"{eid}.{field}")
+                self.assertIsNone(re.search(r"\*\*|`", row[field]), f"{eid}.{field}")
+            self.assertEqual((row["id"], row["outcome"], row["kind"], row["corrected"]), (eid, model.remap_base_row(raw[eid])["outcome"], model.remap_base_row(raw[eid])["kind"], model.remap_base_row(raw[eid])["corrected"]))
+
     def test_complete_register_and_area_counts(self):
         data = self.research()
         self.assertEqual(len(data["experiments"]), 160)
@@ -698,7 +731,8 @@ class ResearchExportTests(unittest.TestCase):
         model = self.model()
         self.assertEqual({eid: spec["number"] for eid, spec in model.CVT23_AMENDMENTS.items()}, {"MT216": 234, "MT213": 236})
         before = {r["id"]: r for r in model.apply_cgn3_amendments(model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO), REPO)}
-        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        # load_register applies CORRECTIONS 244 after these; test_c244_amendments_change_wording_only covers that step.
+        after = {r["id"]: r for r in model.apply_cvt23_amendments(list(before.values()), REPO)}
         self.assertEqual(set(before), set(after))
         for eid, row in after.items():
             if eid not in model.CVT23_AMENDMENTS:
@@ -766,6 +800,48 @@ class ResearchExportTests(unittest.TestCase):
         earlier = [r for r in register if r["id"] not in {"MT222", "MT223"}]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt4", "cvt5"} for r in earlier))
         self.assertFalse(any("CORRECTIONS 240" in r.get("sources", "") or "CORRECTIONS 241" in r.get("sources", "") for r in earlier))
+
+    # ---- CORRECTIONS 244 (campaign commit 0ade9cc): in-place bracketed amendments of rows 222 and 223, and line 5 ----
+    @needs(_REPO)
+    def test_c244_master_table_differs_from_the_cvt45_pin_only_by_inserted_brackets(self):
+        model = self.model()
+        lines, before = model.c244_master_table(REPO), model.cvt45_master_table(REPO)
+        self.assertEqual(len(lines), 223)
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {5, 222, 223})
+        for line in (222, 223):
+            old, new = model.table_cells(before[line - 1]), model.table_cells(lines[line - 1])
+            self.assertEqual([i for i in range(7) if old[i] != new[i]], [5], line)
+            self.assertEqual(model.strip_inserted_brackets(new[5], "CORRECTIONS 244"), old[5], line)
+        with self.assertRaisesRegex(ValueError, "does not match the pinned CORRECTIONS 244 bytes"):
+            pinned = model.C244_COMMIT
+            try:
+                model.C244_COMMIT = model.CVT45_COMMIT
+                model.c244_master_table(REPO)
+            finally:
+                model.C244_COMMIT = pinned
+
+    @needs(_WORKSPACE, _REPO)
+    def test_c244_amendments_change_wording_only(self):
+        model = self.model()
+        self.assertEqual({eid: spec["line"] for eid, spec in model.C244_AMENDMENTS.items()}, {"MT222": 222, "MT223": 223})
+        before = {r["id"]: r for r in model.apply_cvt23_amendments(model.apply_cgn3_amendments(model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO), REPO), REPO)}
+        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        self.assertEqual(set(before), set(after))
+        for eid, row in after.items():
+            if eid not in model.C244_AMENDMENTS:
+                self.assertEqual(row, before[eid], eid)
+                continue
+            changed = {key for key in row if row[key] != before[eid].get(key)}
+            self.assertEqual(changed, {"scope", "sources", "further_amendments"}, eid)
+            self.assertEqual(row["outcome"], before[eid]["outcome"], eid)
+            self.assertEqual(model.strip_inserted_brackets(row["scope"], "CORRECTIONS 244"), before[eid]["scope"], eid)
+        self.assertIn("read as SUFFICIENCY at this cell", after["MT222"]["scope"])
+        self.assertIn("not a measured absence of coupling", after["MT222"]["scope"])
+        self.assertIn("equilibrium of the LEVEL only", after["MT223"]["scope"])
+        drifted = [dict(r, outcome="mixed") if r["id"] == "MT222" else r for r in before.values()]
+        with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 244 amendment"):
+            model.apply_c244_amendments(drifted, REPO)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,10 +53,14 @@ test('MT222 and MT223 are the cvt4 and cvt5 rows, both Goal met under the docume
   assert.match(cvt5.reason, /its level settled \(epoch 105\) before its pin \(~160\)/);
   // The licence clause that does not fit this batch travels with the record.
   assert.match(cvt5.scope, /The scorer's printed RESCUE-SURVIVES licence says the exact clamp came 'at ~96-100'; in this batch HEAD's exact-clamp dwell starts at 299\.8 \/ never \/ 299\.8/);
-  // jobs/run_cifar_cvt4.sh lives only on the cluster; the record says so rather than linking something else.
-  assert.deepEqual(warningsOf('MT222').map(w => w.id), ['warning-MT222-verdict', 'warning-MT222-intervention', 'warning-MT222-source-1']);
-  assert.equal(data.warnings.find(w => w.id === 'warning-MT222-source-1')!.detail, 'Referenced source not available: jobs/run_cifar_cvt4.sh');
-  assert.deepEqual(warningsOf('MT223').map(w => w.id), ['warning-MT223-verdict', 'warning-MT223-intervention']);
+  // jobs/run_cifar_cvt4.sh was archived at campaign commit 0ade9cc (CORRECTIONS 244.1): the runner links, no source warning.
+  // Both rows were amended in place at CORRECTIONS 244 (tests/c244-amendments.test.ts).
+  assert.deepEqual(warningsOf('MT222').map(w => w.id), ['warning-MT222-verdict', 'warning-MT222-amendment-244', 'warning-MT222-intervention']);
+  const runner = data.sources.find(s => s.path === 'jobs/run_cifar_cvt4.sh')!;
+  assert.ok(runner && cvt4.codeIds.includes(runner.id), 'MT222 links the archived cvt4 runner');
+  assert.equal(runner.originalSha256, 'c801fc85115f124d82186078a722904a0e8189b94eff44e0daf0e6a7e1c7145d');
+  assert.ok(!data.warnings.some(w => /Referenced source not available: jobs\/run_cifar_cvt4\.sh/.test(w.detail)), 'no record warns that the cvt4 runner is missing');
+  assert.deepEqual(warningsOf('MT223').map(w => w.id), ['warning-MT223-verdict', 'warning-MT223-amendment-244', 'warning-MT223-intervention']);
 });
 
 test('the intervention warnings name every intervened arm and the exclusion list', () => {

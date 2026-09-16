@@ -12,6 +12,9 @@ const fixture = JSON.parse(readFileSync(new URL('./fixtures/register-ids-2026-09
 const data = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8')) as ResearchData;
 const journal = JSON.parse(readFileSync(new URL('../content/journal.json', import.meta.url), 'utf8')) as ActivityEvent[];
 const byId = new Map(data.experiments.map(e => [e.id, e]));
+// Fixtures before fe542ec keep the ** and backtick marks some titles showed then; the importer now removes them
+// (tests/markdown-marks.test.ts), so a title is compared with its marks stripped.
+const plain = (title: string) => title.replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim();
 const partitionIds = Array.from({ length: 37 }, (_, i) => `MT${175 + i}`);
 // MASTER-TABLE lines 212-217 at campaign commit 64e4f47 (cgn1, cpl1, cvh1, cuc1, cgn2, cpl2).
 const appendedIds = Array.from({ length: 6 }, (_, i) => `MT${212 + i}`);
@@ -24,7 +27,7 @@ test('every previously published experiment keeps its ID, title and section', ()
   for (const old of fixture.experiments) {
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
-    assert.equal(current.title, old.title, `${old.id} must not be renumbered onto another row`);
+    assert.equal(current.title, plain(old.title), `${old.id} must not be renumbered onto another row`);
     assert.equal(current.section, old.section, old.id);
   }
 });
@@ -70,7 +73,7 @@ test('all 148 records published before the lines 212-217 import keep their ID, t
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
     assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
-      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+      [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !previous.experiments.some(e => e.id === id));
   assert.deepEqual(added, [...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223'], 'the imports append exactly MT212-MT217, then MT218, then MT219, then MT220-MT221, then MT222-MT223, in line order');
@@ -112,7 +115,7 @@ test('all 154 records published before the line-218 import keep their ID, title,
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
     assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
-      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+      [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before218.experiments.some(e => e.id === id));
   assert.deepEqual(added, ['MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223']);
@@ -131,7 +134,7 @@ test('all 155 records published before the line-219 import keep their ID, title,
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
     assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
-      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+      [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before219.experiments.some(e => e.id === id));
   assert.deepEqual(added, ['MT219', 'MT220', 'MT221', 'MT222', 'MT223']);
@@ -150,7 +153,7 @@ test('all 156 records published before the lines 220-221 import keep their ID, t
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
     assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
-      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+      [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before220.experiments.some(e => e.id === id));
   assert.deepEqual(added, ['MT220', 'MT221', 'MT222', 'MT223']);
@@ -169,7 +172,7 @@ test('all 158 records published before the lines 222-223 import keep their ID, t
     const current = byId.get(old.id);
     assert.ok(current, `${old.id} must not disappear`);
     assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
-      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+      [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before222.experiments.some(e => e.id === id));
   assert.deepEqual(added, ['MT222', 'MT223']);

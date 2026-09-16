@@ -56,6 +56,13 @@ mapping is reviewable in one place and never applied ad hoc:
    cvt3/cvt2 pin only on header lines 3 and 5; no existing row was amended. Their intervened arms (cvt4's
    step-size holds, cvt5's vote weights) are named from the same exclusion list, grown by appended rows only.
 
+9. CORRECTIONS 244 (campaign commit 0ade9cc) inserted bracketed wording amendments into rows 222 and 223 (and line 5,
+   which feeds no record). ``C244_AMENDMENTS`` carries them into MT222 and MT223 without moving an outcome; the pinned
+   file may differ from the cvt4/cvt5 pin only on those three lines, and only by the inserted brackets.
+
+Record text is plain text: ``clean()`` removes Markdown bold, emphasis and code marks from every MASTER-TABLE cell and
+from the text fields of the campaign's register export (``BASE_TEXT_FIELDS``), which copies the cells with their marks.
+
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
 ``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221,
 then MT222-MT223);
@@ -700,6 +707,106 @@ def cvt45_rows(lines: list[str]) -> list[dict]:
     return with_interventions(appended_rows(lines, CVT45_ROWS, CVT45_FIRST_ROW, CVT45_LAST_ROW, CVT45_COMMIT), CVT45_INTERVENTIONS)
 
 
+# ---------------------------------------------------------------------------
+# 9. CORRECTIONS 244: bracketed wording amendments inserted into rows 222 and 223 (and line 5), no outcome moved.
+# ---------------------------------------------------------------------------
+# Campaign commit 0ade9cc (cycle 152, CORRECTIONS 244, the fix track) applied the wording fixes the cvt4 and cvt5
+# verifiers had asked for and the landing had not carried. Each is a pure insertion of one
+# "**[AMENDED at cycle 152, CORRECTIONS 244: ...]**" bracket: two in row 222's so-what cell (sufficiency at this cell;
+# P_COUP a floor location), one leading row 223's so-what cell (the bound first; the equilibrium is the level's), and
+# one on line 5, which feeds no record. Nothing else may differ from the cvt4/cvt5 pin, no line may move, and removing
+# the inserted brackets must give the pinned cell back byte for byte. Both records keep their outcome (Goal met) and
+# gain a warning-<id>-amendment-244 record; the scope takes the amended cell, so the earlier wording stays in it.
+C244_COMMIT = "0ade9ccfd887fdd421f402084227396b83747e4b"
+C244_MASTER_TABLE_SHA256 = "0aa32e5d943788ecf449f58680540637e6f9130045436bd4a6f468f423821e59"
+C244_EDITED_LINES = {5, 222, 223}
+C244_TAG = "CORRECTIONS 244"
+C244_AMENDMENTS = {
+    "MT222": {"line": 222, "outcome": "success", "cell": 5, "number": 244,
+              "reason": ("Outcome unchanged (Goal met). Amended at CORRECTIONS 244, the cvt4 verifier's wording fixes 2 and 3, inserted in "
+                         "brackets with the earlier wording kept: 'the rescue needs 50 on a SMALL step size' is read as sufficiency at this "
+                         "cell -- the one large trajectory tested (MUTE's, replayed) is sufficient to stall, and 50 at the floor or on HEAD's "
+                         "own trajectory is sufficient to keep the rescue; there is no dose curve and no time window. P_COUP ~ 0 is a reading "
+                         "between two arms at the same floor location, not a measured absence of coupling; COUPLING's predicted HOLDHIGH band "
+                         "56-72 was missed by 44.87 pp.")},
+    "MT223": {"line": 223, "outcome": "success", "cell": 5, "number": 244,
+              "reason": ("Outcome unchanged (Goal met). Amended at CORRECTIONS 244, the cvt5 verifier's wording fixes 4 and 5, which reached "
+                         "the landing cut off: the row now leads with its bound -- no branch bar within 4.5 pp, soft stamps (0.96-1.34 pp "
+                         "inside READ_BAR 1.384), and K13's 'pinned' a hover of the median r over the last quarter, not a clamp -- and reads "
+                         "K-DEPENDENT-EQUILIBRIUM as an equilibrium of the level only: K13's TEST settled from ~epoch 105, ~55 epochs before "
+                         "its complement first reached r <= 2.")},
+}
+
+
+def strip_inserted_brackets(text: str, tag: str) -> str:
+    """``text`` without the "[... <tag> ...]" brackets inserted into it (bold marks and one adjacent space included)."""
+    pattern = re.compile(r"(?:\*\*)?\[[^\[\]]*?" + re.escape(tag) + r"[^\[\]]*\](?:\*\*)?")
+    while True:
+        match = pattern.search(text)
+        if not match:
+            return text
+        start, end = match.span()
+        if end < len(text) and text[end] == " ":
+            end += 1
+        elif start > 0 and text[start - 1] == " ":
+            start -= 1
+        text = text[:start] + text[end:]
+
+
+def c244_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at CORRECTIONS 244; only lines 5, 222 and 223 may differ from the cvt4/cvt5 pin, by inserted brackets."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{C244_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != C244_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {C244_COMMIT[:12]} does not match the pinned CORRECTIONS 244 bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = cvt45_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != len(before) or changed != C244_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {C244_COMMIT[:7]} moved a line or edited lines other than {sorted(C244_EDITED_LINES)}: {sorted(changed)}")
+    for n in changed:
+        if strip_inserted_brackets(lines[n - 1], C244_TAG) != before[n - 1]:
+            raise ValueError(f"MASTER-TABLE line {n} at {C244_COMMIT[:7]} changed more than inserted {C244_TAG} brackets")
+    return lines
+
+
+def apply_c244_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply CORRECTIONS 244's bracketed amendments of rows 222 and 223 to their records."""
+    lines, before = c244_master_table(repo), cvt45_master_table(repo)
+    if {a["line"] for a in C244_AMENDMENTS.values()} != C244_EDITED_LINES - {5}:
+        raise ValueError("Every row amended at CORRECTIONS 244 needs exactly one record amendment")
+    missing = set(C244_AMENDMENTS) - {row["id"] for row in rows}
+    if missing:
+        raise ValueError(f"CORRECTIONS 244 amendments name absent records: {sorted(missing)}")
+    amended = []
+    for row in rows:
+        spec = C244_AMENDMENTS.get(row["id"])
+        if not spec:
+            amended.append(row)
+            continue
+        line, number, cell = spec["line"], spec["number"], spec["cell"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if len(old) != 7 or len(new) != 7 or [i for i in range(7) if old[i] != new[i]] != [cell]:
+            raise ValueError(f"MASTER-TABLE line {line} at {C244_COMMIT[:7]} must change exactly cell {cell}")
+        if row["master_table_line"] != str(line):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != spec["outcome"]:
+            raise ValueError(f"{row['id']} outcome drifted before its CORRECTIONS {number} amendment: {row['outcome']} (expected {spec['outcome']})")
+        row = dict(row)
+        if row["scope"].count(clean(old[cell])) != 1:
+            raise ValueError(f"{row['id']}: the amended MASTER-TABLE cell is not in the record's scope exactly once")
+        row["scope"] = row["scope"].replace(clean(old[cell]), clean(new[cell]))
+        sources = json.loads(row.get("sources") or "[]")
+        # Anchors that pinned the row's text at the cvt4/cvt5 landing now point at the amended row.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        row["sources"] = json.dumps([*sources, f"docs/CORRECTIONS.md [CORRECTIONS {number}]"], ensure_ascii=False)
+        further = json.loads(row.get("further_amendments") or "[]")
+        further.append({"number": number, "line": line, "commit": C244_COMMIT, "previousOutcome": spec["outcome"], "outcome": spec["outcome"],
+                        "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {C244_COMMIT[:7]}; CORRECTIONS {number}"})
+        row["further_amendments"] = json.dumps(further, ensure_ascii=False)
+        amended.append(row)
+    return amended
+
+
 def amended_master_table(repo: Path) -> list[str]:
     """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
     raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
@@ -899,9 +1006,18 @@ def appended_rows(lines: list[str], mapping: dict | None = None, first: int = AP
     return rows
 
 
+BASE_TEXT_FIELDS = ["goal", "comparison", "why", "result", "reason", "scope", "original_question"]
+
+
 def remap_base_row(row: dict) -> dict:
-    """Four outcomes plus the corrected badge for one row of the base register."""
+    """Four outcomes plus the corrected badge for one row of the base register, its text cleaned like a MASTER-TABLE cell."""
     row = dict(row)
+    # The campaign's register export copies MASTER-TABLE cells with their Markdown (**bold**, `code`); 39 of its 111 rows
+    # carry marks. Rows parsed from MASTER-TABLE here go through clean(), so the base rows must too, or their titles,
+    # scopes and verdict warnings show literal ** and backticks. clean() changes nothing else in these rows.
+    for key in BASE_TEXT_FIELDS:
+        if key in row:
+            row[key] = clean(row[key])
     if row["outcome"] == "correction":
         if row["id"] not in CORRECTION_REMAP:
             raise ValueError(f"Register outcome 'correction' has no approved mapping: {row['id']}")
@@ -921,9 +1037,9 @@ def remap_base_row(row: dict) -> dict:
 def load_register(workspace: Path, repo: Path) -> list[dict]:
     """The published register: every row below, with the pinned in-place row amendments applied (229, then 231, then 234/236).
 
-    The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row, so it adds no amendment step."""
+    The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
-    return apply_cvt23_amendments(register, Path(repo))
+    return apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo))
 
 
 def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
