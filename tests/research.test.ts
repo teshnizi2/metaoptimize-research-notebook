@@ -103,3 +103,8 @@ test('published research outcomes and method checks are counted separately',()=>
   assert.equal(e.corrected,Boolean(e.correction),e.id);
  }
 });
+
+test('search finds both editorial wording and the exact registered evidence',()=>{
+ assert.deepEqual(filterExperiments(published.experiments,{query:'timing isolated tensor'}).map(e=>e.id),['MT227']);
+ assert.deepEqual(filterExperiments(published.experiments,{query:'CO-PRIMARIES P_MID'}).map(e=>e.id),['MT227']);
+});
