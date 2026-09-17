@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import type { ResearchData } from '../src/types.ts';
 
 // The final audit of the cvt8 / cvt9 landing (CORRECTIONS 253.15; campaign commit 3cf4201). Wording only: no ID, title,
@@ -35,8 +35,10 @@ test("MT226 counts the DOSE-family accounts exactly: four, three of them hit 6 o
   for (const text of publishedTextOf('MT226')) assert.doesNotMatch(text, /the three DOSE accounts/);
   const record = byId.get('MT226')!;
   assert.match(record.reason, /no registered account fits every band: of the four DOSE-family accounts, three hit 6 of 7 \(DOSE x DIRECT misses HIGHISOPATH by 2\.19 pp\) and DOSE x VIA hits 5,/);
-  // The source package ships docs/MAINTENANCE_PUBLIC.md in place of the maintainer guide, which alone documents CVT89_ROWS.
-  const maintenance = readFileSync(new URL('../docs/MAINTENANCE.md', import.meta.url), 'utf8');
+  // The maintainer guide is checked where it exists: the Vercel upload leaves docs/ out (.vercelignore), and the source package
+  // ships docs/MAINTENANCE_PUBLIC.md in its place, which does not document CVT89_ROWS.
+  const guide = new URL('../docs/MAINTENANCE.md', import.meta.url);
+  const maintenance = existsSync(guide) ? readFileSync(guide, 'utf8') : '';
   assert.doesNotMatch(maintenance, /three DOSE accounts hit 6 of 7/);
   if (maintenance.includes('`CVT89_ROWS` imports')) assert.match(maintenance, /of the four DOSE-family accounts three hit 6 of 7 and DOSE x VIA hits 5/);
 });
