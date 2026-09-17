@@ -1,0 +1,161 @@
+#!/bin/bash
+# =============================================================================
+# cVT6_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `cvt6` HARNESS TREE.
+#   (CORRECTIONS 242.)  Touches NO existing file.  Submits nothing.
+#
+# WHY AN ISOLATED TREE.  `cvt6` needs PATCH_COMPHOLD (patches/patch_comphold.py) in HF.py and the replay file
+# patches/cvt6_headpath.json next to it.  The live shared harness, cvt1's tree ($WS/harness_cvt1) and cvt4's tree
+# ($WS/harness_cvt4, HF.py 84b345ad...) are REGISTERED trees landed batches ran from and are not edited.  So cvt6
+# gets its own tree: a byte-identical copy of cvt4's tree with PATCH_COMPHOLD applied on top of cvt4's HF.py, the
+# replay file (and the TEST-ONLY file cvt6_testdown.json, read only by tests/test_comphold*.py) beside it, and its own
+# runner that differs from jobs/run_cifar.sh in its `cd` line only.
+#
+# WHAT IT BUILDS (under $METAOPT_WS, every path new and cvt6-namespaced):
+#   harness_cvt6/cifar10/                every file of cvt4's tree (data excepted), byte-identical, except HF.py
+#   harness_cvt6/cifar10/data  ->        SYMLINK to the live tree's data/ (the same target as cvt4's)
+#   harness_cvt6/cifar10/Optimizers/HF.py.pre_comphold   cvt4's HF.py bytes (HF_PRE_SHA 84b345ad...)
+#   harness_cvt6/cifar10/Optimizers/HF.py                = cvt4's HF.py + PATCH_COMPHOLD (HF_POST_SHA)
+#   harness_cvt6/cifar10/Optimizers/cvt6_headpath.json   = patches/cvt6_headpath.json (REPLAY_SHA)
+#   harness_cvt6/cifar10/Optimizers/cvt6_testdown.json   = patches/cvt6_testdown.json (TESTDOWN_SHA; tests only)
+#   jobs/run_cifar_cvt6.sh               jobs/run_cifar.sh with EXACTLY the cd line changed
+#   harness_cvt6/STAGE-MANIFEST.txt      sha256 of every staged file
+#
+# USAGE
+#   bash bin/cVT6_stage_harness.sh            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cVT6_stage_harness.sh --stage    # build it (refuses if it exists)
+# =============================================================================
+set -u
+MODE=verify; [ "${1:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+SRC=$WS/harness_cvt4/cifar10
+SRC1=$WS/harness_cvt1/cifar10
+HROOT=$WS/harness_cvt6
+DEST=$HROOT/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+RUNNER=$WS/jobs/run_cifar_cvt6.sh
+PATCH_CH=$REPO/patches/patch_comphold.py
+REPLAY=$REPO/patches/cvt6_headpath.json
+TESTDOWN=$REPO/patches/cvt6_testdown.json
+POST_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_CVT1_SHA=3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52
+HF_PRE_SHA=84b345adf6df8024bbe4c694fcbbaffc6211d1c7b7ae4b9ae933e353298a3d96
+HF_POST_SHA=f1b9c8aa87953c2fd3f64145126591608d332812183911a39ce9f525101edd2e
+REPLAY_SHA=74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d
+TESTDOWN_SHA=ae17432f2a1e7a5399b441c87328f244ffd2f3b488c0208c734d83ebf1aa0198
+RUNNER_SHA=9aa2ed5c15b8ecd8c22d5137ab4be169b97f9556ebe67b8460c4971d4f84783f
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+src_files() { (cd "$SRC" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cVT6_stage_harness: mode=$MODE  WS=$WS"
+echo "  source tree $SRC (cvt4's, read only)"
+echo "  cvt6 tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  for f in "$PATCH_CH" "$REPLAY" "$TESTDOWN"; do [ -f "$f" ] || { echo "!!! $f is missing"; exit 2; }; done
+  [ "$(sha "$REPLAY")" = "$REPLAY_SHA" ] || { echo "!!! $REPLAY sha != pinned $REPLAY_SHA"; exit 2; }
+  [ "$(sha "$TESTDOWN")" = "$TESTDOWN_SHA" ] || { echo "!!! $TESTDOWN sha != pinned $TESTDOWN_SHA"; exit 2; }
+  [ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] || { echo "!!! cvt4's HF.py sha != pinned $HF_PRE_SHA"; exit 2; }
+  [ "$(sha "$SRC/build_network.py")" = "$POST_SHA" ] || { echo "!!! cvt4's build_network.py sha != pinned $POST_SHA"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(src_files); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f" || exit 2
+  done
+  ln -s "$(readlink "$SRC/data")" "$DEST/data" || exit 2
+  HF_PATH="$DEST/Optimizers/HF.py" python3 "$PATCH_CH" || { echo "!!! patch_comphold failed"; exit 2; }
+  cp "$REPLAY" "$DEST/Optimizers/cvt6_headpath.json" || exit 2
+  cp "$TESTDOWN" "$DEST/Optimizers/cvt6_testdown.json" || exit 2
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "SRC $SRC"; echo "DEST $DEST"
+    echo "PATCH_COMPHOLD_SHA256 $(sha "$PATCH_CH")"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+# ---------------------------------------------------------------- VERIFY ------
+[ -d "$DEST" ] || { echo "!!! no cvt6 tree at $DEST -- run with --stage"; exit 2; }
+N=0
+for f in $(src_files); do
+  [ "$f" = ./Optimizers/HF.py ] && continue
+  if [ ! -f "$DEST/$f" ]; then bad "V-a $f missing from the cvt6 tree"; continue; fi
+  [ "$(sha "$SRC/$f")" = "$(sha "$DEST/$f")" ] && N=$((N+1)) || bad "V-a $f differs from cvt4's tree"
+done
+echo "V-a: $N files byte-identical to cvt4's tree (Optimizers/HF.py excepted)"
+EXTRA=$(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do
+          [ -f "$SRC/$f" ] || [ "$f" = ./Optimizers/HF.py.pre_comphold ] || [ "$f" = ./Optimizers/cvt6_headpath.json ] \
+            || [ "$f" = ./Optimizers/cvt6_testdown.json ] || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no file in the cvt6 tree beyond cvt4's except HF.py.pre_comphold, cvt6_headpath.json, cvt6_testdown.json" \
+  || bad "V-a2 extra files: $EXTRA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_comphold")" = "$HF_PRE_SHA" ] && echo "V-h: HF.py.pre_comphold sha == cvt4's HF.py == pinned $HF_PRE_SHA" \
+  || bad "V-h HF.py.pre_comphold sha != pinned $HF_PRE_SHA"
+[ "$(sha "$DEST/Optimizers/HF.py")" = "$HF_POST_SHA" ] && echo "V-h2: cvt6 HF.py sha == pinned post $HF_POST_SHA" \
+  || bad "V-h2 cvt6 HF.py sha $(sha "$DEST/Optimizers/HF.py") != pinned post $HF_POST_SHA"
+[ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] && echo "V-h3: cvt4's HF.py is still $HF_PRE_SHA (untouched)" \
+  || bad "V-h3 cvt4's HF.py has moved"
+[ "$(sha "$SRC1/Optimizers/HF.py")" = "$HF_CVT1_SHA" ] && echo "V-h3b: cvt1's HF.py is still $HF_CVT1_SHA (untouched)" \
+  || bad "V-h3b cvt1's HF.py has moved"
+grep -q -E 'PATCH_COMPHOLD|COMP_HOLD' "$SRC/Optimizers/HF.py" "$SRC1/Optimizers/HF.py" && bad "V-h4 cvt4's or cvt1's HF.py carries PATCH_COMPHOLD" \
+  || echo "V-h4: neither cvt4's nor cvt1's HF.py carries a PATCH_COMPHOLD / COMP_HOLD marker"
+grep -q -E 'PATCH_COMPHOLD|COMP_HOLD' "$LIVE/Optimizers/HF.py" && bad "V-h5 the LIVE HF.py carries PATCH_COMPHOLD" \
+  || echo "V-h5: the LIVE HF.py carries NO PATCH_COMPHOLD / COMP_HOLD marker"
+[ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] && echo "V-h6: the LIVE HF.py is still $HF_LIVE_SHA (untouched)" \
+  || echo "V-h6: NOTE -- the LIVE HF.py has moved ($(sha "$LIVE/Optimizers/HF.py")); the cvt6 tree does not read it."
+[ "$(sha "$DEST/Optimizers/cvt6_headpath.json")" = "$REPLAY_SHA" ] && [ "$(sha "$REPLAY")" = "$REPLAY_SHA" ] \
+  && echo "V-j: the tree's cvt6_headpath.json == the repo's == pinned $REPLAY_SHA" || bad "V-j replay file sha != pinned $REPLAY_SHA"
+[ "$(sha "$DEST/Optimizers/cvt6_testdown.json")" = "$TESTDOWN_SHA" ] && echo "V-j2: the tree's cvt6_testdown.json == pinned $TESTDOWN_SHA (tests only)" \
+  || bad "V-j2 test-only file sha != pinned $TESTDOWN_SHA"
+[ "$(sha "$DEST/build_network.py")" = "$POST_SHA" ] && echo "V-b: cvt6 build_network.py == cpl1's POST_SHA $POST_SHA" \
+  || bad "V-b cvt6 build_network.py != $POST_SHA"
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink, cvt4's target)" \
+  || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-100-python" ] && echo "V-c2: CIFAR-100 visible through the symlink" || bad "V-c2 cifar-100-python not visible"
+if [ -f "$RUNNER" ]; then
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  D=$(printf '%s\n' "$DL" | grep -c '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST" && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ]; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST (sha $RUNNER_SHA)"
+  else
+    bad "V-d the runner diff is not exactly the cd line (or its sha is not $RUNNER_SHA):"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+else
+  bad "V-d no runner at $RUNNER"
+fi
+TMPF=/tmp/cvt6_stage.$$
+if python3 "$REPO/tests/test_plainnet.py" --pre "$DEST/build_network.py.pre_plainnet" --post "$DEST/build_network.py" \
+     --hf "$DEST/Optimizers/HF.py" --csv "$REPO/results/all_runs.csv" >$TMPF.tp 2>&1; then
+  echo "V-e: tests/test_plainnet.py passes on the cvt6 tree ($(grep -c '^  PASS' $TMPF.tp) PASS)"
+else
+  bad "V-e tests/test_plainnet.py FAILS on the cvt6 tree"; grep '^  FAIL' $TMPF.tp | head
+fi
+if python3 "$REPO/tests/test_comphold.py" --pre "$DEST/Optimizers/HF.py.pre_comphold" --post "$DEST/Optimizers/HF.py" \
+     --structural-only >$TMPF.ch 2>&1; then
+  echo "V-f: tests/test_comphold.py C0 (structure: deleting the four regions == cvt4's HF.py, byte for byte) passes ($(grep -c '^  PASS' $TMPF.ch) PASS)"
+else
+  bad "V-f tests/test_comphold.py C0 FAILS on the cvt6 tree"; grep '^  FAIL' $TMPF.ch | head
+fi
+if python3 "$REPO/tests/test_betahold.py" --pre "$DEST/Optimizers/HF.py.pre_betahold" --post "$DEST/Optimizers/HF.py.pre_comphold" \
+     --structural-only >$TMPF.bh 2>&1; then
+  echo "V-g: tests/test_betahold.py B0 (UNEDITED) passes on the base: HF.py.pre_comphold == cvt1's HF.py + PATCH_BETAHOLD ($(grep -c '^  PASS' $TMPF.bh) PASS)"
+else
+  bad "V-g tests/test_betahold.py B0 FAILS on HF.py.pre_comphold"; grep '^  FAIL' $TMPF.bh | head
+fi
+rm -f $TMPF.tp $TMPF.ch $TMPF.bh
+[ "$FAIL" = 0 ] && { echo "cVT6_stage_harness: VERIFIED"; exit 0; } || { echo "cVT6_stage_harness: NOT CONSISTENT"; exit 2; }

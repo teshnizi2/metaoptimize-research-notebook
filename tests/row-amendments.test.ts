@@ -49,8 +49,8 @@ test('the four other amended rows keep their outcome and carry the amendment not
 });
 
 test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw logs', () => {
-  assert.equal(runs.length, 3049);
-  assert.equal(data.meta.stats.runs, 3049);
+  assert.equal(runs.length, 3085);
+  assert.equal(data.meta.stats.runs, 3085);
   const batches: Record<string, [string, number]> = { cgn1: ['MT212', 6], cpl1: ['MT213', 15], cvh1: ['MT214', 12], cuc1: ['MT215', 30], cgn2: ['MT216', 15], cpl2: ['MT217', 15] };
   const landed = runs.filter(run => run.batch in batches);
   assert.equal(landed.length, 93);
@@ -75,11 +75,14 @@ test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw l
   // cvt1 landed at CORRECTIONS 230 and is MT218 (tests/cvt1-landing.test.ts); cgn3 landed at CORRECTIONS 231 and is MT219
   // (tests/cgn3-landing.test.ts); cvt3 and cvt2 landed at CORRECTIONS 235 and 236 and are MT220 and MT221
   // (tests/cvt3-cvt2-landing.test.ts); cvt4 and cvt5 landed at CORRECTIONS 240 and 241 and are MT222 and MT223
-  // (tests/cvt4-cvt5-landing.test.ts). Each has exactly one record.
+  // (tests/cvt4-cvt5-landing.test.ts); cvt6 and cvt7 landed at CORRECTIONS 246 and 247 and are MT224 and MT225
+  // (tests/cvt6-cvt7-landing.test.ts). Each has exactly one record.
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt1')).map(e => e.id), ['MT218']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cgn3')).map(e => e.id), ['MT219']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt3')).map(e => e.id), ['MT220']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt2')).map(e => e.id), ['MT221']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt4')).map(e => e.id), ['MT222']);
   assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt5')).map(e => e.id), ['MT223']);
+  assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt6')).map(e => e.id), ['MT224']);
+  assert.deepEqual(data.experiments.filter(e => e.batches.includes('cvt7')).map(e => e.id), ['MT225']);
 });

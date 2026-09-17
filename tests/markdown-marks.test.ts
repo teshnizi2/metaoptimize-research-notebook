@@ -30,7 +30,9 @@ test('no published record text carries a Markdown bold or code mark (**, __, `)'
 test('every record keeps its ID, section, area, kind, outcome and Corrected badge; a title changes only by losing marks', () => {
   assert.equal(fixture.experiments.length, 160);
   const byId = new Map(data.experiments.map(e => [e.id, e]));
-  assert.deepEqual(data.experiments.map(e => e.id), fixture.experiments.map(e => e.id));
+  // MT224 and MT225 (cvt6, cvt7) were appended after the fix (tests/cvt6-cvt7-landing.test.ts).
+  assert.deepEqual(data.experiments.slice(0, 160).map(e => e.id), fixture.experiments.map(e => e.id));
+  assert.deepEqual(data.experiments.slice(160).map(e => e.id), ['MT224', 'MT225']);
   const plain = (text: string) => text.replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim();
   let retitled = 0;
   for (const old of fixture.experiments) {

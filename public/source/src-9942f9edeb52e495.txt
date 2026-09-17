@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""cvt6 REGISTRATION-TIME DERIVATIONS (CORRECTIONS 242).  Reads ONLY landed probe records of cvt1, cvt2, cvt3,
+cvt4 and cvt5 and the corpus through analysis/corpus_exclusions.filter_rows.  Nothing here reads a cvt6 run.
+What it prints is copied into analysis/cVT6_complementpath_score.py as LITERALS (the replay file's sha256, the
+noise floor); that scorer's selftest re-runs derive_knots() on the host's records and requires equality.
+
+THE QUESTION (240.4(1), 241.12 R1).  In cvt4's HOLDHIGH, 50's large step size stalled the arm, but the
+complement's (group 0's) free Lion beta ALSO collapsed early, on MUTE's path.  So P_HIGH changed both, and the
+batch cannot say whether 50's large step size stalls the network DIRECTLY or THROUGH the complement's early
+collapse.  cvt6 crosses 50's hold (LOW = the floor, HIGH = tri:9428) with an exogenous hold on the complement's
+beta (FREE Lion, or FORCED onto a recorded path: HEADPATH = HEAD's measured complement trajectory; MUTEPATH =
+MUTE's shared collapse trajectory).  The group-0 hold is PATCH_COMPHOLD (patches/patch_comphold.py; ENV
+COMP_HOLD=tri:<P> | rec:<id>), additive on top of cvt4's PATCH_BETAHOLD tree.
+
+THE TWO RECORDED PATHS, and what form each takes (the brief asked: closed form, or an exact replay file?)
+  MUTEPATH  MUTE's shared beta IS a max-rate triangle (237.3: <= 0.114 log units over 24 runs), and in cvt4's
+            HOLDHIGH the free complement followed it within 0.064-0.160.  So MUTEPATH is the CLOSED FORM
+            tri:9428 -- RULE P of 237.3, re-derived here on this host's records (S3).  No new number.
+  HEADPATH  HEAD's complement beta is NOT a triangle (S1): it rises at the maximum Lion rate to ~-4.85 at epoch
+            ~18, falls at the maximum rate for ~2 epochs, then DRIFTS DOWN SLOWLY (~-6.9 at 30, ~-7.9 at 40,
+            ~-9.7 at 50, ~-12.9 at 60) and reaches the -15 clamp by magnitude at epoch ~62-66.  The best
+            max-rate triangle misses every run by several log units (S1), and a hand-built closed form would
+            be a fit with free knots.  So HEADPATH is an EXACT REPLAY FILE of the measured median, knot by knot.
+
+RULE H (written here, before any cvt6 run).  Source: HEAD's complement beta[0] in every landed 100-epoch HEAD run
+at this cell with probe records -- cvt1 HEAD s78-80, cvt2 HEAD s87-89, cvt3 HEAD s84-86, cvt4 HEAD s90-92 (12
+runs; cvt5's HEAD runs are 300-epoch runs and are held OUT as an out-of-sample check).  For record index
+k = 0..499 (step s = 100k, written after meta update n = s + 2):
+      v_k = median over the 12 runs of the record's beta[0]      (python double; mean of the 6th and 7th values)
+      n_k = 100k + 2
+The file patches/cvt6_headpath.json stores {id, rule, source, n, v}.  The patch's schedule for update n:
+      n <  n_0            hold(n) = b0 (the group's own initial beta; update 1 is Lion's no-op)
+      n_k <= n < n_{k+1}  hold(n) = v_k + (v_{k+1} - v_k) * (n - n_k) / float(n_{k+1} - n_k)
+      n >= n_last         hold(n) = v_last
+      then min(hi, max(lo, .)) and stored into float32.
+  TOLERANCE, stated (S2): at every one of the 500 record steps the applied value IS float32(v_k), within
+  <= 1e-6 of the measured median; between records it is linear, while every measured trajectory moves by at
+  most 100 ms = 0.1 log units between two records -- so the schedule is within 0.1 log units of the
+  piecewise-exact median path at every update.  Against the individual runs the spread is reported, not hidden.
+
+Sections:
+  S1  HEAD's complement: per run phases; the best max-rate triangle's miss (why a replay file)
+  S2  RULE H: the knots, the file, fidelity in-sample (12 runs) and out-of-sample (cvt5 HEAD first 100 epochs,
+      cvt4 HOLDLOW / HOLDHEAD complements); r = exp(beta + 15) window means, schedule vs runs
+  S3  MUTEPATH = tri:P_HIGH, RULE P re-run; cvt4 HOLDHIGH's free complement and MUTE's shared beta vs v_9428;
+      how far HEADPATH and MUTEPATH are apart (the contrast the design makes)
+  S4  G-BITE non-vacuity on landed records: the BROKEN-COMP_HOLD null of each forced arm is the landed FREE
+      complement of the matching cvt4 arm -- HIGHHEADPATH's null is HOLDHIGH's complement, LOWMUTEPATH's and
+      LOWHEADPATH's null is HOLDLOW's complement; each read against its schedule misses by >> BH_TOL
+  S5  the meta-optimiser's state when BOTH groups are held (Lion momentum: dead state), stated
+  S6  the noise floor on the current corpus, 227.6's definitions, through corpus_exclusions.filter_rows
+
+  python3 analysis/cvt6_registration_derivations.py <runs dir holding cvt1/ .. cvt5/> [<all_runs.csv>] [--write <json>]
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import cvt4_registration_derivations as DV4      # registered at 237, imported UNEDITED (b0, ms, v_of, RULE P, Lion)
+sys.path.pop(0)
+
+B0, MS, LO, HI, BH_TOL, f32 = DV4.B0, DV4.MS, DV4.LO, DV4.HI, DV4.BH_TOL, DV4.f32
+N_RECORDS = 500
+STEPS_PER_EPOCH = 500
+SRC_HEADC = (("cvt1", "HEAD", (78, 79, 80)), ("cvt2", "HEAD", (87, 88, 89)), ("cvt3", "HEAD", (84, 85, 86)),
+             ("cvt4", "HEAD", (90, 91, 92)))
+OOS_HEADC = (("cvt5", "HEAD", (93, 94, 95)), ("cvt4", "HOLDLOW", (90, 91, 92)), ("cvt4", "HOLDHEAD", (90, 91, 92)))
+FILE_ID = "cvt6_headpath"
+RULE_TEXT = ("RULE H (CORRECTIONS 242): v_k = median over the 12 landed 100-epoch HEAD runs (cvt1 s78-80, cvt2 "
+             "s87-89, cvt3 s84-86, cvt4 s90-92) of probe record k's complement beta[0]; n_k = 100k + 2")
+TEST_ID = "cvt6_testdown"
+
+
+def load(runs, batch, arm, seed, n=N_RECORDS):
+    p = os.path.join(runs, batch, "probe_%s-%s-s%d" % (batch, arm, seed), "probe.jsonl")
+    out = []
+    for ln in open(p):
+        if ln.strip():
+            out.append(json.loads(ln))
+            if len(out) >= n:
+                break
+    return out
+
+
+def traj(recs, g=0):
+    return [(r["step"], float(r["beta"][g])) for r in recs]
+
+
+def median(v):
+    v = sorted(v)
+    m = len(v)
+    return v[m // 2] if m % 2 else 0.5 * (v[m // 2 - 1] + v[m // 2])
+
+
+def source_runs(runs, src, g=0):
+    out = []
+    for batch, arm, seeds in src:
+        for s in seeds:
+            recs = load(runs, batch, arm, s)
+            if [r["step"] for r in recs] != [100 * k for k in range(N_RECORDS)]:
+                raise SystemExit("!!! %s-%s-s%d: records are not steps 0..49900 every 100" % (batch, arm, s))
+            out.append(("%s-%s-s%d" % (batch, arm, s), traj(recs, g)))
+    return out
+
+
+def derive_knots(runs):
+    """RULE H.  -> (n list, v list, source names)"""
+    src = source_runs(runs, SRC_HEADC, 0)
+    n = [100 * k + 2 for k in range(N_RECORDS)]
+    v = [median([tr[k][1] for _nm, tr in src]) for k in range(N_RECORDS)]
+    return n, v, [nm for nm, _tr in src]
+
+
+def knots_json(n, v, names):
+    """the replay file's bytes -- deterministic (json floats are repr, round-trip exact)."""
+    return json.dumps({"id": FILE_ID, "rule": RULE_TEXT, "source": names, "n": n, "v": v},
+                      sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def test_json():
+    """a TEST-ONLY replay file (never a batch arm): rises at the natural rate to update 102, then falls to the clamp
+    by update 302 -- so a 300-step real run shows the rec: mode departing from the natural rise."""
+    return json.dumps({"id": TEST_ID, "rule": "TEST ONLY (CORRECTIONS 242.4): never used by a cvt6 arm",
+                       "source": [], "n": [2, 102, 302], "v": [f32(B0 + MS), f32(B0 + 101 * MS), LO]},
+                      sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def rec_value(n, kn, kv, b0=B0):
+    """the patch's rec: schedule, as float32 -- the SAME arithmetic, in the same order, as _ch_value."""
+    if n < kn[0]:
+        x = b0
+    elif n >= kn[-1]:
+        x = kv[-1]
+    else:
+        lo_, hi_ = 0, len(kn) - 1
+        while hi_ - lo_ > 1:                       # largest k with kn[k] <= n
+            mid = (lo_ + hi_) // 2
+            if kn[mid] <= n:
+                lo_ = mid
+            else:
+                hi_ = mid
+        k = lo_
+        x = kv[k] + (kv[k + 1] - kv[k]) * (n - kn[k]) / float(kn[k + 1] - kn[k])
+    return f32(min(HI, max(LO, x)))
+
+
+def r_window(tr, lo, hi):
+    v = [math.exp(b + 15.0) for s, b in tr if lo <= s / float(STEPS_PER_EPOCH) < hi]
+    return sum(v) / len(v)
+
+
+def sched_traj_rec(kn, kv):
+    return [(100 * k, rec_value(100 * k + 2, kn, kv)) for k in range(N_RECORDS)]
+
+
+def sched_traj_tri(P):
+    return [(100 * k, DV4.v_of(100 * k + 2, P)) for k in range(N_RECORDS)]
+
+
+def dev(tr, sched):
+    d = [abs(b - v) for (_s, b), (_t, v) in zip(tr, sched)]
+    return max(d), sum(d) / len(d), sum(x > BH_TOL for x in d)
+
+
+def mag_pin_epoch(tr, rmax=2.0):
+    """first epoch after the peak from which r = exp(beta+15) stays <= rmax for good (cvh1's magnitude form)"""
+    kpk = max(range(len(tr)), key=lambda i: tr[i][1])
+    for k in range(kpk, len(tr)):
+        if all(math.exp(b + 15.0) <= rmax for _s, b in tr[k:]):
+            return tr[k][0] / float(STEPS_PER_EPOCH)
+    return None
+
+
+def at(tr, ep):
+    k = min(range(len(tr)), key=lambda i: abs(tr[i][0] - ep * STEPS_PER_EPOCH))
+    return tr[k][1]
+
+
+def best_triangle(tr):
+    best, bestP = DV4.min_over_P_maxdev(tr)
+    return best, bestP
+
+
+CELLKEYS = DV4.CELLKEYS
+
+
+def floor(csvpath):
+    sys.path.insert(0, HERE)
+    import corpus_exclusions as CE
+    sys.path.pop(0)
+    naive = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith("cvt6-")]
+    filt = CE.filter_rows(naive)
+    return {"rows": len(naive), "rows_filtered": len(filt),
+            "R18ALL": DV4.pooled_sigma(filt, "ResNet18_c100"), "PLAIN": DV4.pooled_sigma(filt, "PlainNet18_c100"),
+            "R18ALL_naive": DV4.pooled_sigma(naive, "ResNet18_c100"), "PLAIN_naive": DV4.pooled_sigma(naive, "PlainNet18_c100"),
+            "tsv_sha": hashlib.sha256(open(os.path.join(os.path.dirname(HERE), "results", "CORPUS-EXCLUSIONS.tsv"), "rb").read()).hexdigest()}
+
+
+def main():
+    argv = list(sys.argv[1:])
+    write = None
+    if "--write" in argv:
+        i = argv.index("--write")
+        write = argv[i + 1]
+        del argv[i:i + 2]
+    runs = argv[0] if argv else os.path.join(os.path.dirname(os.path.dirname(HERE)), "runs_cluster_b")
+    csvpath = argv[1] if len(argv) > 1 else os.path.join(os.path.dirname(HERE), "results", "all_runs.csv")
+    print("cvt6 registration derivations (CORRECTIONS 242)")
+    print("  runs %s" % runs)
+    print("  b0 = float32(log 1e-6) = %r ; ms = %r ; clamp [%r, %r] ; BH_TOL %r" % (B0, MS, LO, HI, BH_TOL))
+
+    src = source_runs(runs, SRC_HEADC, 0)
+    print("\nS1  HEAD's COMPLEMENT beta[0] IS NOT A MAX-RATE TRIANGLE (12 landed 100-epoch HEAD runs)")
+    print("  %-16s %-18s %-8s %-8s %-8s %-8s %-8s %-8s %-10s %-9s %s" % ("run", "peak (epoch)", "@20", "@30", "@40", "@50", "@60",
+                                                                   "@80", "r<=2 from", "clamp", "best triangle: max|dev| (P)"))
+    worst_tri = 1e9
+    rise_dev = []
+    for nm, tr in src:
+        s_pk, b_pk = DV4.peak(tr)
+        bt, bP = best_triangle(tr)
+        worst_tri = min(worst_tri, bt)
+        pe = DV4.pin_epoch(tr)
+        print("  %-16s %.4f (%5.1f)   %-8.3f %-8.3f %-8.3f %-8.3f %-8.3f %-8.3f %-10s %-9s %.3f (%d)"
+              % (nm, b_pk, s_pk / 500.0, at(tr, 20), at(tr, 30), at(tr, 40), at(tr, 50), at(tr, 60), at(tr, 80),
+                 "%.1f" % mag_pin_epoch(tr), "never" if pe is None else "%.1f" % pe, bt, bP))
+        rise_dev.append(max(abs(b - DV4.v_of(s + 2, 10 ** 6)) for s, b in tr if s <= s_pk))
+    print("  phase 1 (init -> peak) is the max-rate rise: max |record - (b0 + ms (n-1))| up to the peak, per run, %.4f .. %.4f"
+          % (min(rise_dev), max(rise_dev)))
+    print("  => the BEST max-rate triangle misses EVERY run by >= %.3f log units somewhere: a closed-form triangle cannot"
+          " replay HEAD's complement; RULE H replays the measured median instead." % worst_tri)
+
+    print("\nS2  RULE H -> the replay file")
+    kn, kv, names = derive_knots(runs)
+    body = knots_json(kn, kv, names)
+    sha = hashlib.sha256(body.encode()).hexdigest()
+    print("  source (%d runs): %s" % (len(names), " ".join(names)))
+    print("  knots %d, n %d..%d every 100; v_0 %r (== float32(b0 + ms) %r: %s); v_last %r; max v %r at knot %d (epoch %.1f)"
+          % (len(kn), kn[0], kn[-1], kv[0], f32(B0 + MS), kv[0] == f32(B0 + MS), kv[-1], max(kv), kv.index(max(kv)),
+             (kn[kv.index(max(kv))] - 2) / 500.0))
+    print("  REPLAY FILE %s.json  %d bytes  sha256 %s" % (FILE_ID, len(body), sha))
+    tbody = test_json()
+    print("  TEST-ONLY FILE %s.json  %d bytes  sha256 %s" % (TEST_ID, len(tbody), hashlib.sha256(tbody.encode()).hexdigest()))
+    sched = sched_traj_rec(kn, kv)
+    at_knot = max(abs(v - kv[k]) for k, (_s, v) in enumerate(sched))
+    print("  TOLERANCE (a): at the 500 record steps the applied float32 value vs the measured median: max |f32(v_k) - v_k| = %.3e (<= 1e-6: %s)"
+          % (at_knot, at_knot <= 1e-6))
+    jump = max(abs(tr[k + 1][1] - tr[k][1]) for _nm, tr in src for k in range(N_RECORDS - 1))
+    kjump = max(abs(kv[k + 1] - kv[k]) for k in range(N_RECORDS - 1))
+    print("  TOLERANCE (b): largest move of ANY source trajectory between two records %.7f (<= 100 ms = 0.1 up to float32"
+          " accumulation, 1e-4: %s); of the median %.7f" % (jump, jump <= 0.1 + 1e-4, kjump))
+    print("  => the schedule equals the measured median at every record step (<= 1e-6) and is within 0.1 log units of it at every update.")
+    lin_ok = all(rec_value(n, kn, kv) == f32(min(HI, max(LO, kv[(n - 2) // 100] + (kv[(n - 2) // 100 + 1] - kv[(n - 2) // 100]) * ((n - 2) % 100) / 100.0)))
+                 for n in range(2, kn[-1], 37))
+    print("  (the bisection form == the uniform-knot form at every 37th update: %s)" % lin_ok)
+    print("  FIDELITY, IN-SAMPLE (the 12 source runs): max|rec - sched| / mean|.| / records > BH_TOL ; r(15-30) r(30-60) r(60-100) run vs sched")
+    rs = (r_window(sched, 15, 30), r_window(sched, 30, 60), r_window(sched, 60, 100))
+    print("    %-22s %28s  r %8.1f %8.1f %6.2f" % ("SCHEDULE", "", rs[0], rs[1], rs[2]))
+    for nm, tr in src:
+        mx, mn, nb = dev(tr, sched)
+        print("    %-22s %.4f / %.4f / %3d   r %8.1f %8.1f %6.2f   r<=2 from %.1f" % (nm, mx, mn, nb, r_window(tr, 15, 30),
+              r_window(tr, 30, 60), r_window(tr, 60, 100), mag_pin_epoch(tr)))
+    print("    schedule r<=2 from %.1f" % mag_pin_epoch(sched))
+    print("  FIDELITY, OUT-OF-SAMPLE (not in the median): cvt5 HEAD (first 100 epochs), cvt4 HOLDLOW and HOLDHEAD complements")
+    for nm, tr in source_runs(runs, OOS_HEADC, 0):
+        mx, mn, nb = dev(tr, sched)
+        print("    %-22s %.4f / %.4f / %3d   r %8.1f %8.1f %6.2f   r<=2 from %.1f" % (nm, mx, mn, nb, r_window(tr, 15, 30),
+              r_window(tr, 30, 60), r_window(tr, 60, 100), mag_pin_epoch(tr)))
+    if write:
+        open(write, "w").write(body)
+        open(os.path.join(os.path.dirname(os.path.abspath(write)), TEST_ID + ".json"), "w").write(tbody)
+        print("  WROTE %s and %s.json" % (write, TEST_ID))
+
+    print("\nS3  MUTEPATH = the closed form tri:P_HIGH (RULE P, 237.3), re-derived")
+    P = DV4.derive_P(runs)
+    print("  RULE P on this host: P_HIGH %d (MUTE / MUTE50 shared beta), P_HEAD %d, P_K01 %d" % (P["HIGH"], P["HEAD"], P["K01"]))
+    mute = sched_traj_tri(P["HIGH"])
+    for nm, tr in DV4.source_runs(runs, DV4.SRC_MUTE, 0):
+        mx, mn, nb = dev(tr, mute)
+        print("    MUTE shared %-16s vs v_%d: max %.4f mean %.4f" % (nm, P["HIGH"], mx, mn))
+    for s in (90, 91, 92):
+        tr = traj(load(runs, "cvt4", "HOLDHIGH", s), 0)
+        mx, mn, nb = dev(tr, mute)
+        print("    cvt4 HOLDHIGH-s%d FREE complement vs v_%d: max %.4f mean %.4f  (its peak %.3f @ %.1f, clamp %s)"
+              % (s, P["HIGH"], mx, mn, DV4.peak(tr)[1], DV4.peak(tr)[0] / 500.0, DV4.pin_epoch(tr)))
+    print("  HEADPATH vs MUTEPATH (the complement contrast the design makes), schedule values:")
+    for ep in (10, 18, 20, 25, 30, 35, 40, 50, 60, 70, 80, 99.8):
+        k = int(round(ep * 5))
+        k = min(k, N_RECORDS - 1)
+        print("    epoch %5.1f  HEADPATH %8.3f  MUTEPATH %8.3f  diff %+7.3f  r ratio %.3g" % (
+            ep, sched[k][1], mute[k][1], sched[k][1] - mute[k][1], math.exp(sched[k][1] - mute[k][1])))
+    first_part = next(k for k in range(N_RECORDS) if abs(sched[k][1] - mute[k][1]) > 0.1)
+    print("  the two schedules first differ by > 0.1 at record %d (epoch %.1f); r(15-30) %.1f vs %.1f; r(30-60) %.1f vs %.2f"
+          % (first_part, first_part / 5.0, r_window(sched, 15, 30), r_window(mute, 15, 30), r_window(sched, 30, 60), r_window(mute, 30, 60)))
+
+    print("\nS4  G-BITE NON-VACUITY: each forced arm's BROKEN-COMP_HOLD null is a landed FREE complement, read against the schedule")
+    worst = {}
+    for arm, null_arm, schedule in (("HIGHHEADPATH", "HOLDHIGH", sched), ("LOWMUTEPATH", "HOLDLOW", mute),
+                                    ("LOWHEADPATH", "HOLDLOW", sched)):
+        for s in (90, 91, 92):
+            recs = load(runs, "cvt4", null_arm, s)
+            tr = traj(recs, 0)
+            tr_pre = [(r["step"], float(r["beta_pre"][0][0])) for r in recs]
+            pre_s = [(100 * k, (rec_value(100 * k + 1, kn, kv) if schedule is sched else DV4.v_of(100 * k + 1, P["HIGH"])))
+                     for k in range(N_RECORDS)]
+            mx, mn, nb = dev(tr, schedule)
+            mxp, _mnp, nbp = dev(tr_pre, pre_s)
+            worst[arm] = min(worst.get(arm, 1e9), mx)
+            print("  %-13s null = cvt4 %s-s%d free complement: beta misses on %3d/500 records (max %.4f); beta_pre misses on %3d/500 (max %.4f)"
+                  % (arm, null_arm, s, nb, mx, nbp, mxp))
+    ins = min(dev(tr, sched)[0] for _nm, tr in src)
+    print("  even the 12 SOURCE runs of the median miss it by >= %.4f somewhere (>= %.0f x BH_TOL)" % (ins, ins / BH_TOL))
+    print("  NON-VACUITY: min over nulls of max|dev|: %s  (every one >= 100 x BH_TOL: %s)"
+          % (", ".join("%s %.4f" % kv_ for kv_ in sorted(worst.items())), all(x >= 100 * BH_TOL for x in worst.values())))
+    mm, nrec = 0, 0
+    for arm in ("HOLDLOW", "HOLDHIGH"):
+        for s in (90, 91, 92):
+            for r in load(runs, "cvt4", arm, s):
+                nrec += 1
+                nat, _sg = DV4.lion_natural(r["beta_pre"][0][0], r["mom_pre"][0][0], r["z_agg"][0][0])
+                mm += abs(nat - r["beta"][0]) > BH_TOL
+    print("  (the free complement of every landed HOLDLOW / HOLDHIGH record is Lion recomputed from its own record: %d mismatches of %d)" % (mm, nrec))
+
+    print("\nS5  WHEN BOTH GROUPS ARE HELD (HIGHHEADPATH, LOWMUTEPATH, LOWHEADPATH): the meta-optimiser's state, stated")
+    for ln in (
+        "  Lion_meta_update still runs UNCHANGED on the whole 2-vector (sign, momentum EMA, clamp).  Then PATCH_BETAHOLD",
+        "  overwrites beta[0][1] (50) and, AFTER it, PATCH_COMPHOLD overwrites beta[0][0] (the complement).  So in these",
+        "  three arms NO applied beta depends on z or on momentum: both entries of momentum_meta keep the unpatched",
+        "  recursion on their own raw z and are DEAD STATE (the only reader of momentum_meta[i] is entry i's own Lion",
+        "  step, whose output is overwritten on the same update, from init to the last update, with no release).  The",
+        "  step sizes the network receives are an exogenous, open-loop schedule; the gradients, h and z still depend on",
+        "  the network state, so the momentum VALUES differ from any free run's -- they are simply never read.",
+        "  tests/test_comphold.py C4 proves it on the harness's own Lion_meta_update: two objects driven by DIFFERENT",
+        "  random z streams hold BITWISE-identical beta at every update; and the whole momentum vector equals the",
+        "  cvt4-tree object's (same BETA_HOLD, COMP_HOLD unset) given the same z -- the group-0 hold writes nothing else."):
+        print(ln)
+
+    print("\nS6  THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36), 227.6's definitions")
+    if os.path.exists(csvpath):
+        F = floor(csvpath)
+        print("  corpus %s  sha %s  %d rows (cvt6- excluded: none exist), %d after filter_rows; exclusion list sha %s"
+              % (csvpath, hashlib.sha256(open(csvpath, "rb").read()).hexdigest(), F["rows"], F["rows_filtered"], F["tsv_sha"]))
+        for k in ("R18ALL", "PLAIN"):
+            sf, sn = F[k], F[k + "_naive"]
+            print("  SIGMA_%-7s FILTERED %r (df %d, %d cells)   NAIVE %r (df %d, %d cells)" % (k, sf[0], sf[1], sf[2], sn[0], sn[1], sn[2]))
+        sp = max(F["R18ALL"][0], F["PLAIN"][0])
+        print("  SIGMA_PRIOR = max(filtered pair) = %r ; SE_PRIOR = %.6f" % (sp, sp * math.sqrt(2 / 3.0)))
+    else:
+        print("  corpus not readable at %s" % csvpath)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -68,7 +68,7 @@ After the host reports success, verify the reported production URL: check the sn
 - A run's execution state describes inventory completion or supersession. Scientific outcomes belong to experiments; completed jobs can have failed research goals or collapsed trajectories.
 - Completed epochs and requested epochs are different fields. Accuracy is the valid final-five-epoch mean, with no final/best fallback. Historical plateau values use a separate window.
 - A run link identifies the documented batch family and does not assert that the run belongs to every reported contrast.
-- All 3,049 runs in this snapshot have sanitized raw logs linked by `logHref`, with original/public SHA-256 pairs. If a future snapshot omits an archived log, preserve its explicit archived-but-unpublished availability distinction.
+- All 3,085 runs in this snapshot have sanitized raw logs linked by `logHref`, with original/public SHA-256 pairs. If a future snapshot omits an archived log, preserve its explicit archived-but-unpublished availability distinction.
 - Research code records contain both original and public hashes. Redactions can change bytes while retaining scientific content and line references. Related current code is not automatically exact historical runtime provenance.
 - History records documented phases, completions, imports, or maintainer recording times. It does not infer per-run launch times or show live cluster status.
 

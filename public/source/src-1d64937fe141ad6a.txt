@@ -1,0 +1,918 @@
+#!/usr/bin/env python3
+"""cvt6_attack_indep.py <runsdir> <scorer.py> <score.log> <cvt6_headpath.json> <all_runs.csv> <CORPUS-EXCLUSIONS.tsv>
+-- independent re-derivation of `cvt6` (CORRECTIONS 242): PlainNet18_c100, 50's hold x the complement's hold.
+
+Imports NOTHING from analysis/cVT6_complementpath_score.py or any other repo module and uses no regex.  Reads, by
+string splitting only: every raw cvt6-<arm>-s<seed>-<jobid>.out in <runsdir> (ARGS / ENV / PROBE_TENSOR / VOTE_W /
+BETA_HOLD / COMP_HOLD lines, `Epoch` lines, RUN_DONE, Traceback); <runsdir>/cvt6/PARTITION-MANIFEST.txt and
+PROVENANCE.txt; each run's probe dir (probe_tensor.json, block_sizes.json, probe.jsonl); the replay file named on the
+command line (its sha is checked against 242.3's); and -- for the one corpus DISCLOSURE line only -- the CSV and the
+exclusion TSV with the csv module.
+plateau5 = mean TEST over the run's own epochs 95..99; TRAIN5 the same on the Train column.
+Bars, witnesses (BUILT from mode / P / b0 / ms and from the replay file's own sha / knots), the two schedules (the
+max-rate triangle and the linear-between-knots replay, 242.3(2)), G-BITE's clauses (242.6) and the branch order are
+RE-TYPED from the registration text; nothing is copied from the scorer's code.
+
+CORPUS-DEPENDENT LINE, MADE EXPLICIT.  Exactly one rebuilt line depends on the corpus: the scorer's
+`corpus: N rows after corpus_exclusions.filter_rows, cvt6- excluded ...` disclosure.  It is rebuilt here from the CSV
+and TSV given on the command line (rows whose run starts `cvt6-` dropped, then every (run, job_id) key listed in the
+TSV dropped).  This parser was run against results/all_runs.csv sha c2d1164d... (3,049 rows) and
+results/CORPUS-EXCLUSIONS.tsv sha f8455571... (51 rows), the files as committed at 0f4d006 (the cvt4/cvt5 ingest) and
+unchanged through 5309a96 (the commit this landing started from); cluster_b's ~/stage_cvt6 carries the same two shas.
+After the cvt6 ingest the CSV and TSV change and that ONE line will no longer match (as 244.2 disclosed for cvt5):
+re-run with `git show 5309a96:results/all_runs.csv` and `git show 5309a96:results/CORPUS-EXCLUSIONS.tsv`.  No bar,
+sigma, branch or stamp reads the line.
+
+AGREEMENT.  Every scorer line that carries a level, contrast, gate, G-BITE count, sigma, branch, stamp or descriptive
+readout is RE-BUILT here in the scorer's printed format and precision from this file's own numbers and looked up
+VERBATIM in <score.log>.  A line not found is a VIOLATION.  The FINAL token list is compared token by token and as one
+string.  No absolute path is printed, so the output is byte-comparable across hosts.
+
+Sections:
+  [0] manifest, provenance, scorer sha, replay file, corpus disclosure
+  [1] completeness; ARGS / ENV / PROBE_TENSOR / VOTE_W / BETA_HOLD / COMP_HOLD per run
+  [2] levels: per-run plateau5 + TRAIN5, per-arm mean / sd / range, TEST OLS tail slope 80-99; G-FLOOR / G-CEIL
+  [3] sigma (max(frozen prior, in-batch)), SE, every contrast, TEST beside TRAIN; per-seed pairs
+  [4] G-BITE re-derived from the probe records (Lion on every unheld group; both schedules and their beta_pre halves;
+      the bh_* / ch_* audits; key hygiene), plus a NON-VACUITY cross-read (each forced run's complement read against
+      the OTHER complement path and against its free twin's absence of a hold)
+  [5] branch, states, stamps, every bar margin; FINAL compared with the scorer's
+  [6] the scorer's between-batch and descriptive readouts re-derived
+  [7] LINE-BY-LINE AGREEMENT with the scorer log; scorer lines NOT rebuilt are listed (text only)
+  DESCRIPTIVE, NOT REGISTERED (cannot move anything above):
+  [D1] 50's and the complement's APPLIED beta at epochs 10 / 18 / 20 / 30 / 40 (median seed per arm)
+  [D2] TEST (TRAIN) after 15 / 17 / 19 / 30 / 50 / 100 epochs; settle epochs
+  [D3] when HIGHHEADPATH and LOWMUTEPATH depart from LOWHEADPATH (arm mean and same-seed), with the schedules' gap
+  [D4] did HOLDHIGH's free complement again follow MUTE's path (v_9428)? did HOLDLOW's / HEAD's follow HEADPATH?
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+
+PREFIX = "cvt6"
+NET = "PlainNet18_c100"
+SEEDS = [96, 97, 98]
+ARMS = ["k01", "HEAD", "HOLDLOW", "HOLDHIGH", "HIGHHEADPATH", "LOWMUTEPATH", "LOWHEADPATH"]
+HELD = ["HOLDLOW", "HOLDHIGH", "HIGHHEADPATH", "LOWMUTEPATH", "LOWHEADPATH"]
+FORCED = ["HIGHHEADPATH", "LOWMUTEPATH", "LOWHEADPATH"]
+HEADSPEC = "sets:1-49,51-53/layer4.1.bn2.weight"
+SPEC = dict((a, HEADSPEC) for a in ARMS)
+SPEC["k01"] = "scalar"
+IDX50, NAME50 = 50, "layer4.1.bn2.weight"
+P9428 = 9428
+# 242.2 table, re-typed: 50's hold (group 1) and the complement's hold (group 0)
+HOLD50 = {"HOLDLOW": ("floor", None), "HOLDHIGH": ("tri", P9428), "HIGHHEADPATH": ("tri", P9428),
+          "LOWMUTEPATH": ("floor", None), "LOWHEADPATH": ("floor", None)}
+HOLDC = {"HIGHHEADPATH": ("rec", "cvt6_headpath"), "LOWMUTEPATH": ("tri", P9428), "LOWHEADPATH": ("rec", "cvt6_headpath")}
+ENV_WANT = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+            "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 "
+            "EB_RHO=na EB_LOG=0")
+FIXED = {"optimizer": "HF", "alg-base": "SGDm", "momentum-param-base": "0.99", "weight-decay-base": "0.1",
+         "alg-meta": "Lion", "momentum-param-meta": "0.99", "Lion-beta2-meta": "0.9",
+         "weight-decay-meta": "0", "dataset": "CIFAR100", "batch-size": "100", "meta-stepsize": "1e-3",
+         "alpha0": "1e-6", "num-epochs": "100", "NN-name": NET, "gamma": "1"}
+# 242.6 / 237.6 frozen bars, re-typed
+SIGMA_PRIOR = 0.694442846939599
+GAP_MIN, K01_MAX, MATCH, NULL, RESCUE, DIVERGED = 20.0, 20.0, 5.0, 2.0, 10.0, 5.0
+FLOOR_MIN, CEIL_MAX = 15.0, 90.0
+BH_TOL, TIE_REL, N_REC = 1e-5, 1e-12, 500
+MS, B2 = 1e-3, 0.9
+LO, HI = -15.0, -2.3026
+SPE = 500
+# sha prefixes recorded in CORRECTIONS 242.4 / 242.6 / 242.12
+PREF = {"BUILD_NETWORK_SHA256": "e65e6773", "HF_SHA256": "f1b9c8aa", "RUNNER_SHA256": "9aa2ed5c",
+        "REPLAY_SHA256": "74be71fa"}
+MANIFEST_PREFIX, MANIFEST_BYTES = "c519c253", 5922
+REPLAY_SHA = "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d"      # 242.3(2), full
+CORPUS_SHA_PREFIX, TSV_SHA_PREFIX = "c2d1164d", "f8455571"                             # 242.7
+# between-batch literals, re-typed from 240.3 (cvt4) and 230 (cvt1)
+R_CVT4 = [("k01", 11.6947), ("HEAD", 64.7347), ("HOLDLOW", 65.4607), ("HOLDHIGH", 11.1267)]
+R_CVT1 = [("k01", 11.9493), ("HEAD", 64.7940), ("MUTE", 10.9860)]
+
+
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+B0 = f32(math.log(1e-6))
+
+
+def mean(v):
+    return math.fsum(v) / len(v)
+
+
+def sdev(v):
+    m = mean(v)
+    return math.sqrt(math.fsum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def ols(xs, ys):
+    xm, ym = mean(xs), mean(ys)
+    return math.fsum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / math.fsum((x - xm) ** 2 for x in xs)
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def sgn(x):
+    return (x > 0) - (x < 0)
+
+
+def tri(n, P):
+    """237.3(1): u(n) = min(n-1, P) - max(0, n-1-P) for n >= 1, 0 otherwise; beta = clamp(b0 + ms u), float32."""
+    u = 0 if n <= 0 else min(n - 1, P) - max(0, n - 1 - P)
+    return f32(min(HI, max(LO, B0 + MS * u)))
+
+
+class Replay(object):
+    """242.3(2): hold_c(n) = b0 for n < n_0; v_k + (v_{k+1} - v_k)(n - n_k)/(n_{k+1} - n_k) on [n_k, n_{k+1});
+    v_last for n >= n_last; clamped, stored float32."""
+
+    def __init__(self, path):
+        raw = open(path, "rb").read()
+        self.sha = hashlib.sha256(raw).hexdigest()
+        d = json.loads(raw.decode("utf-8"))
+        self.id = d["id"]
+        self.n = [int(x) for x in d["n"]]
+        self.v = [float(x) for x in d["v"]]
+
+    def __call__(self, n):
+        kn, kv = self.n, self.v
+        if n < kn[0]:
+            x = B0
+        elif n >= kn[-1]:
+            x = kv[-1]
+        else:
+            k = (n - kn[0]) // (kn[1] - kn[0])       # knots are equally spaced (checked in [0])
+            while kn[k] > n:
+                k -= 1
+            while kn[k + 1] <= n:
+                k += 1
+            x = kv[k] + (kv[k + 1] - kv[k]) * (n - kn[k]) / float(kn[k + 1] - kn[k])
+        return f32(min(HI, max(LO, x)))
+
+
+def lion(bp, m, z):
+    """242.6(b): clamp(beta_pre - ms*sign(b2*mom_pre + (1-b2)*z_agg)); tie iff |L| <= TIE_REL of its parts."""
+    p, q = B2 * m, (1.0 - B2) * z
+    L = p + q
+    return max(LO, min(HI, bp - MS * sgn(L))), abs(L) <= TIE_REL * (abs(p) + abs(q))
+
+
+def witness_bh(arm):
+    if arm not in HOLD50:
+        return "BETA_HOLD: off"
+    mode, P = HOLD50[arm]
+    w = "BETA_HOLD: on type=blockwise group=1 groupsize=1 name=%s mode=%s" % (NAME50, mode)
+    if mode == "floor":
+        return w + " value=" + repr(LO)
+    return w + " P=%d b0=%s ms=%s lo=%s hi=%s peak=%s" % (P, repr(B0), repr(MS), repr(LO), repr(HI),
+                                                          repr(min(HI, max(LO, B0 + MS * P))))
+
+
+def witness_ch(arm, rep):
+    if arm not in HOLDC:
+        return "COMP_HOLD: off"
+    mode, x = HOLDC[arm]
+    w = "COMP_HOLD: on type=blockwise group=0 groupsize=52 mode=%s" % mode
+    if mode == "tri":
+        return w + " P=%d b0=%s ms=%s lo=%s hi=%s peak=%s" % (x, repr(B0), repr(MS), repr(LO), repr(HI),
+                                                              repr(min(HI, max(LO, B0 + MS * x))))
+    return w + " id=%s sha256=%s knots=%d n0=%d n1=%d b0=%s lo=%s hi=%s vmax=%s vlast=%s" % (
+        rep.id, rep.sha, len(rep.n), rep.n[0], rep.n[-1], repr(B0), repr(LO), repr(HI), repr(max(rep.v)), repr(rep.v[-1]))
+
+
+def parse_out(path):
+    r = {"args": [], "env": [], "pt": [], "vw": [], "bh": [], "ch": [], "ep": {}, "done": False, "tb": 0, "dup": 0}
+    for ln in open(path, errors="replace"):
+        s = ln.rstrip("\n")
+        if s.startswith("ARGS:"):
+            r["args"].append(s)
+        elif s.startswith("ENV:"):
+            r["env"].append(s)
+        elif s.startswith("PROBE_TENSOR:"):
+            r["pt"].append(s)
+        elif s.startswith("VOTE_W"):
+            r["vw"].append(s)
+        elif s.startswith("BETA_HOLD"):
+            r["bh"].append(s)
+        elif s.startswith("COMP_HOLD"):
+            r["ch"].append(s)
+        elif s.startswith("Epoch "):
+            p = s.split(",")
+            e = int(p[0].split()[1])
+            tr = float(p[1].split(":")[1].replace("%", "").strip())
+            te = float(p[2].split(":")[1].replace("%", "").strip())
+            r["dup"] += e in r["ep"]
+            r["ep"][e] = (tr, te)
+        elif s.strip() == "RUN_DONE":
+            r["done"] = True
+        elif "Traceback (most recent call last)" in s:
+            r["tb"] += 1
+    return r
+
+
+def flags_of(line):
+    out = []
+    for t in line[len("ARGS:"):].split():
+        if t.startswith("--"):
+            out.append([t[2:], None])
+        elif out:
+            out[-1][1] = t if out[-1][1] is None else out[-1][1] + " " + t
+    return out
+
+
+def groups_of(spec, names):
+    if spec == "scalar":
+        return [list(range(1, len(names) + 1))]
+    gs = []
+    for g in spec[len("sets:"):].split("/"):
+        idx = []
+        for tok in g.split(","):
+            if tok.isdigit():
+                idx.append(int(tok))
+            elif "-" in tok and all(x.isdigit() for x in tok.split("-")):
+                a, b = tok.split("-")
+                idx.extend(range(int(a), int(b) + 1))
+            else:
+                idx.append(names.index(tok) + 1)
+        gs.append(sorted(idx))
+    return gs
+
+
+def load_recs(pdir):
+    out = []
+    for x in open(os.path.join(pdir, "probe.jsonl")):
+        if not x.strip():
+            continue
+        try:
+            v = json.loads(x)
+        except ValueError:
+            v = None
+        out.append(v if isinstance(v, dict) else None)
+    return out
+
+
+def traj_summary(recs, k):
+    """(peak, peak epoch, continuous-clamp pin epoch or None, mean r epochs [15,30), mean r epochs [30,60)) of group k."""
+    seq = [(x["step"], float(x["beta"][k])) for x in recs]
+    peak = seq[0]
+    for s, b in seq:
+        if b > peak[1]:
+            peak = (s, b)
+    pin = None
+    for j in range(len(seq)):
+        if all(b <= LO + 1e-4 for _s, b in seq[j:]):
+            pin = seq[j][0] / float(SPE)
+            break
+    r1 = mean([math.exp(b + 15.0) for s, b in seq if 15 * SPE <= s < 30 * SPE])
+    r2 = mean([math.exp(b + 15.0) for s, b in seq if 30 * SPE <= s < 60 * SPE])
+    return peak[1], peak[0] / float(SPE), pin, r1, r2
+
+
+def main():
+    runsdir, scorer, slog, reppath, csvp, tsvp = sys.argv[1:7]
+    bad = []
+    expect = []
+
+    def viol(msg):
+        bad.append(msg)
+        print("  VIOLATION " + msg)
+
+    def exp(sec, line):
+        expect.append((sec, line))
+
+    base = os.path.join(runsdir, PREFIX)
+    # ---------------------------------------------------------------- [0]
+    names, numel, man = [], [], {}
+    mpath = os.path.join(base, "PARTITION-MANIFEST.txt")
+    mtext = open(mpath).read()
+    for ln in mtext.split("\n"):
+        p = ln.split()
+        if not p:
+            continue
+        if p[0] == "TENSOR":
+            names.append(p[2])
+            numel.append(int(p[3]))
+        else:
+            man.setdefault(p[0], []).append(ln)
+    msha = sha(mpath)
+    rep = Replay(reppath)
+    print("[0] manifest: %d tensors, %d params; idx50 %s; %d bytes, sha256 %s..." % (
+        len(names), sum(numel), names[IDX50 - 1], len(mtext.encode()), msha[:16]))
+    ok_man = (len(names) == 53 and sum(numel) == 11046308 and names[IDX50 - 1] == NAME50
+              and numel[IDX50 - 1] == 512 and msha.startswith(MANIFEST_PREFIX) and len(mtext.encode()) == MANIFEST_BYTES
+              and man.get("REPLAY") == ["REPLAY B0 %s MS %s P_HIGH %d HEADPATH %s SHA256 %s KNOTS %d"
+                                        % (repr(B0), repr(MS), P9428, rep.id, rep.sha, len(rep.n))]
+              and man.get("WITNESS") == ["WITNESS %s %s" % (a, witness_bh(a)) for a in ARMS]
+              and man.get("CWITNESS") == ["CWITNESS %s %s" % (a, witness_ch(a, rep)) for a in ARMS])
+    print("    REPLAY line, 7 WITNESS and 7 CWITNESS lines == the witnesses built here; sha prefix %s, %d bytes: %s"
+          % (MANIFEST_PREFIX, MANIFEST_BYTES, ok_man))
+    if not ok_man:
+        viol("manifest")
+    spacing = set(rep.n[k + 1] - rep.n[k] for k in range(len(rep.n) - 1))
+    ok_rep = (rep.sha == REPLAY_SHA and rep.id == "cvt6_headpath" and len(rep.n) == 500 and rep.n[0] == 2
+              and rep.n[-1] == 49902 and spacing == set([100]) and rep.v[-1] == -15.0
+              and all(LO <= x <= HI for x in rep.v))
+    print("    replay file: id %s sha256 %s... knots %d n0 %d n1 %d spacing %s vmax %s vlast %s -> as 242.3(2): %s"
+          % (rep.id, rep.sha[:16], len(rep.n), rep.n[0], rep.n[-1], sorted(spacing), repr(max(rep.v)), repr(rep.v[-1]), ok_rep))
+    if not ok_rep:
+        viol("replay file")
+    exp("G-REPLAY", "  PASS G-REPLAY patches/cvt6_headpath.json sha256 == HEADPATH_SHA, 500 knots")
+    prov = {}
+    for ln in open(os.path.join(base, "PROVENANCE.txt")):
+        p = ln.split(None, 1)
+        if len(p) == 2:
+            prov.setdefault(p[0], p[1].strip())
+    s_sha = sha(scorer)
+    ok_prov = (prov.get("MODE") == "submit" and all(prov.get(k, "").startswith(v) for k, v in PREF.items())
+               and prov.get("REPLAY_SHA256") == rep.sha and prov.get("SCORER_SHA256") == s_sha)
+    print("    PROVENANCE MODE %s  BUILD %s...  HF %s...  RUNNER %s...  REPLAY %s... == file: %s  SCORER %s... == scorer file: %s" % (
+        prov.get("MODE"), prov.get("BUILD_NETWORK_SHA256", "")[:8], prov.get("HF_SHA256", "")[:8],
+        prov.get("RUNNER_SHA256", "")[:8], prov.get("REPLAY_SHA256", "")[:8], prov.get("REPLAY_SHA256") == rep.sha,
+        prov.get("SCORER_SHA256", "")[:8], prov.get("SCORER_SHA256") == s_sha))
+    if not ok_prov:
+        viol("provenance")
+    exp("G-STRUCT", "  PASS G-STRUCT byte-identical to synthetic_manifest_text() (53 tensors, HEAD [52,1], both hold tables)"
+        "   %d vs %d bytes" % (MANIFEST_BYTES, MANIFEST_BYTES))
+    exp("G-PROV", "  PASS G-PROV MODE submit   submit")
+    b = prov["BUILD_NETWORK_SHA256"]
+    exp("G-PROV", "  PASS G-PROV build_network.py sha256 == POST_SHA %s...   %s" % (b[:12], b[:16]))
+    b = prov["HF_SHA256"]
+    exp("G-PROV", "  PASS G-PROV HF.py sha256 == HF_POST_SHA %s... (cvt6's PATCH_COMPHOLD tree)   %s" % (b[:12], b[:16]))
+    b = prov["RUNNER_SHA256"]
+    exp("G-PROV", "  PASS G-PROV RUNNER_SHA256 == cvt6's runner %s...   %s" % (b[:12], b[:16]))
+    exp("G-PROV", "  PASS G-PROV REPLAY_SHA256 (the tree's cvt6_headpath.json) == HEADPATH_SHA %s...   %s"
+        % (rep.sha[:12], rep.sha[:16]))
+    exp("G-PROV", "  PASS G-PROV SCORER_SHA256 == this scorer's sha256 %s...   %s" % (s_sha[:12], s_sha[:16]))
+    # corpus disclosure (the one corpus-dependent line)
+    keys = set()
+    tl = [ln.rstrip("\n") for ln in open(tsvp) if ln.strip() and not ln.startswith("#")]
+    head = tl[0].split("\t")
+    for ln in tl[1:]:
+        f = dict(zip(head, ln.split("\t")))
+        keys.add((f["run"], f["job_id"]))
+    rows = [r for r in csv.DictReader(open(csvp)) if not r.get("run", "").startswith(PREFIX + "-")]
+    kept = [r for r in rows if (r.get("run"), r.get("job_id")) not in keys]
+    csha, tsha = sha(csvp), sha(tsvp)
+    print("    corpus (DISCLOSURE line only): csv sha %s rows %d, exclusion tsv sha %s keys %d -> %d rows (cvt6- dropped)"
+          % (csha[:16], len(rows), tsha[:16], len(keys), len(kept)))
+    print("    corpus files are the registration corpus (242.7 %s... / %s...), i.e. commit 0f4d006 = 5309a96's: %s"
+          % (CORPUS_SHA_PREFIX, TSV_SHA_PREFIX, csha.startswith(CORPUS_SHA_PREFIX) and tsha.startswith(TSV_SHA_PREFIX)))
+    exp("CORPUS", "corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- no bar, sigma, "
+        "branch or stamp reads it)" % (len(kept), PREFIX))
+
+    # ---------------------------------------------------------------- [1]
+    print("\n[1] completeness and header lines (witnesses built from mode / P / b0 / ms / the replay file)")
+    files = {}
+    for fn in sorted(os.listdir(runsdir)):
+        if not (fn.startswith(PREFIX + "-") and fn.endswith(".out")):
+            continue
+        stem = fn[:-4].split("-")
+        if len(stem) != 4 or stem[1] not in ARMS:
+            continue
+        files.setdefault((stem[1], int(stem[2][1:])), []).append((int(stem[3]), fn))
+    R = {}
+    envs = set()
+    n_pt_ok = 0
+    for s in SEEDS:
+        for a in ARMS:
+            lst = files.get((a, s), [])
+            if len(lst) != 1:
+                viol("%s-s%d has %d .out files" % (a, s, len(lst)))
+                continue
+            jid, fn = lst[0]
+            r = parse_out(os.path.join(runsdir, fn))
+            r["jid"] = jid
+            R[(a, s)] = r
+            ok_ep = sorted(r["ep"]) == list(range(100)) and r["dup"] == 0
+            f = flags_of(r["args"][0]) if len(r["args"]) == 1 else []
+            ks = [k for k, _ in f]
+            fd = dict(f)
+            want = dict(FIXED)
+            want.update({"stepsize-groups": SPEC[a], "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s)})
+            wrong = [k for k, v in sorted(want.items()) if fd.get(k) != v]
+            rep_f = sorted(set(k for k in ks if ks.count(k) > 1))
+            env = [" ".join(t for t in e.split() if not t.startswith("PROBE_DIR=")) for e in r["env"]]
+            for e in env:
+                envs.add(e)
+            ptw = "PROBE_TENSOR: on every=100 type=%s tensors=53 " % ("scalar" if a == "k01" else "blockwise")
+            pt_ok = len(r["pt"]) == 1 and r["pt"][0].startswith(ptw)
+            n_pt_ok += pt_ok
+            complete = ok_ep and r["done"] and r["tb"] == 0
+            args_ok = len(r["args"]) == 1 and not wrong and not rep_f
+            vw_ok = r["vw"] == ["VOTE_W: off"]
+            bh_ok = r["bh"] == [witness_bh(a)]
+            ch_ok = r["ch"] == [witness_ch(a, rep)]
+            line_ok = complete and args_ok and env == [ENV_WANT] and pt_ok and vw_ok and bh_ok and ch_ok
+            print("  %-4s %-12s s%d job %d  epochs %d  RUN_DONE %s  tb %d  ARGS wrong %s rep %s  ENV %s  PT %s  VOTE_W %s"
+                  "  BETA_HOLD %s  COMP_HOLD %s"
+                  % ("OK" if line_ok else "BAD", a, s, jid, len(r["ep"]), r["done"], r["tb"], wrong or "-", rep_f or "-",
+                     env == [ENV_WANT], pt_ok, vw_ok, bh_ok, ch_ok))
+            if not line_ok:
+                viol("%s-s%d header/completeness" % (a, s))
+            if args_ok:
+                exp("G-ARGS", "  PASS G-ARGS %s-s%d" % (a, s))
+            if vw_ok:
+                exp("G-VOTEW", "  PASS G-VOTEW %s-s%d" % (a, s))
+            if bh_ok:
+                exp("G-HOLDW", "  PASS G-HOLDW %s-s%d" % (a, s))
+            if ch_ok:
+                exp("G-CHOLDW", "  PASS G-CHOLDW %s-s%d" % (a, s))
+    if envs == set([ENV_WANT]) and all(len(R[k]["env"]) == 1 for k in R):
+        exp("G-ENV", "  PASS G-ENV one distinct ENV line, one per run   1 distinct")
+        exp("G-ENV", "        " + ENV_WANT)
+        exp("G-ENV", "  PASS G-ENV the ENV line is cvt1's / cvt4's, byte for byte (PROBE_DIR stripped)")
+    if n_pt_ok == 21:
+        exp("G-ENV", "  PASS G-ENV every run printed ONE `PROBE_TENSOR: on every=100 type=<its arm's> tensors=53`   21 runs")
+
+    # ---------------------------------------------------------------- [2]
+    print("\n[2] levels (plateau5 = mean TEST epochs 95..99; TRAIN5 beside)")
+    P, T = {}, {}
+    for a in ARMS:
+        v, t, sl = [], [], []
+        for s in SEEDS:
+            ep = R[(a, s)]["ep"]
+            v.append(mean([ep[e][1] for e in range(95, 100)]))
+            t.append(mean([ep[e][0] for e in range(95, 100)]))
+            xs = list(range(80, 100))
+            sl.append(ols(xs, [ep[e][1] for e in xs]))
+            r = R[(a, s)]
+            exp("COMPLETE", "  OK   %s-%s-s%d  %d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %.4f (train %.4f)"
+                % (PREFIX, a, s, len(r["ep"]), r["done"], r["tb"] > 0, v[-1], t[-1]))
+        P[a], T[a] = v, t
+        print("  %-12s TEST %.4f (sd %.4f, range %.4f)  TRAIN %.4f  seeds %s  train %s  slope80-99 %s"
+              % (a, mean(v), sdev(v), max(v) - min(v), mean(t), " / ".join("%.4f" % x for x in v),
+                 " / ".join("%.4f" % x for x in t), " / ".join("%+.3f" % x for x in sl)))
+        exp("LEVELS", "  %-12s TEST %.4f  sd %.4f  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+            % (a, mean(v), sdev(v), max(v) - min(v), mean(t), "/".join("%.3f" % x for x in sl)))
+        exp("LEVELS", "               seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(P[a])) for a in ARMS)
+    TM = dict((a, mean(T[a])) for a in ARMS)
+    hi = max(M.values())
+    exp("G-FLOOR", "  PASS G-FLOOR max arm mean >= 15.00 pp (chance 1.00)   max %.4f" % hi)
+    exp("G-CEIL", "  PASS G-CEIL max arm mean <= 90.00 pp   max %.4f" % hi)
+
+    # ---------------------------------------------------------------- [3]
+    print("\n[3] sigma and contrasts (within batch)")
+    ss = math.fsum((x - M[a]) ** 2 for a in ARMS for x in P[a])
+    df = len(ARMS) * (len(SEEDS) - 1)
+    sig_in = math.sqrt(ss / df)
+    sig = max(SIGMA_PRIOR, sig_in)
+    which = "SIGMA_PRIOR_frozen" if sig == SIGMA_PRIOR else "SIGMA_INBATCH"
+    se = sig * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_INBATCH %.6f (df %d)  SIGMA_PRIOR %.6f  -> used %.6f (%s)  SE %.6f" % (sig_in, df, SIGMA_PRIOR, sig, which, se))
+    exp("SIGMA", "  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR))
+    exp("SIGMA", "  %-20s %.6f" % ("SIGMA_INBATCH", sig_in))
+    exp("SIGMA", "  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+    exp("SIGMA", "  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+    C = [("P_50", "LOWHEADPATH", "HIGHHEADPATH", "PRIMARY"), ("P_C", "LOWHEADPATH", "LOWMUTEPATH", "PRIMARY"),
+         ("D_HEAD", "HEAD", "k01", "KEY"), ("P_CTLC", "HEAD", "LOWHEADPATH", "KEY"),
+         ("R_LOW", "HOLDLOW", "HEAD", "KEY"), ("R_HIGH", "HEAD", "HOLDHIGH", "KEY")]
+    C += [("D_" + a, a, "k01", "KEY") for a in HELD]
+    CT = {}
+    for lab, x, y, kind in C:
+        d, dt = M[x] - M[y], TM[x] - TM[y]
+        CT[lab] = (d, dt)
+        print("  %-8s %-16s = %-12s - %-12s TEST %+9.4f pp = %+8.2f SE   TRAIN %+9.4f   per seed %s"
+              % (kind, lab, x, y, d, d / se, dt, " / ".join("%+.4f" % (P[x][j] - P[y][j]) for j in range(3))))
+    pint = CT["P_50"][0] - (M["LOWMUTEPATH"] - M["HOLDHIGH"])
+    print("  %-8s %-16s = P_50 - (LOWMUTEPATH - HOLDHIGH) TEST %+9.4f pp = %+8.2f SE" % ("DESCR", "P_INT", pint, pint / se))
+    d, dt = CT["P_50"]
+    exp("CONTRASTS", "  PRIMARY  P_50     = LOWHEADPATH - HIGHHEADPATH = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  "
+        "[50's magnitude, complement on HEADPATH]" % (d, d / se, dt))
+    d, dt = CT["P_C"]
+    exp("CONTRASTS", "  PRIMARY  P_C      = LOWHEADPATH - LOWMUTEPATH  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  "
+        "[the complement's path, 50 at the floor]" % (d, d / se, dt))
+    d, dt = CT["D_HEAD"]
+    exp("CONTRASTS", "  KEY      D_HEAD   = HEAD - k01                 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [positive control]"
+        % (d, d / se, dt))
+    d, dt = CT["P_CTLC"]
+    exp("CONTRASTS", "  KEY      P_CTLC   = HEAD - LOWHEADPATH         = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [COMP_HOLD control]"
+        % (d, d / se, dt))
+    d, dt = CT["R_LOW"]
+    exp("CONTRASTS", "  KEY      R_LOW    = HOLDLOW - HEAD             = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [cvt4's P_LOW, replicated]"
+        % (d, d / se, dt))
+    d, dt = CT["R_HIGH"]
+    exp("CONTRASTS", "  KEY      R_HIGH   = HEAD - HOLDHIGH            = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [cvt4's P_HIGH, replicated]"
+        % (d, d / se, dt))
+    exp("CONTRASTS", "  DESCR    P_INT    = P_50 - (LOWMUTEPATH - HOLDHIGH) = %+.4f pp = %+.2f SE  [HOLDHIGH's complement is FREE, not forced]"
+        % (pint, pint / se))
+    for a in HELD:
+        d, dt = CT["D_" + a]
+        exp("CONTRASTS", "  KEY      D_%-12s = %-12s - k01  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   HEAD - %-12s = %+.4f"
+            % (a, a, d, d / se, dt, a, M["HEAD"] - M[a]))
+    exp("CONTRASTS", "  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE)"
+        % (GAP_MIN, GAP_MIN / se, MATCH, MATCH / se, NULL, NULL / se, RESCUE, RESCUE / se))
+
+    # ---------------------------------------------------------------- [4]
+    print("\n[4] G-BITE re-derived from the raw probe records (242.6 (a)-(e)); non-vacuity cross-read")
+    RECS = {}
+    bite_ok_all = True
+    nonfin = {}
+    cross = {}
+    for s in SEEDS:
+        for a in ARMS:
+            pdir = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            gs = groups_of(SPEC[a], names)
+            ng = len(gs)
+            recs = load_recs(pdir)
+            RECS[(a, s)] = recs
+            ptj = json.load(open(os.path.join(pdir, "probe_tensor.json")))
+            bsz = json.load(open(os.path.join(pdir, "block_sizes.json")))
+            meta_ok = (ptj.get("n_tensors") == 53 and ptj.get("param_numels") == numel
+                       and bsz.get("n_b") == [sum(numel[i - 1] for i in g) for g in gs])
+            held, forced = a in HOLD50, a in HOLDC
+            c = dict(n=0, nonfin=0, badrec=0, badstep=0, lion=0, ties=0, s50=0, s50p=0, sc=0, scp=0, bh=0, ch=0,
+                     ctl=0, act=0, cact=0)
+            wl = w50 = wc = 0.0
+            last_b = last_c = None
+            prev_b = prev_c = -1
+            for k, x in enumerate(recs):
+                if (x is None or type(x.get("step")) is not int or not isinstance(x.get("beta"), list)
+                        or len(x["beta"]) != ng):
+                    c["badrec"] += 1
+                    continue
+                try:
+                    beta = [float(v) for v in x["beta"]]
+                    bp = [float(v) for v in x["beta_pre"][0]]
+                    mo = [float(v) for v in x["mom_pre"][0]]
+                    za = [float(v) for v in x["z_agg"][0]]
+                except (KeyError, TypeError, ValueError, IndexError):
+                    c["badrec"] += 1
+                    continue
+                if not (len(x["beta_pre"]) == 1 and len(x["mom_pre"]) == 1 and len(x["z_agg"]) == 1
+                        and len(bp) == ng and len(mo) == ng and len(za) == ng):
+                    c["badrec"] += 1
+                    continue
+                if not all(math.isfinite(v) for v in beta + bp + mo + za):
+                    c["nonfin"] += 1
+                    continue
+                st = x["step"]
+                c["badstep"] += st != 100 * k
+                c["n"] += 1
+                n = st + 2
+                if not held:
+                    unheld = list(range(ng))
+                elif not forced:
+                    unheld = [0]
+                else:
+                    unheld = []
+                for g in unheld:
+                    nat, tie = lion(bp[g], mo[g], za[g])
+                    if tie:
+                        c["ties"] += 1
+                        continue
+                    e = abs(nat - beta[g])
+                    wl = max(wl, e)
+                    c["lion"] += e > BH_TOL
+                has_bh = any(key in x for key in ("bh_n", "bh_active", "bh_nat", "bh_held"))
+                has_ch = any(key in x for key in ("ch_n", "ch_active", "ch_nat", "ch_held"))
+                if ng == 2:
+                    for lab, fn_ in (("MUTEPATH", lambda m: tri(m, P9428)), ("HEADPATH", rep)):
+                        e1, e2 = abs(beta[0] - fn_(n)), abs(bp[0] - fn_(n - 1))
+                        cc = cross.setdefault((a, s, lab), [0, 0.0])
+                        cc[0] += (e1 > BH_TOL) or (e2 > BH_TOL)
+                        cc[1] = max(cc[1], e1, e2)
+                if not held:
+                    c["ctl"] += has_bh or has_ch
+                    continue
+                if not forced:
+                    c["ctl"] += has_ch
+                mode, Pp = HOLD50[a]
+                h1, h0 = (LO, LO) if mode == "floor" else (tri(n, Pp), tri(n - 1, Pp))
+                e1, e2 = abs(beta[1] - h1), abs(bp[1] - h0)
+                w50 = max(w50, e1, e2)
+                c["s50"] += e1 > BH_TOL
+                c["s50p"] += e2 > BH_TOL
+                audits = [("bh", 1)] + ([("ch", 0)] if forced else [])
+                if forced:
+                    cm, cx = HOLDC[a]
+                    sch = (lambda m: tri(m, cx)) if cm == "tri" else rep
+                    e1, e2 = abs(beta[0] - sch(n)), abs(bp[0] - sch(n - 1))
+                    wc = max(wc, e1, e2)
+                    c["sc"] += e1 > BH_TOL
+                    c["scp"] += e2 > BH_TOL
+                for pfx, g in audits:
+                    try:
+                        an, aa, anat, aheld = (int(x[pfx + "_n"]), int(x[pfx + "_active"]), float(x[pfx + "_nat"]),
+                                               float(x[pfx + "_held"]))
+                    except (KeyError, TypeError, ValueError):
+                        c[pfx] += 1
+                        continue
+                    nat, tie = lion(bp[g], mo[g], za[g])
+                    prev = prev_b if pfx == "bh" else prev_c
+                    good = (an == n and abs(aheld - beta[g]) <= BH_TOL and 0 <= aa <= an and aa >= prev
+                            and (tie or abs(anat - nat) <= BH_TOL))
+                    c[pfx] += not good
+                    flag = abs(anat - aheld) > BH_TOL
+                    if pfx == "bh":
+                        c["act"] += flag
+                        prev_b = max(prev_b, aa)
+                        last_b = aa
+                    else:
+                        c["cact"] += flag
+                        prev_c = max(prev_c, aa)
+                        last_c = aa
+            ok = (meta_ok and len(recs) == N_REC and c["badrec"] == 0 and c["n"] + c["nonfin"] == N_REC
+                  and c["badstep"] == 0 and c["lion"] == 0 and c["ctl"] == 0)
+            if held:
+                ok = ok and c["s50"] == 0 and c["s50p"] == 0 and c["bh"] == 0 and (last_b is None or last_b >= c["act"])
+            if forced:
+                ok = ok and c["sc"] == 0 and c["scp"] == 0 and c["ch"] == 0 and (last_c is None or last_c >= c["cact"])
+            nonfin[(a, s)] = c["nonfin"]
+            bite_ok_all = bite_ok_all and ok
+            print("  %-4s %-12s s%d meta %s recs %d lion-mism %d ties %d worst %.1e | 50 %d/%d worst %.1e | C %d/%d worst %.1e"
+                  " | bh-audit %d ch-audit %d keys %d | active %d/%d last %s/%s"
+                  % ("PASS" if ok else "FAIL", a, s, meta_ok, len(recs), c["lion"], c["ties"], wl, c["s50"], c["s50p"], w50,
+                     c["sc"], c["scp"], wc, c["bh"], c["ch"], c["ctl"], c["act"], c["cact"], last_b, last_c))
+            if not ok:
+                viol("G-BITE %s-s%d" % (a, s))
+            exp("G-BITE", "  %-4s G-BITE %-12s s%d  records %s  bad %d  nonfinite %d  lion-mismatch %d (ties %d, worst %.1e)  "
+                "sched50 %d/%d (worst %.1e)  schedC %d/%d (worst %.1e)  bh-audit %d  ch-audit %d  keys-on-control %d  "
+                "active %d/%d  bh_active %s  ch_active %s"
+                % ("PASS" if ok else "FAIL", a, s, len(recs), c["badrec"], c["nonfin"], c["lion"], c["ties"], wl,
+                   c["s50"], c["s50p"], w50, c["sc"], c["scp"], wc, c["bh"], c["ch"], c["ctl"], c["act"], c["cact"],
+                   last_b, last_c))
+    print("  NON-VACUITY cross-read: records (of 500) on which the complement (group 0) FAILS each forced path (either half);"
+          " max |error|")
+    for a in ARMS[1:]:
+        for s in SEEDS:
+            print("  %-12s s%d  as MUTEPATH %3d  max %8.4f   as HEADPATH %3d  max %8.4f"
+                  % (a, s, cross[(a, s, "MUTEPATH")][0], cross[(a, s, "MUTEPATH")][1], cross[(a, s, "HEADPATH")][0],
+                     cross[(a, s, "HEADPATH")][1]))
+    own = dict((a, "MUTEPATH" if HOLDC[a][0] == "tri" else "HEADPATH") for a in FORCED)
+    nv_own = all(cross[(a, s, own[a])][0] == 0 for a in FORCED for s in SEEDS)
+    nv_other = all(cross[(a, s, other)][0] > 0 for a in FORCED for s in SEEDS for other in ("MUTEPATH", "HEADPATH")
+                   if other != own[a])
+    nv_free = all(cross[(a, s, lab)][0] > 0 for a in ("HEAD", "HOLDLOW", "HOLDHIGH") for s in SEEDS
+                  for lab in ("MUTEPATH", "HEADPATH"))
+    print("  every forced run passes its own path on all records: %s; fails the other path on >= 1: %s; every free"
+          " complement (HEAD, HOLDLOW, HOLDHIGH) fails BOTH paths on >= 1 record: %s" % (nv_own, nv_other, nv_free))
+    if not (nv_own and nv_other and nv_free):
+        viol("non-vacuity cross-read")
+
+    # ---------------------------------------------------------------- [5]
+    print("\n[5] branch, states, stamps (242.6, re-typed; first match wins)")
+    div = [a for a in ARMS if max(P[a]) - min(P[a]) > DIVERGED]
+    gap = M["HEAD"] - M["k01"]
+
+    def st_of(L):
+        if L >= M["HEAD"] - MATCH:
+            return "AT-HEAD"
+        if L <= M["k01"] + NULL:
+            return "AT-K01"
+        return "BETWEEN"
+
+    states = dict((a, st_of(M[a])) for a in HELD)
+    if not bite_ok_all:
+        branch = "PATCH-NOT-VERIFIED"
+    elif not (FLOOR_MIN <= hi <= CEIL_MAX):
+        branch = "HARNESS-UNSOUND"
+    elif div:
+        branch = "UNRESOLVED-DIVERGED"
+    elif M["k01"] > K01_MAX:
+        branch = "SCALAR-NOT-COLLAPSED"
+    elif gap < GAP_MIN:
+        branch = "POSITIVE-CONTROL-FAILED"
+    elif states["LOWHEADPATH"] == "AT-K01":
+        branch = "COMP-HOLD-CONTROL-FAILED"
+    elif states["LOWHEADPATH"] == "BETWEEN":
+        branch = "COMP-HOLD-CONTROL-PARTIAL"
+    elif states["HOLDLOW"] != "AT-HEAD" or states["HOLDHIGH"] != "AT-K01":
+        branch = "REPLICATE-FAILED"
+    else:
+        branch = {("AT-K01", "AT-HEAD"): "DIRECT", ("AT-HEAD", "AT-K01"): "VIA-COMPLEMENT",
+                  ("AT-HEAD", "AT-HEAD"): "BOTH-NEEDED", ("AT-K01", "AT-K01"): "EITHER-SUFFICES"}.get(
+            (states["HIGHHEADPATH"], states["LOWMUTEPATH"]), "GRADED")
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "HOLD-FROM-INIT", "MUTEPATH-MAX-RATE-TRIANGLE", "HEADPATH-REPLAY-FILE",
+              "FORCED-ARMS-OPEN-LOOP", "ONE-NETWORK-PLAINNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-" + "-".join(div))
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if gap >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if gap >= GAP_MIN:
+        stamps += ["%s-%s" % (a, states[a]) for a in HELD]
+    for a in HELD:
+        if M[a] - M["HEAD"] > MATCH:
+            stamps.append(a + "-ABOVE-HEAD")
+        if M[a] - M["k01"] < -NULL:
+            stamps.append(a + "-BELOW-K01")
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-" + a)
+    if any(abs(M[a] - M["k01"]) <= NULL for a in HELD):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    agree = all((CT[l][1] > 0) == (CT[l][0] > 0) for l in ("P_50", "P_C") if abs(CT[l][0]) >= RESCUE)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("  states: %s" % "  ".join("%s %s" % (a, states[a]) for a in HELD))
+    print("  " + final)
+    exp("G-DIVERGE", "  %s every arm's seed range <= 5.0 pp" % ("PASS" if not div else "FAIL"))
+    margins = [("D_HEAD over GAP_MIN", gap - GAP_MIN), ("k01 under K01_MAX", K01_MAX - M["k01"]),
+               ("worst seed range under DIVERGED (%s)" % max(ARMS, key=lambda a: max(P[a]) - min(P[a])),
+                DIVERGED - max(max(P[a]) - min(P[a]) for a in ARMS))]
+    for a in HELD:
+        margins.append(("%s: L - (HEAD - MATCH)   (>= 0 is AT-HEAD)" % a, M[a] - (M["HEAD"] - MATCH)))
+        margins.append(("%s: (k01 + NULL) - L     (>= 0 is AT-K01)" % a, M["k01"] + NULL - M[a]))
+    for k, v in margins:
+        print("    margin %-52s %+9.4f pp = %+.2f SE" % (k, v, v / se))
+    print("  bars in this batch: AT-HEAD iff L >= %.4f; AT-K01 iff L <= %.4f" % (M["HEAD"] - MATCH, M["k01"] + NULL))
+    print("  per-seed readings against the in-batch k01 mean + NULL and HEAD mean - MATCH (descriptive; the branch reads arm means):")
+    for a in HELD:
+        print("    %-12s %s" % (a, " / ".join("s%d %.4f %s" % (s, P[a][j], st_of(P[a][j])) for j, s in enumerate(SEEDS))))
+    print("  registered accounts (242.5), predicted bands for the three forced arms and the co-primaries, hit or miss:")
+    K01B, FREEB, PARTB = (8.0, 16.0), (56.0, 72.0), (20.0, 50.0)
+    acc = [("DIRECT", K01B, FREEB, FREEB, (40.0, 64.0), (-16.0, 16.0)),
+           ("VIA-COMPLEMENT", FREEB, K01B, FREEB, (-16.0, 16.0), (40.0, 64.0)),
+           ("BOTH-NEEDED", FREEB, FREEB, FREEB, (-16.0, 16.0), (-16.0, 16.0)),
+           ("EITHER-SUFFICES", K01B, K01B, FREEB, (40.0, 64.0), (40.0, 64.0)),
+           ("GRADED", PARTB, PARTB, FREEB, (6.0, 52.0), (6.0, 52.0)),
+           ("COMP-HOLD-BREAKS", K01B, K01B, K01B, (-8.0, 8.0), (-8.0, 8.0))]
+
+    def miss(x, band):
+        return 0.0 if band[0] <= x <= band[1] else min(abs(x - band[0]), abs(x - band[1]))
+
+    for nm, bh_, bl_, bc_, b50, bc in acc:
+        vals = [("HIGHHEADPATH", M["HIGHHEADPATH"], bh_), ("LOWMUTEPATH", M["LOWMUTEPATH"], bl_),
+                ("LOWHEADPATH", M["LOWHEADPATH"], bc_), ("P_50", CT["P_50"][0], b50), ("P_C", CT["P_C"][0], bc)]
+        hits = sum(1 for _n, x, b_ in vals if miss(x, b_) == 0.0)
+        print("    %-17s %d/5 bands hit;  %s" % (nm, hits, "  ".join("%s %s" % (n_, "hit" if miss(x, b_) == 0.0 else "miss %.2f" % miss(x, b_))
+                                                                   for n_, x, b_ in vals)))
+    logl = [ln.rstrip("\n") for ln in open(slog)]
+    fl = [ln for ln in logl if ln.startswith("FINAL:")]
+    print("  scorer log FINAL == this FINAL (whole string): %s" % (fl == [final]))
+    if fl:
+        toks = [t.strip() for t in fl[-1][len("FINAL:"):].split("|")]
+        mine = [branch] + stamps
+        print("  branch token equal: %s;  token lists equal: %s (scorer %d tokens, here %d)"
+              % (toks[0] == branch, toks == mine, len(toks), len(mine)))
+        if toks != mine or fl != [final]:
+            viol("FINAL differs: scorer-only %s / here-only %s" % (sorted(set(toks) - set(mine)), sorted(set(mine) - set(toks))))
+    else:
+        viol("no FINAL line in the scorer log")
+
+    # ---------------------------------------------------------------- [6]
+    print("\n[6] the scorer's between-batch and descriptive readouts, re-derived")
+    exp("BETWEEN", "  cvt4: %s" % "  ".join("%s %.4f" % kv for kv in R_CVT4))
+    exp("BETWEEN", "  cvt1: %s" % "  ".join("%s %.4f" % kv for kv in R_CVT1))
+    exp("BETWEEN", "  cvt6 {96,97,98}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+    SUMM = {}
+    for a in ARMS:
+        for s in SEEDS:
+            recs = RECS[(a, s)]
+            ng = 1 if a == "k01" else 2
+            parts = []
+            for k in range(ng):
+                pk, pke, pin, r1, r2 = traj_summary(recs, k)
+                SUMM[(a, s, k)] = (pk, pke, pin, r1, r2)
+                lab = "beta" if ng == 1 else ("cmpl" if k == 0 else "b50")
+                parts.append("%s peak %.3f @%.1f pin %s r %.0f/%.0f" % (lab, pk, pke, "never" if pin is None else "%.1f" % pin, r1, r2))
+            ab = [x["bh_active"] for x in recs if "bh_active" in x]
+            ac = [x["ch_active"] for x in recs if "ch_active" in x]
+            line = "  %-12s s%d  %s  bh_active %s ch_active %s" % (a, s, " | ".join(parts), ab[-1] if ab else "-",
+                                                                    ac[-1] if ac else "-")
+            print(line)
+            exp("DESCRIPTIVE", line)
+    EPL = (9, 14, 15, 16, 17, 18, 19, 24, 29, 39, 49, 99)
+    AM = dict((a, [mean([R[(a, s)]["ep"][e][1] for s in SEEDS]) for e in range(100)]) for a in ARMS)
+    AT = dict((a, [mean([R[(a, s)]["ep"][e][0] for s in SEEDS]) for e in range(100)]) for a in ARMS)
+    for a in ARMS:
+        exp("DESCRIPTIVE", "  %-12s %s" % (a, " / ".join("%.1f (%.1f)" % (AM[a][e], AT[a][e]) for e in EPL)))
+    FIRST2 = {}
+    for x, y in (("LOWHEADPATH", "HIGHHEADPATH"), ("LOWHEADPATH", "LOWMUTEPATH"), ("HEAD", "HOLDHIGH")):
+        g = [AM[x][e] - AM[y][e] for e in range(100)]
+        first = next((e for e in range(100) if all(v > 2.0 for v in g[e:])), None)
+        FIRST2[(x, y)] = first
+        line = "  first epoch line from which arm-mean TEST %s - %s stays > 2 pp: %s" % (x, y, "never" if first is None else first)
+        print(line)
+        exp("DESCRIPTIVE", line)
+
+    # ---------------------------------------------------------------- [7]
+    print("\n[7] LINE-BY-LINE AGREEMENT with the scorer log (each re-built line looked up verbatim)")
+    logset = set(logl)
+    by = {}
+    for sec, line in expect:
+        hit = line in logset
+        by.setdefault(sec, [0, 0])
+        by[sec][0 if hit else 1] += 1
+        if not hit:
+            viol("line not in scorer log [%s]: %r" % (sec, line))
+    for sec in ("CORPUS", "COMPLETE", "G-ARGS", "G-ENV", "G-VOTEW", "G-HOLDW", "G-CHOLDW", "G-STRUCT", "G-PROV", "G-REPLAY",
+                "LEVELS", "G-FLOOR", "G-CEIL", "G-BITE", "SIGMA", "CONTRASTS", "G-DIVERGE", "BETWEEN", "DESCRIPTIVE"):
+        h, m = by.get(sec, [0, 0])
+        print("  %-12s %3d lines found verbatim, %d not found" % (sec, h, m))
+    n_fail = sum(1 for ln in logl if ln.lstrip().startswith("FAIL"))
+    rebuilt = set(line for _s, line in expect) | set([final])
+    print("  total %d re-built lines (+ FINAL), %d found; FAIL lines in the scorer log: %d"
+          % (len(expect), sum(v[0] for v in by.values()), n_fail))
+    other = [ln for ln in logl if ln.strip() and ln not in rebuilt]
+    print("  scorer log: %d lines, %d non-blank, %d not re-built here (banners, section headers, host-path lines, the"
+          " registered licence text):" % (len(logl), sum(1 for ln in logl if ln.strip()), len(other)))
+    for ln in other:
+        st = ln.lstrip()
+        if st.startswith("manifest: ") or st.startswith("provenance: "):
+            print("    | %s <host path, not printed>" % st.split(":")[0])
+        else:
+            print("    | %s" % ln[:110])
+
+    # ================================================================ DESCRIPTIVE
+    print("\n" + "=" * 100)
+    print("DESCRIPTIVE, NOT REGISTERED -- nothing below can move a level, contrast, gate, branch or stamp above")
+    print("=" * 100)
+    med = {}
+    for a in ARMS:
+        order = sorted(range(3), key=lambda j: P[a][j])
+        med[a] = SEEDS[order[1]]
+    print("\n[D1] APPLIED beta at the end of epoch 10 / 18 / 20 / 30 / 40 (probe record at step 500e), MEDIAN seed per arm"
+          " (by plateau5): %s" % "  ".join("%s s%d" % (a, med[a]) for a in ARMS))
+    print("     c = complement (group 0), 50 = layer4.1.bn2.weight (group 1); k01 has one shared beta (50 rides it)")
+    for a in ARMS:
+        cells = []
+        for e in (10, 18, 20, 30, 40):
+            x = RECS[(a, med[a])][5 * e]
+            if x["step"] != SPE * e:
+                viol("record index %d is not epoch %d" % (5 * e, e))
+            cells.append("%7.3f" % x["beta"][0] if a == "k01" else "%7.3f / %7.3f" % (x["beta"][0], x["beta"][1]))
+        print("  %-12s %-9s %s" % (a, "shared" if a == "k01" else "c / 50", "   ".join(cells)))
+    print("  the registered schedules at the same epochs (value applied at update 500e + 2):")
+    for lab, fn_ in (("v_9428 (MUTEPATH, 50 HIGH)", lambda m: tri(m, P9428)), ("HEADPATH replay", rep)):
+        print("  %-28s %s" % (lab, "   ".join("%7.3f" % fn_(SPE * e + 2) for e in (10, 18, 20, 30, 40))))
+    print("  mean r = exp(beta+15) over epochs [15,30) and [30,60), arm mean of the three seeds (complement ; 50):")
+    for a in ARMS:
+        if a == "k01":
+            print("    %-12s shared %9.1f %9.1f" % (a, mean([SUMM[(a, s, 0)][3] for s in SEEDS]), mean([SUMM[(a, s, 0)][4] for s in SEEDS])))
+        else:
+            print("    %-12s complement %9.1f %9.1f ; 50 %9.1f %9.1f" % (
+                a, mean([SUMM[(a, s, 0)][3] for s in SEEDS]), mean([SUMM[(a, s, 0)][4] for s in SEEDS]),
+                mean([SUMM[(a, s, 1)][3] for s in SEEDS]), mean([SUMM[(a, s, 1)][4] for s in SEEDS])))
+
+    print("\n[D2] TEST (TRAIN) after 15 / 17 / 19 / 30 / 50 / 100 completed epochs (Epoch lines 14 / 16 / 18 / 29 / 49 / 99):"
+          " arm mean, then TEST per seed")
+    for a in ARMS:
+        cells = ["%.2f (%.2f)" % (AM[a][e], AT[a][e]) for e in (14, 16, 18, 29, 49, 99)]
+        per = ["s%d %s" % (s, "/".join("%.2f" % R[(a, s)]["ep"][e][1] for e in (14, 16, 18, 29, 49, 99))) for s in SEEDS]
+        print("  %-12s %s" % (a, "  ".join(cells)))
+        print("  %-12s %s" % ("", "  ".join(per)))
+    print("  settle = first Epoch line after which TEST stays within 0.5 pp of plateau5 (arm mean; per seed); TRAIN likewise")
+    for a in ARMS:
+        st_a = next(e for e in range(100) if all(abs(v - M[a]) <= 0.5 for v in AM[a][e:]))
+        st_t = next(e for e in range(100) if all(abs(v - TM[a]) <= 0.5 for v in AT[a][e:]))
+        ps = []
+        for j, s in enumerate(SEEDS):
+            tv = [R[(a, s)]["ep"][e][1] for e in range(100)]
+            ps.append(next(e for e in range(100) if all(abs(v - P[a][j]) <= 0.5 for v in tv[e:])))
+        print("  %-12s TEST settle %2d (per seed %s)   TRAIN settle %2d" % (a, st_a, "/".join(str(x) for x in ps), st_t))
+
+    print("\n[D3] when HIGHHEADPATH and LOWMUTEPATH depart from LOWHEADPATH (TEST; Epoch line n = after n+1 epochs)")
+    for y in ("HIGHHEADPATH", "LOWMUTEPATH"):
+        g = [AM["LOWHEADPATH"][e] - AM[y][e] for e in range(100)]
+        f1 = next((e for e in range(100) if all(v > 1.0 for v in g[e:])), None)
+        f2 = next((e for e in range(100) if all(v > 2.0 for v in g[e:])), None)
+        f5 = next((e for e in range(100) if all(v > 5.0 for v in g[e:])), None)
+        print("  LOWHEADPATH - %-12s arm-mean gap, lines 10..40: %s" % (y, " ".join("%d:%+.1f" % (e, g[e]) for e in range(10, 41, 2))))
+        print("  %-27s first line from which it stays > 1 / 2 / 5 pp: %s / %s / %s" % ("", f1, f2, f5))
+        per = []
+        for s in SEEDS:
+            gs_ = [R[("LOWHEADPATH", s)]["ep"][e][1] - R[(y, s)]["ep"][e][1] for e in range(100)]
+            per.append("s%d %s" % (s, next((e for e in range(100) if all(v > 2.0 for v in gs_[e:])), None)))
+        print("  %-27s same seed, first line from which it stays > 2 pp: %s" % ("", "  ".join(per)))
+        tg = [AT["LOWHEADPATH"][e] - AT[y][e] for e in range(100)]
+        print("  %-27s TRAIN gap, first line from which it stays > 2 pp: %s" % (
+            "", next((e for e in range(100) if all(v > 2.0 for v in tg[e:])), None)))
+    print("  the two complement schedules (HEADPATH - MUTEPATH, beta at update 500e+2) at epochs 14..40:")
+    print("    %s" % " ".join("%d:%+.2f" % (e, rep(SPE * e + 2) - tri(SPE * e + 2, P9428)) for e in range(14, 41, 2)))
+    fd = next(e10 / 10.0 for e10 in range(0, 1000) if abs(rep(50 * e10 + 2) - tri(50 * e10 + 2, P9428)) > 0.1)
+    print("    first epoch (0.1 grid) at which they differ by > 0.1: %.1f" % fd)
+    print("  50's two schedules (v_9428 - floor) at epochs 2..20: %s" % " ".join(
+        "%d:%+.2f" % (e, tri(SPE * e + 2, P9428) - LO) for e in range(2, 21, 2)))
+    print("  HEAD - HOLDHIGH first line from which it stays > 2 pp (the cvt4 replicate of 240.4(1)'s epoch-16 split): %s"
+          % FIRST2[("HEAD", "HOLDHIGH")])
+
+    print("\n[D4] the FREE complements against the two registered paths (max |beta[0] - schedule(step+2)| over records)")
+    for a in ("HEAD", "HOLDLOW", "HOLDHIGH"):
+        for s in SEEDS:
+            recs = RECS[(a, s)]
+            dm = max(abs(float(x["beta"][0]) - tri(x["step"] + 2, P9428)) for x in recs)
+            dm40 = max(abs(float(x["beta"][0]) - tri(x["step"] + 2, P9428)) for x in recs if x["step"] <= 40 * SPE)
+            dh = max(abs(float(x["beta"][0]) - rep(x["step"] + 2)) for x in recs)
+            mh = mean([abs(float(x["beta"][0]) - rep(x["step"] + 2)) for x in recs])
+            pk, pke, pin, r1, r2 = SUMM[(a, s, 0)]
+            print("  %-9s s%d cmpl peak %.3f @%.1f pin %-5s | vs v_9428: max %.3f (epochs 0-40 %.3f) | vs HEADPATH: max %.3f mean %.3f"
+                  % (a, s, pk, pke, "never" if pin is None else "%.1f" % pin, dm, dm40, dh, mh))
+    hh = [SUMM[("HOLDHIGH", s, 0)] for s in SEEDS]
+    rule = all(p[2] is not None and 38.0 <= p[2] <= 43.0 for p in hh) and max(
+        max(abs(float(x["beta"][0]) - tri(x["step"] + 2, P9428)) for x in RECS[("HOLDHIGH", s)]) for s in SEEDS) < 0.5
+    print("  HOLDHIGH's free complement pinned at %s and stayed within 0.5 of v_9428 on every record: %s"
+          " (cvt4: pinned 40.4 x3, within 0.064-0.160)" % (" / ".join("never" if p[2] is None else "%.1f" % p[2] for p in hh), rule))
+
+    print("\nVIOLATIONS %d" % len(bad))
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()

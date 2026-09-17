@@ -32,10 +32,10 @@ test('every previously published experiment keeps its ID, title and section', ()
   }
 });
 
-test('only the 37 partition-audit rows, the 6 appended rows, the cvt1 row, the cgn3 row, the cvt3 and cvt2 rows and the cvt4 and cvt5 rows are new, keyed on their line in the pinned MASTER-TABLE', () => {
+test('only the 37 partition-audit rows, the 6 appended rows, the cvt1 row, the cgn3 row, the cvt3 and cvt2 rows, the cvt4 and cvt5 rows and the cvt6 and cvt7 rows are new, keyed on their line in the pinned MASTER-TABLE', () => {
   const old = new Set(fixture.experiments.map(e => e.id));
   const added = data.experiments.map(e => e.id).filter(id => !old.has(id));
-  assert.deepEqual(added.sort(), [...partitionIds, ...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223'].sort());
+  assert.deepEqual(added.sort(), [...partitionIds, ...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225'].sort());
   assert.equal(new Set(data.experiments.map(e => e.id)).size, data.experiments.length, 'no duplicate IDs');
   assert.ok(fixture.experiments.every(e => !/^MT\d{3}$/.test(e.id) || Number(e.id.slice(2)) < 167), 'new IDs cannot collide with old ones');
   // The cau1 and cvk1 rows already have records (MT020 and CVK2); no duplicates were created for lines 166-167.
@@ -61,7 +61,7 @@ test('MASTER-TABLE anchors resolve by row content, not by the old line numbers',
   assert.equal(lineOf('MT014'), 14);
   assert.equal(lineOf('MT026'), 25, 'MT026 was keyed on an uncommitted snapshot one line longer; its row is line 25 in every commit');
   assert.equal(lineOf('MT020'), 166, 'the cau1 row was appended at line 166');
-  for (const id of [...partitionIds, ...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223']) assert.equal(lineOf(id), Number(id.slice(2)));
+  for (const id of [...partitionIds, ...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225']) assert.equal(lineOf(id), Number(id.slice(2)));
 });
 
 test('all 148 records published before the lines 212-217 import keep their ID, title, area, kind and outcome', () => {
@@ -76,7 +76,7 @@ test('all 148 records published before the lines 212-217 import keep their ID, t
       [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !previous.experiments.some(e => e.id === id));
-  assert.deepEqual(added, [...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223'], 'the imports append exactly MT212-MT217, then MT218, then MT219, then MT220-MT221, then MT222-MT223, in line order');
+  assert.deepEqual(added, [...appendedIds, 'MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225'], 'the imports append exactly MT212-MT217, then MT218, then MT219, then MT220-MT221, then MT222-MT223, then MT224-MT225, in line order');
 });
 
 test('the appended MASTER-TABLE rows carry their registered verdict, area and no duplicate of cau1 or cvk1', () => {
@@ -118,8 +118,8 @@ test('all 154 records published before the line-218 import keep their ID, title,
       [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before218.experiments.some(e => e.id === id));
-  assert.deepEqual(added, ['MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223']);
-  assert.equal(data.experiments.length, 160);
+  assert.deepEqual(added, ['MT218', 'MT219', 'MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225']);
+  assert.equal(data.experiments.length, 162);
 });
 
 // The 155 records published at acbc2b0, before MASTER-TABLE line 219 (cgn3) was imported and rows 213 and 218
@@ -137,8 +137,8 @@ test('all 155 records published before the line-219 import keep their ID, title,
       [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before219.experiments.some(e => e.id === id));
-  assert.deepEqual(added, ['MT219', 'MT220', 'MT221', 'MT222', 'MT223']);
-  assert.equal(data.experiments.length, 160);
+  assert.deepEqual(added, ['MT219', 'MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225']);
+  assert.equal(data.experiments.length, 162);
 });
 
 // The 156 records published at 944fa47, before MASTER-TABLE lines 220-221 (cvt3, cvt2) were imported and rows 213
@@ -156,8 +156,8 @@ test('all 156 records published before the lines 220-221 import keep their ID, t
       [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before220.experiments.some(e => e.id === id));
-  assert.deepEqual(added, ['MT220', 'MT221', 'MT222', 'MT223']);
-  assert.equal(data.experiments.length, 160);
+  assert.deepEqual(added, ['MT220', 'MT221', 'MT222', 'MT223', 'MT224', 'MT225']);
+  assert.equal(data.experiments.length, 162);
 });
 
 // The 158 records published at d2fb38b, before MASTER-TABLE lines 222-223 (cvt4, cvt5) were imported. The landing
@@ -175,8 +175,26 @@ test('all 158 records published before the lines 222-223 import keep their ID, t
       [old.section, old.area, plain(old.title), old.kind, old.outcome, old.corrected], old.id);
   }
   const added = data.experiments.map(e => e.id).filter(id => !before222.experiments.some(e => e.id === id));
-  assert.deepEqual(added, ['MT222', 'MT223']);
-  assert.equal(data.experiments.length, 160);
+  assert.deepEqual(added, ['MT222', 'MT223', 'MT224', 'MT225']);
+  assert.equal(data.experiments.length, 162);
+});
+
+// The 160 records published at 52db8b6, before MASTER-TABLE lines 224-225 (cvt6, cvt7) were imported. That landing amended
+// no row in place (only header line 3 and line 5, which feeds no record), so no earlier record may change.
+const before224 = JSON.parse(readFileSync(new URL('./fixtures/register-ids-52db8b6.json', import.meta.url), 'utf8')) as typeof previous;
+
+test('all 160 records published before the lines 224-225 import keep their ID, title, area, kind and outcome; only MT224 and MT225 are added', () => {
+  assert.equal(before224.experiments.length, 160);
+  assert.deepEqual(before224.experiments.map(e => e.id), data.experiments.slice(0, 160).map(e => e.id), 'existing records keep their order');
+  for (const old of before224.experiments) {
+    const current = byId.get(old.id);
+    assert.ok(current, `${old.id} must not disappear`);
+    assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
+      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+  }
+  const added = data.experiments.map(e => e.id).filter(id => !before224.experiments.some(e => e.id === id));
+  assert.deepEqual(added, ['MT224', 'MT225']);
+  assert.equal(data.experiments.length, 162);
 });
 
 test('journal entries still resolve to existing experiments', () => {

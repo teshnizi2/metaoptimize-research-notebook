@@ -60,12 +60,19 @@ mapping is reviewable in one place and never applied ad hoc:
    which feeds no record). ``C244_AMENDMENTS`` carries them into MT222 and MT223 without moving an outcome; the pinned
    file may differ from the cvt4/cvt5 pin only on those three lines, and only by the inserted brackets.
 
+10. The rows appended at the cvt6 and cvt7 landings (MASTER-TABLE lines 224-225 at campaign commit dae2a49, CORRECTIONS
+    246-247) are imported by ``CVT67_ROWS``. The pinned file may differ from the CORRECTIONS 244 pin only on header line 3
+    and on line 5, by inserted brackets; no existing row was amended. Their intervened arms (cvt6's step-size and
+    complement holds, some runs carrying both; cvt7's group holds) are named from the same exclusion list. The landing's
+    in-place corrections of its own registrations (CORRECTIONS 242, 243.4) are checked as bracket insertions and shown on
+    MT224 / MT225 as documented limitations.
+
 Record text is plain text: ``clean()`` removes Markdown bold, emphasis and code marks from every MASTER-TABLE cell and
 from the text fields of the campaign's register export (``BASE_TEXT_FIELDS``), which copies the cells with their marks.
 
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
 ``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221,
-then MT222-MT223);
+then MT222-MT223, then MT224-MT225);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -122,6 +129,7 @@ CORRECTION_REMAP = {
 # ---------------------------------------------------------------------------
 PARTITION_AUDIT_COMMIT = "d69b23abcc14547e68017dba91d47a40af6f345e"
 MASTER_TABLE = "docs/MASTER-TABLE.md"
+CORRECTIONS_DOC = "docs/CORRECTIONS.md"
 MASTER_TABLE_SHA256 = "e6f158ea1020f020c1753efe62355014b7148804c3c1def0a9bfeea14b380d88"
 SECTION_HEADING_LINE = 169
 FIRST_ROW, LAST_ROW = 175, 211
@@ -196,7 +204,7 @@ AREAS = {1: "Baseline comparisons", 9: "Mechanism and isolation"}
 # the rows were launched 2026-09-15 (CORRECTIONS 216, commit 918c0aa) and landed
 # 2026-09-16 (CORRECTIONS 217-226, commits 2d09417-64e4f47).
 ADDED_PHASES = [{
-    "id": "phase-09", "date": "2026-09-15", "period": "15-16 Sep", "title": "Off BatchNorm, off residuals, long horizons",
+    "id": "phase-09", "date": "2026-09-15", "period": "15-17 Sep", "title": "Off BatchNorm, off residuals, long horizons",
     "test": "GroupNorm and residual-free ResNet-18 isolation; VGG rescue at 328 epochs; unaugmented CIFAR-100 baseline",
     "observed_result": "Gap and carrier set transfer to GroupNorm; one BN scale rescues without residuals; VGG rescue holds at 328 epochs; unaugmented deficit +12.18 pp",
     "next_question": "Identity versus magnitude remains unresolved on every network",
@@ -205,7 +213,9 @@ ADDED_PHASES = [{
     # cvt2 landings of 16 Sep (CORRECTIONS 232 / 233 registration and launch, 235 / 236 landing), and MT222-MT223,
     # the cvt4 and cvt5 batches registered and launched on 16 Sep (CORRECTIONS 237 / 238) and landed at campaign
     # commit 643264c (CORRECTIONS 240 / 241; 2026-09-17 00:10 +0200, 16 Sep 22:10 UTC).
-    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 223 + 1)],
+    # MT224-MT225, the cvt6 and cvt7 batches registered and launched on 16-17 Sep (CORRECTIONS 242 / 243; 16 Sep 23:19 UTC)
+    # and landed at campaign commit dae2a49 (CORRECTIONS 246 / 247; 2026-09-17 03:54 +0200, 17 Sep 01:54 UTC).
+    "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 225 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
 }]
 
@@ -336,7 +346,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     """job_id -> the campaign's exclusion row for runs whose CSV cell key hides a harness intervention."""
     raw, previous = b"", None
     # Each pin must be a byte prefix of the next: the list may only grow by appended rows.
-    for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256)]:
+    for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256),
+                             (CVT67_COMMIT, CVT67_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -346,16 +357,65 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     body = [line for line in raw.decode("utf-8").splitlines() if line and not line.startswith("#")]
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
-    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS}.items():
+    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS}.items():
         mine = [row for row in rows if row["batch"] == spec["batch"]]
         arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
         if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
             raise ValueError(f"{INTERVENTIONS_TSV} does not list the registered intervened arms of {eid}: {arms}")
         for row in mine:
+            intervention_kinds(row["intervention"])  # every listed hold must be a known kind
             runs[row["job_id"]] = {**row, "experimentId": eid}
     if len(runs) != len(rows):
         raise ValueError(f"{INTERVENTIONS_TSV} lists runs with no registered intervention record")
     return runs
+
+
+# The exclusion list's intervention column is free text: one PATCH=value per hold, separated by spaces (CORRECTIONS 245:
+# cvt6's forced arms carry BETA_HOLD and COMP_HOLD at once). Each kind is named on the run page; an unknown patch stops
+# the export rather than being guessed.
+INTERVENTION_KINDS = {"VOTE_W": "vote-weight", "BETA_HOLD": "step-size hold", "COMP_HOLD": "complement step-size hold",
+                      "GROUP_HOLD": "group step-size hold"}
+
+
+def intervention_kinds(intervention: str) -> list[tuple[str, str]]:
+    """[(patch, value), ...] for the exclusion list's intervention cell, in the order written."""
+    parts = intervention.split(" ") if intervention else []
+    kinds = []
+    for part in parts:
+        patch, sep, value = part.partition("=")
+        if not sep or not value or patch not in INTERVENTION_KINDS:
+            raise ValueError(f"Unknown intervention in {INTERVENTIONS_TSV}: {intervention!r}")
+        kinds.append((patch, value))
+    if not kinds or len({patch for patch, _ in kinds}) != len(kinds):
+        raise ValueError(f"Unreadable intervention in {INTERVENTIONS_TSV}: {intervention!r}")
+    return kinds
+
+
+def intervention_phrase(intervention: str) -> str:
+    """'step-size hold intervention', or 'step-size hold and complement step-size hold interventions' for a two-kind run."""
+    names = [INTERVENTION_KINDS[patch] for patch, _ in intervention_kinds(intervention)]
+    return f"{names[0]} intervention" if len(names) == 1 else " and ".join(names) + " interventions"
+
+
+def additional_witness(lines: list[str], patch: str, value: str) -> str:
+    """The run log's one '<patch>: on' line, checked against the listed value (floor, tri:<P> or rec:<id>).
+
+    The exclusion list carries the witness of a run's first hold only; a second hold is witnessed by the run's own log."""
+    found = [line for line in lines if line.startswith(f"{patch}: on ")]
+    if len(found) != 1:
+        raise ValueError(f"A run log must print exactly one '{patch}: on' line; found {len(found)}")
+    mode = value.rsplit(":", 2)
+    if value.endswith(":floor") or value == "floor":
+        expected = " mode=floor"
+    elif len(mode) >= 2 and mode[-2] == "tri":
+        expected = f" mode=tri P={mode[-1]} "
+    elif len(mode) >= 2 and mode[-2] == "rec":
+        expected = f" mode=rec id={mode[-1]} "
+    else:
+        raise ValueError(f"Unreadable {patch} value: {value!r}")
+    if expected not in found[0] + " ":
+        raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
+    return found[0]
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +867,150 @@ def apply_c244_amendments(rows: list[dict], repo: Path) -> list[dict]:
     return amended
 
 
+# ---------------------------------------------------------------------------
+# 10. The cvt6 and cvt7 landings (CORRECTIONS 246-247): two appended rows, no row amended; registrations corrected in place.
+# ---------------------------------------------------------------------------
+# Campaign commit dae2a49 (cycle 152, CORRECTIONS 246 + 247) appended the cvt6 and cvt7 landings as lines 224 and 225,
+# recounted header line 3 and amended the bottom-line paragraph (line 5) with four inserted brackets, superseded clauses kept.
+# Nothing else may differ from the CORRECTIONS 244 pin and no line may move; line 5 must give the pinned line back byte for
+# byte once the CORRECTIONS 246 and 247 brackets are removed. Line 5 feeds no record. No existing row was amended, so no
+# earlier record changes (MT222's bound, which line 5 now calls partly resolved, is left as its row still reads).
+CVT67_COMMIT = "dae2a49675a950e9848543435526a3ba864b145a"
+CVT67_MASTER_TABLE_SHA256 = "d33f4dfe929e9576282914641645bce376aa73fa8658e4431e57c49ca01b9f22"
+CVT67_FIRST_ROW, CVT67_LAST_ROW = 224, 225
+CVT67_EDITED_LINES = {3, 5}
+CVT67_LINE5_TAGS = ("CORRECTIONS 246", "CORRECTIONS 247")
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# cvt6 is Mixed, as MT218 and MT221: the registered branch GRADED answers the 2x2 question (240.4(1) PARTLY RESOLVED), the
+# complement-hold positive control reproduces and G-BITE passes 21/21, but no registered account fits every band (246.3):
+# GRADED's own account hits 3 of 5 (HIGHHEADPATH 20-50 missed by 8.51 pp, P_50 +6...+52 by 1.53 pp), DIRECT and
+# EITHER-SUFFICES 3 of 5 too, so the observed pattern is a GRADED sub-case no account predicted -- "a registered expectation
+# was defied". Not Goal missed: nothing registered was refuted as a hypothesis and no control failed.
+# cvt7 is Goal met, as MT219 and MT222: the registered branch TRANSFERS-GRADED answers the question ("partly transfers"), its
+# account hits every registered band (247.3: HOLDHIGH 50.23 in 34-56, P_HIGH 19.81 in +6...+44), the positive control
+# HOLDISO reproduces, G-BITE passes 15/15, no bar is near and no numeric prior was registered (243.5). Its bounds -- dose
+# and held set confounded with network, the free complement not ISO-like -- are descriptive limits (247.4), not missed
+# bands, and stay in the reason and scope, as MT222's direct-vs-complement bound did.
+# Neither row corrects an earlier published claim, so neither carries the Corrected badge.
+CVT67_ROWS = {
+    224: ("mixed", 9, ["cvt6"], ["page-19"], None, "GRADED: at cvt1's cell on PlainNet18_c100, HIGHHEADPATH (50 on MUTE's replayed trajectory, the complement forced open-loop onto HEAD's recorded path) sits at the k01 location (11.49 vs k01 12.07) and LOWMUTEPATH (50 at the floor, the complement forced onto MUTE's collapse schedule) sits between at 41.56; P_50 +53.53 pp = +94.40 SE and P_C +23.47 pp = +41.38 SE, the complement-hold control keeps HEAD's level (P_CTLC -0.12 pp), cvt4's HOLDLOW and HOLDHIGH replicate, and G-BITE passes 21/21. But no registered account fits every band: GRADED's own account hits 3 of 5 (HIGHHEADPATH misses 20-50 by 8.51 pp, P_50 misses by 1.53 pp), as do DIRECT and EITHER-SUFFICES, so the pattern is a GRADED sub-case no account predicted. Bounded: the forced arms are open-loop, there is one shape per factor with no dose curve or time gate, readings at k01 are locations, and no single-route sentence or necessity is licensed."),
+    225: ("met", 9, ["cvt7"], ["page-19"], None, "TRANSFERS-GRADED: on ResNet18_c100 at ciso1's cell, holding ISO's three-carrier group on k01's measured trajectory (HOLDHIGH) gives 50.23, between k01 22.95 and ISO 70.04 (P_HIGH +19.81 pp = +34.94 SE), while the floor (HOLDLOW 70.30) and ISO's own replayed trajectory (HOLDISO 70.06, the positive control) keep ISO's level; the TRANSFERS-GRADED account hits every registered band, G-BITE passes 15/15, no bar is near and no numeric prior was registered, so PlainNet's small-step-size sentence partly transfers. Bounded: dose and held set are confounded with network (replay peak -5.21 vs PlainNet's -4.39; three carriers held together vs idx 50 alone), the free complement did not stay ISO-like (pinned at 52.8-54.0 vs ISO's 92.6-99.4), so direct vs via-complement is not separated, and larger trajectories were not tested."),
+}
+CVT67_BEARS_ON = {224: ["MT222", "MT218"], 225: ["MT222"]}  # cvt6 splits the route cvt4's HOLDHIGH left confounded; cvt7 carries cvt4's sentence to ResNet
+CVT67_INTERVENTIONS_TSV_SHA256 = "d0b955cbfce5c485c48c23d53feadd1fee581f379a221596fa65cf99c7eefe93"
+CVT67_INTERVENTIONS = {
+    "MT224": {
+        "batch": "cvt6", "arms": {"HOLDLOW": 3, "HOLDHIGH": 3, "HIGHHEADPATH": 3, "LOWMUTEPATH": 3, "LOWHEADPATH": 3},
+        "title": "HOLDLOW, HOLDHIGH, HIGHHEADPATH, LOWMUTEPATH and LOWHEADPATH are step-size hold interventions, not plain HEAD arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT67_COMMIT[:7]}; CORRECTIONS 242, 245 and 246",
+        "note": ("The five held arms ran cvt4's tree plus the opt-in PATCH_COMPHOLD (COMP_HOLD=tri:<P> | rec:<id>), on HEAD's grouping "
+                 "({50} [52,1]). PATCH_BETAHOLD holds tensor 50's beta (layer4.1.bn2.weight's log step size); PATCH_COMPHOLD overwrites "
+                 "the complement's beta after that hold. HOLDLOW = 50 at the -15 floor with the complement free (Lion); HOLDHIGH = 50 on "
+                 "MUTE's replayed trajectory (tri:9428) with the complement free (cvt4's two arms, replicated); HIGHHEADPATH = 50 on "
+                 "tri:9428 with the complement forced onto HEADPATH (the knot-by-knot median of 12 landed HEAD complements, replay file "
+                 "74be71fa); LOWMUTEPATH = 50 at the floor with the complement forced onto MUTEPATH (tri:9428); LOWHEADPATH = 50 at the "
+                 "floor with the complement on HEADPATH (the complement hold's positive control). HIGHHEADPATH, LOWMUTEPATH and "
+                 "LOWHEADPATH hold both groups, so they are open-loop: both Lion momentum entries are dead state. The holds ride only "
+                 "the run's own BETA_HOLD: and COMP_HOLD: witness lines, so the run inventory writes all 15 rows with HEAD's cell key: "
+                 "seed for seed they differ from HEAD only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT "
+                 "plain HEAD measurements. The 15 rows are listed in results/CORPUS-EXCLUSIONS.tsv by their BETA_HOLD witness; the 9 "
+                 "forced rows' COMP_HOLD line is checked through MULTI_KIND (CORRECTIONS 245) and shown on each run as its additional "
+                 "witness. Drop them before pooling runs by cell. The k01 and HEAD arms print VOTE_W: off, BETA_HOLD: off and "
+                 "COMP_HOLD: off and are ordinary measurements of their cells."),
+    },
+    "MT225": {
+        "batch": "cvt7", "arms": {"HOLDLOW": 3, "HOLDHIGH": 3, "HOLDISO": 3},
+        "title": "HOLDLOW, HOLDHIGH and HOLDISO are group step-size hold interventions, not plain ISO arms",
+        "source": f"{INTERVENTIONS_TSV} at {CVT67_COMMIT[:7]}; CORRECTIONS 243 and 247",
+        "note": ("The three held arms ran a tree built from the live ResNet harness plus PATCH_VOTEWEIGHT, PATCH_BETAHOLD and the "
+                 "opt-in PATCH_GROUPHOLD (GROUP_HOLD=<n1>+<n2>+<n3>:floor|tri:<P>), on ISO's grouping [59,3], which isolates the three "
+                 "carriers layer4.0.bn2.weight, layer4.0.shortcut.1.weight and layer4.1.bn2.weight together in one group with their "
+                 "vote out of the complement's sum. The patch holds that group's beta (its log step size), named by its complete "
+                 "membership, from init; the complement stays on Lion. HOLDLOW = the group at the -15 floor; HOLDHIGH = an exogenous "
+                 "max-rate replay of k01's measured shared trajectory at this cell (tri:8609, peak -5.21); HOLDISO = a replay of ISO's "
+                 "own median carrier trajectory (tri:5153, the hold's positive control). GROUP_HOLD rides only the run's own "
+                 "GROUP_HOLD: witness line, so the run inventory writes all 9 rows with ISO's cell key: seed for seed they differ "
+                 "from ISO only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT plain ISO measurements. "
+                 "The 9 rows are listed in results/CORPUS-EXCLUSIONS.tsv; drop them before pooling runs by cell. With them in, the "
+                 "ResNet18_c100 noise floor depends on the filter (0.688153 filtered against 2.208672 unfiltered, CORRECTIONS 247.11). "
+                 "The k01 and ISO arms print VOTE_W: off, BETA_HOLD: off and GROUP_HOLD: off and are ordinary measurements of their cells."),
+    },
+}
+# The landing also corrected its own registrations in place (docs/CORRECTIONS.md, brackets inserted, superseded wording
+# kept): five brackets in CORRECTIONS 242 and one in 242.14 (246.9), one in 243.4 (247.12). They are registration text,
+# not a record's published claim, so they carry no Corrected badge; each record shows them as a documented limitation.
+# The pinned file at dae2a49 must equal the one at the ingest commit 45eac02 on every earlier line once the tagged
+# brackets are removed from exactly these lines, plus the two appended entries.
+CVT67_PRE_CORRECTIONS_COMMIT = "45eac02ad5afc87ad66c203a575034b2aaa02558"
+CVT67_PRE_CORRECTIONS_SHA256 = "903cca25b6449b8ec82ce64c7a669d2de796ee9880ed7de45bc4d3614569b13e"
+CVT67_CORRECTIONS_SHA256 = "caac42cf2f56edd30d9a043f03a15b47c6308614bda6167bfbb110f3515024db"
+CVT67_CORRECTED_LINES = {32557: "CORRECTIONS 246", 32588: "CORRECTIONS 246", 32589: "CORRECTIONS 246", 32592: "CORRECTIONS 246",
+                         32715: "CORRECTIONS 246", 32775: "CORRECTIONS 246", 32834: "CORRECTIONS 247"}
+CVT67_REGISTRATION_CORRECTIONS = {
+    "MT224": {"number": 246, "entry": "246.9",
+              "reason": ("CORRECTIONS 246.9 corrected cvt6's registration (CORRECTIONS 242) in place, with brackets and the superseded "
+                         "wording kept. RULE H's replay path (HEADPATH) is the median of 12 of the 15 landed 100-epoch HEAD runs at this "
+                         "cell, not of every one: cpl2 HEAD s75-77 were omitted, and the 15-run median differs from the replay by at most "
+                         "0.1601 log units (mean 0.0100), re-derived from the raw probe records; corrected in four places. 242.14's 'the "
+                         "first run COMPLETED': by sacct end times 8 runs had ended at that pass. 242.3(2)'s 'epoch 18.2': update 9,036 = "
+                         "epoch 18.07. The registration stays valid, because the replay file is what was registered, witnessed and bitten; "
+                         "no number, gate, token or outcome moves.")},
+    "MT225": {"number": 247, "entry": "247.12",
+              "reason": ("CORRECTIONS 247.12 corrected a cross-reference in cvt7's registration (CORRECTIONS 243.4) in place, with a "
+                         "bracket: the after-launch hashes are recorded in 243.13, not 243.11. Cosmetic; no number, gate, token or "
+                         "outcome moves.")},
+}
+
+
+def cvt67_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvt6 + cvt7 landing; only header line 3, bracket insertions on line 5 and two appended rows may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT67_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != CVT67_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {CVT67_COMMIT[:12]} does not match the pinned cvt6/cvt7-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = c244_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != CVT67_LAST_ROW or len(before) != CVT67_FIRST_ROW - 1 or changed != CVT67_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {CVT67_COMMIT[:7]} moved a line or edited lines other than {sorted(CVT67_EDITED_LINES)}: {sorted(changed)}")
+    line5 = lines[4]
+    for tag in reversed(CVT67_LINE5_TAGS):
+        line5 = strip_inserted_brackets(line5, tag)
+    if line5 != before[4]:
+        raise ValueError(f"MASTER-TABLE line 5 at {CVT67_COMMIT[:7]} changed more than inserted {' / '.join(CVT67_LINE5_TAGS)} brackets")
+    return lines
+
+
+def cvt67_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the landing and at the ingest; earlier entries may differ only by the listed inserted brackets."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT67_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != CVT67_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT67_COMMIT[:12]} does not match the pinned bytes")
+    previous = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT67_PRE_CORRECTIONS_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(previous).hexdigest() != CVT67_PRE_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT67_PRE_CORRECTIONS_COMMIT[:12]} does not match the pinned bytes")
+    lines, before = raw.decode("utf-8").splitlines(), previous.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) <= len(before) or changed != set(CVT67_CORRECTED_LINES):
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT67_COMMIT[:7]} edited lines other than the listed corrections: {sorted(changed ^ set(CVT67_CORRECTED_LINES))}")
+    for n, tag in CVT67_CORRECTED_LINES.items():
+        if tag not in lines[n - 1] or strip_inserted_brackets(lines[n - 1], tag) != before[n - 1]:
+            raise ValueError(f"{CORRECTIONS_DOC} line {n} at {CVT67_COMMIT[:7]} changed more than an inserted {tag} bracket")
+    if not any(line.startswith("## 246. ") for line in lines[len(before):]) or not any(line.startswith("## 247. ") for line in lines[len(before):]):
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT67_COMMIT[:7]} does not append entries 246 and 247")
+    return lines, before
+
+
+def cvt67_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 224 (cvt6) and 225 (cvt7), attach their intervention notes and registration corrections."""
+    rows = with_interventions(appended_rows(lines, CVT67_ROWS, CVT67_FIRST_ROW, CVT67_LAST_ROW, CVT67_COMMIT), CVT67_INTERVENTIONS)
+    for row in rows:
+        spec = CVT67_REGISTRATION_CORRECTIONS[row["id"]]
+        entries = sorted({line for line, tag in CVT67_CORRECTED_LINES.items() if tag == f"CORRECTIONS {spec['number']}"})
+        row["registration_corrections"] = json.dumps([{"number": spec["number"], "reason": spec["reason"], "lines": entries,
+                                                       "source": f"{CORRECTIONS_DOC} at {CVT67_COMMIT[:7]}; CORRECTIONS {spec['entry']}"}], ensure_ascii=False)
+    return rows
+
+
 def amended_master_table(repo: Path) -> list[str]:
     """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
     raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
@@ -1037,7 +1241,8 @@ def remap_base_row(row: dict) -> dict:
 def load_register(workspace: Path, repo: Path) -> list[dict]:
     """The published register: every row below, with the pinned in-place row amendments applied (229, then 231, then 234/236).
 
-    The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place."""
+    The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place.
+    The cvt6 / cvt7 landing (CORRECTIONS 246-247) amended no row either (only line 5, which feeds no record)."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
     return apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo))
 
@@ -1052,7 +1257,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
         raise ValueError(f"Approved correction mapping names absent IDs: {sorted(missing)}")
     added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
              + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo)))
-             + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo))))
+             + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo)))
+             + cvt67_rows(cvt67_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

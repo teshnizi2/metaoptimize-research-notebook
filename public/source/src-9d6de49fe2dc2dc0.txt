@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""cvt7 REGISTRATION-TIME DERIVATIONS (CORRECTIONS 243).  Reads ONLY landed probe records of the three ResNet18_c100 ISO
+batches (ciso1, cdep1, ciso2: their k01 and ISO arms, first 100 epochs) and the corpus through
+analysis/corpus_exclusions.filter_rows.  The integers it prints (P_HIGH, P_ISO) and the noise floor are copied into
+analysis/cVT7_grouphold_score.py as LITERALS; that scorer's selftest re-runs derive_P() on the host's records and
+requires equality.  Nothing here reads a cvt7 run.
+
+THE QUESTION.  cvt4 (240) on PlainNet18_c100: with idx 50's vote out of the complement's sum, 50 on a LARGE step size
+stalls at k01 and 50 on a SMALL one keeps HEAD's rescue.  Every mechanism result since cvt1 is on PlainNet (RULE 11).
+On ResNet18_c100 -- the audit's headline network -- the rescuing isolation arm is ISO: the three carriers
+{layer4.0.bn2.weight (50), layer4.0.shortcut.1.weight (53), layer4.1.bn2.weight (59)} isolated TOGETHER in ONE group
+(sets:1-49,51-52,54-58,60-62/<the three names>, sizes [59,3]).  cvt7 holds that group's beta (PATCH_GROUPHOLD).
+
+WHICH LANDED RUNS (the sources).  Every landed k01 and ISO run at ISO's cell carrying PROBE_TENSOR records from the
+harness ISO ran from (the LIVE tree, HF.py 4732b74a...): ciso1 s21-23, cdep1 s24-26, ciso2 s31-33 (ciso2 ran 250
+epochs; only its records with step < 50,000 -- the first 100 epochs, the cvt7 horizon -- are read).  9 + 9 runs.
+(ctd1's `sc` arm is the same cell but a different batch design and arm name; it is printed in S1 as an out-of-rule
+check and does not enter RULE P.)
+
+THE SHAPE FACT (S1).  On PlainNet every k01 / MUTE shared beta and HEAD's isolated beta was a max-rate triangle
+(237.3(1)).  Re-checked HERE on ResNet: k01's shared beta[0] and ISO's carrier-group beta[1] against their own max-rate
+triangle.  (ISO's COMPLEMENT beta[0] is NOT a triangle -- it peaks ~-4.9 at epoch ~17.8 and descends slowly -- and is
+printed for the record; no arm replays it.)
+
+THE HOLD SCHEDULE (identical to PATCH_BETAHOLD's tri, 237.3(1)):
+    u(0) = 0;  u(n) = min(n - 1, P) - max(0, n - 1 - P);   v(n) = float32(min(hi, max(lo, b0 + ms u(n))))
+  A probe record with `step` s follows update n = s + 2: beta[1] must equal v(s + 2), beta_pre[1] v(s + 1).
+
+RULE P (written here, before any cvt7 run): P = round((median over the source runs of the run's PEAK record value -
+b0) / ms).
+  P_HIGH  source: k01's shared beta[0] (9 runs).  THE BRIEF's "held HIGH on the scalar arm's measured shared
+          trajectory at that cell": in k01 the three carriers step with this beta; replaying it on the ISO group
+          EXOGENOUSLY hands the carriers the step size they had in the collapsing arm, with their vote still OUT of
+          the complement's sum.  (There is no ResNet MUTE arm, so the PlainNet choice -- MUTE's trajectory -- has no
+          analogue here; on PlainNet MUTE's peak was ~1 log unit above k01's.)
+  P_ISO   source: ISO's carrier-group beta[1] (9 runs) -> HOLDISO, the positive control of the hold.
+
+Sections:
+  S1  per source run: peak value / epoch, pin epoch, max |dev| from its OWN max-rate triangle, r(15-30)
+  S2  RULE P -> P_HIGH, P_ISO; the schedules' peak / clamp epochs; max |record - schedule| per source run
+  S4  G-BITE non-vacuity on landed ISO records (an UNHELD carrier group misses every triangle, the floor), and the
+      Lion recomputation of every landed ISO / k01 record from its own beta_pre / mom_pre / z_agg
+  S5  descriptive, NON-GATING: on ISO's records, how often each hold would override the value Lion writes
+  S6  the noise floor (227.6's definitions) through corpus_exclusions.filter_rows (OPERATIONS 36)
+
+  python3 analysis/cvt7_registration_derivations.py <runs dir holding ciso1/ cdep1/ ciso2/> [<all_runs.csv>]
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import cvt4_registration_derivations as DV      # registered at 237, imported UNEDITED for its pure functions
+sys.path.pop(0)
+
+MS, LO, HI, B2, BH_TOL = DV.MS, DV.LO, DV.HI, DV.B2, DV.BH_TOL
+B0 = DV.B0
+f32, u_of, v_of = DV.f32, DV.u_of, DV.v_of
+peak, pin_epoch, own_triangle_dev, r_window, median = DV.peak, DV.pin_epoch, DV.own_triangle_dev, DV.r_window, DV.median
+lion_natural, min_over_P_maxdev = DV.lion_natural, DV.min_over_P_maxdev
+STEPS_PER_EPOCH = 500
+N_RECORDS = 500
+NET = "ResNet18_c100"
+ISOSPEC = "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight"
+SRC = (("ciso1", (21, 22, 23)), ("cdep1", (24, 25, 26)), ("ciso2", (31, 32, 33)))
+
+
+def load(runs, batch, arm, seed):
+    """the run's records with step < 50,000 (the first 100 epochs), in file order"""
+    p = os.path.join(runs, batch, "probe_%s-%s-s%d" % (batch, arm, seed), "probe.jsonl")
+    recs = [json.loads(ln) for ln in open(p) if ln.strip()]
+    return [r for r in recs if r["step"] < N_RECORDS * 100]
+
+
+def traj(recs, g):
+    return [(r["step"], float(r["beta"][g])) for r in recs]
+
+
+def source_runs(runs, arm, g):
+    out = []
+    for batch, seeds in SRC:
+        for s in seeds:
+            out.append(("%s-%s-s%d" % (batch, arm, s), traj(load(runs, batch, arm, s), g)))
+    return out
+
+
+def derive_P(runs):
+    """RULE P.  -> {"HIGH": P from k01's shared beta, "ISO": P from ISO's carrier-group beta[1]}"""
+    out = {}
+    for key, arm, g in (("HIGH", "k01", 0), ("ISO", "ISO", 1)):
+        pk = median([peak(tr)[1] for _n, tr in source_runs(runs, arm, g)])
+        out[key] = int(round((pk - B0) / MS))
+    return out
+
+
+def clamp_update(P):
+    """first update n at which v(n) == LO"""
+    n = P + 1
+    while v_of(n, P) != LO:
+        n += 1
+    return n
+
+
+# ---- S6: the noise floor (227.6's definitions), as cvt4's derivation computes it -------------------
+def floor(csvpath):
+    sys.path.insert(0, HERE)
+    import corpus_exclusions as CE
+    sys.path.pop(0)
+    naive = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith("cvt7-")]
+    filt = CE.filter_rows(naive)
+    return {"rows": len(naive), "rows_filtered": len(filt),
+            "R18ALL": DV.pooled_sigma(filt, NET), "R18ALL_naive": DV.pooled_sigma(naive, NET)}
+
+
+def main():
+    runs = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.dirname(HERE)), "runs_cluster_b")
+    csvpath = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(HERE), "results", "all_runs.csv")
+    print("cvt7 registration derivations (CORRECTIONS 243)")
+    print("  runs %s" % runs)
+    print("  b0 = float32(log 1e-6) = %r ; ms = %r ; clamp [%r, %r]" % (B0, MS, LO, HI))
+
+    print("\nS1  THE SHAPE on ResNet18_c100: every source trajectory against its OWN max-rate triangle")
+    worst = {}
+    for lab, arm, g in (("k01 shared beta[0]", "k01", 0), ("ISO carrier-group beta[1]", "ISO", 1),
+                        ("ISO complement beta[0] (NOT a source; printed for the record)", "ISO", 0)):
+        print("  %s" % lab)
+        w = 0.0
+        for name, tr in source_runs(runs, arm, g):
+            s_pk, b_pk = peak(tr)
+            d = own_triangle_dev(tr)
+            w = max(w, d)
+            pe = pin_epoch(tr)
+            print("    %-15s records %d  peak %.6f @ epoch %5.1f  pinned-from %s  max|dev| own triangle %.4f  r(15-30) %9.1f  r(30-40) %8.1f"
+                  % (name, len(tr), b_pk, s_pk / 500.0, "never" if pe is None else "%.1f" % pe, d,
+                     r_window(tr, 15, 30), r_window(tr, 30, 40)))
+        worst[lab] = w
+        print("    worst max|dev|: %.4f log units (x%.3f in step size)" % (w, math.exp(w)))
+    ctd = os.path.join(runs, "ctd1", "probe_ctd1-sc-s18", "probe.jsonl")
+    if os.path.exists(ctd):
+        print("  out-of-rule check: ctd1's scalar arm (same cell, not a RULE P source)")
+        for s in (18, 19, 20):
+            tr = traj(load(runs, "ctd1", "sc", s), 0)
+            s_pk, b_pk = peak(tr)
+            print("    ctd1-sc-s%d      peak %.6f @ epoch %5.1f  pinned-from %s  max|dev| own triangle %.4f"
+                  % (s, b_pk, s_pk / 500.0, pin_epoch(tr), own_triangle_dev(tr)))
+    tri_ok = worst["k01 shared beta[0]"] <= 0.15 and worst["ISO carrier-group beta[1]"] <= 0.15
+    print("  MAX-RATE-TRIANGLE PROPERTY at this cell (both sources <= 0.15 log units): %s" % ("HOLDS" if tri_ok else "FAILS"))
+
+    print("\nS2  RULE P")
+    P = derive_P(runs)
+    for key, arm, g in (("HIGH", "k01", 0), ("ISO", "ISO", 1)):
+        pks = [peak(tr)[1] for _n, tr in source_runs(runs, arm, g)]
+        tr_s = [(100 * k, v_of(100 * k + 2, P[key])) for k in range(N_RECORDS)]
+        nc = clamp_update(P[key])
+        print("  P_%-4s = round((median peak %.6f - b0) / ms) = %d   [peaks %s]"
+              % (key, median(pks), P[key], " ".join("%.3f" % x for x in pks)))
+        print("          schedule: peak %.6f after update %d (epoch %.2f); first at the clamp after update %d (epoch %.2f)"
+              % (v_of(P[key] + 1, P[key]), P[key] + 1, (P[key] + 1) / 500.0, nc, nc / 500.0))
+        print("          schedule r(15-30) %.1f  r(30-40) %.1f ; > 100 x the floor (beta > %.4f) from epoch %.2f to %.2f"
+              % (r_window(tr_s, 15, 30), r_window(tr_s, 30, 40), LO + math.log(100.0),
+                 min(n for n in range(0, 50002) if v_of(n, P[key]) > LO + math.log(100.0)) / 500.0,
+                 max(n for n in range(0, 50002) if v_of(n, P[key]) > LO + math.log(100.0)) / 500.0))
+        for name, tr in source_runs(runs, arm, g):
+            d = max(abs(b - v_of(s + 2, P[key])) for s, b in tr)
+            print("          vs %-15s max|record - v(s+2)| %.4f   r(15-30) run %9.1f" % (name, d, r_window(tr, 15, 30)))
+    print("  REGISTERED: P_HIGH %d (HOLDHIGH), P_ISO %d (HOLDISO)." % (P["HIGH"], P["ISO"]))
+    print("  step-size ratio of the two replays over epochs 15-30: r_HIGH / r_ISO = %.0f"
+          % (r_window([(100 * k, v_of(100 * k + 2, P["HIGH"])) for k in range(N_RECORDS)], 15, 30)
+             / r_window([(100 * k, v_of(100 * k + 2, P["ISO"])) for k in range(N_RECORDS)], 15, 30)))
+
+    print("\nS4  G-BITE NON-VACUITY on landed ISO records (tolerance of the schedule gate: %.0e)" % BH_TOL)
+    mm = {"k01": [0], "ISO": [0, 0]}
+    nrec = {"k01": 0, "ISO": 0}
+    worst_tri, worst_fl = 1e9, 1e9
+    for arm, ng in (("k01", 1), ("ISO", 2)):
+        for batch, seeds in SRC:
+            for s in seeds:
+                recs = load(runs, batch, arm, s)
+                for r in recs:
+                    nrec[arm] += 1
+                    for g in range(ng):
+                        nat, _sg = lion_natural(r["beta_pre"][0][g], r["mom_pre"][0][g], r["z_agg"][0][g])
+                        mm[arm][g] += abs(nat - r["beta"][g]) > BH_TOL
+                if arm == "ISO":
+                    tr1 = traj(recs, 1)
+                    best, bestP = min_over_P_maxdev(tr1)
+                    dfl = max(abs(b1 - LO) for _s, b1 in tr1)
+                    worst_tri, worst_fl = min(worst_tri, best), min(worst_fl, dfl)
+                    print("  %-15s unheld beta[1]: min over ALL P of max|beta1 - v_P| %.4f (best P %d); max|beta1 + 15| %.4f"
+                          % ("%s-ISO-s%d" % (batch, s), best, bestP, dfl))
+    print("  NON-VACUITY BOUNDS: an unheld carrier group misses every triangle by >= %.4f and the floor by >= %.4f" % (worst_tri, worst_fl))
+    print("  Lion recomputation == recorded beta: mismatches k01 g0 %d of %d; ISO g0 %d, g1 %d of %d records"
+          % (mm["k01"][0], nrec["k01"], mm["ISO"][0], mm["ISO"][1], nrec["ISO"]))
+
+    print("\nS5  DESCRIPTIVE PRIORS (NON-GATING): records of landed ISO runs on which each hold would override Lion's value")
+    for batch, seeds in SRC:
+        for s in seeds:
+            recs = load(runs, batch, "ISO", s)
+            act = {"floor": 0, "tri_HIGH": 0, "tri_ISO": 0}
+            up = 0
+            for r in recs:
+                L = B2 * r["mom_pre"][0][1] + (1 - B2) * r["z_agg"][0][1]
+                sgn = (L > 0) - (L < 0)
+                up += sgn < 0
+                n = r["step"] + 2
+                act["floor"] += max(LO, min(HI, LO - MS * sgn)) != LO
+                for key in ("HIGH", "ISO"):
+                    vprev, vnow = v_of(n - 1, P[key]), v_of(n, P[key])
+                    act["tri_" + key] += abs(f32(max(LO, min(HI, vprev - MS * sgn))) - vnow) > BH_TOL
+            print("  %-15s the carrier group votes UP on %3d/500 records | active if held: floor %3d  tri(P_HIGH) %3d  tri(P_ISO) %3d"
+                  % ("%s-ISO-s%d" % (batch, s), up, act["floor"], act["tri_HIGH"], act["tri_ISO"]))
+
+    print("\nS6  THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36)")
+    if os.path.exists(csvpath):
+        F = floor(csvpath)
+        print("  corpus %s  sha %s  %d rows (cvt7- excluded: none exist), %d after filter_rows"
+              % (csvpath, hashlib.sha256(open(csvpath, "rb").read()).hexdigest(), F["rows"], F["rows_filtered"]))
+        sf, sn = F["R18ALL"], F["R18ALL_naive"]
+        print("  SIGMA_R18ALL  FILTERED %r (df %d, %d cells)   NAIVE %r (df %d, %d cells)" % (sf[0], sf[1], sf[2], sn[0], sn[1], sn[2]))
+        print("  SIGMA_PRIOR = SIGMA_R18ALL (filtered) = %r ; SE_PRIOR = %.6f" % (sf[0], sf[0] * math.sqrt(2 / 3.0)))
+    else:
+        print("  corpus not readable at %s" % csvpath)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
