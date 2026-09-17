@@ -89,6 +89,16 @@ test('run metric cards do not restyle the execution-state pill as a block label'
   assert.match(declarations('.metric-card>span:not(.status)'), /display:block/);
 });
 
+test('global search and run pages render editorial experiment copy', () => {
+  const layout = read('../src/components/Layout.tsx');
+  const ledger = read('../src/pages/Ledger.tsx');
+  assert.match(layout, /experimentQuestion\(e\)/);
+  assert.doesNotMatch(layout, /\{e\.goal\}/);
+  assert.match(ledger, /experimentQuestion\(e\)/);
+  assert.match(ledger, /experimentResult\(e\)/);
+  assert.doesNotMatch(ledger, /\{e\.(?:goal|result)\}/);
+});
+
 test('research log dates and entry types are separated', () => {
   assert.match(declarations('.activity-date'), /display:flex/);
   assert.match(declarations('.activity-date'), /flex-direction:column/);

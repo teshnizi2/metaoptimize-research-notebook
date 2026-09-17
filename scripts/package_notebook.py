@@ -15,8 +15,8 @@ from pathlib import Path, PurePosixPath
 PORTAL = Path(__file__).resolve().parents[1]
 WORKSPACE = PORTAL.parents[1]
 ROOT_FILES = ["README.md", "index.html", "package.json", "package-lock.json", "tsconfig.json", "vite.config.ts", "vercel.json", ".gitignore"]
-SCRIPTS = ["journal.mjs", "sync-journal.mjs", "sync-artifact-dates.mjs"]
-PORTABLE_COMMANDS = {"dev", "build", "preview", "test", "log", "dates:check"}
+SCRIPTS = ["journal.mjs", "sync-journal.mjs", "sync-artifact-dates.mjs", "check-experiment-copy.ts"]
+PORTABLE_COMMANDS = {"dev", "build", "preview", "test", "log", "dates:check", "copy:check"}
 EXCLUDED_NAMES = {".DS_Store", "notebook-source.zip", "MetaOptimize_Research_Notebook_Source.zip"}
 PRIVATE_PATTERNS = [
     ("private filesystem root", re.compile(r"/(?:Users|home|data1|scratch)/|/zfsstore/user/|/private/var/|[A-Za-z]:[\\/]+Users[\\/]+", re.I)),
@@ -115,6 +115,7 @@ def collect_payloads(root=PORTAL):
     add("docs/MAINTENANCE_PUBLIC.md", "docs/MAINTENANCE.md")
     add("content/journal.json")
     add("content/artifact-dates.json")
+    add("content/experiment-copy.json")
     for name in SCRIPTS:
         add("scripts/" + name)
     for folder in ["src", "public"]:

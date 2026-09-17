@@ -47,6 +47,8 @@ For a later research update, obtain a complete, verified public export from the 
 
 `npm test` checks application behavior and the journal workflow. It does not reproduce model training or replace scientific validation of a new export. `npm run build` validates journal links and compiles the website; it does not rederive registered scores.
 
+The exact evidence wording in `public/data/research.json` remains unchanged for audit. Concise reader-facing wording is maintained separately in `content/experiment-copy.json`, while each experiment page exposes the exact record in a collapsed section. Run `npm run copy:check` after replacing the evidence snapshot. The build runs the same gate and rejects a new imported MASTER-TABLE record if its question, result, explanation, comparison, or rationale is missing, incomplete, oversized, stale, or still contains scorer notation.
+
 ## Publish the static website
 
 After testing, deploy the generated `dist` folder with your chosen static hosting provider. The included `vercel.json` configures a Vite build, output directory, security headers, and route fallbacks for Vercel. Use your own authorized project and account; no deployment association or credentials are supplied.

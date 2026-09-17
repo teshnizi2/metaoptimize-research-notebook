@@ -28,8 +28,10 @@ class NotebookPackageTests(unittest.TestCase):
             "tests/fixtures/register-ids.json": "{}\n",
             "scripts/journal.mjs": "export {};", "scripts/sync-journal.mjs": "export {};",
             "scripts/sync-artifact-dates.mjs": "export {};",
+            "scripts/check-experiment-copy.ts": "export {};",
             "content/journal.json": "[]\n", "public/data/journal.json": "[]\n",
             "content/artifact-dates.json": "{}\n", "public/data/artifact-dates.json": "{}\n",
+            "content/experiment-copy.json": "{}\n",
             "public/data/research.json": json.dumps({"meta": {"snapshotId": "test-snapshot"}, "experiments": [{"id": "CVK2"}]}),
             "public/data/runs.json": "[]", "public/source/example.txt": "Scientific evidence\n",
             "public/assets/notebook-source.zip": "old recursive archive",
@@ -37,7 +39,7 @@ class NotebookPackageTests(unittest.TestCase):
             "scripts/export_research.py": "excluded", "tests/test_private.py": "excluded",
             "docs/superpowers/internal.md": "excluded", "public/.DS_Store": "excluded",
             "package-lock.json": json.dumps({"name": "notebook", "lockfileVersion": 3, "packages": {}}),
-            "package.json": json.dumps({"name": "notebook", "scripts": {"test": "node --test", "build": "node build.mjs", "test:data": "python3 private.py", "deploy": "vercel --prod"}}),
+            "package.json": json.dumps({"name": "notebook", "scripts": {"test": "node --test", "build": "node build.mjs", "copy:check": "tsx scripts/check-experiment-copy.ts", "test:data": "python3 private.py", "deploy": "vercel --prod"}}),
         }
         for name, text in files.items():
             target = self.root / name
@@ -48,7 +50,7 @@ class NotebookPackageTests(unittest.TestCase):
         original = (self.root / "package.json").read_bytes()
         payloads, meta = pack.collect_payloads(self.root)
         self.assertEqual((self.root / "package.json").read_bytes(), original)
-        self.assertEqual(json.loads(payloads["package.json"])["scripts"], {"test": "node --test", "build": "node build.mjs"})
+        self.assertEqual(json.loads(payloads["package.json"])["scripts"], {"test": "node --test", "build": "node build.mjs", "copy:check": "tsx scripts/check-experiment-copy.ts"})
         self.assertEqual(payloads["docs/MAINTENANCE.md"], b"Portable maintenance\n")
         self.assertIn("public/source/example.txt", payloads)
         self.assertIn("content/journal.json", payloads)
@@ -114,6 +116,11 @@ class NotebookPackageTests(unittest.TestCase):
         self.assertIn("scripts/sync-artifact-dates.mjs", payloads)
         self.assertIn("content/artifact-dates.json", payloads)
         self.assertEqual(payloads["content/artifact-dates.json"], payloads["public/data/artifact-dates.json"])
+
+    def test_experiment_copy_and_publication_gate_travel_together(self):
+        payloads, _ = pack.collect_payloads(self.root)
+        self.assertIn("content/experiment-copy.json", payloads)
+        self.assertIn("scripts/check-experiment-copy.ts", payloads)
 
     def test_unsynchronized_artifact_dates_are_rejected(self):
         (self.root / "content/artifact-dates.json").write_text('{"changed": true}')

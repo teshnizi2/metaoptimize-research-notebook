@@ -47,6 +47,7 @@ PUBLICATION_DATE="$(date -u +%F)"
 python3 scripts/export_sources.py --repo "$RESEARCH_REPO" --workspace "$RESEARCH_WORKSPACE" --public ./public --audit "$RESEARCH_WORKSPACE/work/portal_source_audit.json"
 python3 scripts/export_research.py --workspace "$RESEARCH_WORKSPACE" --public-dir ./public --as-of "$PUBLICATION_DATE"
 python3 scripts/export_research.py --public-dir ./public --check
+npm run copy:check
 npx tsx scripts/export_github_links.ts --research-repo "$RESEARCH_REPO" --research-revision "$RESEARCH_REVISION" --archive-revision "$ARCHIVE_REVISION"
 npm run dates:refresh -- --evidence "$RESEARCH_WORKSPACE/work/artifact-date-evidence.json"
 npm run dates:check
@@ -61,6 +62,14 @@ The source import must run first because evidence export validates its source ca
 Record the evidence update with a separate `npm run log` entry linked to the affected experiments, then repeat journal synchronization, source packaging, and the final build after appending it. Import regenerates the base publication history, while `content/journal.json` preserves maintainer history. Do not remove old experiment IDs that existing journal entries reference; a removed ID will block synchronization until the historical reference is restored in the evidence index.
 
 The current validation checks the established 164-record, 3,127-run snapshot (146 research questions, 18 method checks, 10 areas; `EXPECTED_STATS` in `export_research.py`) and its registered CVK2 result. If a later campaign changes the evidence schema or coverage, update the importer and its tests deliberately from verified source evidence before publishing. Do not bypass failed validation to make an import pass.
+
+## Maintain reader-facing experiment copy
+
+The fields in `public/data/research.json` are the exact research register: they preserve scorer tokens, formulas, registered bands, and audit wording. They are evidence, not website prose. The interface reads its concise question, result, explanation, comparison, and rationale from `content/experiment-copy.json`; the experiment page keeps the evidence fields under **Exact registered record**.
+
+Every imported MASTER-TABLE record from MT175 onward needs all five editorial fields: `question`, `result`, `explanation`, `comparison`, and `why`. Keep the numbers and scientific outcome faithful to the register, use ordinary sentences, and never edit the evidence JSON merely to improve wording.
+
+Run `npm run copy:check` after every evidence import. The check rejects missing or stale IDs, blank required fields, oversized summaries, and visible scorer/formula notation. `npm run build` runs this check first, so a newly imported row cannot be published until its reader-facing copy is complete.
 
 ## Outcome model and the partition audit
 

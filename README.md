@@ -6,6 +6,8 @@ The snapshot currently covers 164 records — 146 research questions and 18 meth
 
 The homepage summarizes the whole register through research outcomes, an area-by-area table and dated notebook updates. Every research question has one of four outcomes — Goal met, Goal missed, Mixed or Open. **Corrected** is a separate badge, shown beside the outcome, for records whose earlier claim was corrected; its correction history stays on the record. **Method checks** (errors caught in the campaign's own methods, not findings about MetaOptimize) are listed on their own and excluded from the outcome counts. The mapping is explicit in `scripts/register_model.py`. Outcome counts link to the matching experiments; detailed plots belong to each experiment page. These counts cover different research goals and are not a method win rate or a record of professor reviews.
 
+The research JSON preserves the exact register wording for audit. The website's concise questions, results, explanations, comparisons, and rationales are maintained separately in `content/experiment-copy.json`; experiment pages expose the original fields under **Exact registered record**. `npm run copy:check`, which also runs before every build, prevents a newly imported MASTER-TABLE row from publishing without complete reader-facing copy.
+
 ## Repositories and access
 
 - [Notebook website and versioned log](https://github.com/teshnizi2/metaoptimize-research-notebook)

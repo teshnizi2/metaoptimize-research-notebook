@@ -7,7 +7,8 @@ import { compactDate, safeHref } from '../lib/research';
 import { ArtifactDates } from '../components/ArtifactDates';
 import { ResearchPhaseDetail } from '../components/ResearchPhaseDetail';
 import { researchTimeline, resolvePhaseDetail } from '../lib/timeline';
-import type { Run } from '../types';
+import { experimentQuestion, experimentResult } from '../lib/experiment-copy';
+import type { Experiment, Run } from '../types';
 
 type Filters = Record<string, string | undefined>;
 const size = 50;
@@ -59,7 +60,7 @@ function RunLoading({ error, retry }: { error: string; retry: () => void }) {
     : <div className="empty-state" role="status" aria-busy="true"><Terminal size={28}/><h3>Loading recorded runs…</h3></div>;
 }
 function ExecutionState({ value }: { value: string }) { return <Status outcome="neutral" label={value || 'Not recorded'}/>; }
-function experimentOptions(experiments: { id: string; goal: string }[]) { return experiments.map(e => ({ value: e.id, label: `${e.id} · ${e.goal}` })); }
+function experimentOptions(experiments: Experiment[]) { return experiments.map(e => ({ value: e.id, label: `${e.id} · ${experimentQuestion(e)}` })); }
 
 export function RunsPage() {
   const data = useResearch(), { runs, error, retry } = useRuns(), f = useFilters();
@@ -110,7 +111,7 @@ export function RunDetailPage() {
       <div className="metric-card"><span className="eyebrow">Completed epochs</span><strong>{run.epochs ?? '—'}</strong><span className="small muted">Requested budget is recorded below</span></div></div>
     <p className="notice">A completed job does not establish a successful research result. Accuracy is reported as stored; validity and comparison limits belong to the experiment.</p>
     <section><div className="section-title"><h2>Connected experiments</h2><span className="muted small">{connected.length} questions</span></div>
-      {connected.length ? <div className="warning-list">{connected.map(e => <article className="warning-card" key={e.id}><div><Link className="text-link" to={`/experiments/${e.id}`}><span className="mono">{e.id}</span>{e.goal}<ArrowUpRight size={15}/></Link><p>{e.result}</p></div><ExperimentStatus experiment={e}/></article>)}</div>
+      {connected.length ? <div className="warning-list">{connected.map(e => <article className="warning-card" key={e.id}><div><Link className="text-link" to={`/experiments/${e.id}`}><span className="mono">{e.id}</span>{experimentQuestion(e)}<ArrowUpRight size={15}/></Link><p>{experimentResult(e)}</p></div><ExperimentStatus experiment={e}/></article>)}</div>
         : <Empty title="No experiment association recorded" detail="The job remains in the ledger without an invented experiment link."/>}</section>
     <section><div className="section-title"><h2>Recorded parameters</h2><span className="small muted">{Object.keys(run.parameters).length} fields</span></div>
       <Query value={parameterQuery} onChange={setParameterQuery} placeholder="Find a parameter or value…"/>
