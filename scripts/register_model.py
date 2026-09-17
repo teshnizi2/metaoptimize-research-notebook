@@ -903,8 +903,11 @@ CVT67_INTERVENTIONS = {
         "batch": "cvt6", "arms": {"HOLDLOW": 3, "HOLDHIGH": 3, "HIGHHEADPATH": 3, "LOWMUTEPATH": 3, "LOWHEADPATH": 3},
         "title": "HOLDLOW, HOLDHIGH, HIGHHEADPATH, LOWMUTEPATH and LOWHEADPATH are step-size hold interventions, not plain HEAD arms",
         "source": f"{INTERVENTIONS_TSV} at {CVT67_COMMIT[:7]}; CORRECTIONS 242, 245 and 246",
-        "note": ("The five held arms ran cvt4's tree plus the opt-in PATCH_COMPHOLD (COMP_HOLD=tri:<P> | rec:<id>), on HEAD's grouping "
-                 "({50} [52,1]). PATCH_BETAHOLD holds tensor 50's beta (layer4.1.bn2.weight's log step size); PATCH_COMPHOLD overwrites "
+        # All 21 runs (all seven arms) ran harness_cvt6 through jobs/run_cifar_cvt6.sh (CORRECTIONS 242.12 guard 6); COMP_HOLD was set on
+        # the 9 forced runs only, and HOLDLOW / HOLDHIGH printed 'COMP_HOLD: off' as k01 and HEAD did (results/cvt6_rule20_full.txt: off x12).
+        "note": ("All seven arms ran harness_cvt6 (cvt4's tree plus the opt-in PATCH_COMPHOLD) through jobs/run_cifar_cvt6.sh, on HEAD's "
+                 "grouping ({50} [52,1]). COMP_HOLD (=tri:<P> | rec:<id>) was set only on the three forced arms, HIGHHEADPATH, LOWMUTEPATH "
+                 "and LOWHEADPATH; HOLDLOW and HOLDHIGH ran with COMP_HOLD off, as k01 and HEAD did. PATCH_BETAHOLD holds tensor 50's beta (layer4.1.bn2.weight's log step size); PATCH_COMPHOLD overwrites "
                  "the complement's beta after that hold. HOLDLOW = 50 at the -15 floor with the complement free (Lion); HOLDHIGH = 50 on "
                  "MUTE's replayed trajectory (tri:9428) with the complement free (cvt4's two arms, replicated); HIGHHEADPATH = 50 on "
                  "tri:9428 with the complement forced onto HEADPATH (the knot-by-knot median of 12 landed HEAD complements, replay file "
@@ -1088,6 +1091,29 @@ def clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def split_references(ref: str) -> list[str]:
+    """Split a MASTER-TABLE ref cell into citations on ';' outside brackets; a ';' inside (), [] or {} belongs to its citation.
+
+    Rows 224-225 write 'CORRECTIONS 242 (registration and launch; ... corrected in place at 246), 246 (landing)'. A cell whose
+    brackets do not balance is kept as one citation rather than cut at a guessed position.
+    """
+    pairs, stack, parts, start = {")": "(", "]": "[", "}": "{"}, [], [], 0
+    for index, char in enumerate(ref):
+        if char in "([{":
+            stack.append(char)
+        elif char in pairs:
+            if not stack or stack.pop() != pairs[char]:
+                stack = ["unbalanced"]
+                break
+        elif char == ";" and not stack:
+            parts.append(ref[start:index])
+            start = index + 1
+    if stack:
+        parts, start = [], 0
+    parts.append(ref[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
 def norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", clean(text).lower())
 
@@ -1126,7 +1152,7 @@ def partition_rows(lines: list[str]) -> list[dict]:
         outcome = RULE_OUTCOME[rule]
         kind = "method-check" if rule == "method" else "research"
         references = [{"path": MASTER_TABLE, "line": line, "rowText": lines[line - 1]}]
-        references += [part.strip() for part in ref.split(";") if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
+        references += [part for part in split_references(ref) if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
         rows.append({
             "id": partition_id(line), "section": str(SECTION), "area": AREA,
             "goal": clean(tested), "comparison": clean(varied), "why": WHY,
@@ -1194,7 +1220,7 @@ def appended_rows(lines: list[str], mapping: dict | None = None, first: int = AP
             raise ValueError(f"MASTER-TABLE line {line}: the mapping reason must start with the row's first verdict token {tokens[0]}")
         outcome = RULE_OUTCOME[rule]
         references = [{"path": MASTER_TABLE, "line": line, "rowText": lines[line - 1]}]
-        references += [part.strip() for part in ref.split(";") if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
+        references += [part for part in split_references(ref) if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
         rows.append({
             "id": partition_id(line), "section": str(section), "area": AREAS[section],
             "goal": question, "comparison": clean(varied), "why": label[1] + ".",

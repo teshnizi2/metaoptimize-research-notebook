@@ -55,12 +55,17 @@ test('MT224 (cvt6) is Mixed and MT225 (cvt7) Goal met under the documented rules
   assert.match(cvt7.reason, /the TRANSFERS-GRADED account hits every registered band/);
   assert.match(cvt7.reason, /dose and held set are confounded with network/);
   assert.match(cvt7.scope, /Bounded, and led with \(247\.4\): \(1\) dose and held set are confounded with network/);
-  // The two runners (jobs/run_cifar_cvt6.sh, jobs/run_cifar_cvt7.sh) exist only on the cluster; the records say so rather
-  // than linking something else, as MT222 did before its runner was archived.
-  assert.deepEqual(warningsOf('MT224').map(w => w.id), ['warning-MT224-verdict', 'warning-MT224-registration-246', 'warning-MT224-intervention', 'warning-MT224-source-1']);
-  assert.deepEqual(warningsOf('MT225').map(w => w.id), ['warning-MT225-verdict', 'warning-MT225-registration-247', 'warning-MT225-intervention', 'warning-MT225-source-1']);
-  assert.equal(data.warnings.find(w => w.id === 'warning-MT224-source-1')!.detail, 'Referenced source not available: jobs/run_cifar_cvt6.sh');
-  assert.equal(data.warnings.find(w => w.id === 'warning-MT225-source-1')!.detail, 'Referenced source not available: jobs/run_cifar_cvt7.sh');
+  // The two runners were archived at campaign commit 4ff0891 (CORRECTIONS 250.1, sha256 equal to the registered runners, 242 / 243):
+  // both records link them and neither carries a source-unavailable warning.
+  assert.deepEqual(warningsOf('MT224').map(w => w.id), ['warning-MT224-verdict', 'warning-MT224-registration-246', 'warning-MT224-intervention']);
+  assert.deepEqual(warningsOf('MT225').map(w => w.id), ['warning-MT225-verdict', 'warning-MT225-registration-247', 'warning-MT225-intervention']);
+  for (const [record, path, sha] of [[cvt6, 'jobs/run_cifar_cvt6.sh', '9aa2ed5c15b8ecd8c22d5137ab4be169b97f9556ebe67b8460c4971d4f84783f'],
+    [cvt7, 'jobs/run_cifar_cvt7.sh', '805267e4cbcc64172d79824d553a2577ef7cdd55fb8f5e7731c0ea3251a04c56']] as const) {
+    const runner = data.sources.find(s => s.path === path)!;
+    assert.ok(runner && record.codeIds.includes(runner.id), `${record.id} links the archived runner ${path}`);
+    assert.equal(runner.originalSha256, sha);
+    assert.ok(!data.warnings.some(w => w.detail.includes(`Referenced source not available: ${path}`)), `no record warns that ${path} is missing`);
+  }
 });
 
 test('the registrations corrected in place at the landing travel with the records, outcome unchanged', () => {
@@ -81,6 +86,9 @@ test('the intervention warnings name every intervened arm, both holds of the for
   const cvt6 = data.warnings.find(w => w.id === 'warning-MT224-intervention')!;
   assert.equal(cvt6.title, 'HOLDLOW, HOLDHIGH, HIGHHEADPATH, LOWMUTEPATH and LOWHEADPATH are step-size hold interventions, not plain HEAD arms');
   assert.match(cvt6.detail, /HIGHHEADPATH, LOWMUTEPATH and LOWHEADPATH hold both groups/);
+  // All seven arms ran harness_cvt6; COMP_HOLD was set only on the three forced arms (CORRECTIONS 242; cvt6_rule20_full: COMP_HOLD: off x12).
+  assert.match(cvt6.detail, /^All seven arms ran harness_cvt6 \(cvt4's tree plus the opt-in PATCH_COMPHOLD\) through jobs\/run_cifar_cvt6\.sh, on HEAD's grouping \(\{50\} \[52,1\]\)\. COMP_HOLD \(=tri:<P> \| rec:<id>\) was set only on the three forced arms, HIGHHEADPATH, LOWMUTEPATH and LOWHEADPATH; HOLDLOW and HOLDHIGH ran with COMP_HOLD off, as k01 and HEAD did\./);
+  assert.doesNotMatch(cvt6.detail, /The five held arms ran cvt4's tree plus the opt-in PATCH_COMPHOLD/);
   assert.match(cvt6.detail, /They are NOT plain HEAD measurements\./);
   assert.match(cvt6.detail, /results\/CORPUS-EXCLUSIONS\.tsv at dae2a49; CORRECTIONS 242, 245 and 246\.$/);
   const cvt7 = data.warnings.find(w => w.id === 'warning-MT225-intervention')!;

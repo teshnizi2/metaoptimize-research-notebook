@@ -197,6 +197,20 @@ test('all 160 records published before the lines 224-225 import keep their ID, t
   assert.equal(data.experiments.length, 162);
 });
 
+// The 162 records published at ad152c3. The follow-up fixed two source labels, one intervention note and re-exported sources
+// at campaign commit 4ff0891 (CORRECTIONS 250: the cvt6 / cvt7 runners archived); none of that may move a record.
+const at225 = JSON.parse(readFileSync(new URL('./fixtures/register-ids-ad152c3.json', import.meta.url), 'utf8')) as typeof previous;
+
+test('all 162 records published at ad152c3 keep their ID, section, area, title, kind, outcome, Corrected badge and order', () => {
+  assert.equal(at225.experiments.length, 162);
+  assert.deepEqual(at225.experiments.map(e => e.id), data.experiments.map(e => e.id), 'no record added, removed or reordered');
+  for (const old of at225.experiments) {
+    const current = byId.get(old.id)!;
+    assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
+      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+  }
+});
+
 test('journal entries still resolve to existing experiments', () => {
   for (const entry of journal) for (const id of entry.experimentIds) assert.ok(byId.has(id), `${entry.id} references ${id}`);
 });

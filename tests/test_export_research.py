@@ -88,6 +88,34 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual(clean(r"CEIL-\* / a\_b / `\| LOWER-BOUND`"), "CEIL-* / a_b / | LOWER-BOUND")
         self.assertEqual(clean("an *emphasised* word and 2 * 3"), "an emphasised word and 2 * 3")
 
+    def test_ref_cells_split_into_citations_on_semicolons_outside_brackets_only(self):
+        # MASTER-TABLE rows 224-225 (campaign commit dae2a49) put a ';' inside the parentheses of their ref cell. Splitting there
+        # published 'Cited research record: CORRECTIONS 242 (registration and launch' and dropped the rest of the cell.
+        split = self.model().split_references
+        row224 = "CORRECTIONS 242 (registration and launch; RULE H's '12 runs', 242.14 and 242.3(2) corrected in place at 246), 246 (landing)"
+        self.assertEqual(split(row224), [row224])
+        self.assertEqual(split("CORRECTIONS 212 (registration), 216 (launch); `analysis/x.py` [a; b]; FINDINGS 3"),
+                         ["CORRECTIONS 212 (registration), 216 (launch)", "`analysis/x.py` [a; b]", "FINDINGS 3"])
+        self.assertEqual(split(" a ; ; b "), ["a", "b"])
+        # An unbalanced cell is not guessed at: it stays one citation rather than being cut inside a bracket.
+        self.assertEqual(split("CORRECTIONS 9 (open; never closed"), ["CORRECTIONS 9 (open; never closed"])
+
+    def test_published_source_labels_have_balanced_brackets(self):
+        def unbalanced(text):
+            pairs, stack = {")": "(", "]": "[", "}": "{"}, []
+            for char in text:
+                if char in "([{":
+                    stack.append(char)
+                elif char in pairs and (not stack or stack.pop() != pairs[char]):
+                    return True
+            return bool(stack)
+        research = self.research()
+        links = json.loads((PUBLIC / "data/source-links.json").read_text())
+        labels = [(e["id"], ref["label"]) for e in research["experiments"] for ref in e["sourceRefs"]]
+        labels += [(eid, ref["label"]) for eid, entry in links.items() for ref in entry["sourceRefs"]]
+        self.assertGreater(len(labels), 2000)
+        self.assertEqual([item for item in labels if unbalanced(item[1])], [])
+
     def test_published_text_carries_no_markdown_escapes(self):
         def strings(value, path):
             if isinstance(value, dict):
