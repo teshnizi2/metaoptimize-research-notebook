@@ -857,7 +857,8 @@ class ResearchExportTests(unittest.TestCase):
         model = self.model()
         self.assertEqual({eid: spec["line"] for eid, spec in model.C244_AMENDMENTS.items()}, {"MT222": 222, "MT223": 223})
         before = {r["id"]: r for r in model.apply_cvt23_amendments(model.apply_cgn3_amendments(model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO), REPO), REPO)}
-        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        # load_register applies CORRECTIONS 253.15 (row 227) after this step; test_cvt89_amendment_changes_mt227_wording_only covers it.
+        after = {r["id"]: r for r in model.apply_c244_amendments(list(before.values()), REPO)}
         self.assertEqual(set(before), set(after))
         for eid, row in after.items():
             if eid not in model.C244_AMENDMENTS:
@@ -1117,6 +1118,87 @@ class ResearchExportTests(unittest.TestCase):
         self.assertFalse(any("CORRECTIONS 252" in r.get("sources", "") or "CORRECTIONS 253" in r.get("sources", "") for r in earlier))
         self.assertFalse(any("CORRECTIONS 253" in r.get("registration_corrections", "") for r in earlier))
 
+
+    # ---- The final audit of the cvt8 / cvt9 landing (CORRECTIONS 253.15, campaign commit 3cf4201): wording only ----
+    def test_mt226_reason_matches_the_bigroute_bound_and_counts_the_dose_accounts_exactly(self):
+        model = self.model()
+        reason = model.CVT89_ROWS[226][5]
+        # CORRECTIONS 252.8 item 3: at PlainNet's dose a recovery under 5 pp cannot be seen, and that is not evidence that the
+        # free complement plays no role; "none at PlainNet's dose" overstated it.
+        self.assertNotIn("none at PlainNet's dose", reason)
+        self.assertIn("at PlainNet's dose, with the complement forced, the carriers alone reproduce HOLDBIG's stall (BIGISOPATH 19.42, "
+                      "P_ROUTE_BIG +0.05 pp), but both arms sit below k01, so a recovery under 5 pp could not be seen there and this is not "
+                      "evidence that the free complement's collapse plays no role in HOLDBIG", reason)
+        # CORRECTIONS 252.3: four DOSE-family accounts; three hit 6 of 7 and DOSE x VIA hits 5.
+        self.assertNotIn("three DOSE accounts", reason)
+        self.assertIn("of the four DOSE-family accounts, three hit 6 of 7 (DOSE x DIRECT misses HIGHISOPATH by 2.19 pp) and DOSE x VIA hits 5", reason)
+
+    @needs(_REPO)
+    def test_cvt89_audit_pin_allows_only_row_227s_correction_and_the_253_15_section(self):
+        model = self.model()
+        lines, landing = model.cvt89_audit_master_table(REPO), model.cvt89_master_table(REPO)
+        self.assertEqual((len(landing), len(lines)), (227, 227))
+        self.assertEqual([n for n in range(1, 228) if lines[n - 1] != landing[n - 1]], [227])
+        spec = model.CVT89_AMENDMENTS["MT227"]
+        old, new = model.table_cells(landing[226]), model.table_cells(lines[226])
+        self.assertEqual([i for i in range(7) if old[i] != new[i]], [5])
+        self.assertIn(f"SUPERSEDED wording, kept verbatim: '{spec['superseded']}']", new[5])
+        self.assertEqual(model.strip_inserted_brackets(new[5], "CORRECTIONS 253.15").replace(spec["amended"], spec["superseded"], 1), old[5])
+        # Anything beyond that one correction is refused: a further edit, a bracket that does not keep the old words, no bracket.
+        for tampered in [lines[226].replace("(2) dose is the triangle family", "(2) dose is a triangle family"),
+                         lines[226].replace("SUPERSEDED wording, kept verbatim: 'and DOSE-GRADED", "SUPERSEDED wording: 'and DOSE-GRADED"),
+                         landing[226].replace(spec["superseded"], spec["amended"])]:
+            with self.assertRaisesRegex(ValueError, "CORRECTIONS 253.15"):
+                model.check_in_place_correction(landing[226], tampered, spec)
+        with self.assertRaisesRegex(ValueError, "does not match the pinned"):
+            pinned = model.CVT89_AUDIT_COMMIT
+            try:
+                model.CVT89_AUDIT_COMMIT = "6d09d1fa01d83039dbcf6f6bede32804a32f3c29"  # 253.15 appended, row 227 not yet corrected
+                model.cvt89_audit_master_table(REPO)
+            finally:
+                model.CVT89_AUDIT_COMMIT = pinned
+        corrections, earlier = model.cvt89_audit_corrections(REPO)
+        self.assertEqual(earlier, model.cvt89_corrections(REPO)[0])
+        # Every line of the landing pin is unchanged; only the 253.15 section, with its note, sits before the closing line.
+        self.assertEqual(corrections[:len(earlier) - 1], earlier[:-1])
+        self.assertEqual(corrections[-1], earlier[-1])
+        inserted = corrections[len(earlier) - 1:-1]
+        self.assertTrue(inserted[0].startswith("### 253.15 Addendum (final audit, zero GPU): "))
+        self.assertFalse(any(line.startswith("#") for line in inserted[1:]))
+        self.assertEqual(sum(line.startswith("*Note, added after this entry: MASTER-TABLE row 227 has since been amended in place.") for line in inserted), 1)
+        with self.assertRaisesRegex(ValueError, "does not match the pinned"):
+            pinned = model.CVT89_AUDIT_CORRECTIONS_SHA256
+            try:
+                model.CVT89_AUDIT_CORRECTIONS_SHA256 = model.CVT89_CORRECTIONS_SHA256
+                model.cvt89_audit_corrections(REPO)
+            finally:
+                model.CVT89_AUDIT_CORRECTIONS_SHA256 = pinned
+
+    @needs(_WORKSPACE, _REPO)
+    def test_cvt89_amendment_changes_mt227_wording_only(self):
+        model = self.model()
+        self.assertEqual({eid: (spec["line"], spec["entry"]) for eid, spec in model.CVT89_AMENDMENTS.items()}, {"MT227": (227, "253.15")})
+        before = {r["id"]: r for r in model.apply_c244_amendments(model.apply_cvt23_amendments(model.apply_cgn3_amendments(model.apply_row_amendments(model.load_unamended_register(WORKSPACE, REPO), REPO), REPO), REPO), REPO)}
+        after = {r["id"]: r for r in model.load_register(WORKSPACE, REPO)}
+        self.assertEqual(list(before), list(after))
+        for eid, row in after.items():
+            if eid != "MT227":
+                self.assertEqual(row, before[eid], eid)
+                continue
+            self.assertEqual({key for key in row if row[key] != before[eid].get(key)}, {"scope", "sources", "further_amendments"})
+            self.assertEqual((row["outcome"], row["corrected"], row["kind"]), (before[eid]["outcome"], before[eid]["corrected"], before[eid]["kind"]))
+        spec = model.CVT89_AMENDMENTS["MT227"]
+        # MT227's scope carries both single-arm flip routes; removing the bracket and restoring the old words gives the landing scope.
+        self.assertIn("DOSE-GRADED changes on one arm only if RESDOSE rises, or MIDDOSE falls, by ~39 pp (DOSE-NONMONOTONE) "
+                      "[CORRECTED IN PLACE at cycle 153, CORRECTIONS 253.15:", after["MT227"]["scope"])
+        self.assertEqual(model.strip_inserted_brackets(after["MT227"]["scope"], "CORRECTIONS 253.15").replace(spec["amended"], spec["superseded"], 1),
+                         before["MT227"]["scope"])
+        further = json.loads(after["MT227"]["further_amendments"])
+        self.assertEqual([(f["number"], f["line"], f["commit"], f["previousOutcome"], f["outcome"]) for f in further],
+                         [(253, 227, model.CVT89_AUDIT_COMMIT, "mixed", "mixed")])
+        drifted = [dict(r, outcome="success") if r["id"] == "MT227" else r for r in before.values()]
+        with self.assertRaisesRegex(ValueError, "outcome drifted before its CORRECTIONS 253.15 amendment"):
+            model.apply_cvt89_amendments(drifted, REPO)
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,8 @@ WORKSPACE_OR_REPO_TESTS = {
     "test_export_research.ResearchExportTests.test_cvt89_import_leaves_every_earlier_record_unchanged",
     "test_export_research.ResearchExportTests.test_cvt89_registration_correction_is_one_bracket_insertion",
     "test_export_research.ResearchExportTests.test_cvt89_rows_come_from_the_pinned_landing_commit",
+    "test_export_research.ResearchExportTests.test_cvt89_audit_pin_allows_only_row_227s_correction_and_the_253_15_section",
+    "test_export_research.ResearchExportTests.test_cvt89_amendment_changes_mt227_wording_only",
     "test_export_research.ResearchExportTests.test_base_register_rows_are_cleaned_like_master_table_rows",
     "test_export_research.ResearchExportTests.test_c244_master_table_differs_from_the_cvt45_pin_only_by_inserted_brackets",
     "test_export_research.ResearchExportTests.test_c244_amendments_change_wording_only",

@@ -72,7 +72,10 @@ mapping is reviewable in one place and never applied ad hoc:
     line 5, by inserted brackets; no existing row was amended. Their intervened arms (cvt8's group holds, three of them with
     the rest group forced too; cvt9's step-size and complement holds, two of them cut to an update window, so three holds per
     run) are named from the same exclusion list. The landing's one in-place correction of cvt9's registration (CORRECTIONS
-    249.3) is checked as a bracket insertion and shown on MT227 as a documented limitation.
+    249.3) is checked as a bracket insertion and shown on MT227 as a documented limitation. The CVT89 pin also covers the
+    landing's final audit (campaign commit 3cf4201, CORRECTIONS 253.15): MASTER-TABLE may differ from ba01f54 only by row
+    227's one in-place wording correction (checked by ``check_in_place_correction``), CORRECTIONS only by the inserted 253.15
+    section and its note. ``CVT89_AMENDMENTS`` carries the corrected cell into MT227's scope without moving an outcome.
 
 Record text is plain text: ``clean()`` removes Markdown bold, emphasis and code marks from every MASTER-TABLE cell and
 from the text fields of the campaign's register export (``BASE_TEXT_FIELDS``), which copies the cells with their marks.
@@ -1048,10 +1051,12 @@ CVT89_LINE5_TAGS = ("CORRECTIONS 252", "CORRECTIONS 253")
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
 # Both are Mixed, as MT218, MT221 and MT224: each registered branch answers its question, the positive control reproduces
 # and G-BITE passes 21/21, but a registered expectation was defied -- no registered account fits every band.
-# cvt8 (252.3): the three DOSE accounts hit 6 of 7 (DOSE x DIRECT misses HIGHISOPATH by 2.19 pp, DOSE x PARTIAL-VIA misses
-# BIGISOPATH by 10.58, DOSE-DIRECT-ONLY-AT-BIG misses HIGHISOPATH by 3.81), and both big-dose arms returned registered
+# cvt8 (252.3): of the four DOSE-family accounts, three hit 6 of 7 (DOSE x DIRECT misses HIGHISOPATH by 2.19 pp, DOSE x
+# PARTIAL-VIA misses BIGISOPATH by 10.58, DOSE-DIRECT-ONLY-AT-BIG misses HIGHISOPATH by 3.81) and DOSE x VIA hits 5 (misses
+# HIGHISOPATH by 3.81 and BIGISOPATH by 42.58), and both big-dose arms returned registered
 # BELOW-K01 tokens (every seed under its same-seed k01 run), so DOSE-FULL names a location and BIGROUTE-DIRECT compares two
-# arms below k01. The scorer's two RULE 16 text defects (the BIGROUTE-DIRECT licence's 'the partial loss'; the broken-REST_HOLD
+# arms below k01, where a recovery under 5 pp cannot be seen (252.8 item 3: not evidence that the free complement plays no
+# role). The scorer's two RULE 16 text defects (the BIGROUTE-DIRECT licence's 'the partial loss'; the broken-REST_HOLD
 # null coded at NO-DOSE levels) reach no gate, branch or stamp and stay in the reason and scope.
 # cvt9 (253.3): DOSE-GRADED's account misses the MIDDOSE 20-50 band by 5.86 pp, DOSE-THRESHOLD misses RESDOSE by 5.84,
 # WINDOW-GRADED misses EARLY by 1.63 and BOTH-WINDOWS misses EARLY and LATE; the tokens come from the registered bars, so the
@@ -1060,7 +1065,7 @@ CVT89_LINE5_TAGS = ("CORRECTIONS 252", "CORRECTIONS 253")
 # Not Goal missed for either: no registered hypothesis was refuted and no control failed. Not Goal met: see above.
 # Neither row corrects an earlier published claim, so neither carries the Corrected badge.
 CVT89_ROWS = {
-    226: ("mixed", 9, ["cvt8"], ["page-19"], None, "DOSE-FULL+ROUTE-PARTIAL+BIGROUTE-DIRECT: on ResNet18_c100 at ciso1's cell, ISO's three-carrier group on PlainNet's dose (HOLDBIG, tri:9428, complement free) puts the run at the k01 location (19.38 vs k01 23.06) while k01's own dose (HOLDHIGH 49.63) replicates cvt7's partial loss (P_DOSE +30.25 pp = +53.85 SE); forcing ISO's complement path recovers part of the loss at k01's dose (HIGHISOPATH 58.19, P_ROUTE +8.56 pp = +15.23 SE) and none at PlainNet's dose (BIGISOPATH 19.42, P_ROUTE_BIG +0.05 pp); the complement-hold control keeps ISO's level (LOWISOPATH 70.47, P_CTLC -0.21 pp) and G-BITE passes 21/21. But no registered account fits every band: the three DOSE accounts hit 6 of 7 (DOSE x DIRECT misses HIGHISOPATH by 2.19 pp), both big-dose arms sit below k01 on every seed (HOLDBIG 3.68 pp = -6.54 SE, BIGISOPATH 3.63 pp under), and the scorer carries two RULE 16 text defects that reach no gate (the BIGROUTE-DIRECT licence says 'the partial loss'; the broken-REST_HOLD null is coded at NO-DOSE levels, so only G-BITE separates it). Bounded: the nearest bar is 3.56 pp under ROUTE-PARTIAL, a recovery under 5 pp cannot be seen between two arms below k01, the forced complement is open-loop, three carriers are held where PlainNet held one, and there are two doses with no time gate."),
+    226: ("mixed", 9, ["cvt8"], ["page-19"], None, "DOSE-FULL+ROUTE-PARTIAL+BIGROUTE-DIRECT: on ResNet18_c100 at ciso1's cell, ISO's three-carrier group on PlainNet's dose (HOLDBIG, tri:9428, complement free) puts the run at the k01 location (19.38 vs k01 23.06) while k01's own dose (HOLDHIGH 49.63) replicates cvt7's partial loss (P_DOSE +30.25 pp = +53.85 SE); forcing ISO's complement path recovers part of the loss at k01's dose (HIGHISOPATH 58.19, P_ROUTE +8.56 pp = +15.23 SE); at PlainNet's dose, with the complement forced, the carriers alone reproduce HOLDBIG's stall (BIGISOPATH 19.42, P_ROUTE_BIG +0.05 pp), but both arms sit below k01, so a recovery under 5 pp could not be seen there and this is not evidence that the free complement's collapse plays no role in HOLDBIG; the complement-hold control keeps ISO's level (LOWISOPATH 70.47, P_CTLC -0.21 pp) and G-BITE passes 21/21. But no registered account fits every band: of the four DOSE-family accounts, three hit 6 of 7 (DOSE x DIRECT misses HIGHISOPATH by 2.19 pp) and DOSE x VIA hits 5, both big-dose arms sit below k01 on every seed (HOLDBIG 3.68 pp = -6.54 SE, BIGISOPATH 3.63 pp under), and the scorer carries two RULE 16 text defects that reach no gate (the BIGROUTE-DIRECT licence says 'the partial loss'; the broken-REST_HOLD null is coded at NO-DOSE levels, so only G-BITE separates it). Bounded: the nearest bar is 3.56 pp under ROUTE-PARTIAL, the forced complement is open-loop, three carriers are held where PlainNet held one, and there are two doses with no time gate."),
     227: ("mixed", 9, ["cvt9"], ["page-19"], None, "DOSE-GRADED + WINDOW-GRADED: on PlainNet18_c100 at cvt1's cell, with the complement forced onto HEADPATH in every held arm, idx 50's level falls through two BETWEEN states over the three rungs tried (MIDDOSE tri:7235 55.86, RESDOSE tri:8609 21.84) to the k01 location at tri:9428 (HIGHHEADPATH 11.21 vs k01 12.13), and either half of the large trajectory alone gives a large partial loss (EARLY 18.37, LATE 27.71; P_WIN = LATE - EARLY +9.34 pp = +15.31 SE, same sign on every seed); the control LOWHEADPATH (65.21) replicates cvt6 and G-BITE passes 21/21. But no registered account fits every band (DOSE-GRADED's misses the MIDDOSE 20-50 band by 5.86 pp, WINDOW-GRADED's misses EARLY by 1.63 pp; the tokens come from the registered bars and the band misses are descriptive), so the pattern is one no account predicted. Bounded: one 2.92 pp move turns the whole FINAL into REPLICATE-FAILED, dose is the triangle family with no threshold or functional form, the one window pair is open-loop, cut at the peak and located only to updates 9403-9501, and no necessity or single-window sentence is licensed."),
 }
 CVT89_BEARS_ON = {226: ["MT225", "MT224"], 227: ["MT224", "MT222"]}  # cvt8 resolves cvt7's dose confound and transplants cvt6's HIGHHEADPATH; cvt9 doses and windows cvt6's HIGHHEADPATH (replicating 240's OWN-STEP-MAGNITUDE)
@@ -1188,6 +1193,121 @@ def cvt89_rows(lines: list[str]) -> list[dict]:
         row["registration_corrections"] = json.dumps([{"number": spec["number"], "reason": spec["reason"], "lines": entries,
                                                        "source": f"{CORRECTIONS_DOC} at {CVT89_COMMIT[:7]}; CORRECTIONS {spec['entry']}"}], ensure_ascii=False)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# 11b. The final audit of the cvt8 / cvt9 landing (CORRECTIONS 253.15): row 227 corrected in place, wording only.
+# ---------------------------------------------------------------------------
+# Campaign commit 6d09d1f appended CORRECTIONS 253.15: row 227's bound (1) said "DOSE-GRADED changes on one arm only if
+# RESDOSE rises ~39 pp", but the registered decide() of analysis/cVT9_dosewindow_score.py returns DOSE-NONMONOTONE whenever
+# RESDOSE - MIDDOSE > 5, so MIDDOSE falling by more than 39.02 pp flips the word too. Campaign commit 3cf4201 then corrected
+# row 227's so-what cell in place -- the two-route sentence, followed by one "**[CORRECTED IN PLACE at cycle 153,
+# CORRECTIONS 253.15: ... SUPERSEDED wording, kept verbatim: '<old words>']**" bracket -- and added a one-line note to
+# 253.15. The CVT89 pin covers that commit too. Its MASTER-TABLE may differ from the landing pin (ba01f54) only in row
+# 227's so-what cell, and only by that one correction: removing the bracket and putting the old words back must give the
+# pinned cell back byte for byte, and the bracket must quote the old words verbatim. Its CORRECTIONS may differ from the
+# landing pin only by the 253.15 section, note included, inserted before the closing "Next free number" line. No number,
+# gate, token or outcome moves: MT227 stays Mixed without a Corrected badge, its scope takes the corrected cell (so the old
+# words stay in it, bracketed) and it gains a warning-MT227-amendment-253 record. The rows, the exclusion list and the
+# registration correction stay pinned to the landing commit.
+CVT89_AUDIT_COMMIT = "3cf42011d04339a08631d9b17c413a0121152edb"
+CVT89_AUDIT_MASTER_TABLE_SHA256 = "577c77f756dc1c4bcfb41edd462f3c766f441d67ebf206a8a0baefb57b80c0fe"
+CVT89_AUDIT_CORRECTIONS_SHA256 = "69399df3a856636c36a1fee2823fe59dbd5163b07dcfd9f64e69014c4418fec2"
+CVT89_AUDIT_SECTION = "### 253.15 "
+CVT89_AUDIT_NOTE = "*Note, added after this entry: MASTER-TABLE row 227 has since been amended in place."
+CVT89_AMENDMENTS = {
+    "MT227": {"line": 227, "outcome": "mixed", "cell": 5, "number": 253, "entry": "253.15", "tag": "CORRECTIONS 253.15",
+              "superseded": "and DOSE-GRADED changes on one arm only if RESDOSE rises ~39 pp",
+              "amended": "and DOSE-GRADED changes on one arm only if RESDOSE rises, or MIDDOSE falls, by ~39 pp (DOSE-NONMONOTONE)",
+              "reason": ("Outcome unchanged (Mixed). Amended at CORRECTIONS 253.15, the landing's final audit: row 227's bound said "
+                         "DOSE-GRADED changes on one arm only if RESDOSE rises ~39 pp, but the registered decide() returns "
+                         "DOSE-NONMONOTONE whenever RESDOSE - MIDDOSE > 5, which at the landed means (difference -34.02) happens if "
+                         "RESDOSE rises or MIDDOSE falls by more than 39.02 pp (a MIDDOSE at 16.84 is still BETWEEN). The row now "
+                         "names both routes and keeps the superseded wording in its bracket. No number, gate, token or outcome moves.")},
+}
+
+
+def check_in_place_correction(before: str, after: str, spec: dict) -> None:
+    """``after`` is ``before`` with exactly one in-place wording correction in cell ``spec["cell"]``, or a ValueError.
+
+    The correction replaces ``spec["superseded"]`` by ``spec["amended"]`` once and inserts one bracket carrying
+    ``spec["tag"]`` that quotes the superseded words verbatim; nothing else in the row may change."""
+    tag, cell = spec["tag"], spec["cell"]
+    old, new = table_cells(before), table_cells(after)
+    if len(old) != 7 or len(new) != 7 or [i for i in range(7) if old[i] != new[i]] != [cell]:
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the {tag} correction must change exactly cell {cell}")
+    brackets = re.findall(r"\[[^\[\]]*?" + re.escape(tag) + r"[^\[\]]*\]", new[cell])
+    if len(brackets) != 1 or f"SUPERSEDED wording, kept verbatim: '{spec['superseded']}']" not in brackets[0]:
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the {tag} correction needs one bracket keeping the superseded wording verbatim")
+    stripped = strip_inserted_brackets(new[cell], tag)
+    if stripped.count(spec["amended"]) != 1 or stripped.replace(spec["amended"], spec["superseded"], 1) != old[cell]:
+        raise ValueError(f"MASTER-TABLE line {spec['line']} changed more than the {tag} correction")
+
+
+def cvt89_audit_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the final audit (CORRECTIONS 253.15); only row 227's one in-place correction may differ from ba01f54."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT89_AUDIT_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != CVT89_AUDIT_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {CVT89_AUDIT_COMMIT[:12]} does not match the pinned final-audit bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = cvt89_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != len(before) or changed != {spec["line"] for spec in CVT89_AMENDMENTS.values()}:
+        raise ValueError(f"MASTER-TABLE at {CVT89_AUDIT_COMMIT[:7]} moved a line or edited lines other than row 227: {sorted(changed)}")
+    for spec in CVT89_AMENDMENTS.values():
+        check_in_place_correction(before[spec["line"] - 1], lines[spec["line"] - 1], spec)
+    return lines
+
+
+def cvt89_audit_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the final audit and at the landing pin; only the 253.15 section and its note may be added."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{CVT89_AUDIT_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != CVT89_AUDIT_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT89_AUDIT_COMMIT[:12]} does not match the pinned final-audit bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before, _ = cvt89_corrections(repo)
+    # The landing closes with "Next free number: **254**."; the 253.15 section is inserted just above that line.
+    inserted = lines[len(before) - 1:-1]
+    if (len(lines) <= len(before) or lines[:len(before) - 1] != before[:-1] or lines[-1] != before[-1]
+            or not before[-1].startswith("Next free number: ") or not inserted[0].startswith(CVT89_AUDIT_SECTION)
+            or any(line.startswith("#") for line in inserted[1:]) or sum(line.startswith(CVT89_AUDIT_NOTE) for line in inserted) != 1):
+        raise ValueError(f"{CORRECTIONS_DOC} at {CVT89_AUDIT_COMMIT[:7]} changed more than the inserted 253.15 section and its note")
+    return lines, before
+
+
+def apply_cvt89_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply the final audit's in-place correction of row 227 (CORRECTIONS 253.15) to MT227's scope."""
+    lines, before = cvt89_audit_master_table(repo), cvt89_master_table(repo)
+    cvt89_audit_corrections(repo)
+    missing = set(CVT89_AMENDMENTS) - {row["id"] for row in rows}
+    if missing:
+        raise ValueError(f"CORRECTIONS 253.15 amendments name absent records: {sorted(missing)}")
+    amended = []
+    for row in rows:
+        spec = CVT89_AMENDMENTS.get(row["id"])
+        if not spec:
+            amended.append(row)
+            continue
+        line, cell, entry = spec["line"], spec["cell"], spec["entry"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if row["master_table_line"] != str(line):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != spec["outcome"]:
+            raise ValueError(f"{row['id']} outcome drifted before its CORRECTIONS {entry} amendment: {row['outcome']} (expected {spec['outcome']})")
+        row = dict(row)
+        if row["scope"].count(clean(old[cell])) != 1:
+            raise ValueError(f"{row['id']}: the corrected MASTER-TABLE cell is not in the record's scope exactly once")
+        row["scope"] = row["scope"].replace(clean(old[cell]), clean(new[cell]))
+        sources = json.loads(row.get("sources") or "[]")
+        # The anchor that pinned the row's text at the landing now points at the corrected row.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        row["sources"] = json.dumps([*sources, f"docs/CORRECTIONS.md [CORRECTIONS {entry}]"], ensure_ascii=False)
+        further = json.loads(row.get("further_amendments") or "[]")
+        further.append({"number": spec["number"], "line": line, "commit": CVT89_AUDIT_COMMIT, "previousOutcome": spec["outcome"], "outcome": spec["outcome"],
+                        "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {CVT89_AUDIT_COMMIT[:7]}; CORRECTIONS {entry}"})
+        row["further_amendments"] = json.dumps(further, ensure_ascii=False)
+        amended.append(row)
+    return amended
 
 
 def amended_master_table(repo: Path) -> list[str]:
@@ -1445,9 +1565,9 @@ def load_register(workspace: Path, repo: Path) -> list[dict]:
 
     The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place.
     The cvt6 / cvt7 landing (CORRECTIONS 246-247) amended no row either (only line 5, which feeds no record), nor did the
-    cvt8 / cvt9 landing (CORRECTIONS 252-253)."""
+    cvt8 / cvt9 landing (CORRECTIONS 252-253); its final audit (CORRECTIONS 253.15) then corrected row 227 in place."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
-    return apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo))
+    return apply_cvt89_amendments(apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo)), Path(repo))
 
 
 def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:

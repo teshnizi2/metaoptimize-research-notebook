@@ -46,7 +46,8 @@ test('MT226 (cvt8) and MT227 (cvt9) are both Mixed under the documented rules, w
   assert.match(cvt8.result, /CO-PRIMARIES P_DOSE = HOLDHIGH - HOLDBIG = 49\.6327 - 19\.3780 = \+30\.2547 pp = \+53\.85 SE/);
   assert.match(cvt8.result, /P_ROUTE = HIGHISOPATH - HOLDHIGH = \+8\.5567 pp = \+15\.23 SE/);
   // Mixed, as MT218 and MT224: the branch answers, but no account fits every band and both big-dose arms sit below k01.
-  assert.match(cvt8.reason, /no registered account fits every band: the three DOSE accounts hit 6 of 7/);
+  // 252.3: four DOSE-family accounts, three of them 6 of 7 and DOSE x VIA 5 (the final audit's wording fix; tests/cvt89-audit.test.ts).
+  assert.match(cvt8.reason, /no registered account fits every band: of the four DOSE-family accounts, three hit 6 of 7/);
   assert.match(cvt8.reason, /both big-dose arms sit below k01 on every seed/);
   assert.match(cvt8.reason, /two RULE 16 text defects/);
   assert.match(cvt8.scope, /Bounded, and led with \(252\.4\): \(1\) the two big-dose arms sit BELOW k01, not at it/);
@@ -59,7 +60,8 @@ test('MT226 (cvt8) and MT227 (cvt9) are both Mixed under the documented rules, w
   assert.match(cvt9.scope, /NOT licensed: necessity of any window or dose;/);
   // Both runners were archived at registration (CORRECTIONS 248, 249): the records link them and carry no source-unavailable warning.
   assert.deepEqual(warningsOf('MT226').map(w => w.id), ['warning-MT226-verdict', 'warning-MT226-intervention']);
-  assert.deepEqual(warningsOf('MT227').map(w => w.id), ['warning-MT227-verdict', 'warning-MT227-registration-253', 'warning-MT227-intervention']);
+  // CORRECTIONS 253.15's in-place correction of row 227 (campaign commit 3cf4201) adds a documented amendment warning to MT227.
+  assert.deepEqual(warningsOf('MT227').map(w => w.id), ['warning-MT227-verdict', 'warning-MT227-amendment-253', 'warning-MT227-registration-253', 'warning-MT227-intervention']);
   for (const [record, path, sha] of [[cvt8, 'jobs/run_cifar_cvt8.sh', '1dbe4ff52eccbbb1c9936f4a687ed88172dd41c48b14ae60eb353b45f766f5e0'],
     [cvt9, 'jobs/run_cifar_cvt9.sh', '0fe45b1d1d2cea28740c72e08193af7d5bab3819b397f59f580c71bb9fbf7849']] as const) {
     const runner = data.sources.find(s => s.path === path)!;

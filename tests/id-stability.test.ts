@@ -230,6 +230,20 @@ test('all 162 records published at 57b9ad5 keep their ID, section, area, title, 
   assert.equal(data.experiments.length, 164);
 });
 
+// The 164 records published at 2969a1c. The final audit of the cvt8 / cvt9 landing (CORRECTIONS 253.15; campaign commit 3cf4201)
+// corrected MASTER-TABLE row 227's wording in place and fixed MT226's reason; wording only, so no record may move.
+const at227 = JSON.parse(readFileSync(new URL('./fixtures/register-ids-2969a1c.json', import.meta.url), 'utf8')) as typeof previous;
+
+test('all 164 records published at 2969a1c keep their ID, section, area, title, kind, outcome, Corrected badge and order', () => {
+  assert.equal(at227.experiments.length, 164);
+  assert.deepEqual(at227.experiments.map(e => e.id), data.experiments.map(e => e.id), 'no record added, removed or reordered');
+  for (const old of at227.experiments) {
+    const current = byId.get(old.id)!;
+    assert.deepEqual([current.section, current.area, current.title, current.kind, current.outcome, current.corrected],
+      [old.section, old.area, old.title, old.kind, old.outcome, old.corrected], old.id);
+  }
+});
+
 test('journal entries still resolve to existing experiments', () => {
   for (const entry of journal) for (const id of entry.experimentIds) assert.ok(byId.has(id), `${entry.id} references ${id}`);
 });
