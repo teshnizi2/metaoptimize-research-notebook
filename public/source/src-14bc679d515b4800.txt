@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""cvt8 REGISTRATION-TIME DERIVATIONS (CORRECTIONS 248).  Reads ONLY landed probe records and raw .out files of the
+ResNet18_c100 batches at ciso1's cell (ciso1, cdep1, ciso2, cvt7; ctd1 printed out of rule), the corpus through
+analysis/corpus_exclusions.filter_rows, and (if present) the PlainNet MUTE records RULE P used at 237.3.  Nothing here
+reads a cvt8 run.  What it prints is copied into analysis/cVT8_doseroute_score.py as LITERALS (the replay file's sha256,
+P_BIG, the noise floor); that scorer's selftest re-runs derive_knots() on the host's records and requires the replay
+file BYTE FOR BYTE.
+
+THE QUESTION (247.4(1)-(2), 247.13 R1).  cvt7 (TRANSFERS-GRADED): on ResNet18_c100 the carrier group {layer4.0.bn2,
+layer4.0.shortcut.1, layer4.1.bn2} held on k01's own trajectory (HOLDHIGH, tri:8609, peak -5.21) costs ~20 pp of ISO's
+47 pp rescue, not all of it.  Two bounds stop the PlainNet sentence being stated for ResNet: (1) DOSE -- PlainNet's
+HOLDHIGH replayed MUTE's trajectory (tri:9428, peak -4.39), ~0.8 log units larger; (2) ROUTE -- HOLDHIGH's free
+complement collapsed at epoch ~53 instead of ISO's ~96, so P_HIGH moved both.  cvt8 crosses the carrier group's dose
+(HIGH = tri:8609, BIG = tri:9428) with the complement's path (FREE Lion, or FORCED open-loop onto ISO's measured
+complement path, ISOPATH), plus LOWISOPATH (group at the floor, complement on ISOPATH) as the complement-hold positive
+control.  The complement hold is PATCH_RESTHOLD (patches/patch_resthold.py; ENV REST_HOLD=tri:<P> | rec:<id>),
+additive on top of cvt7's PATCH_GROUPHOLD tree.
+
+RULE I (written here, before any cvt8 run) -- WHICH RUNS ARE ELIGIBLE, AND THE REPLAY.
+  Candidates: EVERY row of results/all_runs.csv with network ResNet18_c100 whose granularity parses (by name, on the
+  62-tensor model) to ISO's partition: two groups, group 1 = {50, 53, 59} = the three carriers.  (Any spelling of the
+  same partition is a candidate, not only ISO's registered string.)  The frame is the corpus AT REGISTRATION (sha
+  355c0977..., 3,085 rows, highest job id 5022526): rows with a higher job id -- cvt8's own runs and anything landed
+  later -- are listed as `LANDED AFTER REGISTRATION` and never enter the replay (REG_MAX_JID).
+  A candidate is ELIGIBLE iff ALL of:
+    E1  its raw .out exists under <runs> and carries exactly ONE ARGS line with ISO's cell: --optimizer HF --alg-base
+        SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99
+        --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100
+        --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 and --num-epochs >= 100;
+    E2  exactly ONE ENV line, == ciso1's byte for byte with PROBE_DIR stripped (AUGMENT=1, BETA_CLIP=-15:-2.3026,
+        HIER=none, SCHED=none, PROBE=100);
+    E3  exactly ONE `PROBE_TENSOR: on every=100 type=blockwise tensors=62` line;
+    E4  NO intervention: it prints no ON line of any kind corpus_exclusions.KINDS knows (VOTE_W / BETA_HOLD /
+        GROUP_HOLD / COMP_HOLD -- an `off` line or no line at all is fine) AND it is not listed in
+        results/CORPUS-EXCLUSIONS.tsv;
+    E5  the CSV row is complete, not superseded;
+    E6  its probe.jsonl holds records at steps 0, 100, ..., 49,900 (the first 100 epochs), each with beta[0].
+  --num-epochs > 100 is ELIGIBLE (ciso2, 250 epochs): the harness passes num_epochs to NOTHING but train.py's epoch loop
+  (HF receives no horizon; SCHED=none; build_optimizer's cosine defaults belong to the AdamW / SGD reference arms, not
+  HF), so its first 50,000 updates are the same process as a 100-epoch run's; only records with step < 50,000 are read
+  (cvt7's RULE P read ciso2 the same way, 243.3).
+  REPLAY: for record index k = 0..499 (step s = 100k, written after meta update n = s + 2):
+      v_k = median over the eligible runs (listed in ascending job id) of the record's complement beta[0]
+            (python double; with an even count, the mean of the two middle values)
+      n_k = 100k + 2
+  The file patches/cvt8_isopath.json stores {id, rule, source, n, v} as sorted-key compact JSON.  The patch's schedule
+  (PATCH_RESTHOLD rec:, the same arithmetic as PATCH_COMPHOLD's rec:, 242.3(2)):
+      n <  n_0            hold(n) = b0
+      n_k <= n < n_{k+1}  hold(n) = v_k + (v_{k+1} - v_k) (n - n_k) / float(n_{k+1} - n_k)
+      n >= n_last         hold(n) = v_last
+      then min(hi, max(lo, .)), stored into float32.
+  TOLERANCE, stated and proved in S2: (a) at each of the 500 record steps the applied float32 value is within 1e-6 of
+  the measured median; (b) between records it is linear, while every eligible trajectory moves by at most 100 ms = 0.1
+  log units (up to float32 accumulation) between two records, so the schedule is within 0.1 log units of the
+  piecewise-exact median path at every update.
+
+THE DOSE (S3).  HOLDBIG = tri:9428: the SAME integer, hence BITWISE the same schedule, as PlainNet's HOLDHIGH /
+HIGHHEADPATH (cvt4, cvt6; b0, ms and the clamp are identical on both networks), so the network-dose confound of 247.4(1)
+is removed in absolute step size.  S3 prints why 9428 and not a larger dose: every ResNet trajectory measured at this
+cell on a carrier-sized isolated group (the carriers, ISO's complement, HOLDHIGH's free complement, ciso1's count-matched
+CTRL group) peaks at or below P ~ 9500; 9428 sits within 0.02 log units of the median peak of the only isolated
+three-tensor group that STALLED at this cell (ciso1 CTRL, P 9447).  The dose matched RELATIVE to each network's own k01
+peak would be 8609 + (9428 - 8437) = 9600 -- 0.172 log units above 9428, printed as the alternative, not chosen.
+
+Sections:
+  S0  RULE I eligibility: every candidate, every clause, the eligible list
+  S1  ISO's complement beta[0] is NOT a max-rate triangle (why a replay file)
+  S2  RULE I -> the replay file; tolerance (a), (b); fidelity in-sample and out-of-sample (cvt7 HOLDLOW / HOLDISO
+      complements: carriers held small, complement free)
+  S3  the dose: RULE P re-run (8609, 5153) and P_BIG 9428; the schedules; measured ResNet trajectories at this cell
+  S4  G-BITE non-vacuity on landed records: each forced arm's BROKEN-REST_HOLD null is a landed FREE complement; the
+      carrier hold tri:9428 against landed unheld / differently held carrier groups
+  S5  descriptive: ISOPATH against HOLDHIGH's free complement (the contrast HIGHISOPATH makes) and against k01's shared
+  S6  the noise floor on the current corpus (227.6's definitions) through corpus_exclusions.filter_rows
+
+  python3 analysis/cvt8_registration_derivations.py <runs dir holding ciso1/ cdep1/ ciso2/ cvt7/ and the .out files>
+          [<all_runs.csv>] [--write <patches/cvt8_isopath.json>]
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import cvt4_registration_derivations as DV4      # registered at 237, imported UNEDITED (b0, ms, v_of, Lion, triangles)
+import cvt6_registration_derivations as DV6      # registered at 242, imported UNEDITED (rec_value, median, dev, r_window)
+import cvt7_registration_derivations as DV7      # registered at 243, imported UNEDITED (RULE P on ResNet)
+import corpus_exclusions as CE                   # CORRECTIONS 239/245 (KINDS, load, filter_rows), imported UNEDITED
+sys.path.pop(0)
+
+B0, MS, LO, HI, BH_TOL, f32 = DV4.B0, DV4.MS, DV4.LO, DV4.HI, DV4.BH_TOL, DV4.f32
+N_RECORDS = 500
+STEPS_PER_EPOCH = 500
+NET = "ResNet18_c100"
+ISOSPEC = "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight"
+CARRIER_IDX = (50, 53, 59)
+P_HIGH = 8609                   # 243.3 RULE P (k01's shared beta at this cell)
+P_ISO = 5153                    # 243.3 RULE P (ISO's carrier group)
+P_BIG = 9428                    # 237.3 RULE P on PlainNet MUTE's shared beta = cvt4 / cvt6 HOLDHIGH
+P_K01_PLAIN = 8437              # 237.3 RULE P on PlainNet k01's shared beta
+FILE_ID = "cvt8_isopath"
+TEST_ID = "cvt8_testdown"
+REG_MAX_JID = 5022526           # the highest job id in the corpus at registration (sha 355c0977..., 3,085 rows)
+ENV_ISO = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default COS_WARMUP=default "
+           "SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+ARGS_CELL = {"optimizer": "HF", "alg-base": "SGDm", "momentum-param-base": "0.99", "weight-decay-base": "0.1",
+             "alg-meta": "Lion", "momentum-param-meta": "0.99", "Lion-beta2-meta": "0.9", "weight-decay-meta": "0",
+             "dataset": "CIFAR100", "NN-name": NET, "batch-size": "100", "gamma": "1", "meta-stepsize": "1e-3",
+             "alpha0": "1e-6"}
+PT_LINE = re.compile(r"^PROBE_TENSOR: on every=100 type=blockwise tensors=62 ")
+
+
+def r18_names():
+    t = ["conv1.weight", "bn1.weight", "bn1.bias"]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [pre + "conv1.weight", pre + "bn1.weight", pre + "bn1.bias", pre + "conv2.weight", pre + "bn2.weight",
+                  pre + "bn2.bias"]
+            if stride != 1 or cin != w:
+                t += [pre + "shortcut.0.weight", pre + "shortcut.1.weight", pre + "shortcut.1.bias"]
+        inp = w
+    return t + ["linear.weight", "linear.bias"]
+
+
+NAMES = r18_names()
+
+
+def parse_sets(spec):
+    if not spec.startswith("sets:"):
+        return None
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            elif tok in NAMES:
+                idx.append(NAMES.index(tok) + 1)
+            else:
+                return None
+        out.append(sorted(idx))
+    return out
+
+
+def is_iso_partition(gran):
+    g = parse_sets(gran or "")
+    return (g is not None and len(g) == 2 and g[1] == list(CARRIER_IDX)
+            and sorted(g[0] + g[1]) == list(range(1, len(NAMES) + 1)))
+
+
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def find_out(runs, run, jid):
+    for p in (os.path.join(runs, "%s-%s.out" % (run, jid)), os.path.join(runs, run.split("-")[0], "%s-%s.out" % (run, jid))):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def probe_path(runs, run):
+    b = run.split("-")[0]
+    return os.path.join(runs, b, "probe_%s" % run, "probe.jsonl")
+
+
+def load_first100(runs, run):
+    p = probe_path(runs, run)
+    if not os.path.exists(p):
+        return None
+    out = []
+    for ln in open(p):
+        if not ln.strip():
+            continue
+        r = json.loads(ln)
+        if r["step"] >= N_RECORDS * 100:
+            break
+        out.append(r)
+    return out
+
+
+_ELIG = {}
+
+
+def eligibility(runs, csvpath):
+    """RULE I, S0.  -> (eligible run names in ascending job id, [(run, jid, epochs, verdict, reasons)] by job id)"""
+    key = (os.path.abspath(runs), os.path.abspath(csvpath))
+    if key not in _ELIG:
+        _ELIG[key] = _eligibility(runs, csvpath)
+    return _ELIG[key]
+
+
+def _eligibility(runs, csvpath):
+    listed = CE.keys()
+    rows = [r for r in csv.DictReader(open(csvpath)) if r.get("network") == NET and is_iso_partition(r.get("granularity"))]
+    table, elig = [], []
+    for r in rows:
+        run, jid = r["run"], r["job_id"]
+        why = []
+        if int(jid) > REG_MAX_JID:
+            table.append((run, jid, r.get("epochs_requested"), "NOT ELIGIBLE", ["LANDED AFTER REGISTRATION (job id > %d)" % REG_MAX_JID]))
+            continue
+        p = find_out(runs, run, jid)
+        if p is None:
+            why.append("E1 no raw .out")
+        else:
+            lines = open(p, errors="replace").read().splitlines()
+            args = [ln for ln in lines if ln.startswith("ARGS:")]
+            if len(args) != 1:
+                why.append("E1 %d ARGS lines" % len(args))
+            else:
+                f = parse_args_line(args[0])
+                bad = [k for k, v in ARGS_CELL.items() if f.get(k, [None])[-1] != v]
+                ne = f.get("num-epochs", [None])[-1]
+                if bad or any(len(v) > 1 for v in f.values()) or not (ne and ne.isdigit() and int(ne) >= 100):
+                    why.append("E1 ARGS not ISO's cell (%s, num-epochs %s)" % (bad, ne))
+            envs = [re.sub(r" PROBE_DIR=\S*", "", ln) for ln in lines if ln.startswith("ENV:")]
+            if envs != [ENV_ISO]:
+                why.append("E2 ENV %r" % (envs[:1],))
+            if len([ln for ln in lines if PT_LINE.match(ln)]) != 1 or len([ln for ln in lines if ln.startswith("PROBE_TENSOR:")]) != 1:
+                why.append("E3 PROBE_TENSOR line")
+            on = [k for k, off in CE.KINDS if any(ln.startswith(k) and ln != off for ln in lines)]
+            if on:
+                why.append("E4 intervention ON: %s" % "/".join(on))
+        if (run, jid) in listed:
+            why.append("E4 listed in CORPUS-EXCLUSIONS.tsv")
+        if not (r.get("complete") == "1" and r.get("superseded") == "0"):
+            why.append("E5 complete %s superseded %s" % (r.get("complete"), r.get("superseded")))
+        recs = load_first100(runs, run)
+        if recs is None or [x["step"] for x in recs] != [100 * k for k in range(N_RECORDS)]:
+            why.append("E6 probe records not steps 0..49900")
+        table.append((run, jid, r.get("epochs_requested"), "ELIGIBLE" if not why else "NOT ELIGIBLE", why))
+        if not why:
+            elig.append((int(jid), run))
+    table.sort(key=lambda t: int(t[1]))
+    return [run for _j, run in sorted(elig)], table
+
+
+def source_runs(runs, names, g=0):
+    return [(nm, [(r["step"], float(r["beta"][g])) for r in load_first100(runs, nm)]) for nm in names]
+
+
+RULE_TEXT = ("RULE I (CORRECTIONS 248): v_k = median over EVERY eligible landed ISO run at ciso1's cell (ResNet18_c100; "
+             "ISO's partition; ISO's ARGS cell, --num-epochs >= 100, records with step < 50000; ciso1's ENV line; "
+             "PROBE_TENSOR blockwise 62; no intervention ON line, not in CORPUS-EXCLUSIONS.tsv; complete) of probe record "
+             "k's complement beta[0]; n_k = 100k + 2")
+
+
+def derive_knots(runs, csvpath):
+    """RULE I.  -> (n list, v list, source names)"""
+    elig, _t = eligibility(runs, csvpath)
+    src = source_runs(runs, elig, 0)
+    n = [100 * k + 2 for k in range(N_RECORDS)]
+    v = [DV6.median([tr[k][1] for _nm, tr in src]) for k in range(N_RECORDS)]
+    return n, v, [nm for nm, _tr in src]
+
+
+def knots_json(n, v, names):
+    return json.dumps({"id": FILE_ID, "rule": RULE_TEXT, "source": names, "n": n, "v": v},
+                      sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def test_json():
+    """TEST-ONLY replay (never a batch arm): the natural rise to update 102, then down to the clamp by update 302."""
+    return json.dumps({"id": TEST_ID, "rule": "TEST ONLY (CORRECTIONS 248): never used by a cvt8 arm",
+                       "source": [], "n": [2, 102, 302], "v": [f32(B0 + MS), f32(B0 + 101 * MS), LO]},
+                      sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def sched_rec(kn, kv):
+    return [(100 * k, DV6.rec_value(100 * k + 2, kn, kv)) for k in range(N_RECORDS)]
+
+
+def sched_tri(P):
+    return [(100 * k, DV4.v_of(100 * k + 2, P)) for k in range(N_RECORDS)]
+
+
+def clamp_update(P):
+    n = P + 1
+    while DV4.v_of(n, P) != LO:
+        n += 1
+    return n
+
+
+def floor(csvpath):
+    naive = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith("cvt8-")]
+    filt = CE.filter_rows(naive)
+    return {"rows": len(naive), "rows_filtered": len(filt),
+            "R18ALL": DV4.pooled_sigma(filt, NET), "PLAIN": DV4.pooled_sigma(filt, "PlainNet18_c100"),
+            "R18ALL_naive": DV4.pooled_sigma(naive, NET), "PLAIN_naive": DV4.pooled_sigma(naive, "PlainNet18_c100"),
+            "tsv_sha": hashlib.sha256(open(CE.DEFAULT_TSV, "rb").read()).hexdigest()}
+
+
+def main():
+    argv = list(sys.argv[1:])
+    write = None
+    if "--write" in argv:
+        i = argv.index("--write")
+        write = argv[i + 1]
+        del argv[i:i + 2]
+    runs = argv[0] if argv else os.path.join(os.path.dirname(REPO), "runs_cluster_b")
+    csvpath = argv[1] if len(argv) > 1 else os.path.join(REPO, "results", "all_runs.csv")
+    print("cvt8 registration derivations (CORRECTIONS 248)")
+    print("  runs %s" % runs)
+    print("  corpus %s sha %s" % (csvpath, hashlib.sha256(open(csvpath, "rb").read()).hexdigest()))
+    print("  b0 = float32(log 1e-6) = %r ; ms = %r ; clamp [%r, %r] ; BH_TOL %r" % (B0, MS, LO, HI, BH_TOL))
+
+    print("\nS0  RULE I ELIGIBILITY: every CSV row of %s whose granularity parses to ISO's partition (group 1 = %s)" % (NET, CARRIER_IDX))
+    elig, table = eligibility(runs, csvpath)
+    for run, jid, ep, verdict, why in table:
+        print("  %-22s %-8s epochs %-4s %-13s %s" % (run, jid, ep, verdict, "; ".join(why) if why else "E1-E6 all hold"))
+    print("  candidates %d; ELIGIBLE %d: %s" % (len(table), len(elig), " ".join(elig)))
+
+    src = source_runs(runs, elig, 0)
+    print("\nS1  ISO's COMPLEMENT beta[0] IS NOT A MAX-RATE TRIANGLE (%d eligible runs)" % len(src))
+    worst_tri = 1e9
+    for nm, tr in src:
+        s_pk, b_pk = DV4.peak(tr)
+        bt, bP = DV4.min_over_P_maxdev(tr)
+        worst_tri = min(worst_tri, bt)
+        print("  %-20s peak %.4f @ %5.1f  @20 %.3f @30 %.3f @40 %.3f @50 %.3f @60 %.3f @80 %.3f  r<=2 from %5.1f  last %.3f  best triangle max|dev| %.3f (P %d)"
+              % (nm, b_pk, s_pk / 500.0, DV6.at(tr, 20), DV6.at(tr, 30), DV6.at(tr, 40), DV6.at(tr, 50), DV6.at(tr, 60),
+                 DV6.at(tr, 80), DV6.mag_pin_epoch(tr), tr[-1][1], bt, bP))
+    print("  => the BEST max-rate triangle misses EVERY eligible run by >= %.3f log units somewhere; RULE I replays the measured"
+          " median instead (243.3(1) found 7.29-7.40 against the arm's OWN triangle)." % worst_tri)
+
+    print("\nS2  RULE I -> the replay file")
+    kn, kv, names = derive_knots(runs, csvpath)
+    body = knots_json(kn, kv, names)
+    sha = hashlib.sha256(body.encode()).hexdigest()
+    print("  source (%d runs): %s" % (len(names), " ".join(names)))
+    print("  knots %d, n %d..%d every 100; v_0 %r (== float32(b0 + ms) %r: %s); v_last %r; max v %r at knot %d (epoch %.1f)"
+          % (len(kn), kn[0], kn[-1], kv[0], f32(B0 + MS), kv[0] == f32(B0 + MS), kv[-1], max(kv), kv.index(max(kv)),
+             (kn[kv.index(max(kv))] - 2) / 500.0))
+    print("  REPLAY FILE %s.json  %d bytes  sha256 %s" % (FILE_ID, len(body), sha))
+    tbody = test_json()
+    print("  TEST-ONLY FILE %s.json  %d bytes  sha256 %s" % (TEST_ID, len(tbody), hashlib.sha256(tbody.encode()).hexdigest()))
+    sched = sched_rec(kn, kv)
+    at_knot = max(abs(v - kv[k]) for k, (_s, v) in enumerate(sched))
+    print("  TOLERANCE (a): at the 500 record steps max |float32 schedule - measured median| = %.3e (<= 1e-6: %s)"
+          % (at_knot, at_knot <= 1e-6))
+    jump = max(abs(tr[k + 1][1] - tr[k][1]) for _nm, tr in src for k in range(N_RECORDS - 1))
+    kjump = max(abs(kv[k + 1] - kv[k]) for k in range(N_RECORDS - 1))
+    print("  TOLERANCE (b): largest move of ANY eligible trajectory between two records %.7f (<= 0.1 + 1e-4: %s); of the median %.7f"
+          % (jump, jump <= 0.1 + 1e-4, kjump))
+    print("  => the schedule equals the measured median at every record step (<= 1e-6) and is within 0.1 log units of the"
+          " piecewise-exact median path at every update.")
+    lin_ok = all(DV6.rec_value(n, kn, kv) == f32(min(HI, max(LO, kv[(n - 2) // 100] + (kv[(n - 2) // 100 + 1] - kv[(n - 2) // 100]) * ((n - 2) % 100) / 100.0)))
+                 for n in range(2, kn[-1], 37))
+    print("  (the bisection form == the uniform-knot form at every 37th update: %s)" % lin_ok)
+    rs = (DV6.r_window(sched, 15, 30), DV6.r_window(sched, 30, 60), DV6.r_window(sched, 60, 100))
+    print("  FIDELITY, IN-SAMPLE: max|rec - sched| / mean|.| / records > BH_TOL ; r(15-30) r(30-60) r(60-100) ; r<=2 from")
+    print("    %-22s %28s  r %8.1f %8.1f %6.2f   r<=2 from %s" % ("SCHEDULE", "", rs[0], rs[1], rs[2], DV6.mag_pin_epoch(sched)))
+    for nm, tr in src:
+        mx, mn, nb = DV6.dev(tr, sched)
+        print("    %-22s %.4f / %.4f / %3d   r %8.1f %8.1f %6.2f   r<=2 from %.1f" % (nm, mx, mn, nb, DV6.r_window(tr, 15, 30),
+              DV6.r_window(tr, 30, 60), DV6.r_window(tr, 60, 100), DV6.mag_pin_epoch(tr)))
+    print("  FIDELITY, OUT-OF-SAMPLE (not in the median; carriers held small, complement FREE): cvt7 HOLDLOW / HOLDISO")
+    for arm in ("HOLDLOW", "HOLDISO"):
+        for s in (99, 100, 101):
+            nm = "cvt7-%s-s%d" % (arm, s)
+            tr = source_runs(runs, [nm], 0)[0][1]
+            mx, mn, nb = DV6.dev(tr, sched)
+            print("    %-22s %.4f / %.4f / %3d   r %8.1f %8.1f %6.2f   r<=2 from %s" % (nm, mx, mn, nb, DV6.r_window(tr, 15, 30),
+                  DV6.r_window(tr, 30, 60), DV6.r_window(tr, 60, 100), DV6.mag_pin_epoch(tr)))
+    if write:
+        open(write, "w").write(body)
+        open(os.path.join(os.path.dirname(os.path.abspath(write)), TEST_ID + ".json"), "w").write(tbody)
+        print("  WROTE %s and %s.json" % (write, TEST_ID))
+
+    print("\nS3  THE DOSE: HOLDHIGH = tri:%d (k01's own trajectory at this cell), HOLDBIG = tri:%d (PlainNet's)" % (P_HIGH, P_BIG))
+    if all(os.path.isdir(os.path.join(runs, b)) for b in ("ciso1", "cdep1", "ciso2")):
+        P7 = DV7.derive_P(runs)
+        print("  RULE P (243.3) re-run on this host: P_HIGH %d, P_ISO %d  (registered 8609 / 5153: %s)"
+              % (P7["HIGH"], P7["ISO"], (P7["HIGH"], P7["ISO"]) == (P_HIGH, P_ISO)))
+    if all(os.path.isdir(os.path.join(runs, b)) for b in ("cvt1", "cvt3")):
+        P4 = DV4.derive_P(runs)
+        print("  RULE P (237.3) re-run on this host's PlainNet records: P_HIGH %d (MUTE / MUTE50), P_K01 %d  (registered 9428 / 8437: %s)"
+              % (P4["HIGH"], P4["K01"], (P4["HIGH"], P4["K01"]) == (P_BIG, P_K01_PLAIN)))
+    else:
+        print("  PlainNet MUTE records not under %s: P_BIG = 9428 is quoted from 237.3 (cvt4 / cvt6 HOLDHIGH's registered string)" % runs)
+    for lab, P in (("HIGH", P_HIGH), ("BIG", P_BIG), ("REL (not chosen)", P_HIGH + (P_BIG - P_K01_PLAIN))):
+        tr_s = sched_tri(P)
+        nc = clamp_update(P)
+        print("  tri:%-5d %-17s peak %.6f after update %d (epoch %.2f); clamp after update %d (epoch %.2f); r(15-30) %9.1f; r(30-40) %8.2f;"
+              " > 100 x floor from epoch %.2f to %.2f"
+              % (P, lab, DV4.v_of(P + 1, P), P + 1, (P + 1) / 500.0, nc, nc / 500.0, DV6.r_window(tr_s, 15, 30),
+                 DV6.r_window(tr_s, 30, 40), min(n for n in range(0, 50002) if DV4.v_of(n, P) > LO + math.log(100.0)) / 500.0,
+                 max(n for n in range(0, 50002) if DV4.v_of(n, P) > LO + math.log(100.0)) / 500.0))
+    rh, rb = DV6.r_window(sched_tri(P_HIGH), 15, 30), DV6.r_window(sched_tri(P_BIG), 15, 30)
+    print("  BIG / HIGH: peak step size x%.3f (%.3f log units); r(15-30) x%.3f; the REL alternative is %.3f log units above BIG"
+          % (math.exp(MS * (P_BIG - P_HIGH)), MS * (P_BIG - P_HIGH), rb / rh, MS * (P_HIGH + P_BIG - P_K01_PLAIN - P_BIG)))
+    print("  measured trajectories at this cell (first 100 epochs), peak value -> the P a triangle with that peak would have:")
+    for b, arm, g, seeds in (("ciso1", "k01", 0, (21, 22, 23)), ("cdep1", "k01", 0, (24, 25, 26)), ("ciso2", "k01", 0, (31, 32, 33)),
+                             ("cvt7", "k01", 0, (99, 100, 101)), ("ciso1", "ISO", 0, (21, 22, 23)), ("cvt7", "ISO", 0, (99, 100, 101)),
+                             ("cvt7", "HOLDHIGH", 0, (99, 100, 101)), ("ciso1", "CTRL", 1, (21, 22, 23)), ("ciso1", "CTRL", 0, (21, 22, 23))):
+        pk = []
+        for s in seeds:
+            recs = load_first100(runs, "%s-%s-s%d" % (b, arm, s))
+            if recs is None:
+                continue
+            pk.append(max(float(r["beta"][g]) for r in recs))
+        if pk:
+            med = DV6.median(pk)
+            print("    %-6s %-9s group %d: peaks %s  median %.4f -> P %d  (vs BIG %+.3f log units)"
+                  % (b, arm, g, " ".join("%.3f" % x for x in pk), med, int(round((med - B0) / MS)), med - (B0 + MS * P_BIG)))
+    print("  NOTE: in the k62 / ctd1 `lay` arms some SINGLETON tensors reach the upper clamp (-2.3026); the carriers there peak at"
+          " -9.0 .. -8.3.  No carrier-sized group measured at this cell rose above P ~ 9500, so a dose above 9428 would not replay"
+          " any measured ResNet trajectory; 9428 is the PlainNet dose, bitwise.")
+
+    print("\nS4  G-BITE NON-VACUITY on landed records")
+    nulls = (("HIGHISOPATH", "cvt7-HOLDHIGH"), ("LOWISOPATH", "cvt7-HOLDLOW"), ("BIGISOPATH", "cvt7-HOLDHIGH"))
+    worst = {}
+    for arm, twin in nulls:
+        for s in (99, 100, 101):
+            recs = load_first100(runs, "%s-s%d" % (twin, s))
+            tr = [(r["step"], float(r["beta"][0])) for r in recs]
+            tr_pre = [(r["step"], float(r["beta_pre"][0][0])) for r in recs]
+            pre_s = [(100 * k, DV6.rec_value(100 * k + 1, kn, kv)) for k in range(N_RECORDS)]
+            mx, _mn, nb = DV6.dev(tr, sched)
+            mxp, _mnp, nbp = DV6.dev(tr_pre, pre_s)
+            worst[arm] = min(worst.get(arm, 1e9), mx, mxp)
+            print("  %-12s null = the FREE complement of %s-s%d: beta misses ISOPATH on %3d/500 records (max %.4f); beta_pre on %3d/500 (max %.4f)"
+                  % (arm, twin, s, nb, mx, nbp, mxp))
+    print("  (BIGISOPATH has no landed free twin -- HOLDBIG is new; its nearest landed null, HOLDHIGH's free complement, is printed)")
+    ins = min(DV6.dev(tr, sched)[0] for _nm, tr in src)
+    print("  even the %d SOURCE runs of the median miss it by >= %.4f somewhere (%.0f x BH_TOL)" % (len(src), ins, ins / BH_TOL))
+    print("  NON-VACUITY (REST_HOLD): min over nulls of max|dev|: %s (every one >= 100 x BH_TOL: %s)"
+          % (", ".join("%s %.4f" % x for x in sorted(worst.items())), all(x >= 100 * BH_TOL for x in worst.values())))
+    wb = 1e9
+    for nm in elig + ["cvt7-HOLDHIGH-s%d" % s for s in (99, 100, 101)]:
+        recs = load_first100(runs, nm)
+        d = max(max(abs(float(r["beta"][1]) - DV4.v_of(r["step"] + 2, P_BIG)), abs(float(r["beta_pre"][0][1]) - DV4.v_of(r["step"] + 1, P_BIG)))
+                for r in recs)
+        wb = min(wb, d)
+    print("  NON-VACUITY (GROUP_HOLD tri:%d): every eligible ISO carrier group (unheld) and cvt7 HOLDHIGH's (held on tri:%d) misses tri:%d"
+          " by >= %.4f somewhere (%.0f x BH_TOL)" % (P_BIG, P_HIGH, P_BIG, wb, wb / BH_TOL))
+    mm = nrec = 0
+    for arm in ("HOLDLOW", "HOLDHIGH", "HOLDISO"):
+        for s in (99, 100, 101):
+            for r in load_first100(runs, "cvt7-%s-s%d" % (arm, s)):
+                nrec += 1
+                nat, _sg = DV4.lion_natural(r["beta_pre"][0][0], r["mom_pre"][0][0], r["z_agg"][0][0])
+                mm += abs(nat - r["beta"][0]) > BH_TOL
+    print("  (the FREE complement of every landed cvt7 held-arm record is Lion recomputed from its own record: %d mismatches of %d)" % (mm, nrec))
+
+    print("\nS5  DESCRIPTIVE (NON-GATING): ISOPATH against HOLDHIGH's free complement (arm mean of cvt7 s99-101) and k01's shared beta")
+    hh = [source_runs(runs, ["cvt7-HOLDHIGH-s%d" % s], 0)[0][1] for s in (99, 100, 101)]
+    kk = [source_runs(runs, ["cvt7-k01-s%d" % s], 0)[0][1] for s in (99, 100, 101)]
+    for ep in (10, 17, 18, 20, 25, 30, 40, 50, 53, 60, 70, 80, 90, 99.8):
+        k = min(N_RECORDS - 1, int(round(ep * 5)))
+        mh = sum(t[k][1] for t in hh) / 3.0
+        mk = sum(t[k][1] for t in kk) / 3.0
+        print("    epoch %5.1f  ISOPATH %8.3f  HOLDHIGH free cmpl %8.3f (diff %+7.3f, r x%.3g)  k01 shared %8.3f"
+              % (ep, sched[k][1], mh, mh - sched[k][1], math.exp(mh - sched[k][1]), mk))
+    print("  r(15-30) ISOPATH %.1f vs HOLDHIGH's %.1f; r(30-60) %.1f vs %.1f; r(60-100) %.2f vs %.2f"
+          % (DV6.r_window(sched, 15, 30), sum(DV6.r_window(t, 15, 30) for t in hh) / 3, DV6.r_window(sched, 30, 60),
+             sum(DV6.r_window(t, 30, 60) for t in hh) / 3, DV6.r_window(sched, 60, 100), sum(DV6.r_window(t, 60, 100) for t in hh) / 3))
+    for lab, P in (("HIGH", P_HIGH), ("BIG", P_BIG)):
+        print("  with the complement on ISOPATH, the carriers' r / the complement's r over epochs 15-30: %s %.3f" % (
+            lab, DV6.r_window(sched_tri(P), 15, 30) / DV6.r_window(sched, 15, 30)))
+
+    print("\nS6  THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36), 227.6's definitions")
+    F = floor(csvpath)
+    print("  %d rows (cvt8- excluded: none exist), %d after filter_rows; exclusion list sha %s" % (F["rows"], F["rows_filtered"], F["tsv_sha"]))
+    for k in ("R18ALL", "PLAIN"):
+        sf, sn = F[k], F[k + "_naive"]
+        print("  SIGMA_%-7s FILTERED %r (df %d, %d cells)   NAIVE %r (df %d, %d cells)" % (k, sf[0], sf[1], sf[2], sn[0], sn[1], sn[2]))
+    print("  SIGMA_PRIOR = SIGMA_R18ALL (filtered) = %r ; SE_PRIOR = %.6f" % (F["R18ALL"][0], F["R18ALL"][0] * math.sqrt(2 / 3.0)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

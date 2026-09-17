@@ -1,0 +1,585 @@
+#!/bin/bash
+# =============================================================================
+# cVT8_doseroute.sh -- `cvt8`: ResNet18_c100 -- IS cvt7's PARTIAL LOSS A DOSE EFFECT, AND IS IT DIRECT OR THROUGH THE
+#   COMPLEMENT?  ONE SUBMISSION, 21 JOBS (7 arms x 3 seeds), 100 EPOCHS, SEEDS {102,103,104}, ResNet18_c100 / CIFAR-100,
+#   ciso1's cell, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.  CORRECTIONS 248.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here touches the other account; every guard
+# and scancel line is filtered on `cvt8-`.
+#
+# REGISTERED SCORER: analysis/cVT8_doseroute_score.py, committed BEFORE this batch is submitted (RULE 21).
+#     DOCUMENTED INVOCATION:  python3 analysis/cVT8_doseroute_score.py <runsdir>
+#
+# NEW HARNESS CODE, ISOLATED AND OPT-IN.  The batch runs from $WS/harness_cvt8/cifar10 = cvt7's tree (the LIVE ResNet
+# harness + PATCH_VOTEWEIGHT + PATCH_BETAHOLD + PATCH_GROUPHOLD) + PATCH_RESTHOLD (patches/patch_resthold.py) + the replay
+# file Optimizers/cvt8_isopath.json, built and verified by bin/cVT8_stage_harness.sh, and the runner
+# $WS/jobs/run_cifar_cvt8.sh (run_cifar.sh with the cd line changed).  Guard 4f requires the inertness / bite log
+# (tests/test_resthold.py + tests/test_resthold_realrun.py, bin/cVT8_realrun_inertness.sbatch) on THIS HF.py and scorer.
+#
+# THE ARMS (ISO's grouping except k01; <C> = layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight)
+#   k01          scalar  GROUP_HOLD unset       REST_HOLD unset
+#   ISO          ISO's   GROUP_HOLD unset       REST_HOLD unset
+#   HOLDHIGH     ISO's   GROUP_HOLD=<C>:tri:8609 REST_HOLD unset
+#   HOLDBIG      ISO's   GROUP_HOLD=<C>:tri:9428 REST_HOLD unset
+#   HIGHISOPATH  ISO's   GROUP_HOLD=<C>:tri:8609 REST_HOLD=rec:cvt8_isopath
+#   BIGISOPATH   ISO's   GROUP_HOLD=<C>:tri:9428 REST_HOLD=rec:cvt8_isopath
+#   LOWISOPATH   ISO's   GROUP_HOLD=<C>:floor    REST_HOLD=rec:cvt8_isopath
+#
+# RULE 20.  Every ARGS value is ONE shell token; every held arm's ARGS line is ISO's except the run name.  GROUP_HOLD and
+# REST_HOLD ride sbatch's --export list and CANNOT ride the runner's ENV line: the patches print their witness lines at
+# construction on EVERY run, and those lines are what the separate ENV audit and the scorer's G-GHOLD / G-RHOLD read.
+# analysis/argsline_guard.py IS NOT EDITED.
+#
+# COST.  cvt7 by sacct: 49,896 s / 15 = 0.92 GPU-h per 100-epoch ResNet18_c100 run including [HOST_3c1b003035] (~0.71 off it).
+# 21 jobs ~= 19.3 GPU-h expected (~15 off [HOST_3c1b003035]); HARD BOUND = WALL x 21 = 63 GPU-h (WALL 03:00:00; cvt7's slowest 5,650 s).
+#
+# USAGE   bash bin/cVT8_doseroute.sh               # dry run: every guard, every composed line printed; submits nothing
+#         bash bin/cVT8_doseroute.sh --submit      # the ONLY submitting form
+# ENV     CVT8_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+H7=$WS/harness_cvt7/cifar10
+HARN=$WS/harness_cvt8/cifar10
+RUNNER=$WS/jobs/run_cifar_cvt8.sh
+SAVE=$WS/runs/cvt8
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="102 103 104"
+MST=1e-3
+A0=1e-6
+NTENS=62
+TOTPAR=11220132
+G_K01='scalar'
+G_ISO='sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight'
+CARR='layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight'
+GH_HIGH="$CARR:tri:8609"
+GH_BIG="$CARR:tri:9428"
+GH_LOW="$CARR:floor"
+RH_ISO="rec:cvt8_isopath"
+ARMS="k01 ISO HOLDHIGH HOLDBIG HIGHISOPATH BIGISOPATH LOWISOPATH"
+NJOBS=21
+WALL=03:00:00
+LIVE_BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_PRE_SHA=2396f2be8102724c120ea5271d2d84acf3835ffb9a5c7947fc282121cf2a588f
+HF_POST_SHA=5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9
+ISOPATH_SHA=08ab25f3a329cb260bb39fb72f3299c021e7169bf612fa27d539166296e28e70
+RUNNER_SHA=1dbe4ff52eccbbb1c9936f4a687ed88172dd41c48b14ae60eb353b45f766f5e0
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cVT8_doseroute_score.py"
+SELF="$REPO/bin/cVT8_doseroute.sh"
+DERIV="$REPO/analysis/cvt8_registration_derivations.py"
+DERIV4="$REPO/analysis/cvt4_registration_derivations.py"
+DERIV6="$REPO/analysis/cvt6_registration_derivations.py"
+DERIV7="$REPO/analysis/cvt7_registration_derivations.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+RRSB="$REPO/bin/cVT8_realrun_inertness.sbatch"
+TESTR8="$REPO/tests/test_resthold.py"
+TESTRR8="$REPO/tests/test_resthold_realrun.py"
+STAGE8="$REPO/bin/cVT8_stage_harness.sh"
+PATCHR="$REPO/patches/patch_resthold.py"
+ISOJ="$REPO/patches/cvt8_isopath.json"
+TESTJ="$REPO/patches/cvt8_testdown.json"
+TESTG="$REPO/tests/test_grouphold.py"
+TESTGR="$REPO/tests/test_grouphold_realrun.py"
+TESTT="$REPO/tests/test_probe_tensor.py"
+SC7="$REPO/analysis/cVT7_grouphold_score.py"
+SC6="$REPO/analysis/cVT6_complementpath_score.py"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+HFH="$HARN/Optimizers/HF.py"
+HFRH="$HARN/Optimizers/HF.py.pre_resthold"
+HFVW="$HARN/Optimizers/HF.py.pre_voteweight"
+HFPRE="$HARN/Optimizers/HF.py.pre_probe_tensor"
+BNH="$HARN/build_network.py"
+ILOG="$SAVE/inertness_resthold.log"
+
+echo "=============================================================="
+echo " cvt8 -- ResNet18_c100: dose x route on the carrier group  (PATCH_GROUPHOLD + PATCH_RESTHOLD)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C  ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   k01          $G_K01"
+echo "   ISO          $G_ISO"
+echo "   HOLDHIGH     ISO's  GROUP_HOLD=$GH_HIGH"
+echo "   HOLDBIG      ISO's  GROUP_HOLD=$GH_BIG"
+echo "   HIGHISOPATH  ISO's  GROUP_HOLD=$GH_HIGH  REST_HOLD=$RH_ISO"
+echo "   BIGISOPATH   ISO's  GROUP_HOLD=$GH_BIG  REST_HOLD=$RH_ISO"
+echo "   LOWISOPATH   ISO's  GROUP_HOLD=$GH_LOW  REST_HOLD=$RH_ISO"
+echo " 7 arms x 3 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " CO-PRIMARY: P_DOSE = HOLDHIGH - HOLDBIG; P_ROUTE = HIGHISOPATH - HOLDHIGH; P_ROUTE_BIG = BIGISOPATH - HOLDBIG"
+echo " DOCUMENTED INVOCATION: python3 analysis/cVT8_doseroute_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${COMP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD and REST_HOLD are UNSET in the launcher's environment" \
+  || guard_fail "guard 0b: an intervention switch is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$SELF" "$DERIV" "$DERIV4" "$DERIV6" "$DERIV7" "$EXCL" "$EXCLT" "$RRSB" "$TESTR8" "$TESTRR8" "$STAGE8" "$PATCHR" "$ISOJ" "$TESTJ" \
+         "$TESTG" "$TESTGR" "$TESTT" "$SC7" "$SC6" "$LIBF" "$AGF" "$CSVP" "$RUNNER" "$HFH" "$HFRH" "$HFVW" "$HFPRE" "$BNH"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cVT8_doseroute_score.py bin/cVT8_doseroute.sh analysis/cvt8_registration_derivations.py bin/cVT8_realrun_inertness.sbatch tests/test_resthold.py tests/test_resthold_realrun.py patches/patch_resthold.py patches/cvt8_isopath.json patches/cvt8_testdown.json bin/cVT8_stage_harness.sh jobs/run_cifar_cvt8.sh"
+REUSEF="analysis/cvt4_registration_derivations.py analysis/cvt6_registration_derivations.py analysis/cvt7_registration_derivations.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv tests/test_grouphold.py tests/test_grouphold_realrun.py tests/test_probe_tensor.py analysis/cVT7_grouphold_score.py analysis/cVT6_complementpath_score.py bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the eleven registration files and twelve reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CVT8_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CVT8_REGISTERED_COMMIT"
+    echo "          (RULE 21 is re-verified by wall clock: that commit's %ct vs the earliest sacct Submit)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CVT8_REGISTERED_COMMIT is unset -- declare the commit whose tree was staged"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CVT8_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+cmp -s "$RUNNER" "$REPO/jobs/run_cifar_cvt8.sh" && echo "guard 1b2: the archived jobs/run_cifar_cvt8.sh is BYTE-IDENTICAL to the runner the batch uses" \
+  || guard_fail "guard 1b2: jobs/run_cifar_cvt8.sh in the repo differs from $RUNNER"
+
+# ---- guard 1c: the scorer selftest, INCLUDING O2, RULE I, the real-record nulls and the invocation ----
+SELFT=/tmp/cvt8_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION\|Traceback' "$SELFT" | head -20; tail -5 "$SELFT"; }
+grep -qE "^  PASS O2 DOSE-FULL x DIRECT x BIG-DIRECT +real\+invented " "$SELFT" && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows at cvt8's cells, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cVT8_doseroute_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows carry seed 102, 103 or 104" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed check ran and passed" || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cIS1's" "$SELFT" && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cDP1's" "$SELFT" \
+  && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cIS2's" "$SELFT" && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cVT7's" "$SELFT" \
+  && grep -q "^  PASS B cvt7's registered scorer: HOLDHIGH's string and witness" "$SELFT" && grep -q "^  PASS B cvt6's registered scorer: P_BIG" "$SELFT" \
+  && echo "guard 1c5: ISO byte-identical to ciso1's / cdep1's / ciso2's / cvt7's; HOLDHIGH is cvt7's string; P_BIG is cvt6's schedule" \
+  || guard_fail "guard 1c5: the byte-identity checks did not pass"
+grep -q "^  PASS B RULE I re-run on THIS host: the eligible runs are exactly the 12 registered sources" "$SELFT" \
+  && grep -q "^  PASS B RULE I re-run on THIS host's landed records reproduces the replay file BYTE FOR BYTE" "$SELFT" \
+  && grep -q "^  PASS B RULE P (243.3) re-run on THIS host == P_HIGH 8609" "$SELFT" \
+  && echo "guard 1c6: RULE I (12 eligible runs, the replay file byte for byte) and RULE P (8609) re-derived ON THIS HOST" \
+  || guard_fail "guard 1c6: RULE I / RULE P were not re-derived on this host"
+grep -q "^  PASS B G-BITE PASSES on all 24 landed" "$SELFT" && grep -q "^  PASS B every landed ISO run read as each of the 5 held arms FAILS" "$SELFT" \
+  && grep -q "^  PASS B cvt7's 3 landed HOLDHIGH runs PASS G-BITE" "$SELFT" && grep -q "^  PASS B THE BROKEN-REST_HOLD NULL ON REAL RECORDS" "$SELFT" \
+  && grep -q "^  PASS B cvt7 HOLDHIGH read as HOLDBIG FAILS" "$SELFT" \
+  && echo "guard 1c7: G-BITE passes 24 landed controls and cvt7's HOLDHIGH; FAILS 60 real-record carrier nulls, 6 REST_HOLD nulls, 3 wrong-dose reads" \
+  || guard_fail "guard 1c7: the real-record G-BITE checks did not pass"
+grep -q "^  PASS SIGMA_R18ALL: the FROZEN literal 0.68815302799238276 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c8: OPERATIONS 36 -- the frozen floor IS the corpus_exclusions.filter_rows value on the registration corpus" \
+  || guard_fail "guard 1c8: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS E BROKEN REST_HOLD: every forced complement UNHELD" "$SELFT" && grep -q "^  PASS E HOLD ONLY AT PROBE STEPS: complement" "$SELFT" \
+  && grep -q "^  PASS E WRONG DOSE: HOLDBIG" "$SELFT" && grep -q "^  PASS E WRONG REPLAY" "$SELFT" && grep -q "^  PASS E FREE COMPLEMENT TOUCHED" "$SELFT" \
+  && echo "guard 1c9: the broken-REST_HOLD null, a probe-step-only hold, a wrong dose, a wrong replay and a touched free complement reach PATCH-NOT-VERIFIED" \
+  || guard_fail "guard 1c9: G-BITE break cases did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+# ---- guard 1d: the derivation reproduces RULE I, RULE P and the floor on THIS host ----------
+DOUT=/tmp/cvt8_deriv.$$
+python3 "$DERIV" "$WS/runs" "$CSVP" >"$DOUT" 2>&1 \
+  && grep -q "^  candidates 21; ELIGIBLE 12: ciso1-ISO-s21 ciso1-ISO-s22 ciso1-ISO-s23 ciso2-ISO-s31 ciso2-ISO-s32 ciso2-ISO-s33 cdep1-ISO-s24 cdep1-ISO-s25 cdep1-ISO-s26 cvt7-ISO-s99 cvt7-ISO-s100 cvt7-ISO-s101$" "$DOUT" \
+  && grep -q "^  REPLAY FILE cvt8_isopath.json  13126 bytes  sha256 $ISOPATH_SHA$" "$DOUT" \
+  && grep -q "^  RULE P (243.3) re-run on this host: P_HIGH 8609, P_ISO 5153  (registered 8609 / 5153: True)" "$DOUT" \
+  && grep -q "SIGMA_R18ALL  FILTERED 0.68815302799238[0-9]* (df 215" "$DOUT" \
+  && echo "guard 1d: analysis/cvt8_registration_derivations.py reproduces RULE I, the replay sha, RULE P and the filtered floor on this host (output sha $(sha "$DOUT"))" \
+  || { guard_fail "guard 1d: the derivation did not reproduce RULE I / RULE P / the floor"; grep -E "ELIGIBLE|REPLAY FILE|RULE P|SIGMA_R18ALL" "$DOUT"; tail -3 "$DOUT"; }
+
+# ---- guard 2: RULE 21 premise -- nothing of this batch exists yet ----------------
+grep -q '^cvt8-' "$CSVP" && guard_fail "guard 2: cvt8-* already in the CSV" || echo "guard 2: no cvt8-* row in the corpus"
+python3 - "$CSVP" "$SEEDS" <<'PYEOF' || guard_fail "guard 2c: corpus premise failed"
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+seeds = set(sys.argv[2].split())
+hit = [r["run"] for r in rows if r.get("seed") in seeds]
+print("guard 2c: rows carrying seed %s: %d" % ("/".join(sorted(seeds)), len(hit)))
+raise SystemExit(1 if hit else 0)
+PYEOF
+NOUT=$(ls "$WS/runs"/cvt8-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cvt8-*.out on disk" || guard_fail "guard 2b: $NOUT cvt8-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (102|103|104)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 102/103/104" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 102/103/104"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cvt8-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cvt8-* jobs" || guard_fail "guard 2e: sacct shows $NS cvt8-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cvt8-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cvt8-* in squeue" || guard_fail "guard 2f: $NQ cvt8-* already queued"
+fi
+
+# ---- guard 3/4a: the cvt8 tree consistent (cvt7's tree and the LIVE tree unchanged) ------------
+bash "$STAGE8" >/tmp/cvt8_stage8.$$ 2>&1 \
+  && { echo "guard 4a: bin/cVT8_stage_harness.sh (verify mode) VERIFIES cvt8's tree:"; grep -E 'V-|VERIFIED' /tmp/cvt8_stage8.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4a: cvt8's tree is NOT consistent"; tail -20 /tmp/cvt8_stage8.$$; }
+rm -f /tmp/cvt8_stage8.$$
+bash "$REPO/bin/cVT7_stage_harness.sh" >/tmp/cvt8_stage7.$$ 2>&1 \
+  && echo "guard 4a1: bin/cVT7_stage_harness.sh (registered, unedited, verify mode) VERIFIES cvt7's tree unchanged" \
+  || { guard_fail "guard 4a1: cvt7's tree is NOT consistent"; tail -10 /tmp/cvt8_stage7.$$; }
+rm -f /tmp/cvt8_stage7.$$
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$BNH")" = "$LIVE_BN_SHA" ] && [ "$(sha "$LIVE/build_network.py")" = "$LIVE_BN_SHA" ] \
+  && echo "guard 3b: build_network.py == the LIVE one c7998883..." || guard_fail "guard 3b: build_network.py is not the LIVE one"
+[ "$(sha "$HFH")" = "$HF_POST_SHA" ] && [ "$(sha "$HFRH")" = "$HF_PRE_SHA" ] && [ "$(sha "$H7/Optimizers/HF.py")" = "$HF_PRE_SHA" ] \
+  && [ "$(sha "$HFVW")" = "$HF_LIVE_SHA" ] && [ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] \
+  && [ "$(sha "$HFPRE")" = "$(sha "$LIVE/Optimizers/HF.py.pre_probe_tensor")" ] \
+  && echo "guard 3c: HF.py == HF_POST_SHA 5197dc2e...; .pre_resthold == cvt7's 2396f2be...; .pre_voteweight == the LIVE 4732b74a..." \
+  || guard_fail "guard 3c: the tree's HF files are not the pinned ones"
+[ "$(sha "$HARN/Optimizers/cvt8_isopath.json")" = "$ISOPATH_SHA" ] && [ "$(sha "$ISOJ")" = "$ISOPATH_SHA" ] \
+  && echo "guard 3f: the tree's and the repo's cvt8_isopath.json == ISOPATH_SHA 08ab25f3..." || guard_fail "guard 3f: replay file sha"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == 1dbe4ff5... (run_cifar.sh with the cd line changed)" \
+  || guard_fail "guard 3e: $RUNNER is not the pinned cvt8 runner"
+grep -q PATCH_RESTHOLD "$LIVE/Optimizers/HF.py" "$H7/Optimizers/HF.py" && guard_fail "guard 3d: the LIVE or cvt7's HF.py carries PATCH_RESTHOLD" \
+  || echo "guard 3d: neither the LIVE nor cvt7's HF.py carries PATCH_RESTHOLD"
+
+# ---- guard 4b/4f: the patches, proved inert; the new patch proved inert and biting ----
+python3 "$TESTT" --pre "$HFPRE" --post "$HFVW" --structural-only >/tmp/cvt8_struct.$$ 2>&1 \
+   && echo "guard 4b: PATCH_PROBE_TENSOR structural inertness R0 PASSES on HF.py.pre_voteweight (= live)" \
+   || { guard_fail "guard 4b: PATCH_PROBE_TENSOR structural R0 FAILED"; tail -8 /tmp/cvt8_struct.$$; }
+python3 "$TESTR8" --pre "$HFRH" --post "$HFH" --structural-only >/tmp/cvt8_rh0.$$ 2>&1 \
+   && echo "guard 4b2: PATCH_RESTHOLD structural R0 PASSES (deleting the four regions == cvt7's HF.py, byte for byte)" \
+   || { guard_fail "guard 4b2: PATCH_RESTHOLD structural R0 FAILED"; tail -8 /tmp/cvt8_rh0.$$; }
+rm -f /tmp/cvt8_struct.$$ /tmp/cvt8_rh0.$$
+HFSHA=$(sha "$HFH"); BNSHA=$(sha "$BNH"); SCSHA=$(sha "$SC")
+if [ -f "$ILOG" ] && grep -q "^TEST_RESTHOLD_RC 0$" "$ILOG" && grep -q "^REALRUN_RC 0$" "$ILOG" \
+   && [ "$(grep -c '^ALL PASS$' "$ILOG")" = 2 ] && [ "$(grep -c '^  FAIL' "$ILOG")" = 0 ] \
+   && grep -q "^TREE_POST $HARN HF $HFSHA build_network $BNSHA " "$ILOG" \
+   && grep -q "^TREE_PRE $H7 HF $HF_PRE_SHA build_network $LIVE_BN_SHA " "$ILOG" && grep -q "^SCORER_SHA256 $SCSHA$" "$ILOG" \
+   && grep -q "^DRIVER_SHA256 $(sha "$TESTRR8")$" "$ILOG" && grep -q "^REGISTERED_TEST_SHA256 $(sha "$TESTGR")$" "$ILOG" \
+   && grep -q "^$(sha "$TESTR8")  tests/test_resthold.py$" "$ILOG" && grep -q "^$(sha "$PATCHR")  patches/patch_resthold.py$" "$ILOG" \
+   && grep -q "PASS RR0 cvt7-tree k01 vs itself: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && [ "$(grep -c "PASS RR1 .* REST_HOLD \(unset\|empty\): every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG")" = 10 ] \
+   && [ "$(grep -c "PASS RR2 [A-Z]*ISOPATH *the scorer's own bite_check on the 30 real records" "$ILOG")" = 3 ] \
+   && [ "$(grep -c "PASS RR3 .* the complement departs from cvt7's" "$ILOG")" = 2 ] \
+   && [ "$(grep -c "PASS RR4 " "$ILOG")" = 3 ] && grep -q "PASS R4 BIGISOPATH   DEAD STATE" "$ILOG"; then
+  echo "guard 4f: the inertness / bite log (tests/test_resthold.py + tests/test_resthold_realrun.py) ALL PASS on THIS HF, THIS scorer: $(grep -c '^  PASS' "$ILOG") PASS / $(grep -c '^  FAIL' "$ILOG") FAIL (sha $(sha "$ILOG" | cut -c1-8))"
+else
+  guard_fail "guard 4f: no ALL PASS inertness log for HF $HFSHA and scorer $SCSHA at $ILOG -- sbatch $RRSB, then copy its .out there"
+fi
+
+# ---- guard 4c': the launcher's literals == the scorer's (imported) and the stage script's ------
+python3 - "$SC" "$G_K01" "$G_ISO" "$GH_HIGH" "$GH_BIG" "$GH_LOW" "$RH_ISO" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" \
+          "$LIVE_BN_SHA" "$HF_PRE_SHA" "$HF_POST_SHA" "$RUNNER_SHA" "$STAGE8" "$ARMS" "$ISOPATH_SHA" <<'PYEOF' \
+  || guard_fail "guard 4c': launcher / scorer / stage-script literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("cvt8sc", sys.argv[1]); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+a = sys.argv
+bad = []
+arms = a[17].split()
+if tuple(arms) != S.ARMS: bad.append("ARMS")
+if S.SPEC != dict((x, a[2] if x == "k01" else a[3]) for x in arms): bad.append("SPEC")
+gh = {"k01": "", "ISO": "", "HOLDHIGH": a[4], "HOLDBIG": a[5], "HIGHISOPATH": a[4], "BIGISOPATH": a[5], "LOWISOPATH": a[6]}
+if gh != S.GROUPHOLD: bad.append("GROUPHOLD")
+rh = dict((x, a[7] if x in ("HIGHISOPATH", "BIGISOPATH", "LOWISOPATH") else "") for x in arms)
+if rh != S.RESTHOLD: bad.append("RESTHOLD")
+if a[8] != S.NET or int(a[9]) != S.NTENS or int(a[10]) != S.TOTPAR: bad.append("NET/NTENS/TOTPAR")
+if tuple(int(x) for x in a[11].split()) != S.SEEDS: bad.append("SEEDS")
+st = open(a[16]).read()
+for name, v in (("LIVE_BN_SHA", a[12]), ("HF_PRE_SHA", a[13]), ("HF_POST_SHA", a[14]), ("RUNNER_SHA", a[15]), ("ISOPATH_SHA", a[18])):
+    b = re.search(r"^%s=([0-9a-f]{64})$" % name, st, re.M)
+    if getattr(S, name) != v or not b or b.group(1) != v: bad.append(name)
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': ARMS, the spec strings, the GROUP_HOLD / REST_HOLD values, NET, NTENS, TOTPAR, SEEDS and the build_network / 2 HF / runner / replay shas agree in launcher / scorer / cvt8 stage script")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, built from cvt8's tree, per arm with NAMES, GROUP_HOLD and REST_HOLD ----
+mkdir -p "$SAVE"
+MTMP=/tmp/cvt8_manifest.$$
+python3 - "$HARN" "$MTMP" "$NTENS" "$TOTPAR" "$NET" "$SC" <<'PYEOF' || guard_fail "guard 4: live partition / hold / source check FAILED"
+import sys, os, io, inspect, re, contextlib, importlib.util
+harn, out, ntens, totpar, net_name, scp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+spm = importlib.util.spec_from_file_location("cvt8sc", scp); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+T, tot = len(nps), sum(numel); bad = 0
+print("guard 4: live %s from cvt8's tree -- %d tensors, %d parameters" % (net_name, T, tot))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar)); raise SystemExit(1)
+nbn = sum(isinstance(m, nn.BatchNorm2d) for m in net.modules()); ngn = sum(isinstance(m, nn.GroupNorm) for m in net.modules())
+if (nbn, ngn) != (S.N_BATCHNORM, 0): bad += 1
+if names != S.NAMES:
+    print("!!! guard 4: the LIVE parameter names are not the scorer's NAMES"); bad += 1
+for i, nm in zip(S.CARRIER_IDX, S.CARRIERS):
+    print("guard 4: idx %d on the live model = %s (%s, numel %d)" % (i, names[i - 1], own[names[i - 1]], numel[i - 1]))
+    if names[i - 1] != nm or own[names[i - 1]] != "BatchNorm2d" or numel[i - 1] != 512: bad += 1
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "NORM BatchNorm2d %d GroupNorm %d" % (nbn, ngn),
+         "CLIP_C %s" % S.CLIP, "EPOCHS %d" % S.EPOCHS, "META_STEPS %d" % (S.EPOCHS * (50000 // S.BATCH))]
+lines += ["TENSOR %d %s %d %s" % (i + 1, names[i], numel[i], own[names[i]]) for i in range(T)]
+lines.append("CARRIERS %s" % ",".join("%d:%s" % (i, names[i - 1]) for i in S.CARRIER_IDX))
+lines.append("REPLAY B0 %r MS %r P_HIGH %d P_BIG %d" % (float(torch.log(torch.tensor(1e-6))), S.MS, S.P_HIGH, S.P_BIG))
+import hashlib
+rj = os.path.join(harn, "Optimizers", S.ISOPATH_ID + ".json")
+lines.append("RESTREPLAY ISOPATH %s SHA256 %s KNOTS %d" % (S.ISOPATH_ID, hashlib.sha256(open(rj, "rb").read()).hexdigest(), len(__import__("json").load(open(rj))["n"])))
+for arm in S.ARMS:
+    spec = S.SPEC[arm]
+    for k in ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD"):
+        os.environ.pop(k, None)
+    if S.GROUPHOLD[arm]:
+        os.environ["GROUP_HOLD"] = S.GROUPHOLD[arm]
+    if S.RESTHOLD[arm]:
+        os.environ["REST_HOLD"] = S.RESTHOLD[arm]
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, spec, nps, 1e-6)
+    os.environ.pop("GROUP_HOLD", None); os.environ.pop("REST_HOLD", None)
+    L = buf.getvalue().splitlines()
+    gl = [ln for ln in L if ln.startswith("GROUP_HOLD")]; rl = [ln for ln in L if ln.startswith("REST_HOLD")]
+    bl = [ln for ln in L if ln.startswith("BETA_HOLD")]; vl = [ln for ln in L if ln.startswith("VOTE_W")]
+    cl = [ln for ln in L if ln.startswith("COMP_HOLD")]
+    shp = [tuple(b.shape) for b in o.beta]
+    b0 = [float(x) for x in o.beta[0].reshape(-1)]
+    print("guard 4: %-12s %-12s type=%s beta %s init %s  _gh_on %s mode %s P %s  _rh_on %s mode %s"
+          % (arm, spec[:12], o.stepsize_type, shp, b0, getattr(o, "_gh_on", None), getattr(o, "_gh_mode", None), getattr(o, "_gh_P", None),
+             getattr(o, "_rh_on", None), getattr(o, "_rh_mode", None)))
+    print("         GROUP_HOLD == registered: %s ; REST_HOLD == registered: %s ; BETA_HOLD %s ; VOTE_W %s ; COMP_HOLD lines %d"
+          % (gl == [S.WITNESS_GH[arm]], rl == [S.WITNESS_RH[arm]], bl, vl, len(cl)))
+    if gl != [S.WITNESS_GH[arm]] or rl != [S.WITNESS_RH[arm]] or vl != ["VOTE_W: off"] or bl != ["BETA_HOLD: off"] or cl \
+       or o.stepsize_type != S.PT_TYPE[arm] or bool(getattr(o, "_gh_on", False)) != bool(S.GROUPHOLD[arm]) \
+       or bool(getattr(o, "_rh_on", False)) != bool(S.RESTHOLD[arm]) \
+       or getattr(o, "_rednorm", False) or getattr(o, "_bh_on", False) or getattr(o, "_vw_on", False):
+        print("!!! guard 4: %s does not construct as registered" % arm); bad += 1
+    if arm in S.MODE:
+        m_, P_ = S.MODE[arm]
+        want1 = S.LO if m_ == "floor" else S.B0
+        if o._gh_mode != m_ or o._gh_P != P_ or o._gh_g != 1 or b0 != [S.B0, want1]:
+            print("!!! guard 4: %s carrier hold state is not the registered one" % arm); bad += 1
+    if arm in S.RMODE:
+        if o._rh_mode != "rec" or o._rh_g != 0 or len(o._rh_kn) != S.ISOPATH_KNOTS or \
+           any(float(torch.tensor([o._rh_value(n)], dtype=torch.float32)[0]) != S.hold_r_value(arm, n) for n in (0, 1, 2, 3, 101, 8999, 20000, 49902, 50001)):
+            print("!!! guard 4: %s complement hold state is not the registered one" % arm); bad += 1
+    if spec == "scalar":
+        if shp != [()]: bad += 1
+        lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % arm)
+    else:
+        g = HF.polish_the_stepsize_groups(None, spec, nps)
+        sizes = [len(x) for x in g]; pc = [sum(numel[names.index(n)] for n in x) for x in g]
+        g1 = list(g[1])
+        if sizes != S.ISO_SIZES or pc != S.ISO_PARAMS or g1 != list(S.CARRIERS) or shp != [(2,)] or [len(x) for x in o.param_groups_indices] != sizes:
+            print("!!! guard 4: %s is not the registered [59,3] partition" % arm); bad += 1
+        lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                     % (arm, spec, len(g), ",".join(str(s) for s in sizes), ",".join(str(s) for s in pc), " ".join(g1)))
+    lines.append("GROUPHOLD %s %s" % (arm, S.GROUPHOLD[arm] if S.GROUPHOLD[arm] else "off"))
+    lines.append("RESTHOLD %s %s" % (arm, S.RESTHOLD[arm] if S.RESTHOLD[arm] else "off"))
+    lines.append("WITNESS %s %s" % (arm, gl[0] if gl else "(none)"))
+    lines.append("RWITNESS %s %s" % (arm, rl[0] if rl else "(none)"))
+src = inspect.getsource(HF.Lion_meta_update)
+m = re.search(r"torch\.sign\(self\.args_meta\['Lion_beta2'\]\*self\.momentum_meta\[i\]\s*\+\s*\(1-self\.args_meta\['Lion_beta2'\]\)\*HtT_gradft\[i\]\)", src)
+print("guard 4f: Lion_meta_update subtracts ms*sign(b2*momentum_meta + (1-b2)*z), elementwise: %s" % bool(m))
+if not m: bad += 1
+st = inspect.getsource(HF.step)
+i_mu, i_cl = st.find("self.meta_update(HtT_gradft)"), st.find(".clamp(self._beta_lo, self._beta_hi)")
+i_bh, i_gh, i_rh, i_pr = st.find("self._bh_apply()"), st.find("self._gh_apply()"), st.find("self._rh_apply()"), st.find("self._probe(HtT_gradft)")
+ok_st = 0 <= i_mu < i_cl < i_bh < i_gh < i_rh < i_pr and st.count("self._rh_apply()") == 1
+print("guard 4f: step() order meta_update < clamp < _bh_apply < _gh_apply < _rh_apply < _probe, one _rh_apply: %s" % ok_st)
+if not ok_st: bad += 1
+pr = inspect.getsource(HF._probe)
+ok_pr = pr.count("self._rh_attach(rec)") == 1 and pr.find("self._gh_attach(rec)") < pr.find("self._rh_attach(rec)") < pr.find("self._pt_attach(rec)")
+print("guard 4f: _probe attaches rh_* keys once, after GROUP_HOLD's and before PROBE_TENSOR's keys: %s" % ok_pr)
+if not ok_pr: bad += 1
+bp = inspect.getsource(HF.block_product)
+ok_bp = bp.count("return self._vw_block_product(u, v)") == 2 and "_gh_" not in bp and "_rh_" not in bp
+print("guard 4f: block_product is cvt1's (two guarded VOTE_W returns, no _gh_ / _rh_): %s" % ok_bp)
+if not ok_bp: bad += 1
+cap = inspect.getsource(HF._pt_capture)
+ok_cap = "zt = torch.stack([(u_*v_).sum() for u_, v_ in zip(u, v)]).detach().float()" in cap and "'beta_pre': _bp" in cap
+print("guard 4f: PROBE_TENSOR records the raw z_tensor and beta_pre: %s" % ok_cap)
+if not ok_cap: bad += 1
+txt = "\n".join(lines) + "\n"
+if txt != S.synthetic_manifest_text():
+    print("!!! guard 4d: the live manifest differs from the scorer's synthetic_manifest_text()")
+    a_, b_ = txt.splitlines(), S.synthetic_manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("    first difference at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "(none)")[:200], (b_[k] if k < len(b_) else "(none)")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cvt8-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+rm -f "$MTMP"
+
+# ---- guard 4g: provenance (the scored file ONLY on --submit) ---------------------
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $BNSHA"
+  echo "HF_SHA256 $HFSHA"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "REPLAY_SHA256 $(sha "$HARN/Optimizers/cvt8_isopath.json")"
+  echo "SCORER_SHA256 $SCSHA"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "DERIVATIONS_SHA256 $(sha "$DERIV")"
+  echo "REGISTERED_COMMIT ${CVT8_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "HF_PRE_RESTHOLD_SHA256 $(sha "$HFRH")"
+  echo "CVT7_HF_SHA256 $(sha "$H7/Optimizers/HF.py")"
+  echo "LIVE_HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "LIVE_BUILD_NETWORK_SHA256 $(sha "$LIVE/build_network.py")"
+  echo "PATCH_RESTHOLD_SHA256 $(sha "$PATCHR")"
+  echo "INERTNESS_RESTHOLD_LOG_SHA256 $(sha "$ILOG" 2>/dev/null)"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cvt8/STAGE-MANIFEST.txt")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "GROUP_HOLD HOLDHIGH=HIGHISOPATH=$GH_HIGH"; echo "GROUP_HOLD HOLDBIG=BIGISOPATH=$GH_BIG"; echo "GROUP_HOLD LOWISOPATH=$GH_LOW"
+  echo "REST_HOLD HIGHISOPATH=BIGISOPATH=LOWISOPATH=$RH_ISO"
+  echo "GROUP_HOLD / REST_HOLD k01=ISO=unset; REST_HOLD HOLDHIGH=HOLDBIG=unset; BETA_HOLD, COMP_HOLD, VOTE_W unset on every arm"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cvt8-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions ----------------------------------
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest -----------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cvt8", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+# ---- guard 9: the harness the guards tested IS the harness the runner runs ---------
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+# ---- compose, guard each line under RULE 20, then (only with --submit) submit ----
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01)         G=$G_K01; WG="";       WR="" ;;
+      ISO)         G=$G_ISO; WG="";       WR="" ;;
+      HOLDHIGH)    G=$G_ISO; WG=$GH_HIGH; WR="" ;;
+      HOLDBIG)     G=$G_ISO; WG=$GH_BIG;  WR="" ;;
+      HIGHISOPATH) G=$G_ISO; WG=$GH_HIGH; WR=$RH_ISO ;;
+      BIGISOPATH)  G=$G_ISO; WG=$GH_BIG;  WR=$RH_ISO ;;
+      LOWISOPATH)  G=$G_ISO; WG=$GH_LOW;  WR=$RH_ISO ;;
+    esac
+    HX=""; [ -n "$WG" ] && HX=",GROUP_HOLD=$WG"; [ -n "$WR" ] && HX="$HX,REST_HOLD=$WR"
+    RN="cvt8-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR$HX \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    GOTG=$(printf '%s\n' "$CMD" | grep -o 'GROUP_HOLD=[^ ,]*'); NGH=$(printf '%s\n' "$CMD" | grep -o 'GROUP_HOLD=' | wc -l | tr -d ' ')
+    GOTR=$(printf '%s\n' "$CMD" | grep -o 'REST_HOLD=[^ ,]*');  NRH=$(printf '%s\n' "$CMD" | grep -o 'REST_HOLD=' | wc -l | tr -d ' ')
+    NOTHER=$(printf '%s\n' "$CMD" | grep -o 'BETA_HOLD=\|VOTE_W=\|COMP_HOLD=\|cvt8_testdown\|tri:100' | wc -l | tr -d ' ')
+    [ "$NOTHER" = 0 ] || { echo "!!! $RN carries a BETA_HOLD / VOTE_W / COMP_HOLD or a test-only string"; BAD=$((BAD+1)); }
+    if [ -z "$WG" ]; then [ "$NGH" = 0 ] || { echo "!!! $RN carries a GROUP_HOLD"; BAD=$((BAD+1)); }
+    else [ "$NGH" = 1 ] && [ "$GOTG" = "GROUP_HOLD=$WG" ] || { echo "!!! $RN: $NGH GROUP_HOLD or not its own"; BAD=$((BAD+1)); }; fi
+    if [ -z "$WR" ]; then [ "$NRH" = 0 ] || { echo "!!! $RN carries a REST_HOLD"; BAD=$((BAD+1)); }
+    else [ "$NRH" = 1 ] && [ "$GOTR" = "REST_HOLD=$WR" ] || { echo "!!! $RN: $NRH REST_HOLD or not its own"; BAD=$((BAD+1)); }; fi
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / GROUP_HOLD / REST_HOLD pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cvt8-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cvt8-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cvt8- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cvt8-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cvt8 job started inside the window.  Re-check with:"
+       echo "         python3 $AGF $WS/runs --name cvt8- --batch-consistency --vary stepsize-groups --vary seed --vary run-name" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cvt8-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 21/21 RUN_DONE, after RULE 20 at full coverage):"
+  echo "    python3 $REPO/analysis/cVT8_doseroute_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cVT8_doseroute.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

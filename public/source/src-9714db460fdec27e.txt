@@ -1,0 +1,1921 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cVT8_doseroute_score.py -- THE REGISTERED SCORER FOR `cvt8`:
+#   ResNet18_c100: IS cvt7's PARTIAL LOSS A DOSE EFFECT, AND IS IT DIRECT OR THROUGH THE COMPLEMENT?  (CORRECTIONS 248)
+#   ONE SUBMISSION, 21 JOBS (7 arms x 3 seeds), 100 EPOCHS, SEEDS {102,103,104}, ResNet18_c100 / CIFAR-100, ciso1's cell,
+#   ISO's grouping, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM, run from the ISOLATED tree $WS/harness_cvt8 = cvt7's tree
+#   (the LIVE ResNet harness + PATCH_VOTEWEIGHT + PATCH_BETAHOLD + PATCH_GROUPHOLD) + PATCH_RESTHOLD
+#   (patches/patch_resthold.py) + the replay file Optimizers/cvt8_isopath.json; every switch OFF unless set.
+#
+# Committed BEFORE any cvt8 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cVT8_doseroute_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# FROZEN BARS (O2).  Every bar, sigma and tolerance score() uses is a LITERAL here; score() reads the corpus ONLY for a
+# row-count disclosure.  The only data-dependent term that can enter a bar is SIGMA_INBATCH through compose_sigma()
+# (ONE argument).  --selftest proves the FINAL line invariant across four corpora.  The noise floor is read through
+# analysis/corpus_exclusions.filter_rows (OPERATIONS 36).
+#
+# THE ARMS (group 1 = the carriers {layer4.0.bn2.weight, layer4.0.shortcut.1.weight, layer4.1.bn2.weight}, ISO's [59,3];
+# group 0 = the 59-tensor complement)
+#   k01          scalar   GROUP_HOLD unset          REST_HOLD unset          floor anchor
+#   ISO          ISO's    unset                     unset                    positive control (byte-identical spec)
+#   HOLDHIGH     ISO's    <carriers>:tri:8609       unset (Lion)             HIGH x FREE   (cvt7 replicate)
+#   HOLDBIG      ISO's    <carriers>:tri:9428       unset (Lion)             BIG  x FREE   (PlainNet's dose, bitwise)
+#   HIGHISOPATH  ISO's    <carriers>:tri:8609       rec:cvt8_isopath         HIGH x ISOPATH
+#   BIGISOPATH   ISO's    <carriers>:tri:9428       rec:cvt8_isopath         BIG  x ISOPATH
+#   LOWISOPATH   ISO's    <carriers>:floor          rec:cvt8_isopath         LOW  x ISOPATH (REST_HOLD positive control)
+#   tri:<P>: u(n) = min(n-1, P) - max(0, n-1-P); beta = min(hi, max(lo, b0 + ms u(n))).  8609 = RULE P on k01's shared
+#   beta at this cell (243.3); 9428 = RULE P on PlainNet MUTE's shared beta (237.3), the schedule cvt4 / cvt6 HOLDHIGH
+#   applied.  ISOPATH = RULE I (analysis/cvt8_registration_derivations.py): the record-by-record median complement beta
+#   of the 12 eligible landed ISO runs at this cell, linear between records (242.3(2)'s rec: arithmetic).
+#
+# CO-PRIMARY (in batch; bounded in neither direction):
+#   P_DOSE      = HOLDHIGH - HOLDBIG          does PlainNet's larger dose cost more, complement free?
+#   P_ROUTE     = HIGHISOPATH - HOLDHIGH      does forcing ISO's complement path undo the HIGH-dose loss?
+#   P_ROUTE_BIG = BIGISOPATH - HOLDBIG        the same at the BIG dose
+# KEY: D_ISO = ISO - k01; P_CTLC = ISO - LOWISOPATH; R_HIGH = ISO - HOLDHIGH (cvt7's P_HIGH, replicated);
+#      P_DOSE_PATH = HIGHISOPATH - BIGISOPATH (dose with the complement pinned to ISOPATH); D_<arm> = arm - k01.
+# DESCRIPTIVE: P_INT = P_ROUTE_BIG - P_ROUTE.
+#
+# BRANCH MAP (decide(); first match wins):
+#   UNRESOLVED-DIVERGED (a seed range > 5) -> SCALAR-NOT-COLLAPSED (k01 > 30) -> POSITIVE-CONTROL-FAILED (ISO-k01 < 20)
+#   state(L): AT-ISO iff L >= ISO - 5; AT-K01 iff L <= k01 + 2; else BETWEEN
+#   COMP-HOLD-CONTROL-FAILED   LOWISOPATH AT-K01
+#   COMP-HOLD-CONTROL-PARTIAL  LOWISOPATH BETWEEN
+#   REPLICATE-FAILED           HOLDHIGH outside [k01 + 10, ISO - 10] (cvt7's BETWEEN, with room to read both factors)
+#   otherwise the branch is THREE words, "<DOSE>+<ROUTE>+<BIGROUTE>":
+#     DOSE      HOLDBIG AT-K01 -> DOSE-FULL; |HOLDBIG - HOLDHIGH| <= 5 -> NO-DOSE; HOLDBIG > HOLDHIGH + 5 ->
+#               DOSE-REVERSED; else DOSE-PARTIAL
+#     ROUTE     (HIGHISOPATH vs HOLDHIGH): >= ISO - 5 -> ROUTE-VIA; <= HOLDHIGH + 5 -> ROUTE-DIRECT; else ROUTE-PARTIAL
+#     BIGROUTE  (BIGISOPATH vs HOLDBIG): HOLDBIG > ISO - 10 -> BIGROUTE-UNREADABLE; >= ISO - 5 -> BIGROUTE-VIA;
+#               <= HOLDBIG + 5 -> BIGROUTE-DIRECT; else BIGROUTE-PARTIAL
+# The BROKEN-REST_HOLD null predicts ROUTE-DIRECT + BIGROUTE-DIRECT exactly (forced arm = its free twin): G-BITE
+# separates it, before any level.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import inspect
+import io
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+PREFIX = "cvt8"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (102, 103, 104)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+ARMS = ("k01", "ISO", "HOLDHIGH", "HOLDBIG", "HIGHISOPATH", "BIGISOPATH", "LOWISOPATH")
+HELD = ("HOLDHIGH", "HOLDBIG", "HIGHISOPATH", "BIGISOPATH", "LOWISOPATH")        # carrier group held (GROUP_HOLD)
+FORCED = ("HIGHISOPATH", "BIGISOPATH", "LOWISOPATH")                             # complement held too (REST_HOLD)
+ISOSPEC = "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight"
+SPEC = dict((a, "scalar" if a == "k01" else ISOSPEC) for a in ARMS)
+PT_TYPE = dict((a, "scalar" if SPEC[a] == "scalar" else "blockwise") for a in ARMS)
+NULL_TWIN = {"HIGHISOPATH": "HOLDHIGH", "BIGISOPATH": "HOLDBIG", "LOWISOPATH": "ISO"}
+
+CARRIER_IDX = (50, 53, 59)
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+P_HIGH = 8609                          # 243.3 RULE P, k01's shared beta at this cell
+P_BIG = 9428                           # 237.3 RULE P, PlainNet MUTE's shared beta (cvt4 / cvt6 HOLDHIGH)
+P_ISO = 5153                           # 243.3; printed only
+MODE = {"HOLDHIGH": ("tri", P_HIGH), "HOLDBIG": ("tri", P_BIG), "HIGHISOPATH": ("tri", P_HIGH),
+        "BIGISOPATH": ("tri", P_BIG), "LOWISOPATH": ("floor", None)}
+ISOPATH_ID = "cvt8_isopath"
+ISOPATH_SHA = "08ab25f3a329cb260bb39fb72f3299c021e7169bf612fa27d539166296e28e70"      # RULE I, 248.3
+ISOPATH_FILE = os.path.join(REPO, "patches", ISOPATH_ID + ".json")
+ISOPATH_KNOTS = 500
+ISOPATH_N0, ISOPATH_N1 = 2, 49902
+ISOPATH_VMAX = -4.985378742218018
+ISOPATH_VLAST = -14.924964427947998
+ISOPATH_SOURCE = ["ciso1-ISO-s21", "ciso1-ISO-s22", "ciso1-ISO-s23", "ciso2-ISO-s31", "ciso2-ISO-s32", "ciso2-ISO-s33",
+                  "cdep1-ISO-s24", "cdep1-ISO-s25", "cdep1-ISO-s26", "cvt7-ISO-s99", "cvt7-ISO-s100", "cvt7-ISO-s101"]
+TESTDOWN_ID = "cvt8_testdown"          # TEST-ONLY replay file (tests/test_resthold*.py); never an arm
+TESTDOWN_SHA = "733a429e74435b90e39183b4a8c7939e02ebd5b46bf154bba8d3e8ba533dc3b4"
+RMODE = dict((a, ("rec", ISOPATH_ID)) for a in FORCED)
+MS = 1e-3
+B2 = 0.9
+LO, HI = -15.0, -2.3026
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+B0 = f32(math.log(1e-6))               # -13.815510749816895
+
+
+def grouphold_of(arm):
+    if arm not in MODE:
+        return ""
+    m, P = MODE[arm]
+    return "%s:%s" % ("+".join(CARRIERS), m if m != "tri" else "tri:%d" % P)
+
+
+def resthold_of(arm):
+    if arm not in RMODE:
+        return ""
+    m, x = RMODE[arm]
+    return "tri:%d" % x if m == "tri" else "rec:%s" % x
+
+
+def witness_gh_of(mode, P=None, g=1):
+    if mode is None:
+        return "GROUP_HOLD: off"
+    d = "GROUP_HOLD: on type=blockwise group=%d groupsize=%d names=%s" % (g, len(CARRIERS), "+".join(CARRIERS))
+    if mode == "floor":
+        return d + " mode=floor value=%r" % (LO,)
+    return d + " mode=tri P=%d b0=%r ms=%r lo=%r hi=%r peak=%r" % (P, B0, MS, LO, HI, min(HI, max(LO, B0 + MS * P)))
+
+
+def witness_rh_of(mode, x=None, sha=ISOPATH_SHA, knots=ISOPATH_KNOTS, n0=ISOPATH_N0, n1=ISOPATH_N1,
+                  vmax=ISOPATH_VMAX, vlast=ISOPATH_VLAST):
+    if mode is None:
+        return "REST_HOLD: off"
+    d = "REST_HOLD: on type=blockwise group=0 groupsize=59"
+    if mode == "tri":
+        return d + " mode=tri P=%d b0=%r ms=%r lo=%r hi=%r peak=%r" % (x, B0, MS, LO, HI, min(HI, max(LO, B0 + MS * x)))
+    return d + (" mode=rec id=%s sha256=%s knots=%d n0=%d n1=%d b0=%r lo=%r hi=%r vmax=%r vlast=%r"
+                % (x, sha, knots, n0, n1, B0, LO, HI, vmax, vlast))
+
+
+GROUPHOLD = dict((a, grouphold_of(a)) for a in ARMS)
+RESTHOLD = dict((a, resthold_of(a)) for a in ARMS)
+WITNESS_GH = dict((a, witness_gh_of(*MODE[a]) if a in MODE else witness_gh_of(None)) for a in ARMS)
+WITNESS_RH = dict((a, witness_rh_of(*RMODE[a]) if a in RMODE else witness_rh_of(None)) for a in ARMS)
+WITNESS_VW = "VOTE_W: off"
+WITNESS_BH = "BETA_HOLD: off"
+
+NTENS = 62
+TOTPAR = 11220132
+N_BATCHNORM = 20
+ISO_SIZES = [59, 3]
+ISO_PARAMS = [TOTPAR - 1536, 1536]
+LIVE_BN_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+HF_LIVE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+HF_CVT4_SHA = "84b345adf6df8024bbe4c694fcbbaffc6211d1c7b7ae4b9ae933e353298a3d96"
+HF_PRE_SHA = "2396f2be8102724c120ea5271d2d84acf3835ffb9a5c7947fc282121cf2a588f"      # cvt7's HF.py (+ PATCH_GROUPHOLD)
+HF_POST_SHA = "5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9"     # + PATCH_RESTHOLD (cvt8's)
+RUNNER_SHA = "1dbe4ff52eccbbb1c9936f4a687ed88172dd41c48b14ae60eb353b45f766f5e0"                                                 # $WS/jobs/run_cifar_cvt8.sh
+CVT7_RUNNER_SHA = "805267e4cbcc64172d79824d553a2577ef7cdd55fb8f5e7731c0ea3251a04c56"
+LIVE_RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+
+# ---- the noise floor, FROZEN (O2), re-derived through corpus_exclusions.filter_rows (248.7) --------
+SIGMA_R18ALL = 0.6881530279923828      # ResNet18_c100 std cell, any granularity, FILTERED, df 215, 46 cells
+SIGMA_R18ALL_NAIVE = 2.2086717848823785  # UNFILTERED (the OPERATIONS 36 trap: cvt7's held rows) -- disclosure only
+SIGMA_PRIOR = 0.6881530279923828
+SE_PRIOR = 0.561875                    # SIGMA_PRIOR * sqrt(2/3)
+REG_CORPUS_SHA256 = "355c0977b2a6f87ba08aaae51ec9e9f84f7c10fa5432eff3505e89488bb58bdd"
+REG_CORPUS_ROWS = 3085
+REG_EXCLUSIONS_SHA256 = "d0b955cbfce5c485c48c23d53feadd1fee581f379a221596fa65cf99c7eefe93"
+
+# ---- the bars, FROZEN -----------------------------------------------------------------
+GAP_MIN = 20.0
+K01_MAX = 30.0
+RESCUE_BAR = 10.0
+NULL_BAR = 2.0
+MATCH_BAR = 5.0
+REP_MARGIN = 10.0
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+TIE_REL = 1e-12
+STEPS_PER_EPOCH = 50000 // BATCH
+N_RECORDS = EPOCHS * STEPS_PER_EPOCH // PROBE      # 500
+
+# ---- between-batch references, NON-GATING ----------------------------------------------
+R_BETWEEN = {"cvt7": {"k01": 22.9527, "ISO": 70.0413, "HOLDHIGH": 50.2273},
+             "ciso1": {"k01": 23.2807, "ISO": 70.2113}, "cdep1": {"k01": 23.3520, "ISO": 70.0440}}
+R18_PER_RUN_GPUH = 0.92                # cvt7 sacct incl. [HOST_3c1b003035] (0.71 off it)
+
+# ---- the floor table (UNSURE) -----------------------------------------------------------------
+K01_PL = (18.0, 28.0)
+FREE_PL = (62.0, 78.0)
+HIGH_PL = (44.0, 56.0)
+PART_PL = (30.0, 42.0)
+PV_PL = (57.0, 63.0)
+
+
+def _acc(hb, hip, bip, low=FREE_PL, hh=HIGH_PL):
+    return {"k01": K01_PL, "ISO": FREE_PL, "HOLDHIGH": hh, "HOLDBIG": hb, "HIGHISOPATH": hip, "BIGISOPATH": bip,
+            "LOWISOPATH": low}
+
+
+ACCOUNTS = {
+    "DOSE x DIRECT":          _acc(K01_PL, HIGH_PL, K01_PL),
+    "DOSE x VIA":             _acc(K01_PL, FREE_PL, FREE_PL),
+    "DOSE x PARTIAL-VIA":     _acc(K01_PL, PV_PL, PART_PL),
+    "DOSE, DIRECT ONLY AT BIG": _acc(K01_PL, FREE_PL, K01_PL),
+    "NO-DOSE x DIRECT":       _acc(HIGH_PL, HIGH_PL, HIGH_PL),
+    "NO-DOSE x VIA":          _acc(HIGH_PL, FREE_PL, FREE_PL),
+    "NO-DOSE x PARTIAL-VIA":  _acc(HIGH_PL, PV_PL, PV_PL),
+    "PARTIAL-DOSE x DIRECT":  _acc(PART_PL, HIGH_PL, PART_PL),
+    "PARTIAL-DOSE x VIA":     _acc(PART_PL, FREE_PL, FREE_PL),
+    "COMP-HOLD-BREAKS":       _acc(HIGH_PL, K01_PL, K01_PL, low=K01_PL),
+    "HOLDHIGH-DOES-NOT-REPLICATE": _acc(K01_PL, K01_PL, K01_PL, hh=K01_PL),
+    "BROKEN-REST_HOLD (null)": _acc(HIGH_PL, HIGH_PL, HIGH_PL),
+}
+EXPECTED_BRANCH = {
+    "DOSE x DIRECT": "DOSE-FULL+ROUTE-DIRECT+BIGROUTE-DIRECT",
+    "DOSE x VIA": "DOSE-FULL+ROUTE-VIA+BIGROUTE-VIA",
+    "DOSE x PARTIAL-VIA": "DOSE-FULL+ROUTE-PARTIAL+BIGROUTE-PARTIAL",
+    "DOSE, DIRECT ONLY AT BIG": "DOSE-FULL+ROUTE-VIA+BIGROUTE-DIRECT",
+    "NO-DOSE x DIRECT": "NO-DOSE+ROUTE-DIRECT+BIGROUTE-DIRECT",
+    "NO-DOSE x VIA": "NO-DOSE+ROUTE-VIA+BIGROUTE-VIA",
+    "NO-DOSE x PARTIAL-VIA": "NO-DOSE+ROUTE-PARTIAL+BIGROUTE-PARTIAL",
+    "PARTIAL-DOSE x DIRECT": "DOSE-PARTIAL+ROUTE-DIRECT+BIGROUTE-DIRECT",
+    "PARTIAL-DOSE x VIA": "DOSE-PARTIAL+ROUTE-VIA+BIGROUTE-VIA",
+    "COMP-HOLD-BREAKS": "COMP-HOLD-CONTROL-FAILED",
+    "HOLDHIGH-DOES-NOT-REPLICATE": "REPLICATE-FAILED",
+    "BROKEN-REST_HOLD (null)": "NO-DOSE+ROUTE-DIRECT+BIGROUTE-DIRECT",
+}
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^cvt8-(k01|ISO|HOLDHIGH|HOLDBIG|HIGHISOPATH|BIGISOPATH|LOWISOPATH)-s(\d+)-(\d+)\.out$")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise|blockwise) tensors=%d " % (PROBE, NTENS))
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =============================================================================
+# the schedules and the Lion recomputation -- pure functions
+# =============================================================================
+def u_of(n, P):
+    if n <= 0:
+        return 0
+    return min(n - 1, P) - max(0, n - 1 - P)
+
+
+def v_of(n, P, b0=B0):
+    return f32(min(HI, max(LO, b0 + MS * u_of(n, P))))
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    a, b = B2 * mom_pre, (1 - B2) * z
+    L = a + b
+    tie = abs(L) <= TIE_REL * (abs(a) + abs(b))
+    s = (L > 0) - (L < 0)
+    return max(LO, min(HI, beta_pre - MS * s)), tie
+
+
+def hold_value(arm, n):
+    """the carrier group's schedule (group 1)."""
+    m, P = MODE[arm]
+    if m == "floor":
+        return LO
+    return v_of(n, P)
+
+
+_KNOTS = {}
+
+
+def load_knots(path=ISOPATH_FILE, want_sha=ISOPATH_SHA):
+    if path in _KNOTS:
+        return _KNOTS[path]
+    out = None
+    if os.path.exists(path):
+        body = open(path, "rb").read()
+        if hashlib.sha256(body).hexdigest() == want_sha:
+            d = json.loads(body.decode("utf-8"))
+            out = ([int(x) for x in d["n"]], [float(x) for x in d["v"]])
+    _KNOTS[path] = out
+    return out
+
+
+def rec_value(n, kn, kv, b0=B0):
+    """PATCH_RESTHOLD's rec: schedule as float32 -- the SAME arithmetic, in the same order, as _rh_value."""
+    if n < kn[0]:
+        x = b0
+    elif n >= kn[-1]:
+        x = kv[-1]
+    else:
+        lo_, hi_ = 0, len(kn) - 1
+        while hi_ - lo_ > 1:
+            mid = (lo_ + hi_) // 2
+            if kn[mid] <= n:
+                lo_ = mid
+            else:
+                hi_ = mid
+        k = lo_
+        x = kv[k] + (kv[k + 1] - kv[k]) * (n - kn[k]) / float(kn[k + 1] - kn[k])
+    return f32(min(HI, max(LO, x)))
+
+
+def hold_r_value(arm, n):
+    """the complement's schedule (group 0) of a forced arm; None if the replay file is unavailable."""
+    m, x = RMODE[arm]
+    if m == "tri":
+        return v_of(n, x)
+    K = load_knots()
+    if K is None:
+        return None
+    return rec_value(n, K[0], K[1])
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+# =============================================================================
+# the frozen manifest (no torch).  The launcher's guard 4d proves the LIVE manifest BYTE-IDENTICAL.
+# =============================================================================
+def r18_tensors():
+    t = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [(pre + "conv1.weight", w * cin * 9, "Conv2d"), (pre + "bn1.weight", w, "BatchNorm2d"),
+                  (pre + "bn1.bias", w, "BatchNorm2d"), (pre + "conv2.weight", w * w * 9, "Conv2d"),
+                  (pre + "bn2.weight", w, "BatchNorm2d"), (pre + "bn2.bias", w, "BatchNorm2d")]
+            if stride != 1 or cin != w:
+                t += [(pre + "shortcut.0.weight", w * cin, "Conv2d"), (pre + "shortcut.1.weight", w, "BatchNorm2d"),
+                      (pre + "shortcut.1.bias", w, "BatchNorm2d")]
+        inp = w
+    return t + [("linear.weight", 512 * 100, "Linear"), ("linear.bias", 100, "Linear")]
+
+
+NAMES = [n for n, _q, _o in r18_tensors()]
+
+
+def parse_sets(spec, names):
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def arm_groups(arm, names=None):
+    names = names or NAMES
+    if SPEC[arm] == "scalar":
+        return [list(range(1, len(names) + 1))]
+    return parse_sets(SPEC[arm], names)
+
+
+def synthetic_manifest_text():
+    t = r18_tensors()
+    names = [n for n, _q, _o in t]
+    numel = [q for _n, q, _o in t]
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+             "NORM BatchNorm2d %d GroupNorm 0" % N_BATCHNORM,
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH)]
+    for i, (n, q, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("CARRIERS %s" % ",".join("%d:%s" % x for x in zip(CARRIER_IDX, CARRIERS)))
+    lines.append("REPLAY B0 %r MS %r P_HIGH %d P_BIG %d" % (B0, MS, P_HIGH, P_BIG))
+    lines.append("RESTREPLAY ISOPATH %s SHA256 %s KNOTS %d" % (ISOPATH_ID, ISOPATH_SHA, ISOPATH_KNOTS))
+    for a in ARMS:
+        g = arm_groups(a, names)
+        if SPEC[a] == "scalar":
+            lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        else:
+            lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                         % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                            ",".join(str(sum(numel[i - 1] for i in x)) for x in g),
+                            " ".join(names[i - 1] for i in g[1])))
+        lines.append("GROUPHOLD %s %s" % (a, GROUPHOLD[a] if GROUPHOLD[a] else "off"))
+        lines.append("RESTHOLD %s %s" % (a, RESTHOLD[a] if RESTHOLD[a] else "off"))
+        lines.append("WITNESS %s %s" % (a, WITNESS_GH[a]))
+        lines.append("RWITNESS %s %s" % (a, WITNESS_RH[a]))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "vw": [ln for ln in lines if ln.startswith("VOTE_W")],
+           "bh": [ln for ln in lines if ln.startswith("BETA_HOLD")],
+           "gh": [ln for ln in lines if ln.startswith("GROUP_HOLD")],
+           "rh": [ln for ln in lines if ln.startswith("REST_HOLD")],
+           "ch": [ln for ln in lines if ln.startswith("COMP_HOLD")],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["plateau5"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    """(arm, seed) -> the run.  The highest job id among COMPLETE runs wins."""
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s" % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# corpus readers -- --selftest and a NON-GATING row-count disclosure ONLY, always through filter_rows
+# =============================================================================
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r):
+    return (r.get("epochs_requested") == str(EPOCHS) and r.get("augment") == AUG and r.get("beta_clip") == CLIP
+            and r.get("meta_stepsize") == MST and r.get("alpha0") == A0 and r.get("batch_size") == str(BATCH))
+
+
+def pooled_sigma(rows, extra):
+    cells = {}
+    for r in rows:
+        if usable(r) and std_cell(r) and extra(r):
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+def net_is(net):
+    return lambda r: r.get("network") == net and r.get("dataset") == DSET
+
+
+# =============================================================================
+# probe records and G-BITE
+# =============================================================================
+def load_probe(runsdir, arm, seed, prefix=PREFIX, max_step=None):
+    """-> list of records, or None if absent.  Unparseable lines are None entries.  max_step (selftest only) keeps
+    records with step < max_step."""
+    for base in (os.path.join(runsdir, prefix), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (prefix, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            if max_step is not None:
+                recs = [r for r in recs if isinstance(r, dict) and isinstance(r.get("step"), int) and r["step"] < max_step]
+            return recs
+    return None
+
+
+GH_KEYS = ("gh_n", "gh_active", "gh_nat", "gh_held")
+RH_KEYS = ("rh_n", "rh_active", "rh_nat", "rh_held")
+FOREIGN_KEYS = ("bh_n", "bh_active", "bh_nat", "bh_held", "ch_n", "ch_active", "ch_nat", "ch_held")
+
+
+def _groupvec(r, key, ng):
+    v = r.get(key)
+    if not (isinstance(v, list) and len(v) == 1 and isinstance(v[0], list) and len(v[0]) == ng):
+        return None
+    return [float(x) for x in v[0]]
+
+
+def _audit(r, pfx, n, g, beta, bpre, mom, z, prev):
+    """one patch's own record on one group.  -> (ok, active_flag, count); count None if unreadable."""
+    try:
+        cn, ca, cnat, cheld = (int(r[pfx + "_n"]), int(r[pfx + "_active"]), float(r[pfx + "_nat"]), float(r[pfx + "_held"]))
+    except (KeyError, TypeError, ValueError):
+        return False, False, None
+    nat, tie = lion_natural(bpre[g], mom[g], z[g])
+    ok = (cn == n and abs(cheld - beta[g]) <= BH_TOL and 0 <= ca <= cn and ca >= prev and (tie or abs(cnat - nat) <= BH_TOL))
+    return ok, abs(cnat - cheld) > BH_TOL, ca
+
+
+def bite_check(arm, recs):
+    """G-BITE for ONE run.  -> (ok, detail).  Pure function of the records."""
+    ng = len(arm_groups(arm))
+    held = arm in HELD
+    forced = arm in FORCED
+    d = {"n": 0, "nonfinite": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0,
+         "bad_sched": 0, "bad_sched_pre": 0, "bad_rsched": 0, "bad_rsched_pre": 0, "bad_gh": 0, "bad_rh": 0,
+         "keys_wrong": 0, "active_records": 0, "ractive_records": 0, "gh_active_last": None, "rh_active_last": None,
+         "worst_lion": 0.0, "worst_sched": 0.0, "worst_rsched": 0.0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    if forced and hold_r_value(arm, 2) is None:
+        d["why"] = "replay file %s unavailable or sha != ISOPATH_SHA" % ISOPATH_FILE
+        return False, d
+    prev_g, prev_r = -1, -1
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre = _groupvec(r, "beta_pre", ng)
+            mom = _groupvec(r, "mom_pre", ng)
+            z = _groupvec(r, "z_agg", ng)
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        s = r["step"]
+        if s != 100 * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        n = s + 2
+        unheld = range(ng) if not held else (() if forced else (0,))
+        for g in unheld:
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst_lion"] = max(d["worst_lion"], e)
+            d["bad_lion"] += e > BH_TOL
+        has_gh = any(key in r for key in GH_KEYS)
+        has_rh = any(key in r for key in RH_KEYS)
+        d["keys_wrong"] += any(key in r for key in FOREIGN_KEYS)
+        if not held:
+            d["keys_wrong"] += has_gh or has_rh
+            continue
+        if not forced:
+            d["keys_wrong"] += has_rh
+        es, ep = abs(beta[1] - hold_value(arm, n)), abs(bpre[1] - hold_value(arm, n - 1))
+        d["worst_sched"] = max(d["worst_sched"], es, ep)
+        d["bad_sched"] += es > BH_TOL
+        d["bad_sched_pre"] += ep > BH_TOL
+        ok, act, ca = _audit(r, "gh", n, 1, beta, bpre, mom, z, prev_g)
+        d["bad_gh"] += not ok
+        if ca is not None:
+            d["active_records"] += act
+            prev_g = max(prev_g, ca)
+            d["gh_active_last"] = ca
+        if forced:
+            cs, cp = abs(beta[0] - hold_r_value(arm, n)), abs(bpre[0] - hold_r_value(arm, n - 1))
+            d["worst_rsched"] = max(d["worst_rsched"], cs, cp)
+            d["bad_rsched"] += cs > BH_TOL
+            d["bad_rsched_pre"] += cp > BH_TOL
+            ok, act, ca = _audit(r, "rh", n, 0, beta, bpre, mom, z, prev_r)
+            d["bad_rh"] += not ok
+            if ca is not None:
+                d["ractive_records"] += act
+                prev_r = max(prev_r, ca)
+                d["rh_active_last"] = ca
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS
+          and d["bad_step"] == 0 and d["bad_lion"] == 0 and d["keys_wrong"] == 0)
+    if held:
+        ok = (ok and d["bad_sched"] == 0 and d["bad_sched_pre"] == 0 and d["bad_gh"] == 0
+              and (d["gh_active_last"] is None or d["gh_active_last"] >= d["active_records"]))
+    if forced:
+        ok = (ok and d["bad_rsched"] == 0 and d["bad_rsched_pre"] == 0 and d["bad_rh"] == 0
+              and (d["rh_active_last"] is None or d["rh_active_last"] >= d["ractive_records"]))
+    return ok, d
+
+
+# =============================================================================
+# DESCRIPTIVE, NON-GATING probe readouts.  Nothing here reaches decide(), a gate or the FINAL line.
+# =============================================================================
+def beta_summary(recs, coord):
+    vals = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("beta"), list) and len(r["beta"]) > coord and isinstance(r.get("step"), int):
+            try:
+                v = float(r["beta"][coord])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                vals.append((r["step"], v))
+    if not vals:
+        return None
+    pin = None
+    kpk = max(range(len(vals)), key=lambda i: vals[i][1])
+    for k in range(kpk, len(vals)):
+        if all(math.exp(v + 15.0) <= 2.0 for _s, v in vals[k:]):
+            pin = vals[k][0] / float(STEPS_PER_EPOCH)
+            break
+    win = [math.exp(v + 15.0) for s, v in vals if 15 <= s / float(STEPS_PER_EPOCH) < 30]
+    win2 = [math.exp(v + 15.0) for s, v in vals if 30 <= s / float(STEPS_PER_EPOCH) < 60]
+    return {"last": vals[-1][1], "peak": vals[kpk][1], "peak_epoch": vals[kpk][0] / float(STEPS_PER_EPOCH),
+            "pin_epoch": pin, "r1530": mean(win), "r3060": mean(win2)}
+
+
+def descriptive_probe_readout(runsdir, runs):
+    print("\nDESCRIPTIVE, NON-GATING -- beta from the runs' own probe.jsonl; r = exp(beta + 15) over epochs 15-30 / 30-60;"
+          " pin = first r <= 2 for good")
+    for a in ARMS:
+        for s in SEEDS:
+            recs = load_probe(runsdir, a, s)
+            if not recs:
+                continue
+            parts = []
+            for coord in ((0,) if PT_TYPE[a] == "scalar" else (0, 1)):
+                bs = beta_summary(recs, coord)
+                if bs:
+                    parts.append("%s peak %.3f @%.1f pin %s r %.0f/%.0f" % (
+                        "beta" if PT_TYPE[a] == "scalar" else ("cmpl" if coord == 0 else "carr"), bs["peak"],
+                        bs["peak_epoch"], "never" if bs["pin_epoch"] is None else "%.1f" % bs["pin_epoch"], bs["r1530"],
+                        bs["r3060"]))
+            lg = [r for r in recs if isinstance(r, dict) and "gh_active" in r]
+            lr = [r for r in recs if isinstance(r, dict) and "rh_active" in r]
+            print("  %-12s s%d  %s  gh_active %s rh_active %s" % (a, s, " | ".join(parts), lg[-1]["gh_active"] if lg else "-",
+                                                                  lr[-1]["rh_active"] if lr else "-"))
+    ep_list = (9, 14, 15, 16, 17, 18, 19, 24, 29, 39, 49, 99)
+    print("\nDESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) at epoch lines %s" % " / ".join(str(e) for e in ep_list))
+    for a in ARMS:
+        cells = []
+        for e in ep_list:
+            te = [runs[(a, s)]["eps"][e][1] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            tr = [runs[(a, s)]["eps"][e][0] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            cells.append("%.1f (%.1f)" % (mean(te), mean(tr)) if te else "n/a")
+        print("  %-12s %s" % (a, " / ".join(cells)))
+
+    def am(arm, e):
+        v = [runs[(arm, s)]["eps"][e][1] for s in SEEDS if e in runs[(arm, s)]["eps"]]
+        return mean(v) if len(v) == len(SEEDS) else None
+    for x, y in (("ISO", "HOLDHIGH"), ("HOLDHIGH", "HOLDBIG"), ("HIGHISOPATH", "HOLDHIGH"), ("BIGISOPATH", "HOLDBIG"),
+                 ("ISO", "LOWISOPATH")):
+        first = None
+        for e in range(EPOCHS):
+            if all(am(x, f) is not None and am(y, f) is not None and abs(am(x, f) - am(y, f)) > 2.0 for f in range(e, EPOCHS)):
+                first = e
+                break
+        print("  first epoch line from which |arm-mean TEST %s - %s| stays > 2 pp: %s" % (x, y, "never" if first is None else first))
+
+
+# =============================================================================
+# THE BRANCH MAP -- a pure function of the in-batch means and one flag
+# =============================================================================
+def state(L, M):
+    if L >= M["ISO"] - MATCH_BAR:
+        return "AT-ISO"
+    if L <= M["k01"] + NULL_BAR:
+        return "AT-K01"
+    return "BETWEEN"
+
+
+def dose_word(M):
+    if M["HOLDBIG"] <= M["k01"] + NULL_BAR:
+        return "DOSE-FULL"
+    if abs(M["HOLDBIG"] - M["HOLDHIGH"]) <= MATCH_BAR:
+        return "NO-DOSE"
+    if M["HOLDBIG"] > M["HOLDHIGH"] + MATCH_BAR:
+        return "DOSE-REVERSED"
+    return "DOSE-PARTIAL"
+
+
+def route_word(L, ref, M, pfx):
+    if ref > M["ISO"] - REP_MARGIN:
+        return pfx + "-UNREADABLE"
+    if L >= M["ISO"] - MATCH_BAR:
+        return pfx + "-VIA"
+    if L <= ref + MATCH_BAR:
+        return pfx + "-DIRECT"
+    return pfx + "-PARTIAL"
+
+
+def decide(M, diverged=False):
+    """M: arm -> mean plateau5."""
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M["ISO"] - M["k01"] < GAP_MIN:
+        return "POSITIVE-CONTROL-FAILED"
+    st = state(M["LOWISOPATH"], M)
+    if st == "AT-K01":
+        return "COMP-HOLD-CONTROL-FAILED"
+    if st == "BETWEEN":
+        return "COMP-HOLD-CONTROL-PARTIAL"
+    if not (M["k01"] + REP_MARGIN <= M["HOLDHIGH"] <= M["ISO"] - REP_MARGIN):
+        return "REPLICATE-FAILED"
+    return "%s+%s+%s" % (dose_word(M), route_word(M["HIGHISOPATH"], M["HOLDHIGH"], M, "ROUTE"),
+                         route_word(M["BIGISOPATH"], M["HOLDBIG"], M, "BIGROUTE"))
+
+
+READING = ("247's bounds on TRANSFERS-GRADED (247.4(1) dose confounded with network; 247.4(2) direct vs via the "
+           "complement) and 240's PlainNet sentence")
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement about the" % (FLOOR_MIN, CEIL_MAX),
+                        "harness, not about dose or route.  " + READING + " stay as registered at 247."],
+    "PATCH-NOT-VERIFIED": [
+        "G-BITE failed: on at least one run the probe records do not show the registered holds -- the carrier group on its",
+        "schedule and, on the three forced arms, the complement on ISOPATH -- at every record (or show Lion's own value",
+        "there, a hold key on a control, a touched free complement, the wrong schedule, a hold that acted only at probe",
+        "steps, a patch record that does not audit, a foreign bh_* / ch_* key, missing / short / unreadable records, or",
+        "the replay file is unavailable).  This is the BROKEN-PATCH null or an unreadable witness: NO level is read -- a",
+        "REST_HOLD that never bit predicts EXACTLY ROUTE-DIRECT and BIGROUTE-DIRECT.  " + READING + " stay as at 247."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch; " + READING + " stay as at 247."],
+    "SCALAR-NOT-COLLAPSED": ["k01 did not sit at its collapsed level in batch (> %.0f pp).  Nothing to explain." % K01_MAX],
+    "POSITIVE-CONTROL-FAILED": [
+        "ISO (byte-identical to ciso1's / cdep1's / ciso2's / cvt7's) did not lift the scalar arm by %.0f pp in this batch." % GAP_MIN,
+        "No dose or route statement is licensed.  Report and stop."],
+    "COMP-HOLD-CONTROL-FAILED": [
+        "THE COMP-HOLD-BREAKS ACCOUNT.  LOWISOPATH -- the carriers at the floor, the complement forced open-loop onto ISO's own",
+        "measured complement path -- sits at k01.  Forcing the complement onto an exogenous replay breaks the rescue by",
+        "itself on ResNet, so no forced arm can be read.  EFFECT ON " + READING + ": the ROUTE bound is UNTESTED by this",
+        "design; the DOSE arms are stamped, not branched.  Not licensed: any route sentence."],
+    "COMP-HOLD-CONTROL-PARTIAL": [
+        "LOWISOPATH (the REST_HOLD positive control) sits between k01 and ISO: the complement hold costs part of the",
+        "rescue by itself.  EFFECT ON " + READING + ": untested; report and stop."],
+    "REPLICATE-FAILED": [
+        "HOLDHIGH (cvt7's arm, bitwise the same string) did not land at least %.0f pp above k01 and %.0f pp below ISO" % (REP_MARGIN, REP_MARGIN),
+        "at new seeds (its state stamped).  Both factors are read against HOLDHIGH, so neither is read.  EFFECT ON",
+        READING + ": cvt7's TRANSFERS-GRADED PUT IN QUESTION by a failed replication (not rescinded)."],
+}
+LICENSE_DOSE = {
+    "DOSE-FULL": [
+        "DOSE-FULL: the carrier group on PlainNet's dose (tri:9428, peak -4.39; the schedule cvt4 / cvt6 HOLDHIGH applied, bitwise),",
+        "complement free, sits at the k01 LOCATION while k01's own dose (HOLDHIGH) sits between.  247.4(1)'s DOSE confound",
+        "is RESOLVED IN FAVOUR OF DOSE: at matched absolute step size the ResNet carrier group stalls the run as PlainNet's",
+        "tensor 50 did; 'part on ResNet, all on PlainNet' was (sufficiently) a dose difference.  Not licensed: a dose curve",
+        "(two doses); that held set (three tensors vs one) plays no role; necessity."],
+    "NO-DOSE": [
+        "NO-DOSE: PlainNet's dose (tri:9428) costs no more than k01's (within %.0f pp), complement free.  247.4(1): dose does" % MATCH_BAR,
+        "NOT explain 'part vs all' over this 0.82-log-unit step; network or held set remains.  Not licensed: that a larger",
+        "dose would not stall (none measured at this cell is larger); which of network / held set."],
+    "DOSE-PARTIAL": [
+        "DOSE-PARTIAL: PlainNet's dose costs MORE than k01's (> %.0f pp below HOLDHIGH) but stays above the k01 location:" % MATCH_BAR,
+        "the loss is graded in dose over this step, and PlainNet's dose does not reproduce PlainNet's full stall on ResNet.",
+        "Not licensed: a dose curve; what makes up the remainder (network, held set)."],
+    "DOSE-REVERSED": [
+        "DOSE-REVERSED: PlainNet's larger dose costs LESS than k01's (HOLDBIG > HOLDHIGH + %.0f pp).  Not predicted by any" % MATCH_BAR,
+        "registered account; reported, no dose sentence."],
+}
+LICENSE_ROUTE = {
+    "ROUTE-VIA": [
+        "ROUTE-VIA (k01's dose): with the complement forced open-loop onto ISO's measured path, the carriers on k01's dose",
+        "keep ISO's level: at this dose the ~20 pp loss of cvt7's HOLDHIGH runs THROUGH the complement's earlier collapse.",
+        "247.4(2) RESOLVED, VIA-COMPLEMENT, at this dose.  Not licensed: how the carriers drive the collapse; open-loop != closed-loop."],
+    "ROUTE-DIRECT": [
+        "ROUTE-DIRECT (k01's dose): with the complement forced onto ISO's measured path, the carriers on k01's dose sit at or",
+        "below HOLDHIGH's level (within %.0f pp or lower): the partial loss does NOT need the complement's earlier collapse." % MATCH_BAR,
+        "247.4(2) RESOLVED, DIRECT, at this dose.  Also what a REST_HOLD that never bit predicts -- reachable only because",
+        "G-BITE passed.  Not licensed: that the complement's collapse contributes nothing in the free arm; which window."],
+    "ROUTE-PARTIAL": [
+        "ROUTE-PARTIAL (k01's dose): forcing ISO's complement path recovers more than %.0f pp of HOLDHIGH's loss but not" % MATCH_BAR,
+        "ISO's level: part direct, part via the complement.  No single-route sentence at this dose."],
+    "ROUTE-UNREADABLE": ["ROUTE-UNREADABLE: the free reference arm sits within %.0f pp of ISO; no route reading." % REP_MARGIN],
+}
+LICENSE_BIG = dict((k.replace("ROUTE", "BIGROUTE"), [ln.replace("ROUTE-", "BIGROUTE-").replace("k01's dose", "PlainNet's dose")
+                                                     .replace("HOLDHIGH", "HOLDBIG") for ln in v])
+                   for k, v in LICENSE_ROUTE.items())
+
+
+def licence_lines(branch):
+    if branch in LICENSE:
+        return LICENSE[branch]
+    parts = branch.split("+")
+    if len(parts) != 3 or parts[0] not in LICENSE_DOSE or parts[1] not in LICENSE_ROUTE or parts[2] not in LICENSE_BIG:
+        return None
+    out = LICENSE_DOSE[parts[0]] + LICENSE_ROUTE[parts[1]] + LICENSE_BIG[parts[2]]
+    if parts[0] == "DOSE-FULL" and parts[2] == "BIGROUTE-DIRECT":
+        out = out + ["TOGETHER: at PlainNet's dose the ResNet carrier group stalls the run with the complement on ISO's own path --",
+                     "the transplant of cvt6's HIGHHEADPATH-AT-K01.  EFFECT ON 240's PlainNet sentence: it TRANSFERS to",
+                     "ResNet18_c100 at this cell AT PlainNet's DOSE (three carriers held together; open-loop complement)."]
+    out = out + ["EFFECT ON " + READING + ": as the three words say, at this cell only (ResNet18_c100, ciso1's cell, 100",
+                 "epochs, the three carriers held together, the complement's path forced OPEN-LOOP).  Readings at k01 are LOCATIONS."]
+    return out
+
+
+def all_branches():
+    out = set(LICENSE)
+    for d in LICENSE_DOSE:
+        for r in LICENSE_ROUTE:
+            for b in LICENSE_BIG:
+                out.add("%s+%s+%s" % (d, r, b))
+    return out
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    print("=" * 78)
+    print(" cvt8 -- ResNet18_c100: DOSE x ROUTE on the carrier group  (PATCH_GROUPHOLD + PATCH_RESTHOLD)")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-12s %-7s GROUP_HOLD %-26s REST_HOLD %s" % (a, "scalar" if SPEC[a] == "scalar" else "ISO's",
+                                                              (GROUPHOLD[a].split(":", 1)[1] if GROUPHOLD[a] else "(unset)"),
+                                                              RESTHOLD[a] or "(unset)"))
+    print(" CO-PRIMARY: P_DOSE = HOLDHIGH - HOLDBIG; P_ROUTE = HIGHISOPATH - HOLDHIGH; P_ROUTE_BIG = BIGISOPATH - HOLDBIG.")
+    print(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)." % (EPOCHS - 5, EPOCHS - 1))
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+    runs, rnotes = read_runs(runsdir)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET, "NN-name": NET,
+                    "batch-size": str(BATCH), "num-epochs": str(EPOCHS), "meta-stepsize": MST, "alpha0": A0,
+                    "stepsize-groups": SPEC[a], "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                    "momentum-param-base": "0.99", "weight-decay-base": "0.1", "momentum-param-meta": "0.99",
+                    "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad]) if (dup or bad) else "")
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()), "G-ENV one distinct ENV line, one per run",
+         "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is ciso1's / cdep1's / cvt7's, byte for byte (PROBE_DIR stripped)")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0]) or PT_RE.match(r["pt"][0]).group(1) != PT_TYPE[a]]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`" % (PROBE, NTENS),
+         "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    print("\nG-VOTEW / G-BHOLD / G-CHOLD / G-GHOLD / G-RHOLD   ONE `VOTE_W: off`, ONE `BETA_HOLD: off`, NO COMP_HOLD line,")
+    print("          ONE GROUP_HOLD line and ONE REST_HOLD line == the arm's registered witnesses, per run")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            hchk(r["vw"] == [WITNESS_VW], "G-VOTEW %s-s%d" % (a, s), "" if r["vw"] == [WITNESS_VW] else "got %r" % (r["vw"][:2],))
+            hchk(r["bh"] == [WITNESS_BH], "G-BHOLD %s-s%d" % (a, s), "" if r["bh"] == [WITNESS_BH] else "got %r" % (r["bh"][:2],))
+            hchk(r["ch"] == [], "G-CHOLD %s-s%d" % (a, s), "" if r["ch"] == [] else "got %r" % (r["ch"][:2],))
+            hchk(r["gh"] == [WITNESS_GH[a]], "G-GHOLD %s-s%d" % (a, s),
+                 "" if r["gh"] == [WITNESS_GH[a]] else "got %r" % ([x[:200] for x in r["gh"][:2]],))
+            hchk(r["rh"] == [WITNESS_RH[a]], "G-RHOLD %s-s%d" % (a, s),
+                 "" if r["rh"] == [WITNESS_RH[a]] else "got %r" % ([x[:200] for x in r["rh"][:2]],))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(), "G-STRUCT byte-identical to synthetic_manifest_text() (62 tensors, ISO [59,3], both hold tables)",
+             "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == LIVE_BN_SHA, "G-PROV build_network.py == the LIVE one %s..." % LIVE_BN_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        hchk(prov.get("HF_SHA256") == HF_POST_SHA, "G-PROV HF.py == HF_POST_SHA %s... (cvt8's PATCH_RESTHOLD tree)" % HF_POST_SHA[:12],
+             str(prov.get("HF_SHA256"))[:16])
+        hchk(prov.get("RUNNER_SHA256") == RUNNER_SHA, "G-PROV RUNNER_SHA256 == cvt8's runner %s..." % RUNNER_SHA[:12],
+             str(prov.get("RUNNER_SHA256"))[:16])
+        hchk(prov.get("REPLAY_SHA256") == ISOPATH_SHA, "G-PROV REPLAY_SHA256 (the tree's %s.json) == ISOPATH_SHA %s..."
+             % (ISOPATH_ID, ISOPATH_SHA[:12]), str(prov.get("REPLAY_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer's sha256 %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    print("\nG-REPLAY  the replay file this scorer reads")
+    hchk(os.path.exists(ISOPATH_FILE) and file_sha(ISOPATH_FILE) == ISOPATH_SHA and load_knots() is not None
+         and len(load_knots()[0]) == ISOPATH_KNOTS,
+         "G-REPLAY %s sha256 == ISOPATH_SHA, %d knots" % (os.path.relpath(ISOPATH_FILE, REPO), ISOPATH_KNOTS))
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-12s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        print("               seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    the registered holds reached beta at every record, and touched nothing else")
+    print("  (a) 500 records; (b) every UNHELD group == Lion recomputed from its own beta_pre/mom_pre/z_agg (tol %.0e);" % BH_TOL)
+    print("  (c) carrier group 1 of every held arm: beta == hold(step+2), beta_pre == hold(step+1); complement group 0 of every")
+    print("      forced arm: the same against ISOPATH; (d) gh_* / rh_* records audit; (e) no hold key where none is registered,")
+    print("      no bh_* / ch_* key anywhere.  Non-finite records are counted and stamped, not failed.")
+    bite_fail = []
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = load_probe(runsdir, a, s)
+            ok, d = bite_check(a, recs)
+            nonfin[(a, s)] = d["nonfinite"]
+            print("  %-4s G-BITE %-12s s%-3d records %s  bad %d  nonfinite %d  lion %d (ties %d, worst %.1e)  sched %d/%d (worst %.1e)"
+                  "  rsched %d/%d (worst %.1e)  gh-audit %d  rh-audit %d  keys-wrong %d  gh_active %s  rh_active %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), d["bad_rec"], d["nonfinite"],
+                     d["bad_lion"], d["ties"], d["worst_lion"], d["bad_sched"], d["bad_sched_pre"], d["worst_sched"],
+                     d["bad_rsched"], d["bad_rsched_pre"], d["worst_rsched"], d["bad_gh"], d["bad_rh"], d["keys_wrong"],
+                     d["gh_active_last"], d["rh_active_last"], ("  (%s)" % d["why"]) if "why" in d else ""))
+            if not ok:
+                bite_fail.append("%s-s%d" % (a, s))
+    if bite_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | G-BITE failed on %s" % ",".join(bite_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+
+    C = {"P_DOSE": ("HOLDHIGH", "HOLDBIG"), "P_ROUTE": ("HIGHISOPATH", "HOLDHIGH"), "P_ROUTE_BIG": ("BIGISOPATH", "HOLDBIG")}
+    K = {"D_ISO": ("ISO", "k01"), "P_CTLC": ("ISO", "LOWISOPATH"), "R_HIGH": ("ISO", "HOLDHIGH"),
+         "P_DOSE_PATH": ("HIGHISOPATH", "BIGISOPATH")}
+    print("\nCONTRASTS (every one WITHIN batch)")
+    for nm, (x, y) in C.items():
+        v = M[x] - M[y]
+        print("  PRIMARY  %-12s = %-11s - %-11s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, T[x] - T[y]))
+    for nm, (x, y) in K.items():
+        v = M[x] - M[y]
+        print("  KEY      %-12s = %-11s - %-11s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, T[x] - T[y]))
+    for a in HELD:
+        print("  KEY      D_%-11s = %-11s - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   ISO - %s = %+.4f"
+              % (a, a, M[a] - M["k01"], (M[a] - M["k01"]) / se, T[a] - T["k01"], a, M["ISO"] - M[a]))
+    pint = (M["BIGISOPATH"] - M["HOLDBIG"]) - (M["HIGHISOPATH"] - M["HOLDHIGH"])
+    print("  DESCRIPTIVE P_INT = P_ROUTE_BIG - P_ROUTE = %+.4f pp" % pint)
+    print("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | REP_MARGIN %.1f pp (%.2f SE) | RESCUE %.1f pp"
+          % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, NULL_BAR, NULL_BAR / se, REP_MARGIN, REP_MARGIN / se, RESCUE_BAR))
+
+    print("\nG-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR, "" if not div else "  diverged: %s" % div))
+
+    branch = decide(M, bool(div))
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "HOLD-FROM-INIT", "REPLAY-MAX-RATE-TRIANGLE", "BIG-IS-PLAINNET-DOSE",
+              "ISOPATH-REPLAY-FILE", "FORCED-ARMS-OPEN-LOOP", "CARRIER-GROUP-OF-3", "ONE-NETWORK-RESNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    D_ISO = M["ISO"] - M["k01"]
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if D_ISO >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if D_ISO >= GAP_MIN:
+        for a in HELD:
+            stamps.append("%s-%s" % (a, state(M[a], M)))
+        if branch in ("COMP-HOLD-CONTROL-FAILED", "COMP-HOLD-CONTROL-PARTIAL", "REPLICATE-FAILED"):
+            stamps.append("UNBRANCHED-%s" % dose_word(M))
+    for a in HELD:
+        if M[a] - M["ISO"] > MATCH_BAR:
+            stamps.append("%s-ABOVE-ISO" % a)
+        if M[a] - M["k01"] < -NULL_BAR:
+            stamps.append("%s-BELOW-K01" % a)
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % a)
+    for x, y in (("HIGHISOPATH", "HOLDHIGH"), ("BIGISOPATH", "HOLDBIG")):
+        if M[x] < M[y] - MATCH_BAR:
+            stamps.append("%s-BELOW-%s" % (x, y))
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in HELD):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    qual = [(M[x] - M[y], T[x] - T[y]) for x, y in C.values()]
+    agree = all((t > 0) == (p > 0) for p, t in qual if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cvt8 bar or contrast):")
+    for b, dct in R_BETWEEN.items():
+        print("  %s: %s" % (b, "  ".join("%s %.4f" % kv for kv in dct.items())))
+    print("  cvt8 {102,103,104}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+
+    try:
+        descriptive_probe_readout(runsdir, runs)
+    except Exception as ex:
+        print("  (descriptive probe readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in licence_lines(branch):
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Any other network, cell or horizon; GroupNorm, VGG (RULE 11).")
+    print("  * Any single carrier: the three are held together as ISO's group; the held-set difference from PlainNet stays.")
+    print("  * A dose curve: two doses (k01's, PlainNet's) and the floor.")
+    print("  * WHEN a step size acts: every hold runs from init to the end, one shape each.")
+    print("  * That an open-loop forced complement behaves as a responsive one (the forced arms are OPEN-LOOP).")
+    print("  * Point agreement for an arm at the k01 level: such readings are LOCATIONS (164.6).")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_ENV = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+          "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+          "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 PROBE_DIR=/x/probe EB_RHO=na EB_LOG=0")
+_E_BASE = {"k01": 23.0, "ISO": 70.0, "HOLDHIGH": 50.0, "HOLDBIG": 23.4, "HIGHISOPATH": 50.5, "BIGISOPATH": 23.3,
+           "LOWISOPATH": 69.8}      # DOSE-FULL+ROUTE-DIRECT+BIGROUTE-DIRECT-like
+_E_BRANCH0 = "DOSE-FULL+ROUTE-DIRECT+BIGROUTE-DIRECT"
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, gh=None, rh=None, vw=None,
+             bh=None, ch=None):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cvt8 --run-name %s" % (NET, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env, "NVIDIA L4, 23034 MiB",
+             WITNESS_VW if vw is None else vw, WITNESS_BH if bh is None else bh,
+             WITNESS_GH[arm] if gh is None else gh, WITNESS_RH[arm] if rh is None else rh, ch or "",
+             "Files already downloaded and verified", "Files already downloaded and verified",
+             "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 dir=/x"
+             % (PT_TYPE[arm], NTENS)]
+    lines = [ln for ln in lines if ln != ""]
+    for e in range(n_ep):
+        te = level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0))
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.9, te + 15.0), te))
+    if run_done:
+        lines += ["43  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_probe_records(arm, seed=0, n=N_RECORDS, as_arm=None, as_rarm=None, unheld=False, runheld=False,
+                     touch_complement=False, pre_natural=False, rpre_natural=False, gh_forge=False, rh_forge=False,
+                     gh_off_by_one=False, rh_off_by_one=False, strip_gh=False, strip_rh=False, add_gh=False,
+                     add_rh=False, add_bh=False, add_ch=False, rh_as_tri=None):
+    """synthetic PROBE_TENSOR records consistent with the harness's Lion step and the arm's holds.
+    as_arm / as_rarm: the carrier / complement hold of ANOTHER arm.  unheld / runheld: that group follows Lion (the nulls).
+    rh_as_tri: the complement follows tri:<P> instead of ISOPATH (wrong replay)."""
+    import random
+    rnd = random.Random(8000 + seed + 7 * ARMS.index(arm))
+    ng = len(arm_groups(arm))
+    harm = as_arm or arm
+    rarm = as_rarm or arm
+    out = []
+    active = ractive = 0
+    for k in range(n):
+        s = 100 * k
+        mom = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        z = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        bpre = [f32(max(LO, min(HI, -13.8 + 0.3 * math.sin(k / 30.0) - 0.004 * k))) for _ in range(ng)]
+        beta = [f32(lion_natural(bpre[g], mom[g], z[g])[0]) for g in range(ng)]
+        rec = {"step": s, "pt_b2": 0.9, "pt_mp": 0.99}
+        if ng == 2 and arm in HELD and not unheld:
+            bpre[1] = hold_value(harm, s + 1) if not pre_natural else f32(bpre[1] + 0.25)
+            beta[1] = hold_value(harm, s + 2)
+            nat1 = f32(lion_natural(bpre[1], mom[1], z[1])[0])
+            if abs(nat1 - beta[1]) > BH_TOL:
+                active += 1
+            rec.update({"gh_n": s + 2 + (1 if gh_off_by_one else 0), "gh_active": active,
+                        "gh_nat": (nat1 + 0.01) if gh_forge else nat1, "gh_held": beta[1]})
+            if strip_gh:
+                for key in GH_KEYS:
+                    rec.pop(key)
+        if ng == 2 and rarm in FORCED and not runheld:
+            hv = (lambda m: v_of(m, rh_as_tri)) if rh_as_tri else (lambda m: hold_r_value(rarm, m))
+            bpre[0] = hv(s + 1) if not rpre_natural else f32(bpre[0] + 0.25)
+            beta[0] = hv(s + 2)
+            nat0 = f32(lion_natural(bpre[0], mom[0], z[0])[0])
+            if abs(nat0 - beta[0]) > BH_TOL:
+                ractive += 1
+            rec.update({"rh_n": s + 2 + (1 if rh_off_by_one else 0), "rh_active": ractive,
+                        "rh_nat": (nat0 + 0.01) if rh_forge else nat0, "rh_held": beta[0]})
+            if strip_rh:
+                for key in RH_KEYS:
+                    rec.pop(key)
+        if touch_complement:
+            beta[0] = f32(beta[0] + 0.002)
+        if add_gh:
+            rec.update({"gh_n": s + 2, "gh_active": 0, "gh_nat": beta[-1], "gh_held": beta[-1]})
+        if add_rh:
+            rec.update({"rh_n": s + 2, "rh_active": 0, "rh_nat": beta[0], "rh_held": beta[0]})
+        if add_bh:
+            rec.update({"bh_n": s + 2, "bh_active": 0, "bh_nat": beta[-1], "bh_held": beta[-1]})
+        if add_ch:
+            rec.update({"ch_n": s + 2, "ch_active": 0, "ch_nat": beta[0], "ch_held": beta[0]})
+        rec.update({"beta": beta, "beta_pre": [bpre], "mom_pre": [mom], "z_agg": [z],
+                    "z_tensor": [0.0] * NTENS, "m_tensor": [0.0] * NTENS})
+        out.append(rec)
+    return out
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            p = os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for r in _e_probe_records(a, seed=s):
+                    f.write(json.dumps(r) + "\n")
+
+
+def _e_prov(d, mode="submit", bn=LIVE_BN_SHA, hf=HF_POST_SHA, runner=None, replay=ISOPATH_SHA, scorer=None):
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nBUILD_NETWORK_SHA256 %s\nHF_SHA256 %s\nRUNNER_SHA256 %s\nREPLAY_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (mode, bn, hf, runner or RUNNER_SHA, replay, scorer or file_sha(os.path.abspath(__file__))))
+
+
+def _e_build(d, template, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None, env_break=None,
+             spec_break=None, gh_break=None, rh_break=None, vw_break=None, bh_break=None, ch_break=None, manifest=None,
+             prov=None, probe_break=None, probe_drop=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(manifest if manifest is not None else synthetic_manifest_text())
+    _e_prov(d, **(prov or {}))
+    jid = 9900000
+    pb = probe_break or {}
+
+    def pick(br, a, s):
+        return br[1] if br and br[0] == (a, s) else None
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                p = os.path.join(d, PREFIX, pname)
+                os.makedirs(p)
+                with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                    for r in pb[(a, s)]:
+                        f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = "scalar" if spec_break == (a, s) else None
+            _e_write(d, a, s, jid, L, env=env, spec=spec, gh=pick(gh_break, a, s), rh=pick(rh_break, a, s),
+                     vw=pick(vw_break, a, s), bh=pick(bh_break, a, s), ch=pick(ch_break, a, s))
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0, "gamma": "1",
+            "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH), "epochs_requested": str(EPOCHS), "hier": "none",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (net, gran, v) in enumerate([(NET, "scalar", 1.0), (NET, "scalar", 80.0), (NET, "scalar", 40.0),
+                                        (NET, ISOSPEC, 2.0), (NET, ISOSPEC, 95.0), (NET, ISOSPEC, 45.0),
+                                        (NET, ISOSPEC, 23.0), (NET, "layerwise", 3.0), (NET, "layerwise", 95.0),
+                                        ("PlainNet18_c100", "scalar", 2.0), ("PlainNet18_c100", "scalar", 60.0)]):
+        inv.append(dict(base, network=net, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _bar_lines(out):
+    return [ln for ln in out.splitlines() if ln.startswith("  SIGMA_USED") or ln.startswith("  SE_ARM_DIFF")
+            or ln.startswith("  bars:") or ln.startswith("  PRIMARY")]
+
+
+def _spec_from_scorer(fname, key):
+    p = os.path.join(HERE, fname)
+    if not os.path.exists(p):
+        return None
+    import ast
+    txt = open(p).read()
+    m = re.search(r"^SPEC = (\{.*?^\})", txt, re.S | re.M)
+    if not m:
+        return None
+    return ast.literal_eval(m.group(1)).get(key)
+
+
+def _load_module(name, fname):
+    import importlib.util
+    p = os.path.join(HERE, fname)
+    if not os.path.exists(p):
+        return None
+    spec = importlib.util.spec_from_file_location(name, p)
+    m = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, HERE)
+    try:
+        spec.loader.exec_module(m)
+    finally:
+        sys.path.pop(0)
+    return m
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cVT8 --selftest: design, RULE I and RULE P re-derived from the landed records, the G-BITE nulls on REAL records,")
+    print("the frozen manifest, frozen bars (O2), the noise floor through corpus_exclusions.filter_rows, the floor table, the")
+    print("REAL score() on synthetic runs, the corpus-invariance proof and the documented one-argument invocation.\n")
+
+    print("A. ARITHMETIC, REGEX AND DESIGN")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6, "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)")
+    chk(SIGMA_PRIOR == SIGMA_R18ALL, "SIGMA_PRIOR = SIGMA_R18ALL (ResNet18_c100 only)")
+    chk(list(inspect.signature(compose_sigma).parameters) == ["sigma_in"], "compose_sigma() takes ONE argument -- NO corpus")
+    chk(all(compose_sigma(s)[1] == max(SIGMA_PRIOR, s) for s in (0.0, 0.2, SIGMA_PRIOR, 0.8, 1.5, 4.0)),
+        "SIGMA_USED == max(frozen floor, in-batch) over 6 in-batch values")
+    src = inspect.getsource(score)
+    chk("pooled_sigma" not in src and src.count("read_corpus") == 1,
+        "score() calls no corpus statistic; its single read_corpus() feeds a row-count print only")
+    chk(list(inspect.signature(decide).parameters) == ["M", "diverged"], "decide() is a function of the in-batch means and one flag")
+    dsrc = inspect.getsource(decide) + inspect.getsource(dose_word) + inspect.getsource(route_word) + inspect.getsource(state)
+    chk("load_probe" not in dsrc and "recs" not in dsrc, "decide() and its word functions read NO probe record")
+    chk(src.index("final = \"FINAL: %s | %s\"") < src.index("descriptive_probe_readout(runsdir, runs)"),
+        "the descriptive probe readout runs AFTER the FINAL line is composed")
+    chk(src.index("G-BITE failed on") < src.index("CONTRASTS (every one") < src.index("branch = decide(M"),
+        "order: G-BITE, then contrasts, then the branch")
+    chk(GAP_MIN >= 2 * RESCUE_BAR and RESCUE_BAR > MATCH_BAR > NULL_BAR > 0 and REP_MARGIN == 2 * MATCH_BAR,
+        "bar ordering GAP_MIN >= 2 RESCUE > MATCH > NULL; REP_MARGIN = 2 MATCH")
+    chk(GAP_MIN > MATCH_BAR + NULL_BAR, "AT-ISO and AT-K01 cannot overlap once D_ISO >= GAP_MIN")
+    chk(REP_MARGIN >= MATCH_BAR + MATCH_BAR and REP_MARGIN > NULL_BAR + MATCH_BAR,
+        "once HOLDHIGH is in [k01+REP, ISO-REP]: ROUTE-DIRECT (<= HOLDHIGH+5) and ROUTE-VIA (>= ISO-5) are disjoint, and"
+        " DOSE-FULL (<= k01+2) and NO-DOSE (>= HOLDHIGH-5) are disjoint")
+    chk(MATCH_BAR >= 5 * SE_PRIOR and NULL_BAR >= 3 * SE_PRIOR, "MATCH >= 5 SE and NULL >= 3 SE at the prior",
+        "%.2f / %.2f SE" % (MATCH_BAR / SE_PRIOR, NULL_BAR / SE_PRIOR))
+    chk(all(K01_MAX > R_BETWEEN[b]["k01"] + 5 and K01_MAX < R_BETWEEN[b]["ISO"] - 30 for b in R_BETWEEN),
+        "K01_MAX sits between every anchor's k01 (+5) and ISO (-30)")
+    chk(R_BETWEEN["cvt7"]["k01"] + REP_MARGIN + 5 < R_BETWEEN["cvt7"]["HOLDHIGH"] < R_BETWEEN["cvt7"]["ISO"] - REP_MARGIN - 5,
+        "cvt7's HOLDHIGH (50.23) sits > 5 pp inside the replicate window at cvt7's anchors")
+    chk(BH_TOL <= MS / 50.0, "BH_TOL is <= 1/50 of one Lion step")
+    chk(EPTR_RE.search("Epoch 99, Train Accuracy: 94.61 %, Test Accuracy: 70.44 %") is not None, "epoch-line regex matches")
+    chk(all(OUT_RE.match("cvt8-%s-s102-1234567.out" % a) for a in ARMS) and OUT_RE.match("cvt7-HOLDHIGH-s99-1.out") is None
+        and OUT_RE.match("cvt8-HOLDLOW-s102-1.out") is None and OUT_RE.match("cvt8-ISOPATH-s102-1.out") is None,
+        "run-file regex matches cvt8's seven arms ONLY")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=62 x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=53 x") is None, "PROBE_TENSOR regex: 62, not 53")
+    chk(set(SPEC) == set(ARMS) == set(GROUPHOLD) == set(RESTHOLD) == set(WITNESS_GH) == set(WITNESS_RH)
+        and set(MODE) == set(HELD) and set(RMODE) == set(FORCED) and len(ARMS) == 7, "seven arms; tables cover exactly them")
+    chk(SPEC["k01"] == "scalar" and all(SPEC[a] == ISOSPEC for a in ARMS if a != "k01"),
+        "every held arm keeps ISO's grouping (the carriers' vote stays OUT of the complement's sum)")
+    chk(all(re.match(r"^[A-Za-z0-9_.:+]*$", v) and "," not in v for v in list(GROUPHOLD.values()) + list(RESTHOLD.values())),
+        "every GROUP_HOLD / REST_HOLD value is ONE token of [A-Za-z0-9_.:+], no comma")
+    car = "layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight"
+    chk(GROUPHOLD["HOLDHIGH"] == GROUPHOLD["HIGHISOPATH"] == car + ":tri:8609"
+        and GROUPHOLD["HOLDBIG"] == GROUPHOLD["BIGISOPATH"] == car + ":tri:9428" and GROUPHOLD["LOWISOPATH"] == car + ":floor"
+        and GROUPHOLD["k01"] == GROUPHOLD["ISO"] == "", "the GROUP_HOLD strings, literal")
+    chk(all(RESTHOLD[a] == "rec:cvt8_isopath" for a in FORCED) and all(RESTHOLD[a] == "" for a in ARMS if a not in FORCED),
+        "the REST_HOLD strings, literal")
+    prefixes = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD")
+    chk(not any(p != q and p.startswith(q) for p in prefixes for q in prefixes)
+        and all(w.startswith("REST_HOLD: ") for w in WITNESS_RH.values()) and all(w.startswith("GROUP_HOLD: ") for w in WITNESS_GH.values()),
+        "no witness prefix is a prefix of another (V/B/G/C/R, CORRECTIONS 245): every witness line is read as ONE kind")
+    chk(B0 == -13.815510749816895, "b0 = float32(log 1e-6) = -13.815510749816895")
+    chk(WITNESS_GH["HOLDBIG"] == "GROUP_HOLD: on type=blockwise group=1 groupsize=3 names=%s mode=tri P=9428 "
+        "b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=%r" % (car, B0 + MS * 9428), "HOLDBIG's GROUP_HOLD witness, literal")
+    chk(WITNESS_RH["LOWISOPATH"] == ("REST_HOLD: on type=blockwise group=0 groupsize=59 mode=rec id=cvt8_isopath sha256=%s "
+                                     "knots=500 n0=2 n1=49902 b0=-13.815510749816895 lo=-15.0 hi=-2.3026 "
+                                     "vmax=-4.985378742218018 vlast=-14.924964427947998" % ISOPATH_SHA),
+        "the REST_HOLD witness, literal (the replay sha rides it)")
+    for P, ep in ((P_HIGH, 36.81), (P_BIG, 40.08)):
+        nclamp = min(n for n in range(P, 60000) if v_of(n, P) == LO)
+        chk(all(v_of(n, P) == LO for n in range(nclamp, 50002, 97)) and abs(nclamp / 500.0 - ep) < 0.01
+            and v_of(P + 1, P) == f32(B0 + MS * P) and v_of(1, P) == B0 and v_of(2, P) == f32(B0 + MS),
+            "tri(%d): b0 at updates 0-1, peak after update P+1, clamp after update %d (epoch %.2f) and stays" % (P, nclamp, nclamp / 500.0))
+    K = load_knots()
+    chk(K is not None and os.path.exists(ISOPATH_FILE) and file_sha(ISOPATH_FILE) == ISOPATH_SHA,
+        "the replay file patches/cvt8_isopath.json is present with ISOPATH_SHA")
+    if K is not None:
+        kn, kv = K
+        d = json.load(open(ISOPATH_FILE))
+        chk(len(kn) == ISOPATH_KNOTS and kn == [100 * k + 2 for k in range(500)] and kn[0] == ISOPATH_N0 and kn[-1] == ISOPATH_N1
+            and max(kv) == ISOPATH_VMAX and kv[-1] == ISOPATH_VLAST and d.get("id") == ISOPATH_ID and d.get("source") == ISOPATH_SOURCE,
+            "the replay: 500 knots n = 100k + 2, vmax / vlast as witnessed, id, and the 12 registered source runs")
+        chk(rec_value(0, kn, kv) == B0 and rec_value(1, kn, kv) == B0 and rec_value(2, kn, kv) == f32(kv[0]) and kv[0] == f32(B0 + MS),
+            "rec: hold(0) = hold(1) = b0; hold(2) = v_0 = b0 + ms")
+        chk(all(abs(rec_value(kn[k], kn, kv) - kv[k]) <= 1e-6 for k in range(500)),
+            "rec: the float32 schedule equals the knot value within 1e-6 at every record step")
+        chk(all(rec_value(n, kn, kv) == f32(min(HI, max(LO, kv[(n - 2) // 100] + (kv[(n - 2) // 100 + 1] - kv[(n - 2) // 100]) * ((n - 2) % 100) / 100.0)))
+                for n in range(2, kn[-1], 41)) and rec_value(60000, kn, kv) == f32(kv[-1]),
+            "rec: linear between knots (every 41st update), v_last after the last knot")
+        chk(all(LO <= v <= HI for v in kv) and all(abs(kv[k + 1] - kv[k]) <= 0.1 + 1e-4 for k in range(499)),
+            "rec: every knot inside the clamp; consecutive knots <= 0.1 log units apart")
+    nat, tie = lion_natural(-10.0, 1e-3, 1e-3)
+    chk(abs(nat - (-10.001)) < 1e-12 and not tie and lion_natural(-15.0, 1e-3, 0.0)[0] == -15.0 and lion_natural(-3.0, 0.0, 0.0)[1],
+        "lion_natural: DOWN on L > 0, clamps at -15, flags L == 0 as a tie")
+    chk(SEEDS == (102, 103, 104) and N_RECORDS == 500, "seeds {102,103,104} (pre-assigned); 500 records per run")
+    chk(re.match(r"^[0-9a-f]{64}$", RUNNER_SHA) is not None, "RUNNER_SHA is a pinned sha256")
+    chk(all(licence_lines(b) is not None for b in all_branches()) and len(all_branches()) == len(LICENSE) + 4 * 4 * 4,
+        "every one of the %d registered branches has a licence text" % len(all_branches()))
+    note("expected cost %.1f GPU-h at 100 ep (cvt7 sacct incl. [HOST_3c1b003035]); hard bound = launcher WALL x %d" % (R18_PER_RUN_GPUH * 21, 21))
+
+    print("\nB. THE FROZEN MANIFEST, RULE I, RULE P AND THE G-BITE NULLS ON LANDED RECORDS")
+    t = r18_tensors()
+    numel = [q for _n, q, _o in t]
+    chk(len(t) == NTENS and sum(numel) == TOTPAR, "ResNet18_c100: %d tensors, %d parameters" % (NTENS, TOTPAR))
+    chk(tuple(NAMES[i - 1] for i in CARRIER_IDX) == CARRIERS and all(numel[i - 1] == 512 for i in CARRIER_IDX),
+        "carriers 50 / 53 / 59 by NAME, 512 each")
+    g = parse_sets(ISOSPEC, NAMES)
+    chk(len(g) == 2 and [len(x) for x in g] == ISO_SIZES and g[1] == list(CARRIER_IDX)
+        and [sum(numel[i - 1] for i in x) for x in g] == ISO_PARAMS, "ISO: [59,3], group 1 = the three carriers")
+    for key, fname in (("ISO", "cIS1_ciso1_isolate_score.py"), ("k01", "cIS1_ciso1_isolate_score.py"),
+                       ("ISO", "cDP1_cdep1_depth_score.py"), ("ISO", "cIS2_ciso2_horizon_score.py")):
+        theirs = _spec_from_scorer(fname, key)
+        if theirs is None:
+            skip("%s not reachable -- byte-identity of %s not checked" % (fname, key))
+        else:
+            chk(theirs == SPEC[key], "%s's spec is BYTE-IDENTICAL to %s's (%s)" % (key, fname.split("_")[0], fname))
+    S7 = _load_module("cvt7_scorer_for_cvt8", "cVT7_grouphold_score.py")
+    if S7 is not None:
+        chk(S7.SPEC["ISO"] == SPEC["ISO"] == S7.SPEC["HOLDHIGH"] and S7.SPEC["k01"] == SPEC["k01"],
+            "ISO's spec is BYTE-IDENTICAL to cVT7's (cVT7_grouphold_score.py, imported)")
+        chk(S7.WITNESS_GH["HOLDHIGH"] == WITNESS_GH["HOLDHIGH"] == WITNESS_GH["HIGHISOPATH"]
+            and S7.witness_gh_of("tri", P_BIG) == WITNESS_GH["HOLDBIG"] and S7.witness_gh_of("floor") == WITNESS_GH["LOWISOPATH"]
+            and S7.GROUPHOLD["HOLDHIGH"] == GROUPHOLD["HOLDHIGH"] and S7.HF_POST_SHA == HF_PRE_SHA and S7.NAMES == NAMES
+            and all(S7.v_of(n, P) == v_of(n, P) for P in (P_HIGH, P_BIG) for n in range(0, 50002, 17)),
+            "B cvt7's registered scorer: HOLDHIGH's string and witness are cvt7's BYTE FOR BYTE; its witness form gives HOLDBIG's "
+            "and LOWISOPATH's; its tree's HF is this batch's pre; its schedule == this one")
+    S6 = _load_module("cvt6_scorer_for_cvt8", "cVT6_complementpath_score.py")
+    if S6 is not None:
+        chk(S6.P_HIGH == P_BIG and S6.BETAHOLD["HOLDHIGH"].endswith(":tri:9428")
+            and all(S6.v_of(n, P_BIG) == v_of(n, P_BIG) for n in range(0, 50002, 13))
+            and all(S6.rec_value(n, [2, 102, 302], [-13.8, -13.7, -15.0]) == rec_value(n, [2, 102, 302], [-13.8, -13.7, -15.0])
+                    for n in range(0, 400)),
+            "B cvt6's registered scorer: P_BIG == PlainNet's HOLDHIGH P, the same schedule at every 13th update; the same rec: arithmetic")
+    have = runsdir and all(os.path.isdir(os.path.join(runsdir, b)) for b in ("ciso1", "cdep1", "ciso2", "cvt7"))
+    if have:
+        DV = _load_module("cvt8_deriv_for_scorer", "cvt8_registration_derivations.py")
+        chk(DV.B0 == B0 and DV.MS == MS and (DV.LO, DV.HI) == (LO, HI) and DV.ISOSPEC == ISOSPEC and DV.P_BIG == P_BIG
+            and DV.P_HIGH == P_HIGH and DV.FILE_ID == ISOPATH_ID and DV.TEST_ID == TESTDOWN_ID,
+            "B the derivation module's constants == this scorer's")
+        csvp = csvpath if csvpath and os.path.exists(csvpath) else DEFAULT_CSV
+        elig, table = DV.eligibility(runsdir, csvp)
+        late = [x[0] for x in table if any("LANDED AFTER REGISTRATION" in w for w in x[4])]
+        chk(elig == ISOPATH_SOURCE, "B RULE I re-run on THIS host: the eligible runs are exactly the 12 registered sources",
+            "%d eligible; %d candidates landed after registration (excluded by rule)" % (len(elig), len(late)))
+        kn2, kv2, names2 = DV.derive_knots(runsdir, csvp)
+        body = DV.knots_json(kn2, kv2, names2).encode()
+        chk(hashlib.sha256(body).hexdigest() == ISOPATH_SHA and body == open(ISOPATH_FILE, "rb").read(),
+            "B RULE I re-run on THIS host's landed records reproduces the replay file BYTE FOR BYTE")
+        chk(hashlib.sha256(DV.test_json().encode()).hexdigest() == TESTDOWN_SHA, "B the TEST-ONLY file's bytes (TESTDOWN_SHA)")
+        if K is not None:
+            chk(all(DV.DV6.rec_value(n, K[0], K[1]) == rec_value(n, K[0], K[1]) for n in range(0, 50002, 13)),
+                "B the derivation's rec: schedule == this scorer's at every 13th update")
+        P7 = DV.DV7.derive_P(runsdir)
+        chk(P7["HIGH"] == P_HIGH, "B RULE P (243.3) re-run on THIS host == P_HIGH %d" % P_HIGH, str(P7))
+        # real-record G-BITE
+        n_ctl = n_ctl_tot = 0
+        for nm in ISOPATH_SOURCE:
+            b, _a, s0 = nm.split("-")
+            recs = load_probe(runsdir, "ISO", int(s0[1:]), prefix=b, max_step=50000)
+            n_ctl += bite_check("ISO", recs)[0]
+            n_ctl_tot += 1
+        for b, seeds in (("ciso1", (21, 22, 23)), ("cdep1", (24, 25, 26)), ("ciso2", (31, 32, 33)), ("cvt7", (99, 100, 101))):
+            for s0 in seeds:
+                n_ctl += bite_check("k01", load_probe(runsdir, "k01", s0, prefix=b, max_step=50000))[0]
+                n_ctl_tot += 1
+        chk(n_ctl == n_ctl_tot == 24, "B G-BITE PASSES on all 24 landed k01 / ISO runs (ciso1, cdep1, ciso2, cvt7) read as controls",
+            "%d/%d" % (n_ctl, n_ctl_tot))
+        n_iso_null = 0
+        for nm in ISOPATH_SOURCE:
+            b, _a, s0 = nm.split("-")
+            recs = load_probe(runsdir, "ISO", int(s0[1:]), prefix=b, max_step=50000)
+            for a in HELD:
+                okn, dn = bite_check(a, recs)
+                n_iso_null += (not okn) and (dn["bad_sched"] + dn["bad_sched_pre"] > 0)
+        chk(n_iso_null == 60, "B every landed ISO run read as each of the 5 held arms FAILS the carrier schedule (60/60)", "%d/60" % n_iso_null)
+        hh_ok = hh_null = hh_big = lo_null = 0
+        for s0 in (99, 100, 101):
+            rh_ = load_probe(runsdir, "HOLDHIGH", s0, prefix="cvt7")
+            hh_ok += bite_check("HOLDHIGH", rh_)[0]
+            okn, dn = bite_check("HIGHISOPATH", rh_)
+            hh_null += (not okn) and dn["bad_sched"] == 0 and dn["bad_rsched"] > 0
+            okb, db = bite_check("HOLDBIG", rh_)
+            hh_big += (not okb) and db["bad_sched"] > 0
+            rl_ = load_probe(runsdir, "HOLDLOW", s0, prefix="cvt7")
+            okl, dl = bite_check("LOWISOPATH", rl_)
+            lo_null += (not okl) and dl["bad_sched"] == 0 and dl["bad_rsched"] > 0
+        chk(hh_ok == 3, "B cvt7's 3 landed HOLDHIGH runs PASS G-BITE as cvt8's HOLDHIGH (the same design, bitwise the same string)")
+        chk(hh_null == 3 and lo_null == 3,
+            "B THE BROKEN-REST_HOLD NULL ON REAL RECORDS: cvt7 HOLDHIGH read as HIGHISOPATH and cvt7 HOLDLOW read as LOWISOPATH pass the"
+            " carrier schedule and FAIL the complement schedule (3/3, 3/3)", "%d / %d" % (hh_null, lo_null))
+        chk(hh_big == 3, "B cvt7 HOLDHIGH read as HOLDBIG FAILS the carrier schedule (3/3): tri:8609 is not tri:9428")
+    else:
+        note("landed ciso1 / cdep1 / ciso2 / cvt7 records not under %s -- RULE I and the real-record nulls are recorded at 248" % runsdir)
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(), "B the LIVE manifest guard 4 wrote is BYTE-IDENTICAL to synthetic_manifest_text()")
+    else:
+        note("no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+
+    print("\nC. CORPUS PREMISES AND THE NOISE FLOOR, read through corpus_exclusions.filter_rows (OPERATIONS 36)")
+    try:
+        CE = _exclusions()
+        chk(hasattr(CE, "filter_rows"), "analysis/corpus_exclusions.py imports and provides filter_rows")
+    except Exception as ex:
+        CE = None
+        chk(False, "analysis/corpus_exclusions.py imports", "%s: %s" % (type(ex).__name__, ex))
+    chk("filter_rows" in inspect.getsource(read_corpus), "read_corpus() calls filter_rows by default")
+    rows = read_corpus(csvpath) if CE else None
+    if rows is None:
+        skip("corpus premises -- %s not readable" % csvpath)
+    else:
+        sha = file_sha(csvpath)
+        reg = sha == REG_CORPUS_SHA256
+        naive = read_corpus(csvpath, filtered=False)
+        note("corpus %d rows (cvt8 excluded), %d after filter_rows, sha %s... -- %s" % (
+            len(naive), len(rows), sha[:12], "THE REGISTRATION CORPUS" if reg else "not the registration corpus: drift NOTED"))
+        s_f = pooled_sigma(rows, net_is(NET))
+        s_n = pooled_sigma(naive, net_is(NET))
+        print("       SIGMA_R18ALL  FILTERED %s (df %s, cells %s)   NAIVE %s (df %s)" % (fmt(s_f[0], 12), s_f[1], s_f[2], fmt(s_n[0], 12), s_n[1]))
+        if reg:
+            chk(s_f[0] is not None and abs(s_f[0] - SIGMA_R18ALL) < 1e-12 and s_f[1] == 215,
+                "SIGMA_R18ALL: the FROZEN literal %.17g IS the FILTERED value (df 215)" % SIGMA_R18ALL)
+            chk(s_n[0] is not None and abs(s_n[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and s_n[0] > 3 * s_f[0],
+                "the NAIVE ResNet floor %.4f is > 3 x the filtered one: cvt7's held rows would inflate it (the trap, disclosed)" % SIGMA_R18ALL_NAIVE)
+        else:
+            note("SIGMA_R18ALL filtered %s vs frozen %.17g -- feeds no bar (O2)" % (fmt(s_f[0], 12), SIGMA_R18ALL))
+        chk(not any(r.get("seed") in ("102", "103", "104") for r in naive), "ZERO corpus rows carry seed 102, 103 or 104")
+        note("THE CSV HAS NO GROUP_HOLD / REST_HOLD COLUMN: at ingest the 15 held rows share ISO's cell keys and go into "
+             "results/CORPUS-EXCLUSIONS.tsv in the SAME commit (OPERATIONS 36); the 9 forced rows are two-kind (MULTI_KIND, 248)")
+
+    print("\nD. THE FLOOR TABLE (164.6).  Chance %.2f pp, ceiling 100.  Levels UNSURE." % CHANCE)
+    lo_all = 100.0
+    for acc, pred in ACCOUNTS.items():
+        print("  %-28s %s" % (acc, "  ".join("%s %.0f-%.0f" % (a, pred[a][0], pred[a][1]) for a in ARMS)))
+        lo_all = min(lo_all, min(pred[a][0] for a in ARMS))
+        for nm, (x, y) in (("P_DOSE", ("HOLDHIGH", "HOLDBIG")), ("P_ROUTE", ("HIGHISOPATH", "HOLDHIGH")),
+                           ("P_ROUTE_BIG", ("BIGISOPATH", "HOLDBIG"))):
+            dlo, dhi = pred[x][0] - pred[y][1], pred[x][1] - pred[y][0]
+            chk(dhi <= (100 - CHANCE) - 25 and dlo >= -(100 - CHANCE) + 25,
+                "%-28s %s predicted %+.0f..%+.0f is >= 25 pp inside both hard bounds" % (acc, nm, dlo, dhi))
+        chk(pred["ISO"][0] - pred["k01"][1] >= 3 * RESCUE_BAR, "%-28s ISO predicted >= 30 pp off k01" % acc)
+        mid = dict((a, (pred[a][0] + pred[a][1]) / 2.0) for a in ARMS)
+        chk(decide(mid) == EXPECTED_BRANCH[acc], "%-28s midpoint lands in %s" % (acc, EXPECTED_BRANCH[acc]), decide(mid))
+    chk(lo_all - CHANCE >= 7.0, "the LOWEST level ANY account predicts for ANY arm is >= 7 pp above chance", "%.1f" % (lo_all - CHANCE))
+    null = ACCOUNTS["BROKEN-REST_HOLD (null)"]
+    chk(null == ACCOUNTS["NO-DOSE x DIRECT"]
+        and all(ACCOUNTS[x]["HIGHISOPATH"] == ACCOUNTS[x]["HOLDHIGH"] and ACCOUNTS[x]["BIGISOPATH"] == ACCOUNTS[x]["HOLDBIG"]
+                for x in ("DOSE x DIRECT", "NO-DOSE x DIRECT", "PARTIAL-DOSE x DIRECT")),
+        "DECLARED: a REST_HOLD that never bit (forced arm = its free twin) predicts EXACTLY the <dose> x DIRECT levels -- G-BITE separates them")
+    mids = set(decide(dict((a, (p[a][0] + p[a][1]) / 2.0) for a in ARMS)) for k_, p in ACCOUNTS.items() if "null" not in k_)
+    chk(len(mids) == len(ACCOUNTS) - 1, "the %d non-null accounts' midpoints land in %d different branches" % (len(ACCOUNTS) - 1, len(ACCOUNTS) - 1),
+        str(len(mids)))
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS (invented numbers; evidence of nothing)")
+    tmp = tempfile.mkdtemp(prefix="cvt8_selftest_")
+    template = os.path.join(tmp, "_probe_template")
+    _e_probe_template(template)
+    plman = synthetic_manifest_text().replace("NETWORK ResNet18_c100", "NETWORK PlainNet18_c100")
+    B0R = _E_BRANCH0
+    wit_cvt6 = ("COMP_HOLD: on type=blockwise group=0 groupsize=52 mode=tri P=9428 b0=-13.815510749816895 ms=0.001 "
+                "lo=-15.0 hi=-2.3026 peak=-4.387510749816894")
+    cases = [
+        ("DOSE-FULL x DIRECT x BIG-DIRECT", {}, {}, B0R),
+        ("DOSE-FULL x VIA x BIG-VIA", {"HIGHISOPATH": 69.0, "BIGISOPATH": 68.5}, {}, "DOSE-FULL+ROUTE-VIA+BIGROUTE-VIA"),
+        ("DOSE-FULL x VIA x BIG-DIRECT", {"HIGHISOPATH": 69.0}, {}, "DOSE-FULL+ROUTE-VIA+BIGROUTE-DIRECT"),
+        ("DOSE-FULL x PARTIAL x BIG-PARTIAL", {"HIGHISOPATH": 60.0, "BIGISOPATH": 40.0}, {}, "DOSE-FULL+ROUTE-PARTIAL+BIGROUTE-PARTIAL"),
+        ("NO-DOSE x DIRECT x BIG-DIRECT", {"HOLDBIG": 48.0, "BIGISOPATH": 47.0}, {}, "NO-DOSE+ROUTE-DIRECT+BIGROUTE-DIRECT"),
+        ("NO-DOSE x VIA x BIG-VIA", {"HOLDBIG": 48.0, "BIGISOPATH": 68.0, "HIGHISOPATH": 68.0}, {}, "NO-DOSE+ROUTE-VIA+BIGROUTE-VIA"),
+        ("DOSE-PARTIAL x DIRECT x BIG-DIRECT", {"HOLDBIG": 36.0, "BIGISOPATH": 35.0}, {}, "DOSE-PARTIAL+ROUTE-DIRECT+BIGROUTE-DIRECT"),
+        ("DOSE-REVERSED x DIRECT x BIG-UNREADABLE", {"HOLDBIG": 63.0, "BIGISOPATH": 63.0}, {}, "DOSE-REVERSED+ROUTE-DIRECT+BIGROUTE-UNREADABLE"),
+        ("HIGHISOPATH below HOLDHIGH is DIRECT, stamped", {"HIGHISOPATH": 30.0}, {}, B0R),
+        ("COMP-HOLD-CONTROL-FAILED", {"LOWISOPATH": 23.5, "HIGHISOPATH": 23.2}, {}, "COMP-HOLD-CONTROL-FAILED"),
+        ("COMP-HOLD-CONTROL-PARTIAL", {"LOWISOPATH": 50.0}, {}, "COMP-HOLD-CONTROL-PARTIAL"),
+        ("REPLICATE-FAILED low", {"HOLDHIGH": 30.0}, {}, "REPLICATE-FAILED"),
+        ("REPLICATE-FAILED high", {"HOLDHIGH": 62.0}, {}, "REPLICATE-FAILED"),
+        ("positive control fails", {"ISO": 35.0, "LOWISOPATH": 35.0, "HOLDHIGH": 30.0}, {}, "POSITIVE-CONTROL-FAILED"),
+        ("scalar not collapsed", {"k01": 40.0}, {}, "SCALAR-NOT-COLLAPSED"),
+        ("near-bar DOSE NULL just inside", {"HOLDBIG": 23.0 + NULL_BAR - 0.05}, {}, B0R),
+        ("near-bar DOSE NULL just outside", {"HOLDBIG": 23.0 + NULL_BAR + 0.05, "BIGISOPATH": 25.0}, {}, "DOSE-PARTIAL+ROUTE-DIRECT+BIGROUTE-DIRECT"),
+        ("near-bar NO-DOSE just inside", {"HOLDBIG": 50.0 - MATCH_BAR + 0.05, "BIGISOPATH": 45.0}, {}, "NO-DOSE+ROUTE-DIRECT+BIGROUTE-DIRECT"),
+        ("near-bar NO-DOSE just outside", {"HOLDBIG": 50.0 - MATCH_BAR - 0.05, "BIGISOPATH": 45.0}, {}, "DOSE-PARTIAL+ROUTE-DIRECT+BIGROUTE-DIRECT"),
+        ("near-bar ROUTE MATCH just inside", {"HIGHISOPATH": 50.0 + MATCH_BAR - 0.05}, {}, B0R),
+        ("near-bar ROUTE MATCH just outside", {"HIGHISOPATH": 50.0 + MATCH_BAR + 0.05}, {}, "DOSE-FULL+ROUTE-PARTIAL+BIGROUTE-DIRECT"),
+        ("near-bar ROUTE VIA just inside", {"HIGHISOPATH": 70.0 - MATCH_BAR + 0.05}, {}, "DOSE-FULL+ROUTE-VIA+BIGROUTE-DIRECT"),
+        ("near-bar REP_MARGIN just inside", {"HOLDHIGH": 70.0 - REP_MARGIN - 0.05, "HIGHISOPATH": 59.0}, {}, B0R),
+        ("near-bar LOWISOPATH MATCH just outside", {"LOWISOPATH": 70.0 - MATCH_BAR - 0.05}, {}, "COMP-HOLD-CONTROL-PARTIAL"),
+        ("diverged", {}, {"over": {("HOLDBIG", 103): 40.0}}, "UNRESOLVED-DIVERGED"),
+        ("harness: every arm tiny", dict((a, 3.0) for a in ARMS), {}, "HARNESS-UNSOUND"),
+        ("harness: AUGMENT=0 on one run", {}, {"env_break": ("HOLDBIG", 104)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS spec != arm", {}, {"spec_break": ("BIGISOPATH", 103)}, "HARNESS-UNSOUND"),
+        ("harness: HOLDBIG printed HOLDHIGH's GROUP_HOLD witness", {}, {"gh_break": (("HOLDBIG", 102), WITNESS_GH["HOLDHIGH"])}, "HARNESS-UNSOUND"),
+        ("harness: ISO printed a GROUP_HOLD on-line", {}, {"gh_break": (("ISO", 103), WITNESS_GH["LOWISOPATH"])}, "HARNESS-UNSOUND"),
+        ("harness: no GROUP_HOLD line (cvt4's tree)", {}, {"gh_break": (("LOWISOPATH", 104), "")}, "HARNESS-UNSOUND"),
+        ("harness: no REST_HOLD line (cvt7's tree)", {}, {"rh_break": (("HOLDHIGH", 102), "")}, "HARNESS-UNSOUND"),
+        ("harness: no REST_HOLD line on a forced arm", {}, {"rh_break": (("HIGHISOPATH", 103), "")}, "HARNESS-UNSOUND"),
+        ("harness: HOLDBIG printed a REST_HOLD on-line", {}, {"rh_break": (("HOLDBIG", 104), WITNESS_RH["BIGISOPATH"])}, "HARNESS-UNSOUND"),
+        ("harness: a REST_HOLD witness with another replay sha", {},
+         {"rh_break": (("LOWISOPATH", 102), WITNESS_RH["LOWISOPATH"].replace(ISOPATH_SHA, "0" * 64))}, "HARNESS-UNSOUND"),
+        ("harness: a REST_HOLD tri witness", {}, {"rh_break": (("BIGISOPATH", 102), witness_rh_of("tri", 9428))}, "HARNESS-UNSOUND"),
+        ("harness: a cvt6 COMP_HOLD line", {}, {"ch_break": (("HIGHISOPATH", 104), wit_cvt6)}, "HARNESS-UNSOUND"),
+        ("harness: a VOTE_W on-line", {}, {"vw_break": (("HOLDHIGH", 102), "VOTE_W: on type=blockwise items=50:x")}, "HARNESS-UNSOUND"),
+        ("harness: a BETA_HOLD on-line", {}, {"bh_break": (("HOLDBIG", 103), "BETA_HOLD: on type=blockwise group=1 x")}, "HARNESS-UNSOUND"),
+        ("harness: no BETA_HOLD line (the LIVE tree)", {}, {"bh_break": (("ISO", 104), "")}, "HARNESS-UNSOUND"),
+        ("harness: manifest names another net", {}, {"manifest": plman}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt7's HF", {}, {"prov": {"hf": HF_PRE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the LIVE HF", {}, {"prov": {"hf": HF_LIVE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt7's runner", {}, {"prov": {"runner": CVT7_RUNNER_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the LIVE runner", {}, {"prov": {"runner": LIVE_RUNNER_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another replay", {}, {"prov": {"replay": "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names PlainNet's build_network", {},
+         {"prov": {"bn": "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance dry-run", {}, {"prov": {"mode": "dry-run"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another scorer", {}, {"prov": {"scorer": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("BROKEN REST_HOLD: every forced complement UNHELD at DIRECT's levels", {},
+         {"probe_break": dict((((a, 103), _e_probe_records(a, seed=103, runheld=True, strip_rh=True)) for a in FORCED))}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN REST_HOLD: unheld but carrying rh keys", {},
+         {"probe_break": {("HIGHISOPATH", 102): _e_probe_records("HIGHISOPATH", seed=102, runheld=True, add_rh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN GROUP_HOLD: HOLDBIG's carriers unheld", {"HOLDBIG": 50.0},
+         {"probe_break": {("HOLDBIG", 104): _e_probe_records("HOLDBIG", seed=104, unheld=True, strip_gh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: HOLDBIG records carry tri:8609", {},
+         {"probe_break": {("HOLDBIG", 102): _e_probe_records("HOLDBIG", seed=102, as_arm="HOLDHIGH")}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: BIGISOPATH records carry tri:8609", {},
+         {"probe_break": {("BIGISOPATH", 103): _e_probe_records("BIGISOPATH", seed=103, as_arm="HIGHISOPATH")}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG REPLAY: the complement on tri:9428 (cvt6's MUTEPATH)", {},
+         {"probe_break": {("LOWISOPATH", 104): _e_probe_records("LOWISOPATH", seed=104, rh_as_tri=9428)}}, "PATCH-NOT-VERIFIED"),
+        ("HOLD ONLY AT PROBE STEPS: complement beta_pre is Lion's", {},
+         {"probe_break": {("HIGHISOPATH", 103): _e_probe_records("HIGHISOPATH", seed=103, rpre_natural=True)}}, "PATCH-NOT-VERIFIED"),
+        ("HOLD ONLY AT PROBE STEPS: carrier beta_pre is Lion's", {},
+         {"probe_break": {("HOLDHIGH", 104): _e_probe_records("HOLDHIGH", seed=104, pre_natural=True)}}, "PATCH-NOT-VERIFIED"),
+        ("FREE COMPLEMENT TOUCHED on HOLDBIG", {},
+         {"probe_break": {("HOLDBIG", 103): _e_probe_records("HOLDBIG", seed=103, touch_complement=True)}}, "PATCH-NOT-VERIFIED"),
+        ("rh_nat FORGED", {}, {"probe_break": {("BIGISOPATH", 102): _e_probe_records("BIGISOPATH", seed=102, rh_forge=True)}}, "PATCH-NOT-VERIFIED"),
+        ("gh_nat FORGED", {}, {"probe_break": {("HOLDHIGH", 103): _e_probe_records("HOLDHIGH", seed=103, gh_forge=True)}}, "PATCH-NOT-VERIFIED"),
+        ("rh_n OFF BY ONE", {}, {"probe_break": {("LOWISOPATH", 103): _e_probe_records("LOWISOPATH", seed=103, rh_off_by_one=True)}}, "PATCH-NOT-VERIFIED"),
+        ("HOLDHIGH carries rh keys", {}, {"probe_break": {("HOLDHIGH", 102): _e_probe_records("HOLDHIGH", seed=102, add_rh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("a CONTROL carries gh keys", {}, {"probe_break": {("ISO", 102): _e_probe_records("ISO", seed=102, add_gh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("a held arm carries bh keys", {}, {"probe_break": {("HOLDBIG", 104): _e_probe_records("HOLDBIG", seed=104, add_bh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("a forced arm carries ch keys", {}, {"probe_break": {("BIGISOPATH", 104): _e_probe_records("BIGISOPATH", seed=104, add_ch=True)}}, "PATCH-NOT-VERIFIED"),
+        ("k01's Lion half broken", {}, {"probe_break": {("k01", 104): _e_probe_records("k01", seed=104, touch_complement=True)}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a BIGISOPATH file garbled", {},
+         {"probe_break": {("BIGISOPATH", 102): _e_probe_records("BIGISOPATH", seed=102)[:499] + ["{not json"]}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a LOWISOPATH probe dir missing", {}, {"probe_drop": ("LOWISOPATH", 103)}, "PATCH-NOT-VERIFIED"),
+        ("probe: an ISO file short (400 records)", {}, {"probe_break": {("ISO", 104): _e_probe_records("ISO", n=400, seed=104)}}, "PATCH-NOT-VERIFIED"),
+        ("a DROPPED run", {}, {"drop": ("HOLDBIG", 103)}, "INCOMPLETE"),
+        ("a TRUNCATED higher-jid resubmission", {}, {"shadow": ("BIGISOPATH", 102)}, B0R),
+    ]
+    results = {}
+    for lab, lv, kw, want in cases:
+        dd = os.path.join(tmp, re.sub(r"\W+", "_", lab))
+        os.makedirs(dd)
+        _e_build(dd, template, levels=lv, **kw)
+        rc, fin, out = _e_score(dd, csvpath)
+        results[lab] = (rc, fin, out, dd)
+        chk(fin.startswith("FINAL: %s |" % want), "E %-60s -> %s" % (lab, want), fin[:100])
+    rc, fin, out, dpath = results["DOSE-FULL x DIRECT x BIG-DIRECT"]
+    chk(rc == 0 and all(x in fin for x in ("HARNESS-CLEAN", "PATCH-BITES", "HOLDBIG-AT-K01", "HOLDHIGH-BETWEEN", "LOWISOPATH-AT-ISO",
+                                          "FLOOR-READINGS-ARE-BOUNDS", "ONE-NETWORK-RESNET", "BIG-IS-PLAINNET-DOSE",
+                                          "ISOPATH-REPLAY-FILE", "FORCED-ARMS-OPEN-LOOP", "TRAIN-AGREES")),
+        "E the base case exits 0 with the state stamps and the unconditional stamps", fin[:160])
+    chk("HIGHISOPATH-BELOW-HOLDHIGH" in results["HIGHISOPATH below HOLDHIGH is DIRECT, stamped"][1],
+        "E HIGHISOPATH more than 5 pp below HOLDHIGH is stamped, and reads ROUTE-DIRECT")
+    chk("UNBRANCHED-DOSE-FULL" in results["COMP-HOLD-CONTROL-FAILED"][1], "E an unbranched batch stamps its dose word")
+    chk(results["BROKEN REST_HOLD: every forced complement UNHELD at DIRECT's levels"][0] == 1,
+        "E the BROKEN-REST_HOLD null at DIRECT's levels exits 1, reaching NO branch")
+    chk(results["a DROPPED run"][0] == 2, "E a DROPPED run exits 2 (INCOMPLETE)")
+    chk(results["harness: AUGMENT=0 on one run"][0] == 1, "E a harness failure exits 1")
+    chk(results["a TRUNCATED higher-jid resubmission"][1] == results["DOSE-FULL x DIRECT x BIG-DIRECT"][1],
+        "E a truncated higher-jid resubmission does not shadow a complete run")
+    chk("G-BITE BIGISOPATH   s102 records 500  bad 0  nonfinite 0  lion 0" in out and "keys-wrong 0" in out,
+        "E G-BITE reads 500 records per run and audits every half")
+    chk("arm-mean TEST (TRAIN) at epoch lines" in out and "TOGETHER: at PlainNet's dose" in out,
+        "E the descriptive readout and the composed licence print (after FINAL)")
+
+    print("\n   O2 INVARIANCE: the SAME synthetic runs against four corpora")
+    variants = _e_csv_variants(csvpath if csvpath and os.path.exists(csvpath) else None, tmp)
+    for case in ("DOSE-FULL x DIRECT x BIG-DIRECT", "NO-DOSE x VIA x BIG-VIA", "DOSE-PARTIAL x DIRECT x BIG-DIRECT"):
+        ref_fin, ref_bars = None, None
+        dd = results[case][3]
+        for lab in ("real", "real+invented", "minimal-invented", "no-corpus"):
+            if lab not in variants:
+                skip("O2 %s corpus not available on this host" % lab)
+                continue
+            rc, fin, out = _e_score(dd, variants[lab])
+            bars = _bar_lines(out)
+            if ref_fin is None:
+                ref_fin, ref_bars = fin, bars
+            chk(fin == ref_fin and bars == ref_bars and len(bars) == 6,
+                "O2 %-36s %-17s FINAL and SIGMA/SE/bars/PRIMARY lines are IDENTICAL" % (case, lab), fin[:44])
+    if "real+invented" in variants:
+        a_ = pooled_sigma(read_corpus(variants["real"]), net_is(NET))[0]
+        b_ = pooled_sigma(read_corpus(variants["real+invented"]), net_is(NET))[0]
+        chk(a_ is not None and b_ is not None and b_ > 5 * a_,
+            "O2 non-vacuity: invented rows at cvt8's own cells MOVE the FILTERED ResNet sigma (%.4f -> %.4f); FINAL did not move"
+            % (a_ or 0, b_ or 0))
+
+    print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION, as a subprocess")
+    me = os.path.abspath(__file__)
+    try:
+        p = subprocess.run([sys.executable, me, dpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 0 and fl and fl[-1] == results["DOSE-FULL x DIRECT x BIG-DIRECT"][1],
+            "`python3 %s <runsdir>` exits 0 with the in-process FINAL line" % os.path.basename(me), "rc %d" % p.returncode)
+        p = subprocess.run([sys.executable, me, results["a DROPPED run"][3]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 2 and fl and fl[-1].startswith("FINAL: INCOMPLETE"), "... and on a dropped run exits 2 with FINAL: INCOMPLETE",
+            "rc %d" % p.returncode)
+    except Exception as e:
+        chk(False, "subprocess invocation", "%s: %s" % (type(e).__name__, e))
+
+    print("\nF. THE BRANCH MAP IS TOTAL -- 20,000 random in-batch means, every branch registered")
+    import random
+    rnd = random.Random(20260917)
+    seen = set()
+    for _ in range(20000):
+        m = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        if rnd.random() < 0.7:
+            m["k01"], m["ISO"] = rnd.uniform(15, 28), rnd.uniform(62, 78)
+            m["LOWISOPATH"] = m["ISO"] - rnd.uniform(-3, 4)
+            m["HOLDHIGH"] = rnd.uniform(m["k01"] + 10, m["ISO"] - 10)
+        seen.add(decide(m, rnd.random() < 0.02))
+    chk(seen <= all_branches() and all(licence_lines(b) for b in seen), "every branch decide() returns has a registered licence text",
+        "%d distinct" % len(seen))
+    reached = set(r[1].split(" |")[0][len("FINAL: "):] for r in results.values())
+    note("branches reached by section E or the sweep: %d of %d registered (the rest are word combinations of reached words)"
+         % (len(reached | seen), len(all_branches())))
+    words = set(w for b in (reached | seen) for w in b.split("+"))
+    chk(set(LICENSE_DOSE) | set(LICENSE_ROUTE) | set(LICENSE_BIG) - {"ROUTE-UNREADABLE"} <= words | {"ROUTE-UNREADABLE"}
+        and set(LICENSE) - {"INCOMPLETE", "HARNESS-UNSOUND", "PATCH-NOT-VERIFIED"} <= reached | seen,
+        "every registered word and every single-word branch is reached (ROUTE-UNREADABLE is unreachable past the replicate gate)")
+    chk(all("247" in " ".join(licence_lines(b)) for b in all_branches() if b not in ("INCOMPLETE", "SCALAR-NOT-COLLAPSED", "POSITIVE-CONTROL-FAILED")),
+        "every substantive licence states its effect on 247's bounds")
+
+    print("\nG. RULE 21 PREMISE: no cvt8 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cvt8-*.out under %s" % runsdir, "%d found" % len(runs))
+    if csvpath and os.path.exists(csvpath):
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in csv.DictReader(open(csvpath))), "no cvt8- row in the CSV")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cvt8 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cVT8_doseroute_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cvt8/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

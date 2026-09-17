@@ -1,0 +1,1848 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cVT9_dosewindow_score.py -- THE REGISTERED SCORER FOR `cvt9`:
+#   PLAINNET TENSOR 50: WHEN DOES ITS LARGE STEP SIZE DO THE DAMAGE, AND HOW DOES THE DAMAGE SCALE WITH DOSE?
+#   (CORRECTIONS 249)
+#   ONE SUBMISSION, 21 JOBS (7 arms x 3 seeds), 100 EPOCHS, SEEDS {105,106,107},
+#   PlainNet18_c100 / CIFAR-100, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM,
+#   run from the ISOLATED tree $WS/harness_cvt9 = cvt6's tree + PATCH_WINDOWHOLD (patches/patch_windowhold.py).
+#
+# Committed BEFORE any cvt9 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cVT9_dosewindow_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# FROZEN BARS (O2): every bar, sigma and tolerance score() uses is a LITERAL here; the only data-dependent terms are
+# the in-batch arm means (the anchors k01 and LOWHEADPATH, and LATE's own onset level, below) and SIGMA_INBATCH through
+# compose_sigma(), a max() with the frozen floor.  The noise floor is read through corpus_exclusions.filter_rows.
+#
+# THE ARMS (HEAD's grouping sets:1-49,51-53/layer4.1.bn2.weight on every arm but k01; the complement is forced
+# open-loop onto HEADPATH = rec:cvt6_headpath on EVERY held arm, so held arms differ ONLY in 50's schedule)
+#   k01           scalar  --                                                   floor anchor
+#   LOWHEADPATH   50 floor                                                     CONTROL (CTL; cvt6 replicate, 65.02)
+#   HIGHHEADPATH  50 tri:9428 (MUTE's replay, peak -4.3875)                    full-dose replicate (cvt6, 11.49 AT-K01)
+#   MIDDOSE       50 tri:7235 (RULE M, peak -6.5805)                           dose rung
+#   RESDOSE       50 tri:8609 (cvt7's ResNet k01 replay, peak -5.2065)         dose rung (cross-check of cvt7 / cvt8)
+#   EARLY         50 tri:9428 for updates n < 9429 (the rise), floor after      WINDOW_HOLD=0:9429
+#   LATE          50 floor for n < 9429, then the rest of tri:9428 (peak+fall)  WINDOW_HOLD=9429:end
+#   RULE E: n_E = P_HIGH + 1 = 9429 (the peak): the two halves carry the same step sizes (integrated r within 0.10 %),
+#   ~12.0 epochs of r > 100 each; 11 of 12 landed TEST splits end inside EARLY (cvt9_registration_derivations.py S3).
+#
+# ACCOUNTS (UNSURE levels; K01 8-16, FREE 56-72, PART 20-50, LATESTALL 10-17).  Every account: k01 K01, CTL FREE,
+# HIGHHEADPATH K01.
+#   DOSE    DOSE-ALL-STALL (MID K01, RES K01) | DOSE-THRESHOLD (MID FREE, RES K01) | DOSE-ONLY-HIGH-STALLS (MID FREE,
+#           RES FREE) | DOSE-GRADED (a rung PART) | DOSE-NONMONOTONE (MID K01, RES FREE) | BROKEN-DOSE null (every tri
+#           acts as 9428) = DOSE-ALL-STALL's levels, separated by G-HOLDW and G-BITE.
+#   WINDOW  EARLY-WINDOW (EARLY K01, LATE FREE) | LATE-WINDOW (EARLY FREE, LATE LATESTALL) | BOTH-WINDOWS (EARLY K01,
+#           LATE LATESTALL) | NEITHER-WINDOW (both FREE: the damage needs the whole trajectory) | WINDOW-GRADED (PART)
+#           | BROKEN-WINDOW null (WINDOW_HOLD never bites: both = HIGHHEADPATH, K01) = BOTH-WINDOWS' levels, separated
+#           ONLY by G-BITE (declared).
+#
+# STATES.  Dose / replicate arms: AT-CTL iff L >= CTL - 5; AT-K01 iff L <= k01 + 2; else BETWEEN.
+#   Window arms: RESCUED iff L >= CTL - 5; STALLED iff L <= STALLBAR; else PARTIAL, with
+#   STALLBAR(EARLY) = k01 + 2 and STALLBAR(LATE) = max(k01 + 2, ONSET + 5), ONSET = LATE's own arm-mean TEST at Epoch
+#   line 17 (the last line wholly before its window opens at update 9429).  LATE's first 18.86 epochs are the control's
+#   schedule, so a LATE stall cannot sit below what the network had learned when the window opened (cvt6 prior 12.28).
+#
+# BRANCH MAP (decide(); first match wins):  UNRESOLVED-DIVERGED (a seed range > 5) -> SCALAR-NOT-COLLAPSED (k01 > 20)
+#   -> CONTROL-FAILED (CTL - k01 < 20) -> REPLICATE-FAILED (HIGHHEADPATH not AT-K01) -> then TWO tokens:
+#   DOSE:   DOSE-NONMONOTONE (RES - MID > 5) | DOSE-ALL-STALL | DOSE-THRESHOLD | DOSE-ONLY-HIGH-STALLS | DOSE-GRADED
+#   WINDOW: WINDOW-ONSET-UNRESOLVED (STALLBAR(LATE) >= CTL - 5) | EARLY-WINDOW | LATE-WINDOW | BOTH-WINDOWS |
+#           NEITHER-WINDOW | WINDOW-GRADED
+# CO-PRIMARY (in batch; bounded in neither direction): P_MID = CTL - MIDDOSE; P_RES = CTL - RESDOSE;
+#   P_EARLY = CTL - EARLY; P_LATE = CTL - LATE; P_WIN = LATE - EARLY.
+# KEY: D_CTL = CTL - k01; R_HIGH = CTL - HIGHHEADPATH (cvt6's P_50 replicated).  DESCRIPTIVE: ADD = P_EARLY + P_LATE -
+#   R_HIGH.
+# G-BITE (-> PATCH-NOT-VERIFIED, before any level): 500 records; Lion on k01; group 1 == the arm's (windowed) schedule
+#   and group 0 == HEADPATH at every record in beta AND beta_pre; bh_* / ch_* / wh_* records audit; no hold key on
+#   k01, no wh_* key on a non-windowed arm.
+# plateau5 PRIMARY (epochs 95..99 of each run's own .out); TRAIN beside TEST; the probe readout after FINAL is
+# DESCRIPTIVE and cannot move it.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import inspect
+import io
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+PREFIX = "cvt9"
+NET = "PlainNet18_c100"
+PARENT = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (105, 106, 107)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+CTL = "LOWHEADPATH"
+ARMS = ("k01", "LOWHEADPATH", "HIGHHEADPATH", "MIDDOSE", "RESDOSE", "EARLY", "LATE")
+HELD = ARMS[1:]
+FORCED = HELD
+WINDOWED = ("EARLY", "LATE")
+DOSE_ARMS = ("MIDDOSE", "RESDOSE")
+HEADSPEC = "sets:1-49,51-53/layer4.1.bn2.weight"
+SPEC = {"k01": "scalar", "LOWHEADPATH": HEADSPEC, "HIGHHEADPATH": HEADSPEC, "MIDDOSE": HEADSPEC, "RESDOSE": HEADSPEC,
+        "EARLY": HEADSPEC, "LATE": HEADSPEC}
+PT_TYPE = dict((a, "scalar" if SPEC[a] == "scalar" else "blockwise") for a in ARMS)
+
+IDX_HEAD = 50
+NAME_HEAD = "layer4.1.bn2.weight"
+P_HIGH = 9428                          # RULE P, MUTE's shared beta (237.3)
+P_HEAD = 5041                          # RULE P, HEAD's isolated 50 (237.3)
+P_MID = 7235                           # RULE M = (P_HEAD + P_HIGH + 1) // 2 (249)
+P_RES = 8609                           # cvt7's RULE P on ResNet18_c100 k01 (243.3(2))
+N_E = 9429                             # RULE E = P_HIGH + 1 (249)
+E1_LINE = 17                           # the last Epoch line wholly before update N_E (line 17 ends at update 9000)
+MODE = {"LOWHEADPATH": ("floor", None), "HIGHHEADPATH": ("tri", P_HIGH), "MIDDOSE": ("tri", P_MID),
+        "RESDOSE": ("tri", P_RES), "EARLY": ("tri", P_HIGH), "LATE": ("tri", P_HIGH)}
+WINDOW = {"EARLY": (0, N_E), "LATE": (N_E, None)}
+HEADPATH_ID = "cvt6_headpath"
+HEADPATH_SHA = "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d"   # RULE H, 242.3 (reused)
+HEADPATH_FILE = os.path.join(REPO, "patches", HEADPATH_ID + ".json")
+HEADPATH_KNOTS = 500
+HEADPATH_N0, HEADPATH_N1 = 2, 49902
+HEADPATH_VMAX = -4.852388381958008
+HEADPATH_VLAST = -15.0
+MS = 1e-3
+B2 = 0.9
+LO, HI = -15.0, -2.3026
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+B0 = f32(math.log(1e-6))
+
+
+def betahold_of(arm):
+    if arm not in MODE:
+        return ""
+    m, P = MODE[arm]
+    return "%s:%s" % (NAME_HEAD, m if m != "tri" else "tri:%d" % P)
+
+
+def comphold_of(arm):
+    return "rec:%s" % HEADPATH_ID if arm in FORCED else ""
+
+
+def windowhold_of(arm):
+    if arm not in WINDOW:
+        return ""
+    n0, n1 = WINDOW[arm]
+    return "%d:%s" % (n0, "end" if n1 is None else "%d" % n1)
+
+
+def witness_bh_of(mode, P=None):
+    if mode is None:
+        return "BETA_HOLD: off"
+    d = "BETA_HOLD: on type=blockwise group=1 groupsize=1 name=%s" % NAME_HEAD
+    if mode == "floor":
+        return d + " mode=floor value=%r" % (LO,)
+    return d + " mode=tri P=%d b0=%r ms=%r lo=%r hi=%r peak=%r" % (P, B0, MS, LO, HI, min(HI, max(LO, B0 + MS * P)))
+
+
+def witness_ch_of(on, sha=HEADPATH_SHA):
+    if not on:
+        return "COMP_HOLD: off"
+    return ("COMP_HOLD: on type=blockwise group=0 groupsize=52 mode=rec id=%s sha256=%s knots=%d n0=%d n1=%d b0=%r lo=%r "
+            "hi=%r vmax=%r vlast=%r" % (HEADPATH_ID, sha, HEADPATH_KNOTS, HEADPATH_N0, HEADPATH_N1, B0, LO, HI,
+                                        HEADPATH_VMAX, HEADPATH_VLAST))
+
+
+def witness_wh_of(win, P=P_HIGH):
+    if win is None:
+        return "WINDOW_HOLD: off"
+    n0, n1 = win
+    return ("WINDOW_HOLD: on type=blockwise group=1 name=%s base=tri P=%d n0=%d n1=%s outside=floor value=%r"
+            % (NAME_HEAD, P, n0, "end" if n1 is None else "%d" % n1, LO))
+
+
+BETAHOLD = dict((a, betahold_of(a)) for a in ARMS)
+COMPHOLD = dict((a, comphold_of(a)) for a in ARMS)
+WINDOWHOLD = dict((a, windowhold_of(a)) for a in ARMS)
+WITNESS_BH = dict((a, witness_bh_of(*MODE[a]) if a in MODE else witness_bh_of(None)) for a in ARMS)
+WITNESS_CH = dict((a, witness_ch_of(a in FORCED)) for a in ARMS)
+WITNESS_WH = dict((a, witness_wh_of(WINDOW.get(a))) for a in ARMS)
+WITNESS_VW = "VOTE_W: off"
+
+NTENS = 53
+TOTPAR = 11046308
+PARENT_NTENS = 62
+N_BATCHNORM = 17
+BN512_IDX = (41, 44, 47, 50)
+BN512_NAMES = ("layer4.0.bn1.weight", "layer4.0.bn2.weight", "layer4.1.bn1.weight", "layer4.1.bn2.weight")
+SHORTCUT_9 = tuple("layer%d.0.shortcut.%s" % (s, k) for s in (2, 3, 4) for k in ("0.weight", "1.weight", "1.bias"))
+HEAD_SIZES = [52, 1]
+HEAD_PARAMS = [TOTPAR - 512, 512]
+POST_SHA = "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b"       # build_network (cpl1)
+HF_CVT1_SHA = "3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52"
+HF_CVT4_SHA = "84b345adf6df8024bbe4c694fcbbaffc6211d1c7b7ae4b9ae933e353298a3d96"
+HF_PRE_SHA = "f1b9c8aa87953c2fd3f64145126591608d332812183911a39ce9f525101edd2e"     # cvt6's HF.py (+ PATCH_COMPHOLD)
+HF_POST_SHA = "816e335777f7c0bb52747949dff81aa57fe0695bab2d61d984ae6ce9daab3a9d"    # + PATCH_WINDOWHOLD
+HF_LIVE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+RUNNER_SHA = "0fe45b1d1d2cea28740c72e08193af7d5bab3819b397f59f580c71bb9fbf7849"      # $WS/jobs/run_cifar_cvt9.sh
+CVT6_RUNNER_SHA = "9aa2ed5c15b8ecd8c22d5137ab4be169b97f9556ebe67b8460c4971d4f84783f"
+
+# ---- the noise floor, FROZEN (O2), through corpus_exclusions.filter_rows (cvt9_registration_derivations.py S7) --
+SIGMA_R18ALL = 0.6881530279923828      # ResNet18_c100 std cell, FILTERED, df 215, 46 cells
+SIGMA_PLAIN = 0.4421126341915261       # PlainNet18_c100 std cell, FILTERED, df 53, 7 cells
+SIGMA_PLAIN_NAIVE = 15.946402139840398  # UNFILTERED -- disclosure only
+SIGMA_R18ALL_NAIVE = 2.2086717848823785  # UNFILTERED -- disclosure only
+SIGMA_PRIOR = 0.6881530279923828       # = max(SIGMA_R18ALL, SIGMA_PLAIN)
+SE_PRIOR = 0.561875                    # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_SHA256 = "355c0977b2a6f87ba08aaae51ec9e9f84f7c10fa5432eff3505e89488bb58bdd"
+REG_CORPUS_ROWS = 3085
+REG_EXCLUSIONS_SHA256 = "d0b955cbfce5c485c48c23d53feadd1fee581f379a221596fa65cf99c7eefe93"
+
+# ---- the bars, FROZEN (cvt4's / cvt6's) ----------------------------------------------
+GAP_MIN = 20.0
+K01_MAX = 20.0
+RESCUE_BAR = 10.0
+NULL_BAR = 2.0
+MATCH_BAR = 5.0
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+TIE_REL = 1e-12
+STEPS_PER_EPOCH = 50000 // BATCH
+N_RECORDS = EPOCHS * STEPS_PER_EPOCH // PROBE      # 500
+# non-vacuity on landed cvt6 records (cvt9_registration_derivations.py S5), re-derived by selftest B
+NONVAC_MIN = {("HIGHHEADPATH", "MIDDOSE"): 4.3860, ("HIGHHEADPATH", "RESDOSE"): 1.6380, ("HIGHHEADPATH", "EARLY"): 10.5395,
+              ("HIGHHEADPATH", "LATE"): 10.5855, ("LOWHEADPATH", "EARLY"): 10.5855, ("LOWHEADPATH", "LATE"): 10.5395}
+ONSET_PRIOR = 12.28                    # cvt6 LOWHEADPATH arm-mean TEST at line 17 (S3) -- selftest D only
+
+R_BETWEEN = {"cvt6": {"k01": 12.0700, "LOWHEADPATH": 65.0207, "HIGHHEADPATH": 11.4933, "HEAD": 64.9000},
+             "cvt4": {"HOLDHEAD(tri:5041)": 64.6660, "HOLDHIGH(tri:9428)": 11.1267},
+             "cvt7 (ResNet, carrier group)": {"HOLDHIGH(tri:8609)": 50.2273, "ISO": 70.0413, "k01": 22.9527}}
+PL_PER_RUN_GPUH = 0.67
+
+K01_PL = (8.0, 16.0)
+FREE_PL = (56.0, 72.0)
+PART_PL = (20.0, 50.0)
+LATESTALL_PL = (10.0, 17.0)
+
+
+def _acc(mid, res, early, late):
+    return {"k01": K01_PL, "LOWHEADPATH": FREE_PL, "HIGHHEADPATH": K01_PL, "MIDDOSE": mid, "RESDOSE": res,
+            "EARLY": early, "LATE": late}
+
+
+DOSE_ACCOUNTS = {"DOSE-ALL-STALL": (K01_PL, K01_PL), "DOSE-THRESHOLD": (FREE_PL, K01_PL),
+                 "DOSE-ONLY-HIGH-STALLS": (FREE_PL, FREE_PL), "DOSE-GRADED": (PART_PL, PART_PL),
+                 "DOSE-NONMONOTONE": (K01_PL, FREE_PL), "BROKEN-DOSE": (K01_PL, K01_PL)}
+DOSE_EXPECTED = {"DOSE-ALL-STALL": "DOSE-ALL-STALL", "DOSE-THRESHOLD": "DOSE-THRESHOLD",
+                 "DOSE-ONLY-HIGH-STALLS": "DOSE-ONLY-HIGH-STALLS", "DOSE-GRADED": "DOSE-GRADED",
+                 "DOSE-NONMONOTONE": "DOSE-NONMONOTONE", "BROKEN-DOSE": "DOSE-ALL-STALL"}
+WIN_ACCOUNTS = {"EARLY-WINDOW": (K01_PL, FREE_PL), "LATE-WINDOW": (FREE_PL, LATESTALL_PL),
+                "BOTH-WINDOWS": (K01_PL, LATESTALL_PL), "NEITHER-WINDOW": (FREE_PL, FREE_PL),
+                "WINDOW-GRADED": (PART_PL, PART_PL), "BROKEN-WINDOW": (K01_PL, K01_PL)}
+WIN_EXPECTED = {"EARLY-WINDOW": "EARLY-WINDOW", "LATE-WINDOW": "LATE-WINDOW", "BOTH-WINDOWS": "BOTH-WINDOWS",
+                "NEITHER-WINDOW": "NEITHER-WINDOW", "WINDOW-GRADED": "WINDOW-GRADED", "BROKEN-WINDOW": "BOTH-WINDOWS"}
+COPRIMARY = (("P_MID", (CTL, "MIDDOSE")), ("P_RES", (CTL, "RESDOSE")), ("P_EARLY", (CTL, "EARLY")),
+             ("P_LATE", (CTL, "LATE")), ("P_WIN", ("LATE", "EARLY")))
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize",
+            "alpha0", "gamma", "augment", "beta_clip", "batch_size",
+            "epochs_requested", "hier", "lam", "eta_ratio"]
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,"
+                     r"\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^cvt9-(k01|LOWHEADPATH|HIGHHEADPATH|MIDDOSE|RESDOSE|EARLY|LATE)-s(\d+)-(\d+)\.out$")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise|blockwise) tensors=%d " % (PROBE, NTENS))
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =============================================================================
+# schedules, Lion
+# =============================================================================
+def u_of(n, P):
+    if n <= 0:
+        return 0
+    return min(n - 1, P) - max(0, n - 1 - P)
+
+
+def v_of(n, P, b0=B0):
+    return f32(min(HI, max(LO, b0 + MS * u_of(n, P))))
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    a, b = B2 * mom_pre, (1 - B2) * z
+    L = a + b
+    tie = abs(L) <= TIE_REL * (abs(a) + abs(b))
+    s = (L > 0) - (L < 0)
+    return max(LO, min(HI, beta_pre - MS * s)), tie
+
+
+def in_window(arm, n):
+    if arm not in WINDOW:
+        return True
+    n0, n1 = WINDOW[arm]
+    return n >= n0 and (n1 is None or n < n1)
+
+
+def hold_value(arm, n):
+    """50's applied schedule (group 1), window included, as float32."""
+    m, P = MODE[arm]
+    if m == "floor" or not in_window(arm, n):
+        return f32(LO)
+    return v_of(n, P)
+
+
+_KNOTS = {}
+
+
+def load_knots(path=HEADPATH_FILE, want_sha=HEADPATH_SHA):
+    if path in _KNOTS:
+        return _KNOTS[path]
+    out = None
+    if os.path.exists(path):
+        body = open(path, "rb").read()
+        if hashlib.sha256(body).hexdigest() == want_sha:
+            d = json.loads(body.decode("utf-8"))
+            out = ([int(x) for x in d["n"]], [float(x) for x in d["v"]])
+    _KNOTS[path] = out
+    return out
+
+
+def rec_value(n, kn, kv, b0=B0):
+    """PATCH_COMPHOLD's rec: schedule as float32 (242.3(2))."""
+    if n < kn[0]:
+        x = b0
+    elif n >= kn[-1]:
+        x = kv[-1]
+    else:
+        lo_, hi_ = 0, len(kn) - 1
+        while hi_ - lo_ > 1:
+            mid = (lo_ + hi_) // 2
+            if kn[mid] <= n:
+                lo_ = mid
+            else:
+                hi_ = mid
+        k = lo_
+        x = kv[k] + (kv[k + 1] - kv[k]) * (n - kn[k]) / float(kn[k + 1] - kn[k])
+    return f32(min(HI, max(LO, x)))
+
+
+def hold_c_value(n):
+    K = load_knots()
+    if K is None:
+        return None
+    return rec_value(n, K[0], K[1])
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+# =============================================================================
+# the frozen manifest (no torch).  The launcher's guard 4d proves the LIVE manifest BYTE-IDENTICAL.
+# =============================================================================
+def r18_tensors(plain):
+    t = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [(pre + "conv1.weight", w * cin * 9, "Conv2d"), (pre + "bn1.weight", w, "BatchNorm2d"),
+                  (pre + "bn1.bias", w, "BatchNorm2d"), (pre + "conv2.weight", w * w * 9, "Conv2d"),
+                  (pre + "bn2.weight", w, "BatchNorm2d"), (pre + "bn2.bias", w, "BatchNorm2d")]
+            if not plain and (stride != 1 or cin != w):
+                t += [(pre + "shortcut.0.weight", w * cin, "Conv2d"), (pre + "shortcut.1.weight", w, "BatchNorm2d"),
+                      (pre + "shortcut.1.bias", w, "BatchNorm2d")]
+        inp = w
+    return t + [("linear.weight", 512 * 100, "Linear"), ("linear.bias", 100, "Linear")]
+
+
+NAMES = [n for n, _q, _o in r18_tensors(True)]
+
+
+def parse_sets(spec, names):
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def arm_groups(arm, names=None):
+    names = names or NAMES
+    if SPEC[arm] == "scalar":
+        return [list(range(1, len(names) + 1))]
+    return parse_sets(SPEC[arm], names)
+
+
+def synthetic_manifest_text():
+    t = r18_tensors(True)
+    names = [n for n, _q, _o in t]
+    numel = [q for _n, q, _o in t]
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+             "NORM BatchNorm2d %d GroupNorm 0" % N_BATCHNORM, "PARENT %s %d" % (PARENT, PARENT_NTENS),
+             "PARENT_REMOVED %s" % " ".join(SHORTCUT_9),
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH)]
+    for i, (n, q, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("W512 %s" % ",".join("%d:%s" % x for x in zip(BN512_IDX, BN512_NAMES)))
+    lines.append("REPLAY B0 %r MS %r P_HIGH %d P_MID %d P_RES %d N_E %d HEADPATH %s SHA256 %s KNOTS %d"
+                 % (B0, MS, P_HIGH, P_MID, P_RES, N_E, HEADPATH_ID, HEADPATH_SHA, HEADPATH_KNOTS))
+    for a in ARMS:
+        g = arm_groups(a, names)
+        if SPEC[a] == "scalar":
+            lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        else:
+            lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                         % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                            ",".join(str(sum(numel[i - 1] for i in x)) for x in g),
+                            " ".join(names[i - 1] for i in g[1])))
+        lines.append("BETAHOLD %s %s" % (a, BETAHOLD[a] or "off"))
+        lines.append("COMPHOLD %s %s" % (a, COMPHOLD[a] or "off"))
+        lines.append("WINDOWHOLD %s %s" % (a, WINDOWHOLD[a] or "off"))
+        lines.append("WITNESS %s %s" % (a, WITNESS_BH[a]))
+        lines.append("CWITNESS %s %s" % (a, WITNESS_CH[a]))
+        lines.append("WWITNESS %s %s" % (a, WITNESS_WH[a]))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "vw": [ln for ln in lines if ln.startswith("VOTE_W")],
+           "bh": [ln for ln in lines if ln.startswith("BETA_HOLD")],
+           "ch": [ln for ln in lines if ln.startswith("COMP_HOLD")],
+           "wh": [ln for ln in lines if ln.startswith("WINDOW_HOLD")],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["plateau5"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s" % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r):
+    return (r.get("epochs_requested") == str(EPOCHS) and r.get("augment") == AUG and r.get("beta_clip") == CLIP
+            and r.get("meta_stepsize") == MST and r.get("alpha0") == A0 and r.get("batch_size") == str(BATCH))
+
+
+def pooled_sigma(rows, extra):
+    cells = {}
+    for r in rows:
+        if usable(r) and std_cell(r) and extra(r):
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc, nm = 0.0, 0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+        nm += len(v)
+    return (math.sqrt(ss / df) if df else None), df, nc, nm
+
+
+def net_is(net):
+    return lambda r: r.get("network") == net and r.get("dataset") == DSET
+
+
+# =============================================================================
+# probe records and G-BITE
+# =============================================================================
+def load_probe(runsdir, arm, seed, prefix=PREFIX):
+    for base in (os.path.join(runsdir, prefix), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (prefix, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            return recs
+    return None
+
+
+BH_KEYS = ("bh_n", "bh_active", "bh_nat", "bh_held")
+CH_KEYS = ("ch_n", "ch_active", "ch_nat", "ch_held")
+WH_KEYS = ("wh_n", "wh_active", "wh_nat", "wh_held")
+
+
+def _groupvec(r, key, ng):
+    v = r.get(key)
+    if not (isinstance(v, list) and len(v) == 1 and isinstance(v[0], list) and len(v[0]) == ng):
+        return None
+    return [float(x) for x in v[0]]
+
+
+def _audit(r, pfx, n, g, beta, want_nat, prev, tie=False):
+    """one patch's own record on one group.  -> (ok, active_flag, count); count None if unreadable."""
+    try:
+        cn, ca, cnat, cheld = (int(r[pfx + "_n"]), int(r[pfx + "_active"]), float(r[pfx + "_nat"]),
+                               float(r[pfx + "_held"]))
+    except (KeyError, TypeError, ValueError):
+        return False, False, None
+    ok = (cn == n and abs(cheld - beta[g]) <= BH_TOL and 0 <= ca <= cn and ca >= prev
+          and (tie or abs(cnat - want_nat) <= BH_TOL))
+    return ok, abs(cnat - cheld) > BH_TOL, ca
+
+
+def bite_check(arm, recs):
+    """G-BITE for ONE run.  -> (ok, detail).  Pure function of the records."""
+    ng = len(arm_groups(arm))
+    held = arm in HELD
+    win = arm in WINDOWED
+    d = {"n": 0, "nonfinite": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0,
+         "bad_sched": 0, "bad_sched_pre": 0, "bad_csched": 0, "bad_csched_pre": 0, "bad_bh": 0, "bad_ch": 0,
+         "bad_wh": 0, "keys_on_control": 0, "active_records": 0, "cactive_records": 0, "wactive_records": 0,
+         "bh_active_last": None, "ch_active_last": None, "wh_active_last": None,
+         "worst_lion": 0.0, "worst_sched": 0.0, "worst_csched": 0.0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    if held and hold_c_value(2) is None:
+        d["why"] = "replay file %s unavailable or sha != HEADPATH_SHA" % HEADPATH_FILE
+        return False, d
+    prev_b = prev_c = prev_w = -1
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) \
+                or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre = _groupvec(r, "beta_pre", ng)
+            mom = _groupvec(r, "mom_pre", ng)
+            z = _groupvec(r, "z_agg", ng)
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        s = r["step"]
+        if s != 100 * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        n = s + 2
+        has_bh = any(key in r for key in BH_KEYS)
+        has_ch = any(key in r for key in CH_KEYS)
+        has_wh = any(key in r for key in WH_KEYS)
+        if not held:
+            for g in range(ng):
+                nat, tie = lion_natural(bpre[g], mom[g], z[g])
+                if tie:
+                    d["ties"] += 1
+                    continue
+                e = abs(nat - beta[g])
+                d["worst_lion"] = max(d["worst_lion"], e)
+                d["bad_lion"] += e > BH_TOL
+            d["keys_on_control"] += has_bh or has_ch or has_wh
+            continue
+        if not win:
+            d["keys_on_control"] += has_wh
+        es, ep = abs(beta[1] - hold_value(arm, n)), abs(bpre[1] - hold_value(arm, n - 1))
+        d["worst_sched"] = max(d["worst_sched"], es, ep)
+        d["bad_sched"] += es > BH_TOL
+        d["bad_sched_pre"] += ep > BH_TOL
+        nat1, tie1 = lion_natural(bpre[1], mom[1], z[1])
+        ok, act, ca = _audit(r, "bh", n, 1, beta, nat1, prev_b, tie1)
+        d["bad_bh"] += not ok
+        if ca is not None:
+            d["active_records"] += act
+            prev_b = max(prev_b, ca)
+            d["bh_active_last"] = ca
+        cs, cp = abs(beta[0] - hold_c_value(n)), abs(bpre[0] - hold_c_value(n - 1))
+        d["worst_csched"] = max(d["worst_csched"], cs, cp)
+        d["bad_csched"] += cs > BH_TOL
+        d["bad_csched_pre"] += cp > BH_TOL
+        nat0, tie0 = lion_natural(bpre[0], mom[0], z[0])
+        ok, act, ca = _audit(r, "ch", n, 0, beta, nat0, prev_c, tie0)
+        d["bad_ch"] += not ok
+        if ca is not None:
+            d["cactive_records"] += act
+            prev_c = max(prev_c, ca)
+            d["ch_active_last"] = ca
+        if win:
+            ok, act, ca = _audit(r, "wh", n, 1, beta, v_of(n, MODE[arm][1]), prev_w)
+            d["bad_wh"] += not ok
+            if ca is not None:
+                d["wactive_records"] += act
+                prev_w = max(prev_w, ca)
+                d["wh_active_last"] = ca
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS
+          and d["bad_step"] == 0 and d["bad_lion"] == 0 and d["keys_on_control"] == 0)
+    if held:
+        ok = (ok and d["bad_sched"] == 0 and d["bad_sched_pre"] == 0 and d["bad_bh"] == 0
+              and d["bad_csched"] == 0 and d["bad_csched_pre"] == 0 and d["bad_ch"] == 0
+              and (d["ch_active_last"] is None or d["ch_active_last"] >= d["cactive_records"]))
+        if not win:   # under a window bh_active counts tri-vs-Lion differences, not held-vs-Lion (patch_windowhold.py)
+            ok = ok and (d["bh_active_last"] is None or d["bh_active_last"] >= d["active_records"])
+    if win:
+        ok = (ok and d["bad_wh"] == 0 and d["wh_active_last"] is not None
+              and d["wh_active_last"] >= d["wactive_records"])
+    return ok, d
+
+
+# =============================================================================
+# DESCRIPTIVE readouts (after FINAL; cannot move it)
+# =============================================================================
+def beta_summary(recs, coord):
+    vals = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("beta"), list) and len(r["beta"]) > coord \
+                and isinstance(r.get("step"), int):
+            try:
+                v = float(r["beta"][coord])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                vals.append((r["step"], v))
+    if not vals:
+        return None
+    pk = max(vals, key=lambda sv: sv[1])
+    win = [math.exp(v + 15.0) for s, v in vals if 15 <= s / float(STEPS_PER_EPOCH) < 30]
+    win0 = [math.exp(v + 15.0) for s, v in vals if 5 <= s / float(STEPS_PER_EPOCH) < 18.858]
+    win1 = [math.exp(v + 15.0) for s, v in vals if 18.858 <= s / float(STEPS_PER_EPOCH) < 41]
+    return {"peak": pk[1], "peak_epoch": pk[0] / float(STEPS_PER_EPOCH), "r1530": mean(win), "rE": mean(win0),
+            "rL": mean(win1)}
+
+
+def descriptive_probe_readout(runsdir, runs):
+    print("\nDESCRIPTIVE, NON-GATING -- 50's beta from the runs' own probe.jsonl; r = exp(beta + 15) over epochs 5-18.86 / 18.86-41")
+    for a in ARMS:
+        for s in SEEDS:
+            recs = load_probe(runsdir, a, s)
+            if not recs:
+                continue
+            bs = beta_summary(recs, 0 if PT_TYPE[a] == "scalar" else 1)
+            last = [r for r in recs if isinstance(r, dict)]
+            act = " ".join("%s %s" % (k, last[-1].get(k, "-")) for k in ("bh_active", "ch_active", "wh_active")) if last else ""
+            if bs:
+                print("  %-12s s%d  %s peak %.3f @%.1f  r(5-18.9) %.0f  r(18.9-41) %.0f  %s"
+                      % (a, s, "beta" if PT_TYPE[a] == "scalar" else "b50", bs["peak"], bs["peak_epoch"], bs["rE"], bs["rL"], act))
+    ep_list = (9, 14, 15, 16, 17, 18, 19, 20, 22, 24, 29, 39, 49, 99)
+    print("\nDESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) at epoch lines %s" % " / ".join(str(e) for e in ep_list))
+    for a in ARMS:
+        cells = []
+        for e in ep_list:
+            te = [runs[(a, s)]["eps"][e][1] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            tr = [runs[(a, s)]["eps"][e][0] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            cells.append("%.1f (%.1f)" % (mean(te), mean(tr)) if te else "n/a")
+        print("  %-12s %s" % (a, " / ".join(cells)))
+    for y in HELD[1:]:
+        first = None
+        cx = dict((e, mean([runs[(CTL, s)]["eps"][e][1] for s in SEEDS])) for e in range(EPOCHS))
+        cy = dict((e, mean([runs[(y, s)]["eps"][e][1] for s in SEEDS])) for e in range(EPOCHS))
+        for e in range(EPOCHS):
+            if all(cx[f] - cy[f] > 2.0 for f in range(e, EPOCHS)):
+                first = e
+                break
+        print("  first epoch line from which arm-mean TEST %s - %s stays > 2 pp: %s" % (CTL, y, "never" if first is None else first))
+
+
+# =============================================================================
+# THE BRANCH MAP -- a pure function of the in-batch means, one flag and LATE's onset level
+# =============================================================================
+def state(L, M):
+    if L >= M[CTL] - MATCH_BAR:
+        return "AT-CTL"
+    if L <= M["k01"] + NULL_BAR:
+        return "AT-K01"
+    return "BETWEEN"
+
+
+def stallbar(arm, M, onset_late):
+    if arm == "LATE":
+        return max(M["k01"] + NULL_BAR, onset_late + MATCH_BAR)
+    return M["k01"] + NULL_BAR
+
+
+def wstate(arm, M, onset_late):
+    L = M[arm]
+    if L >= M[CTL] - MATCH_BAR:
+        return "RESCUED"
+    if L <= stallbar(arm, M, onset_late):
+        return "STALLED"
+    return "PARTIAL"
+
+
+def decide(M, diverged=False, onset_late=ONSET_PRIOR):
+    """M: arm -> mean plateau5; onset_late: LATE's arm-mean TEST at Epoch line E1_LINE."""
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M[CTL] - M["k01"] < GAP_MIN:
+        return "CONTROL-FAILED"
+    if state(M["HIGHHEADPATH"], M) != "AT-K01":
+        return "REPLICATE-FAILED"
+    sm, sr = state(M["MIDDOSE"], M), state(M["RESDOSE"], M)
+    if M["RESDOSE"] - M["MIDDOSE"] > MATCH_BAR:
+        dose = "DOSE-NONMONOTONE"
+    elif sm == "AT-K01" and sr == "AT-K01":
+        dose = "DOSE-ALL-STALL"
+    elif sm == "AT-CTL" and sr == "AT-K01":
+        dose = "DOSE-THRESHOLD"
+    elif sm == "AT-CTL" and sr == "AT-CTL":
+        dose = "DOSE-ONLY-HIGH-STALLS"
+    else:
+        dose = "DOSE-GRADED"
+    if stallbar("LATE", M, onset_late) >= M[CTL] - MATCH_BAR:
+        window = "WINDOW-ONSET-UNRESOLVED"
+    else:
+        we, wl = wstate("EARLY", M, onset_late), wstate("LATE", M, onset_late)
+        if we == "STALLED" and wl == "RESCUED":
+            window = "EARLY-WINDOW"
+        elif we == "RESCUED" and wl == "STALLED":
+            window = "LATE-WINDOW"
+        elif we == "STALLED" and wl == "STALLED":
+            window = "BOTH-WINDOWS"
+        elif we == "RESCUED" and wl == "RESCUED":
+            window = "NEITHER-WINDOW"
+        else:
+            window = "WINDOW-GRADED"
+    return "%s | %s" % (dose, window)
+
+
+READING = "240's OWN-STEP-MAGNITUDE and 246's GRADED (HIGHHEADPATH-AT-K01)"
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement about the" % (FLOOR_MIN, CEIL_MAX),
+                        "harness only; " + READING + " is untouched."],
+    "PATCH-NOT-VERIFIED": [
+        "G-BITE failed: on at least one run the probe records do not show 50 on its registered (windowed) schedule and",
+        "the complement on HEADPATH at every record, or a patch record does not audit, or a key sits on a control, or",
+        "records are missing / short / unreadable.  This is the BROKEN-WINDOW / BROKEN-DOSE null or an unreadable",
+        "witness: NO level is read (a WINDOW_HOLD that never bit predicts EXACTLY BOTH-WINDOWS' levels).  " + READING + " untouched."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch; " + READING + " is untouched."],
+    "SCALAR-NOT-COLLAPSED": ["k01 did not collapse in batch (> %.0f pp).  Nothing to explain." % K01_MAX],
+    "CONTROL-FAILED": [
+        "LOWHEADPATH (50 at the floor, the complement forced onto HEADPATH; cvt6 65.02) did not lift the arm %.0f pp above" % GAP_MIN,
+        "k01 in this batch: the COMP-HOLD-BREAKS account, or the forced rescue did not reproduce.  Every held arm shares",
+        "that complement schedule, so no dose or window sentence is licensed.  EFFECT ON " + READING + ": untested; stop."],
+    "REPLICATE-FAILED": [
+        "HIGHHEADPATH (the full tri:9428 with the complement on HEADPATH; cvt6 11.49 AT-K01) is not within %.0f pp of k01" % NULL_BAR,
+        "in this batch (state stamped).  Dose rungs and windows are read against that full-dose stall.  EFFECT ON",
+        READING + ": HIGHHEADPATH-AT-K01 PUT IN QUESTION by a failed replication at new seeds (not rescinded); no dose or window sentence."],
+    "DOSE-NONMONOTONE": [
+        "RESDOSE (the larger rung) sits more than %.0f pp ABOVE MIDDOSE: the level is not monotone in this triangle family." % MATCH_BAR,
+        "EFFECT ON " + READING + ": no dose sentence; the dose curve is not a threshold or a graded fall in peak step size."],
+    "DOSE-ALL-STALL": [
+        "Both rungs sit at the k01 location: 50 on tri:7235 (peak -6.58, r ~4,500 at the peak) is already sufficient to",
+        "stall at this cell, as are tri:8609 and tri:9428; tri:5041 (cvt4 HOLDHEAD, between batch) kept the rescue.",
+        "EFFECT ON " + READING + ": the large-step sentence holds down to MIDDOSE's peak; any threshold lies between",
+        "the peaks -8.77 and -6.58 (not located).  CROSS-CHECK: RESDOSE (cvt7's ResNet replay) stalls PlainNet fully, so",
+        "cvt7's partial ResNet loss is not explained by that trajectory being too small a dose by itself (network or",
+        "held set remain).  Not licensed: a dose curve below MIDDOSE; sufficiency on another network."],
+    "DOSE-THRESHOLD": [
+        "MIDDOSE keeps the control's level and RESDOSE sits at the k01 location: at this cell the stall switches on",
+        "between the peaks -6.58 (tri:7235) and -5.21 (tri:8609) -- a threshold-like dose response over these rungs.",
+        "EFFECT ON " + READING + ": 'large' is located above peak -6.58.  CROSS-CHECK: cvt7's ResNet replay is ABOVE the",
+        "PlainNet threshold, so its partial ResNet loss is not a too-small dose (network or held set remain).  Not",
+        "licensed: the threshold's exact location, sharpness between rungs, any other network."],
+    "DOSE-ONLY-HIGH-STALLS": [
+        "Both rungs keep the control's level; only tri:9428 (HIGHHEADPATH) stalls: the stall switches on between the peaks",
+        "-5.21 and -4.39.  EFFECT ON " + READING + ": 'large' means MUTE's replay or near it.  CROSS-CHECK: cvt7's ResNet",
+        "replay does NOT stall PlainNet either, so a dose account of cvt7's partial loss is open (dose could explain",
+        "'part').  Not licensed: the threshold's location between the two rungs; any other network."],
+    "DOSE-GRADED": [
+        "At least one rung sits between k01 and the control (states stamped), monotone within %.0f pp: the damage grows" % MATCH_BAR,
+        "with the peak step size across the triangle family rather than switching at one rung.  EFFECT ON " + READING + ":",
+        "the stall is GRADED in dose at this cell; read P_MID and P_RES.  CROSS-CHECK: RESDOSE's state is the PlainNet",
+        "level of cvt7's ResNet trajectory.  Not licensed: a functional form; any other network."],
+    "WINDOW-ONSET-UNRESOLVED": [
+        "LATE's stall bar max(k01 + %.0f, onset + %.0f) reaches the control's AT-CTL bar: the network had already learned" % (NULL_BAR, MATCH_BAR),
+        "too much by update %d for a LATE stall to be told from a rescue.  EFFECT ON " % N_E + READING + ": no window",
+        "sentence; the window question is untested by this cut."],
+    "EARLY-WINDOW": [
+        "EARLY (the rise of tri:9428 to update %d, then the floor) sits at the k01 location while LATE (the floor, then" % N_E,
+        "the peak and the fall) keeps the control's level.  EFFECT ON " + READING + ": at this cell the damage is done by",
+        "the RISE of 50's large step size (epochs 0-18.86); the same step sizes delivered after epoch 18.86 are harmless,",
+        "and the damage persists after 50 is frozen.  Not licensed: which sub-window of the rise; why; any other network."],
+    "LATE-WINDOW": [
+        "EARLY keeps the control's level while LATE stalls at or near the level it had when its window opened.  EFFECT ON",
+        READING + ": at this cell the damage is done by the PEAK AND FALL (epochs 18.86-40); the rise alone is harmless",
+        "even though the TEST split was seen at line 16.  Not licensed: which sub-window; why; any other network."],
+    "BOTH-WINDOWS": [
+        "Both halves stall: either half of tri:9428 is sufficient.  IDENTICAL IN LEVEL TO THE BROKEN-WINDOW NULL (both",
+        "= HIGHHEADPATH), which G-BITE excluded.  EFFECT ON " + READING + ": no window is necessary at this cut; the",
+        "damage needs neither the whole trajectory nor a particular half.  Not licensed: a smaller sufficient window."],
+    "NEITHER-WINDOW": [
+        "Both halves keep the control's level while the whole tri:9428 stalls: the damage needs the WHOLE trajectory",
+        "(rise AND peak/fall).  EFFECT ON " + READING + ": REFINED -- no half of the large trajectory is sufficient at",
+        "this cut.  Not licensed: that duration rather than a specific rise-then-fall shape is what matters."],
+    "WINDOW-GRADED": [
+        "At least one window arm is PARTIAL (states stamped): each half carries part, or one half partly.  EFFECT ON",
+        READING + ": PARTLY LOCATED -- read P_EARLY, P_LATE and P_WIN; no single-window sentence."],
+}
+
+
+def license_lines(branch):
+    out = []
+    for tok in branch.split(" | "):
+        out += LICENSE[tok]
+    return out
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    print("=" * 78)
+    print(" cvt9 -- PLAINNET TENSOR 50: WHEN (EARLY / LATE) AND HOW MUCH (MIDDOSE / RESDOSE)?  (PATCH_WINDOWHOLD)")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-12s %-38s BETA_HOLD %-30s COMP_HOLD %-18s WINDOW_HOLD %s" % (a, SPEC[a], BETAHOLD[a] or "(unset)",
+              COMPHOLD[a] or "(unset)", WINDOWHOLD[a] or "(unset)"))
+    print(" CO-PRIMARY: P_MID, P_RES, P_EARLY, P_LATE (= LOWHEADPATH - arm), P_WIN = LATE - EARLY.")
+    print(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)." % (EPOCHS - 5, EPOCHS - 1))
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+
+    runs, rnotes = read_runs(runsdir)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                    "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                    "momentum-param-base": "0.99", "weight-decay-base": "0.1", "momentum-param-meta": "0.99",
+                    "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad]) if (dup or bad) else "")
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()), "G-ENV one distinct ENV line, one per run",
+         "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is cvt1's / cvt4's / cvt6's, byte for byte (PROBE_DIR stripped)")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0]) or PT_RE.match(r["pt"][0]).group(1) != PT_TYPE[a]]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`" % (PROBE, NTENS),
+         "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    print("\nG-VOTEW / G-HOLDW / G-CHOLDW / G-WHOLDW   one line of each kind per run == the arm's registered witness")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            hchk(r["vw"] == [WITNESS_VW], "G-VOTEW %s-s%d" % (a, s), "" if r["vw"] == [WITNESS_VW] else "got %r" % (r["vw"][:2],))
+            hchk(r["bh"] == [WITNESS_BH[a]], "G-HOLDW %s-s%d" % (a, s),
+                 "" if r["bh"] == [WITNESS_BH[a]] else "got %r" % ([x[:160] for x in r["bh"][:2]],))
+            hchk(r["ch"] == [WITNESS_CH[a]], "G-CHOLDW %s-s%d" % (a, s),
+                 "" if r["ch"] == [WITNESS_CH[a]] else "got %r" % ([x[:200] for x in r["ch"][:2]],))
+            hchk(r["wh"] == [WITNESS_WH[a]], "G-WHOLDW %s-s%d" % (a, s),
+                 "" if r["wh"] == [WITNESS_WH[a]] else "got %r" % ([x[:160] for x in r["wh"][:2]],))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(),
+             "G-STRUCT byte-identical to synthetic_manifest_text() (53 tensors, HEAD [52,1], the three hold tables)",
+             "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == POST_SHA, "G-PROV build_network.py sha256 == POST_SHA %s..." % POST_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        hchk(prov.get("HF_SHA256") == HF_POST_SHA, "G-PROV HF.py sha256 == HF_POST_SHA %s... (cvt9's PATCH_WINDOWHOLD tree)"
+             % HF_POST_SHA[:12], str(prov.get("HF_SHA256"))[:16])
+        hchk(prov.get("RUNNER_SHA256") == RUNNER_SHA, "G-PROV RUNNER_SHA256 == cvt9's runner %s..." % RUNNER_SHA[:12],
+             str(prov.get("RUNNER_SHA256"))[:16])
+        hchk(prov.get("REPLAY_SHA256") == HEADPATH_SHA, "G-PROV REPLAY_SHA256 == HEADPATH_SHA %s..." % HEADPATH_SHA[:12],
+             str(prov.get("REPLAY_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer's sha256 %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    print("\nG-REPLAY  the replay file this scorer reads")
+    hchk(os.path.exists(HEADPATH_FILE) and file_sha(HEADPATH_FILE) == HEADPATH_SHA and load_knots() is not None
+         and len(load_knots()[0]) == HEADPATH_KNOTS,
+         "G-REPLAY %s sha256 == HEADPATH_SHA, %d knots" % (os.path.relpath(HEADPATH_FILE, REPO), HEADPATH_KNOTS))
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-12s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        print("               seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    the registered holds reached the step sizes at every record, and touched nothing else")
+    print("  (a) 500 records; (b) k01's beta == Lion recomputed (tol %.0e); (c) every held arm: group 1 == 50's (windowed)" % BH_TOL)
+    print("  schedule and group 0 == HEADPATH, in beta (step+2) AND beta_pre (step+1); (d) bh_* / ch_* / wh_* audit;")
+    print("  (e) no hold key on k01, no wh_* key on a non-windowed arm.")
+    bite_fail = []
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = load_probe(runsdir, a, s)
+            ok, d = bite_check(a, recs)
+            nonfin[(a, s)] = d["nonfinite"]
+            print("  %-4s G-BITE %-12s s%d  records %s  bad %d  nonfinite %d  lion-mismatch %d (ties %d, worst %.1e)  "
+                  "sched50 %d/%d (worst %.1e)  schedC %d/%d (worst %.1e)  bh-audit %d  ch-audit %d  wh-audit %d  "
+                  "keys-on-control %d  active %d/%d/%d  bh_active %s  ch_active %s  wh_active %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), d["bad_rec"], d["nonfinite"],
+                     d["bad_lion"], d["ties"], d["worst_lion"], d["bad_sched"], d["bad_sched_pre"], d["worst_sched"],
+                     d["bad_csched"], d["bad_csched_pre"], d["worst_csched"], d["bad_bh"], d["bad_ch"], d["bad_wh"],
+                     d["keys_on_control"], d["active_records"], d["cactive_records"], d["wactive_records"],
+                     d["bh_active_last"], d["ch_active_last"], d["wh_active_last"], ("  (%s)" % d["why"]) if "why" in d else ""))
+            if not ok:
+                bite_fail.append("%s-s%d" % (a, s))
+    if bite_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | G-BITE failed on %s" % ",".join(bite_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+
+    onset = mean([runs[("LATE", s)]["eps"][E1_LINE][1] for s in SEEDS])
+    print("\nONSET     LATE's own arm-mean TEST at Epoch line %d (the last line wholly before update %d): %.4f  (seeds %s)"
+          % (E1_LINE, N_E, onset, " / ".join("%.3f" % runs[("LATE", s)]["eps"][E1_LINE][1] for s in SEEDS)))
+
+    print("\nCONTRASTS (every one WITHIN batch)")
+    CP = {}
+    for nm, (x, y) in COPRIMARY:
+        CP[nm] = (M[x] - M[y], T[x] - T[y])
+        print("  PRIMARY  %-7s = %-11s - %-11s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   seeds %s"
+              % (nm, x, y, CP[nm][0], CP[nm][0] / se, CP[nm][1],
+                 " / ".join("%+.3f" % (runs[(x, s)]["plateau5"] - runs[(y, s)]["plateau5"]) for s in SEEDS)))
+    D_CTL = M[CTL] - M["k01"]
+    R_HIGH = M[CTL] - M["HIGHHEADPATH"]
+    print("  KEY      D_CTL   = LOWHEADPATH - k01          = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [positive control]"
+          % (D_CTL, D_CTL / se, T[CTL] - T["k01"]))
+    print("  KEY      R_HIGH  = LOWHEADPATH - HIGHHEADPATH = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [cvt6's P_50, replicated]"
+          % (R_HIGH, R_HIGH / se, T[CTL] - T["HIGHHEADPATH"]))
+    ADD = CP["P_EARLY"][0] + CP["P_LATE"][0] - R_HIGH
+    print("  DESCR    ADD     = P_EARLY + P_LATE - R_HIGH  = %+.4f pp  [0 if the two halves' losses add up to the whole]" % ADD)
+    for a in HELD:
+        print("  KEY      D_%-12s = %-12s - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   kept fraction of R_HIGH %.3f"
+              % (a, a, M[a] - M["k01"], (M[a] - M["k01"]) / se, T[a] - T["k01"],
+                 (M[a] - M["HIGHHEADPATH"]) / R_HIGH if R_HIGH else float("nan")))
+    print("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE)"
+          % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, NULL_BAR, NULL_BAR / se, RESCUE_BAR, RESCUE_BAR / se))
+    print("  state bars: AT-CTL / RESCUED iff L >= %.4f ; AT-K01 / STALLED(EARLY) iff L <= %.4f ; STALLED(LATE) iff L <= %.4f"
+          % (M[CTL] - MATCH_BAR, M["k01"] + NULL_BAR, stallbar("LATE", M, onset)))
+
+    print("\nG-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR,
+                                                     "" if not div else "  diverged: %s" % div))
+
+    branch = decide(M, bool(div), onset)
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "HOLD-FROM-INIT", "COMPLEMENT-ON-HEADPATH", "FORCED-ARMS-OPEN-LOOP",
+              "DOSE-IS-TRIANGLE-FAMILY", "WINDOW-CUT-AT-PEAK", "ONE-WINDOW-PAIR", "ONE-NETWORK-PLAINNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if D_CTL >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if D_CTL >= GAP_MIN:
+        for a in ("HIGHHEADPATH",) + DOSE_ARMS:
+            stamps.append("%s-%s" % (a, state(M[a], M)))
+        for a in WINDOWED:
+            stamps.append("%s-%s" % (a, wstate(a, M, onset)))
+    stamps.append("LATE-ONSET:%.2f" % onset)
+    for a in HELD:
+        if M[a] - M[CTL] > MATCH_BAR:
+            stamps.append("%s-ABOVE-CTL" % a)
+        if M[a] - M["k01"] < -NULL_BAR:
+            stamps.append("%s-BELOW-K01" % a)
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % a)
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in HELD):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    agree = all((t > 0) == (p > 0) for p, t in CP.values() if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cvt9 bar or contrast):")
+    for b, dct in R_BETWEEN.items():
+        print("  %s: %s" % (b, "  ".join("%s %.4f" % kv for kv in dct.items())))
+    print("  cvt9 {105,106,107}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+
+    try:
+        descriptive_probe_readout(runsdir, runs)
+    except Exception as ex:
+        print("  (descriptive probe readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in license_lines(branch):
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Anything about ResNet18_c100, VGG or any other tensor: one network, one cell, one held tensor (idx 50).")
+    print("  * A window finer than the one cut at the peak (update 9429); which sub-window of a half acts.")
+    print("  * A dose curve beyond the four triangle rungs (5041 between batch, 7235, 8609, 9428); the family moves peak,")
+    print("    fall onset and duration together.")
+    print("  * That the forced (open-loop) complement stands for a free one; necessity of anything; point agreement at k01.")
+    print("  * Anything beyond 100 epochs.")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_ENV = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+          "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+          "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 PROBE_DIR=/x/probe EB_RHO=na EB_LOG=0")
+_E_BASE = {"k01": 12.0, "LOWHEADPATH": 64.5, "HIGHHEADPATH": 11.8, "MIDDOSE": 64.0, "RESDOSE": 12.3, "EARLY": 12.1,
+           "LATE": 63.8}   # DOSE-THRESHOLD | EARLY-WINDOW
+_E_ONSET_CTL = 12.3       # LATE follows the control's curve to line E1_LINE, reaching about this value there
+
+
+def _e_curve(level, arm, onset=None):
+    """an invented TEST curve: exactly `level` over the last 5 epochs.  LATE follows a control-like curve to line
+    E1_LINE (value `onset`) and then moves to its level."""
+    out = []
+    for e in range(EPOCHS):
+        if e >= EPOCHS - 5:
+            out.append(level)
+        elif arm == "LATE":
+            on = _E_ONSET_CTL if onset is None else onset
+            if e <= E1_LINE:
+                out.append(on * (e + 1) / float(E1_LINE + 1))
+            else:
+                out.append(level + (on - level) * math.exp(-(e - E1_LINE) / 6.0))
+        else:
+            out.append(level * (1 - math.exp(-(e + 1) / 12.0)))
+    return out
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, bh=None, ch=None, wh=None, vw=None,
+             onset=None):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cvt9 --run-name %s" % (NET, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env, "NVIDIA L4, 23034 MiB",
+             WITNESS_VW if vw is None else vw, WITNESS_BH[arm] if bh is None else bh,
+             WITNESS_CH[arm] if ch is None else ch, WITNESS_WH[arm] if wh is None else wh,
+             "Files already downloaded and verified", "Files already downloaded and verified",
+             "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 dir=/x"
+             % (PT_TYPE[arm], NTENS)]
+    lines = [ln for ln in lines if ln != ""]
+    curve = _e_curve(level, arm, onset)
+    for e in range(n_ep):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.4f %%" % (e, min(99.9, curve[e] + 15.0), curve[e]))
+    if run_done:
+        lines += ["41  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_probe_records(arm, seed=0, n=N_RECORDS, as_arm=None, unheld=False, cunheld=False, unwindowed=False,
+                     pre_natural=False, wpre_natural=False, bh_forge=False, wh_forge=False, wh_off_by_one=False,
+                     strip_wh=False, add_bh=False, add_wh=False, touch=False):
+    """synthetic PROBE_TENSOR records consistent with Lion and the arm's holds.  as_arm: 50 on ANOTHER arm's schedule;
+    unheld / cunheld: that group follows Lion; unwindowed: a windowed arm's 50 carries the WHOLE tri (the null)."""
+    import random
+    rnd = random.Random(3000 + seed + 11 * ARMS.index(arm))
+    ng = len(arm_groups(arm))
+    harm = as_arm or arm
+    out = []
+    active = cactive = wactive = 0
+    for k in range(n):
+        s = 100 * k
+        mom = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        z = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        bpre = [f32(max(LO, min(HI, -13.8 + 0.3 * math.sin(k / 30.0) - 0.004 * k))) for _ in range(ng)]
+        beta = [f32(lion_natural(bpre[g], mom[g], z[g])[0]) for g in range(ng)]
+        rec = {"step": s, "pt_b2": 0.9, "pt_mp": 0.99}
+        if arm in HELD:
+            if not unheld:
+                if unwindowed:
+                    sch = lambda nn: v_of(nn, MODE[harm][1])
+                else:
+                    sch = lambda nn: hold_value(harm, nn)
+                bpre[1] = sch(s + 1) if not (pre_natural or wpre_natural) else f32(bpre[1] + 0.25)
+                beta[1] = sch(s + 2)
+            nat1 = f32(lion_natural(bpre[1], mom[1], z[1])[0])
+            if abs(nat1 - beta[1]) > BH_TOL:
+                active += 1
+            rec.update({"bh_n": s + 2, "bh_active": active, "bh_nat": (nat1 + 0.01) if bh_forge else nat1, "bh_held": beta[1]})
+            if not cunheld:
+                bpre[0] = hold_c_value(s + 1)
+                beta[0] = hold_c_value(s + 2)
+            nat0 = f32(lion_natural(bpre[0], mom[0], z[0])[0])
+            if abs(nat0 - beta[0]) > BH_TOL:
+                cactive += 1
+            rec.update({"ch_n": s + 2, "ch_active": cactive, "ch_nat": nat0, "ch_held": beta[0]})
+            if (harm in WINDOWED and not strip_wh) or add_wh:
+                wn = v_of(s + 2, MODE[harm][1]) if harm in MODE and MODE[harm][0] == "tri" else beta[1]
+                if abs(wn - beta[1]) > BH_TOL:
+                    wactive += 1
+                rec.update({"wh_n": s + 2 + (1 if wh_off_by_one else 0), "wh_active": wactive,
+                            "wh_nat": (wn + 0.01) if wh_forge else wn, "wh_held": beta[1]})
+        if touch:
+            beta[0] = f32(beta[0] + 0.002)
+        if add_bh:
+            rec.update({"bh_n": s + 2, "bh_active": 0, "bh_nat": beta[-1], "bh_held": beta[-1]})
+        rec.update({"beta": beta, "beta_pre": [bpre], "mom_pre": [mom], "z_agg": [z],
+                    "z_tensor": [0.0] * NTENS, "m_tensor": [0.0] * NTENS})
+        out.append(rec)
+    return out
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            p = os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for r in _e_probe_records(a, seed=s):
+                    f.write(json.dumps(r) + "\n")
+
+
+def _e_prov(d, mode="submit", bn=POST_SHA, hf=HF_POST_SHA, runner=None, replay=HEADPATH_SHA, scorer=None):
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nBUILD_NETWORK_SHA256 %s\nHF_SHA256 %s\nRUNNER_SHA256 %s\nREPLAY_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (mode, bn, hf, runner or RUNNER_SHA, replay, scorer or file_sha(os.path.abspath(__file__))))
+
+
+def _e_build(d, template, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None, env_break=None,
+             spec_break=None, bh_break=None, ch_break=None, wh_break=None, vw_break=None, manifest=None, prov=None,
+             probe_break=None, probe_drop=None, onset=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(manifest if manifest is not None else synthetic_manifest_text())
+    _e_prov(d, **(prov or {}))
+    jid = 9900000
+    pb = probe_break or {}
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                p = os.path.join(d, PREFIX, pname)
+                os.makedirs(p)
+                with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                    for r in pb[(a, s)]:
+                        f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = "scalar" if spec_break == (a, s) else None
+            bh = bh_break[1] if bh_break and bh_break[0] == (a, s) else None
+            ch = ch_break[1] if ch_break and ch_break[0] == (a, s) else None
+            wh = wh_break[1] if wh_break and wh_break[0] == (a, s) else None
+            vw = vw_break[1] if vw_break and vw_break[0] == (a, s) else None
+            _e_write(d, a, s, jid, L, env=env, spec=spec, bh=bh, ch=ch, wh=wh, vw=vw, onset=onset)
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0, "gamma": "1",
+            "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH), "epochs_requested": str(EPOCHS), "hier": "none",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (net, gran, v) in enumerate([(NET, "scalar", 1.0), (NET, "scalar", 70.0), (NET, "scalar", 35.0),
+                                        (NET, HEADSPEC, 2.0), (NET, HEADSPEC, 90.0), (NET, HEADSPEC, 40.0),
+                                        (NET, "layerwise", 3.0), (NET, "layerwise", 95.0),
+                                        (PARENT, "scalar", 2.0), (PARENT, "scalar", 60.0),
+                                        (PARENT, "layerwise", 30.0), (PARENT, "layerwise", 95.0)]):
+        inv.append(dict(base, network=net, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _bar_lines(out):
+    return [ln for ln in out.splitlines()
+            if ln.startswith("  SIGMA_USED") or ln.startswith("  SE_ARM_DIFF") or ln.startswith("  bars:")
+            or ln.startswith("  PRIMARY") or ln.startswith("  state bars:")]
+
+
+def _dv(name):
+    sys.path.insert(0, HERE)
+    try:
+        return __import__(name)
+    finally:
+        sys.path.pop(0)
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cVT9 --selftest: design and arithmetic, RULE P / RULE M / RULE E and the replay re-derived from landed records,")
+    print("G-BITE on REAL landed cvt6 records (positives and nulls), the frozen manifest, frozen bars (O2), the noise floor")
+    print("through corpus_exclusions.filter_rows, the floor tables, the REAL score() on synthetic runs, the O2 invariance")
+    print("proof and the documented one-argument invocation.\n")
+
+    print("A. ARITHMETIC, REGEX AND DESIGN")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6, "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)")
+    chk(SIGMA_PRIOR == max(SIGMA_R18ALL, SIGMA_PLAIN), "SIGMA_PRIOR = max(SIGMA_R18ALL, SIGMA_PLAIN)")
+    chk(list(inspect.signature(compose_sigma).parameters) == ["sigma_in"], "compose_sigma() takes ONE argument -- NO corpus")
+    chk(all(compose_sigma(s)[1] == max(SIGMA_PRIOR, s) for s in (0.0, 0.3, SIGMA_PLAIN, SIGMA_PRIOR, 0.9, 3.0)),
+        "SIGMA_USED == max(frozen floor, in-batch)")
+    src = inspect.getsource(score)
+    chk("pooled_sigma" not in src and src.count("read_corpus") == 1,
+        "score() calls no corpus statistic; its single read_corpus() feeds a row-count print only")
+    chk(list(inspect.signature(decide).parameters) == ["M", "diverged", "onset_late"],
+        "decide() is a function of the in-batch means, one divergence flag and LATE's onset level only")
+    dsrc = inspect.getsource(decide) + inspect.getsource(state) + inspect.getsource(wstate) + inspect.getsource(stallbar)
+    chk("load_probe" not in dsrc and "recs" not in dsrc and "csv" not in dsrc, "decide() reads NO probe record and no corpus")
+    chk(src.index("final = \"FINAL: %s | %s\"") < src.index("descriptive_probe_readout(runsdir, runs)"),
+        "the descriptive probe readout runs AFTER the FINAL line is composed")
+    chk(src.index("G-BITE failed on") < src.index("CONTRASTS (every one") < src.index("branch = decide(M"),
+        "order: G-BITE, then contrasts, then the branch")
+    chk(GAP_MIN >= 2 * RESCUE_BAR and RESCUE_BAR > MATCH_BAR > NULL_BAR > 0, "bar ordering GAP_MIN >= 2 RESCUE > MATCH > NULL")
+    chk(GAP_MIN > MATCH_BAR + NULL_BAR, "AT-CTL and AT-K01 cannot overlap once D_CTL >= GAP_MIN")
+    chk(MATCH_BAR >= 5 * SE_PRIOR and NULL_BAR >= 3 * SE_PRIOR, "MATCH >= 5 SE and NULL >= 3 SE at the prior",
+        "%.2f / %.2f SE" % (MATCH_BAR / SE_PRIOR, NULL_BAR / SE_PRIOR))
+    chk(BH_TOL <= MS / 50.0, "BH_TOL <= 1/50 of one Lion step")
+    chk(EPTR_RE.search("Epoch 99, Train Accuracy: 83.61 %, Test Accuracy: 64.44 %") is not None, "epoch-line regex")
+    chk(all(OUT_RE.match("cvt9-%s-s105-1234567.out" % a) for a in ARMS) and OUT_RE.match("cvt6-LOWHEADPATH-s96-1.out") is None
+        and OUT_RE.match("cvt9-HEAD-s105-1.out") is None and OUT_RE.match("cvt8-EARLY-s102-1.out") is None,
+        "run-file regex matches cvt9's seven arms ONLY")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=53 x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=62 x") is None, "PROBE_TENSOR regex: 53 tensors only")
+    chk(set(SPEC) == set(ARMS) == set(BETAHOLD) == set(COMPHOLD) == set(WINDOWHOLD) == set(WITNESS_BH) == set(WITNESS_CH)
+        == set(WITNESS_WH) and set(MODE) == set(HELD) and set(WINDOW) == set(WINDOWED) and len(ARMS) == 7,
+        "seven arms; every table covers exactly them; MODE the six held, WINDOW the two windowed")
+    chk(SPEC["k01"] == "scalar" and all(SPEC[a] == HEADSPEC for a in HELD), "every held arm keeps HEAD's grouping")
+    chk(all(re.match(r"^[A-Za-z0-9_.:]*$", v) and "," not in v
+            for v in list(BETAHOLD.values()) + list(COMPHOLD.values()) + list(WINDOWHOLD.values())),
+        "every BETA_HOLD / COMP_HOLD / WINDOW_HOLD value is ONE token of [A-Za-z0-9_.:], no comma")
+    chk(BETAHOLD["LOWHEADPATH"] == "layer4.1.bn2.weight:floor" and BETAHOLD["HIGHHEADPATH"] == BETAHOLD["EARLY"]
+        == BETAHOLD["LATE"] == "layer4.1.bn2.weight:tri:9428" and BETAHOLD["MIDDOSE"] == "layer4.1.bn2.weight:tri:7235"
+        and BETAHOLD["RESDOSE"] == "layer4.1.bn2.weight:tri:8609" and BETAHOLD["k01"] == "", "the BETA_HOLD strings, literal")
+    chk(all(COMPHOLD[a] == "rec:cvt6_headpath" for a in HELD) and COMPHOLD["k01"] == "", "the COMP_HOLD strings, literal")
+    chk(WINDOWHOLD["EARLY"] == "0:9429" and WINDOWHOLD["LATE"] == "9429:end" and all(WINDOWHOLD[a] == "" for a in ARMS if a not in WINDOW),
+        "the WINDOW_HOLD strings, literal")
+    chk(WITNESS_BH["HIGHHEADPATH"] == ("BETA_HOLD: on type=blockwise group=1 groupsize=1 name=layer4.1.bn2.weight mode=tri "
+                                       "P=9428 b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=-4.387510749816894")
+        and WITNESS_BH["LOWHEADPATH"] == "BETA_HOLD: on type=blockwise group=1 groupsize=1 name=layer4.1.bn2.weight mode=floor value=-15.0",
+        "the BETA_HOLD witnesses of the replicate arms are cvt6's registered lines, literal")
+    chk(WITNESS_CH["LOWHEADPATH"] == ("COMP_HOLD: on type=blockwise group=0 groupsize=52 mode=rec id=cvt6_headpath sha256="
+                                      "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d knots=500 n0=2 "
+                                      "n1=49902 b0=-13.815510749816895 lo=-15.0 hi=-2.3026 vmax=-4.852388381958008 vlast=-15.0"),
+        "the COMP_HOLD witness is cvt6's registered rec line, literal")
+    chk(WITNESS_WH["EARLY"] == "WINDOW_HOLD: on type=blockwise group=1 name=layer4.1.bn2.weight base=tri P=9428 n0=0 n1=9429 outside=floor value=-15.0"
+        and WITNESS_WH["LATE"] == "WINDOW_HOLD: on type=blockwise group=1 name=layer4.1.bn2.weight base=tri P=9428 n0=9429 n1=end outside=floor value=-15.0"
+        and WITNESS_WH["k01"] == "WINDOW_HOLD: off", "the WINDOW_HOLD witnesses, literal")
+    chk(not any(w.startswith(p) for w in WITNESS_WH.values() for p in ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD"))
+        and not any(p.startswith("WINDOW_HOLD") for p in ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD")),
+        "prefix rule: WINDOW_HOLD is not a prefix of, nor prefixed by, any registered kind (first letter W)")
+    chk(B0 == -13.815510749816895, "b0 = float32(log 1e-6)")
+    chk(P_MID == (P_HEAD + P_HIGH + 1) // 2 == 7235 and N_E == P_HIGH + 1, "RULE M 7235 and RULE E 9429 from the literals")
+    chk(v_of(N_E, P_HIGH) == f32(B0 + MS * P_HIGH) and v_of(N_E - 1, P_HIGH) == v_of(N_E + 1, P_HIGH),
+        "tri:9428 peaks after update N_E and is symmetric about it")
+    chk(hold_value("EARLY", 0) == B0 and hold_value("EARLY", N_E - 1) == v_of(N_E - 1, P_HIGH) and hold_value("EARLY", N_E) == LO
+        and hold_value("LATE", 0) == LO and hold_value("LATE", N_E - 1) == LO and hold_value("LATE", N_E) == v_of(N_E, P_HIGH)
+        and hold_value("LATE", 20000) == v_of(20000, P_HIGH), "window schedules: EARLY tri then floor, LATE floor then tri, at the cut")
+    part = all((hold_value("EARLY", n) == v_of(n, P_HIGH)) != (hold_value("LATE", n) == v_of(n, P_HIGH))
+               or v_of(n, P_HIGH) == f32(LO) for n in range(0, 50002, 7))
+    chk(part, "EARLY and LATE partition tri:9428 pointwise (every 7th update)")
+    ie = sum(math.exp(hold_value("EARLY", n) + 15) - 1 for n in range(50001))
+    il = sum(math.exp(hold_value("LATE", n) + 15) - 1 for n in range(50001))
+    chk(abs(il / ie - 1) < 0.002, "the two halves carry the same integrated step size within 0.2 %", "LATE/EARLY %.5f" % (il / ie))
+    chk(all(hold_value(a, n) == v_of(n, MODE[a][1]) for a in ("MIDDOSE", "RESDOSE", "HIGHHEADPATH") for n in (0, 1, 5000, 9429, 30000)),
+        "dose arms hold the unwindowed triangle")
+    nat, tie = lion_natural(-10.0, 1e-3, 1e-3)
+    chk(abs(nat - (-10.001)) < 1e-12 and not tie and lion_natural(-3.0, 0.0, 0.0)[1], "lion_natural: sign, clamp, tie")
+    K = load_knots()
+    chk(K is not None and len(K[0]) == HEADPATH_KNOTS and max(K[1]) == HEADPATH_VMAX and K[1][-1] == HEADPATH_VLAST
+        and hold_c_value(0) == B0 and hold_c_value(50000) == LO, "the replay file: sha, 500 knots, vmax / vlast, hold_c(0) = b0")
+    chk(SEEDS == (105, 106, 107) and N_RECORDS == 500 and E1_LINE == N_E // 500 - 1 and 500 * (E1_LINE + 1) < N_E,
+        "seeds {105,106,107}; 500 records; E1_LINE 17 is the last line ending before N_E")
+    note("expected cost %.1f GPU-h (0.67 per run, cvt6 sacct); %.1f at 0.83; hard bound = WALL x 21" % (PL_PER_RUN_GPUH * 21, 0.83 * 21))
+
+    print("\nB. THE FROZEN MANIFEST, THE RULES AND G-BITE ON LANDED RECORDS")
+    t = r18_tensors(True)
+    numel = [q for _n, q, _o in t]
+    chk(len(t) == NTENS and sum(numel) == TOTPAR, "PlainNet18_c100: %d tensors, %d parameters" % (NTENS, TOTPAR))
+    chk(NAMES[IDX_HEAD - 1] == NAME_HEAD and numel[IDX_HEAD - 1] == 512, "idx 50 = layer4.1.bn2.weight")
+    g = parse_sets(HEADSPEC, NAMES)
+    chk([len(x) for x in g] == HEAD_SIZES and g[1] == [IDX_HEAD], "HEAD: [52,1], 50 alone in group 1")
+    c6 = os.path.join(HERE, "cVT6_complementpath_score.py")
+    if os.path.exists(c6):
+        txt6 = open(c6).read()
+        chk('HEADSPEC = "%s"' % HEADSPEC in txt6 and 'HEADPATH_SHA = "%s"' % HEADPATH_SHA in txt6 and "HF_POST_SHA = \"%s\"" % HF_PRE_SHA in txt6
+            and "RUNNER_SHA = \"%s\"" % CVT6_RUNNER_SHA in txt6, "B HEADSPEC, HEADPATH_SHA, cvt6's HF and runner shas == cVT6's registered literals")
+        S6 = _dv("cVT6_complementpath_score")
+        chk(S6.WITNESS_BH["HIGHHEADPATH"] == WITNESS_BH["HIGHHEADPATH"] and S6.WITNESS_BH["LOWHEADPATH"] == WITNESS_BH["LOWHEADPATH"]
+            and S6.WITNESS_CH["LOWHEADPATH"] == WITNESS_CH["LOWHEADPATH"] == WITNESS_CH["EARLY"], "B the replicate arms' witnesses == cVT6's (imported)")
+    else:
+        skip("cVT6 scorer not reachable")
+    c7 = os.path.join(HERE, "cVT7_grouphold_score.py")
+    chk(os.path.exists(c7) and re.search(r"^P_HIGH = 8609\s", open(c7).read(), re.M) is not None, "B P_RES 8609 == cVT7's registered P_HIGH")
+    have = runsdir and all(os.path.isdir(os.path.join(runsdir, b, "probe_%s-%s-s%d" % (b, a, s0)))
+                           for b, a, s0 in (("cvt1", "HEAD", 78), ("cvt3", "MUTE50", 84), ("cvt6", "LOWHEADPATH", 96),
+                                            ("cvt6", "HIGHHEADPATH", 98), ("cvt6", "k01", 97)))
+    if have:
+        DV9 = _dv("cvt9_registration_derivations")
+        P = DV9.DV4.derive_P(runsdir)
+        chk(P["HIGH"] == P_HIGH and P["HEAD"] == P_HEAD, "B RULE P re-run on THIS host == 9428 / 5041", str(P))
+        chk(DV9.rule_m(P["HEAD"], P["HIGH"]) == P_MID and DV9.rule_e(P["HIGH"]) == N_E and DV9.p_res_registered() == P_RES,
+            "B RULE M == 7235, RULE E == 9429, P_RES == 8609 from the derivation module")
+        chk(all(DV9.win_value(n, P_HIGH, *((0, N_E) if a == "EARLY" else (N_E, None))) == hold_value(a, n)
+                for a in WINDOWED for n in range(0, 50002, 11)), "B the derivation's window schedules == this scorer's")
+        DV6 = _dv("cvt6_registration_derivations")
+        kn, kv, names = DV6.derive_knots(runsdir)
+        chk(hashlib.sha256(DV6.knots_json(kn, kv, names).encode()).hexdigest() == HEADPATH_SHA,
+            "B cvt6's RULE H re-run on THIS host reproduces the replay file BYTE FOR BYTE")
+        nk = sum(bite_check("k01", load_probe(runsdir, "k01", s0, prefix=b))[0] for b, ss in (("cvt4", (90, 91, 92)), ("cvt6", (96, 97, 98))) for s0 in ss)
+        chk(nk == 6, "B G-BITE's Lion half PASSES on the 6 landed cvt4 / cvt6 k01 runs", "%d/6" % nk)
+        npos = sum(bite_check(a, load_probe(runsdir, a, s0, prefix="cvt6"))[0] for a in ("LOWHEADPATH", "HIGHHEADPATH") for s0 in (96, 97, 98))
+        chk(npos == 6, "B the 6 landed cvt6 LOWHEADPATH / HIGHHEADPATH runs PASS G-BITE as cvt9's (same holds)", "%d/6" % npos)
+        nnull, worst = 0, {}
+        for src_arm, reads in (("HIGHHEADPATH", ("MIDDOSE", "RESDOSE", "EARLY", "LATE")), ("LOWHEADPATH", ("EARLY", "LATE"))):
+            for s0 in (96, 97, 98):
+                recs = load_probe(runsdir, src_arm, s0, prefix="cvt6")
+                for a in reads:
+                    ok_, d_ = bite_check(a, recs)
+                    nnull += (not ok_) and d_["bad_sched"] > 0 and d_["bad_csched"] == 0
+                    worst[(src_arm, a)] = min(worst.get((src_arm, a), 1e9), max(abs(float(r["beta"][1]) - hold_value(a, r["step"] + 2)) for r in recs))
+        chk(nnull == 18, "B THE NULLS ON REAL RECORDS: landed HIGHHEADPATH read as MIDDOSE / RESDOSE / EARLY / LATE and LOWHEADPATH read"
+            " as EARLY / LATE FAIL on 50's schedule (complement on schedule)", "%d/18" % nnull)
+        chk(all(abs(worst[k] - NONVAC_MIN[k]) < 5e-4 and worst[k] >= 100 * BH_TOL for k in NONVAC_MIN),
+            "B non-vacuity minima re-derived == the literals (every >= 100 x BH_TOL)", str(dict((k[1] + "<-" + k[0], round(v, 4)) for k, v in worst.items())))
+        nh = sum(not bite_check(a, load_probe(runsdir, "HEAD", s0, prefix="cvt6"))[0] for a in HELD for s0 in (96, 97, 98))
+        chk(nh == 18, "B every landed cvt6 HEAD run read as each of the 6 held arms FAILS G-BITE", "%d/18" % nh)
+    else:
+        note("landed cvt1-cvt6 probe records not under %s -- RULE P / M / E and the real-record checks are recorded at 249" % runsdir)
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(), "B the LIVE manifest guard 4 wrote is BYTE-IDENTICAL")
+    else:
+        note("no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+
+    print("\nC. CORPUS PREMISES AND THE NOISE FLOOR, through corpus_exclusions.filter_rows (OPERATIONS 36)")
+    try:
+        CE = _exclusions()
+        chk(hasattr(CE, "filter_rows"), "analysis/corpus_exclusions.py imports and provides filter_rows")
+    except Exception as ex:
+        CE = None
+        chk(False, "analysis/corpus_exclusions.py imports", "%s: %s" % (type(ex).__name__, ex))
+    rows = read_corpus(csvpath) if CE else None
+    if rows is None:
+        skip("corpus premises -- %s not readable" % csvpath)
+    else:
+        sha = file_sha(csvpath)
+        reg = sha == REG_CORPUS_SHA256
+        naive = read_corpus(csvpath, filtered=False)
+        note("corpus %d rows, %d after filter_rows, sha %s... -- %s" % (len(naive), len(rows), sha[:12],
+             "THE REGISTRATION CORPUS" if reg else "not the registration corpus: drift NOTED, never failed"))
+        for nm, fn, frozen, fnaive in (("SIGMA_R18ALL", net_is(PARENT), SIGMA_R18ALL, SIGMA_R18ALL_NAIVE),
+                                       ("SIGMA_PLAIN", net_is(NET), SIGMA_PLAIN, SIGMA_PLAIN_NAIVE)):
+            s_f, s_n = pooled_sigma(rows, fn), pooled_sigma(naive, fn)
+            print("       %-13s FILTERED %s (df %s)   NAIVE %s (df %s)" % (nm, fmt(s_f[0], 12), s_f[1], fmt(s_n[0], 12), s_n[1]))
+            if reg:
+                chk(s_f[0] is not None and abs(s_f[0] - frozen) < 1e-12, "%s: the FROZEN literal %.17g IS the FILTERED value" % (nm, frozen))
+                chk(abs(s_n[0] - fnaive) < 1e-9 and s_n[0] > 3 * frozen, "%s: the NAIVE value is %.4f, NOT the literal" % (nm, s_n[0]))
+        n_pl = sorted({r["run"].split("-")[0] for r in rows if r.get("network") == NET})
+        chk(set(n_pl) <= {"cpl1", "cpl2", "cvt1", "cvt2", "cvt3", "cvt4", "cvt5", "cvt6"}, "%s appears ONLY in cpl1/cpl2/cvt1-cvt6 rows" % NET, str(n_pl))
+        chk(not any(r.get("seed") in ("105", "106", "107") for r in naive), "ZERO corpus rows carry seed 105, 106 or 107")
+        note("THE CSV HAS NO BETA_HOLD / COMP_HOLD / WINDOW_HOLD COLUMN: at ingest the 18 held rows share HEAD's cell key -- they go "
+             "into results/CORPUS-EXCLUSIONS.tsv in the SAME commit as the ingest (249)")
+
+    print("\nD. THE FLOOR TABLES (164.6).  Chance %.2f pp.  Levels UNSURE." % CHANCE)
+    mid = lambda iv: (iv[0] + iv[1]) / 2.0
+    lo_all = 100.0
+    for acc, (pm, pr) in DOSE_ACCOUNTS.items():
+        pred = _acc(pm, pr, *WIN_ACCOUNTS["EARLY-WINDOW"])
+        m = dict((a, mid(pred[a])) for a in ARMS)
+        lo_all = min([lo_all] + [pred[a][0] for a in ARMS])
+        chk(decide(m, False, ONSET_PRIOR) == "%s | EARLY-WINDOW" % DOSE_EXPECTED[acc],
+            "%-22s midpoint lands in %s (window fixed EARLY-WINDOW)" % (acc, DOSE_EXPECTED[acc]), decide(m, False, ONSET_PRIOR))
+    for acc, (pe, pl) in WIN_ACCOUNTS.items():
+        pred = _acc(FREE_PL, K01_PL, pe, pl)
+        m = dict((a, mid(pred[a])) for a in ARMS)
+        lo_all = min([lo_all] + [pred[a][0] for a in ARMS])
+        chk(decide(m, False, ONSET_PRIOR) == "DOSE-THRESHOLD | %s" % WIN_EXPECTED[acc],
+            "%-22s midpoint lands in %s (dose fixed DOSE-THRESHOLD; onset prior %.2f)" % (acc, WIN_EXPECTED[acc], ONSET_PRIOR),
+            decide(m, False, ONSET_PRIOR))
+        for nm, (x, y) in COPRIMARY:
+            dlo, dhi = pred[x][0] - pred[y][1], pred[x][1] - pred[y][0]
+            chk(dhi <= (100 - CHANCE) - 25 and dlo >= -(100 - CHANCE) + 25, "%-22s %s predicted %+.0f..%+.0f is >= 25 pp inside +-99" % (acc, nm, dlo, dhi))
+    chk(lo_all - CHANCE >= 7.0, "the LOWEST level any account predicts is >= 7 pp above chance", "%.1f" % (lo_all - CHANCE))
+    chk(DOSE_ACCOUNTS["BROKEN-DOSE"] == DOSE_ACCOUNTS["DOSE-ALL-STALL"], "BROKEN-DOSE null == DOSE-ALL-STALL's levels (declared)")
+    chk(WIN_EXPECTED["BROKEN-WINDOW"] == "BOTH-WINDOWS", "the BROKEN-WINDOW null reaches BOTH-WINDOWS by level (declared; G-BITE separates)")
+    chk(FREE_PL[0] - K01_PL[1] >= 4 * RESCUE_BAR, "the control is predicted >= 40 pp off k01")
+    chk(LATESTALL_PL[1] <= ONSET_PRIOR + MATCH_BAR, "LATE-STALL's predicted band sits under its stall bar at the onset prior")
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS (invented numbers; evidence of nothing)")
+    tmp = tempfile.mkdtemp(prefix="cvt9_selftest_")
+    template = os.path.join(tmp, "_probe_template")
+    _e_probe_template(template)
+    gnman = synthetic_manifest_text().replace("PlainNet18_c100", "ResNet18_gn_c100")
+    wE, wL = WITNESS_WH["EARLY"], WITNESS_WH["LATE"]
+    PB = lambda a, s, **kw: {"probe_break": {(a, s): _e_probe_records(a, seed=s, **kw)}}
+    cases = [
+        ("THRESHOLD+EARLY", {}, {}, "DOSE-THRESHOLD | EARLY-WINDOW"),
+        ("ALL-STALL", {"MIDDOSE": 12.4}, {}, "DOSE-ALL-STALL | EARLY-WINDOW"),
+        ("ONLY-HIGH", {"RESDOSE": 63.9}, {}, "DOSE-ONLY-HIGH-STALLS | EARLY-WINDOW"),
+        ("GRADED (RES between)", {"RESDOSE": 35.0}, {}, "DOSE-GRADED | EARLY-WINDOW"),
+        ("GRADED (MID between, RES k01)", {"MIDDOSE": 40.0}, {}, "DOSE-GRADED | EARLY-WINDOW"),
+        ("NONMONOTONE", {"MIDDOSE": 12.4, "RESDOSE": 63.0}, {}, "DOSE-NONMONOTONE | EARLY-WINDOW"),
+        ("NONMONOTONE (both between)", {"MIDDOSE": 25.0, "RESDOSE": 40.0}, {}, "DOSE-NONMONOTONE | EARLY-WINDOW"),
+        ("LATE-WINDOW", {"EARLY": 63.5, "LATE": 15.0}, {}, "DOSE-THRESHOLD | LATE-WINDOW"),
+        ("LATE stall above k01+2 but within onset+5", {"EARLY": 63.5, "LATE": 17.0}, {}, "DOSE-THRESHOLD | LATE-WINDOW"),
+        ("LATE just above its stall bar", {"EARLY": 63.5, "LATE": _E_ONSET_CTL + MATCH_BAR + 0.1}, {}, "DOSE-THRESHOLD | WINDOW-GRADED"),
+        ("BOTH-WINDOWS", {"LATE": 14.0}, {}, "DOSE-THRESHOLD | BOTH-WINDOWS"),
+        ("NEITHER-WINDOW", {"EARLY": 63.5}, {}, "DOSE-THRESHOLD | NEITHER-WINDOW"),
+        ("WINDOW-GRADED (EARLY partial)", {"EARLY": 35.0}, {}, "DOSE-THRESHOLD | WINDOW-GRADED"),
+        ("WINDOW-GRADED (LATE partial)", {"LATE": 30.0}, {}, "DOSE-THRESHOLD | WINDOW-GRADED"),
+        ("WINDOW-ONSET-UNRESOLVED", {}, {"onset": 58.0}, "DOSE-THRESHOLD | WINDOW-ONSET-UNRESOLVED"),
+        ("near-bar MATCH inside (MIDDOSE)", {"MIDDOSE": 64.5 - MATCH_BAR + 0.05}, {}, "DOSE-THRESHOLD | EARLY-WINDOW"),
+        ("near-bar MATCH outside (MIDDOSE)", {"MIDDOSE": 64.5 - MATCH_BAR - 0.05}, {}, "DOSE-GRADED | EARLY-WINDOW"),
+        ("near-bar NULL inside (RESDOSE)", {"RESDOSE": 12.0 + NULL_BAR - 0.05}, {}, "DOSE-THRESHOLD | EARLY-WINDOW"),
+        ("near-bar NULL outside (RESDOSE)", {"RESDOSE": 12.0 + NULL_BAR + 0.05}, {}, "DOSE-GRADED | EARLY-WINDOW"),
+        ("near-bar NULL outside (EARLY)", {"EARLY": 12.0 + NULL_BAR + 0.05}, {}, "DOSE-THRESHOLD | WINDOW-GRADED"),
+        ("REPLICATE-FAILED (HIGHHEADPATH between)", {"HIGHHEADPATH": 40.0}, {}, "REPLICATE-FAILED"),
+        ("REPLICATE-FAILED (HIGHHEADPATH rescues)", {"HIGHHEADPATH": 63.0}, {}, "REPLICATE-FAILED"),
+        ("CONTROL-FAILED", dict((a, 25.0) for a in ("LOWHEADPATH", "MIDDOSE", "LATE")), {}, "CONTROL-FAILED"),
+        ("scalar not collapsed", {"k01": 30.0}, {}, "SCALAR-NOT-COLLAPSED"),
+        ("diverged", {}, {"over": {("LATE", 107): 40.0}}, "UNRESOLVED-DIVERGED"),
+        ("an arm above CTL", {"MIDDOSE": 71.0}, {}, "DOSE-THRESHOLD | EARLY-WINDOW"),
+        ("harness: every arm tiny", dict((a, 3.0) for a in ARMS), {}, "HARNESS-UNSOUND"),
+        ("harness: AUGMENT=0 on one run", {}, {"env_break": ("EARLY", 107)}, "HARNESS-UNSOUND"),
+        ("harness: ARGS spec != arm", {}, {"spec_break": ("MIDDOSE", 106)}, "HARNESS-UNSOUND"),
+        ("harness: EARLY printed LATE's WINDOW_HOLD witness", {}, {"wh_break": (("EARLY", 105), wL)}, "HARNESS-UNSOUND"),
+        ("harness: HIGHHEADPATH printed a WINDOW_HOLD on-line", {}, {"wh_break": (("HIGHHEADPATH", 105), wE)}, "HARNESS-UNSOUND"),
+        ("harness: no WINDOW_HOLD line (cvt6's tree)", {}, {"wh_break": (("LOWHEADPATH", 107), "")}, "HARNESS-UNSOUND"),
+        ("harness: MIDDOSE printed tri:9428's BETA_HOLD witness", {}, {"bh_break": (("MIDDOSE", 105), WITNESS_BH["HIGHHEADPATH"])}, "HARNESS-UNSOUND"),
+        ("harness: RESDOSE printed COMP_HOLD off", {}, {"ch_break": (("RESDOSE", 106), "COMP_HOLD: off")}, "HARNESS-UNSOUND"),
+        ("harness: a rec witness with another sha", {}, {"ch_break": (("LATE", 106), WITNESS_CH["LATE"].replace("74be71fa", "00000000"))}, "HARNESS-UNSOUND"),
+        ("harness: a VOTE_W on-line", {}, {"vw_break": (("RESDOSE", 105), "VOTE_W: on type=blockwise items=50:x")}, "HARNESS-UNSOUND"),
+        ("harness: manifest names another net", {}, {"manifest": gnman}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt6's HF", {}, {"prov": {"hf": HF_PRE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt6's runner", {}, {"prov": {"runner": CVT6_RUNNER_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance replay sha differs", {}, {"prov": {"replay": "1" * 64}}, "HARNESS-UNSOUND"),
+        ("harness: provenance dry-run", {}, {"prov": {"mode": "dry-run"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another scorer", {}, {"prov": {"scorer": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("BROKEN WINDOW: EARLY and LATE carry the whole tri at BOTH-WINDOWS levels", {"LATE": 12.2},
+         {"probe_break": dict((((a, 106), _e_probe_records(a, seed=106, unwindowed=True)) for a in WINDOWED))}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN WINDOW: LATE unwindowed, wh keys stripped", {}, PB("LATE", 105, unwindowed=True, strip_wh=True), "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: MIDDOSE records carry tri:9428", {}, PB("MIDDOSE", 107, as_arm="HIGHHEADPATH"), "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: RESDOSE records carry tri:7235", {}, PB("RESDOSE", 106, as_arm="MIDDOSE"), "PATCH-NOT-VERIFIED"),
+        ("WRONG WINDOW: EARLY records carry LATE's", {}, PB("EARLY", 105, as_arm="LATE"), "PATCH-NOT-VERIFIED"),
+        ("COMPLEMENT UNHELD on EARLY", {}, PB("EARLY", 107, cunheld=True), "PATCH-NOT-VERIFIED"),
+        ("50 UNHELD on RESDOSE", {}, PB("RESDOSE", 105, unheld=True), "PATCH-NOT-VERIFIED"),
+        ("WINDOW ONLY AT PROBE STEPS: beta_pre[1] natural", {}, PB("LATE", 107, wpre_natural=True), "PATCH-NOT-VERIFIED"),
+        ("wh_nat FORGED", {}, PB("EARLY", 106, wh_forge=True), "PATCH-NOT-VERIFIED"),
+        ("wh_n OFF BY ONE", {}, PB("LATE", 106, wh_off_by_one=True), "PATCH-NOT-VERIFIED"),
+        ("bh_nat FORGED", {}, PB("MIDDOSE", 106, bh_forge=True), "PATCH-NOT-VERIFIED"),
+        ("HIGHHEADPATH carries wh keys", {}, PB("HIGHHEADPATH", 107, add_wh=True), "PATCH-NOT-VERIFIED"),
+        ("k01 carries bh keys", {}, PB("k01", 105, add_bh=True), "PATCH-NOT-VERIFIED"),
+        ("k01's Lion broken", {}, PB("k01", 106, touch=True), "PATCH-NOT-VERIFIED"),
+        ("probe: an EARLY file garbled", {}, {"probe_break": {("EARLY", 105): _e_probe_records("EARLY", seed=105)[:499] + ["{not json"]}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a LATE probe dir missing", {}, {"probe_drop": ("LATE", 106)}, "PATCH-NOT-VERIFIED"),
+        ("probe: a MIDDOSE file short", {}, PB("MIDDOSE", 107, n=400), "PATCH-NOT-VERIFIED"),
+        ("a DROPPED run", {}, {"drop": ("EARLY", 106)}, "INCOMPLETE"),
+        ("a TRUNCATED higher-jid resubmission", {}, {"shadow": ("LATE", 105)}, "DOSE-THRESHOLD | EARLY-WINDOW"),
+    ]
+    results = {}
+    for lab, lv, kw, want in cases:
+        d = os.path.join(tmp, re.sub(r"\W+", "_", lab))
+        os.makedirs(d)
+        _e_build(d, template, levels=lv, **kw)
+        rc, fin, out = _e_score(d, csvpath)
+        results[lab] = (rc, fin, out, d)
+        chk(fin.startswith("FINAL: %s |" % want), "E %-66s -> %s" % (lab, want), fin[:100])
+    rc, fin, out, dpath = results["THRESHOLD+EARLY"]
+    chk(rc == 0 and all(x in fin for x in ("HARNESS-CLEAN", "PATCH-BITES", "MIDDOSE-AT-CTL", "RESDOSE-AT-K01", "HIGHHEADPATH-AT-K01",
+                                           "EARLY-STALLED", "LATE-RESCUED", "LATE-ONSET:", "FLOOR-READINGS-ARE-BOUNDS", "TRAIN-AGREES",
+                                           "WINDOW-CUT-AT-PEAK", "COMPLEMENT-ON-HEADPATH")),
+        "E the base case exits 0 with the state stamps and the unconditional stamps", fin)
+    chk("MIDDOSE-ABOVE-CTL" in results["an arm above CTL"][1], "E an arm > CTL + 5 is stamped ABOVE-CTL, not branched")
+    chk(results["BROKEN WINDOW: EARLY and LATE carry the whole tri at BOTH-WINDOWS levels"][0] == 1,
+        "E the BROKEN-WINDOW null at BOTH-WINDOWS' levels exits 1, reaching NO branch")
+    chk(results["a DROPPED run"][0] == 2 and results["harness: AUGMENT=0 on one run"][0] == 1, "E exit codes: dropped 2, harness 1")
+    chk(results["a TRUNCATED higher-jid resubmission"][1] == results["THRESHOLD+EARLY"][1], "E a truncated resubmission does not shadow")
+    chk("G-BITE LATE         s105  records 500  bad 0  nonfinite 0  lion-mismatch 0" in out and "wh-audit 0" in out,
+        "E G-BITE reads 500 records per run and audits the window")
+    chk("arm-mean TEST (TRAIN) at epoch lines" in out, "E the descriptive readout runs (after FINAL)")
+
+    print("\n   O2 INVARIANCE: the SAME synthetic runs against four corpora")
+    variants = _e_csv_variants(csvpath if csvpath and os.path.exists(csvpath) else None, tmp)
+    for case in ("THRESHOLD+EARLY", "LATE-WINDOW", "GRADED (RES between)"):
+        ref_fin, ref_bars = None, None
+        dd = results[case][3]
+        for lab in ("real", "real+invented", "minimal-invented", "no-corpus"):
+            if lab not in variants:
+                skip("O2 %s corpus not available on this host" % lab)
+                continue
+            rc, fin, out = _e_score(dd, variants[lab])
+            bars = _bar_lines(out)
+            if ref_fin is None:
+                ref_fin, ref_bars = fin, bars
+            chk(fin == ref_fin and bars == ref_bars and len(bars) == 9,
+                "O2 %-22s %-17s FINAL and SIGMA/SE/bars/PRIMARY lines IDENTICAL" % (case, lab), fin[:44])
+    if "real+invented" in variants:
+        a_ = pooled_sigma(read_corpus(variants["real"]), net_is(NET))[0]
+        b_ = pooled_sigma(read_corpus(variants["real+invented"]), net_is(NET))[0]
+        chk(a_ is not None and b_ is not None and b_ > 5 * a_,
+            "O2 non-vacuity: invented rows MOVE the FILTERED PlainNet sigma (%.4f -> %.4f); FINAL did not move" % (a_ or 0, b_ or 0))
+
+    print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION, as a subprocess")
+    me = os.path.abspath(__file__)
+    try:
+        p = subprocess.run([sys.executable, me, dpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 0 and fl and fl[-1] == results["THRESHOLD+EARLY"][1],
+            "`python3 %s <runsdir>` exits 0 with the in-process FINAL line" % os.path.basename(me), "rc %d" % p.returncode)
+        p = subprocess.run([sys.executable, me, results["a DROPPED run"][3]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 2 and fl and fl[-1].startswith("FINAL: INCOMPLETE"), "... and on a dropped run exits 2 with FINAL: INCOMPLETE",
+            "rc %d" % p.returncode)
+    except Exception as e:
+        chk(False, "subprocess invocation", "%s: %s" % (type(e).__name__, e))
+
+    print("\nF. THE BRANCH MAP IS TOTAL -- 6,000 random in-batch means and onsets")
+    import random
+    rnd = random.Random(20260917)
+    seen = set()
+    for _ in range(6000):
+        m = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        for tok in decide(m, rnd.random() < 0.05, rnd.uniform(0.0, 70.0)).split(" | "):
+            seen.add(tok)
+    reached = set()
+    for r in results.values():
+        head = r[1][len("FINAL: "):].split(" | ")
+        reached.update(tk for tk in head[:2] if tk in LICENSE)
+    chk(seen <= set(LICENSE), "every token decide() returns has a registered licence text", "%d distinct" % len(seen))
+    chk(reached | seen == set(LICENSE), "every registered token is reached by section E or the sweep", "missing %s" % sorted(set(LICENSE) - reached - seen))
+    chk(all("240" in " ".join(LICENSE[b]) for b in LICENSE if b not in ("INCOMPLETE", "SCALAR-NOT-COLLAPSED")),
+        "every substantive token's licence states what it does to 240's / 246's reading")
+
+    print("\nG. RULE 21 PREMISE: no cvt9 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cvt9-*.out under %s" % runsdir, "%d found" % len(runs))
+    if csvpath and os.path.exists(csvpath):
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in csv.DictReader(open(csvpath))), "no cvt9- row in the CSV")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cvt9 registered scorer.  python3 analysis/cVT9_dosewindow_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cvt9/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

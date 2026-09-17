@@ -17,10 +17,10 @@ test('the register CSV has one row per published record and the documented colum
   assert.deepEqual(parsed.errors, []);
   assert.deepEqual(parsed.meta.fields, columns);
   assert.equal(rows.length, data.experiments.length);
-  assert.equal(rows.length, 162);
+  assert.equal(rows.length, 164);
   assert.deepEqual(rows.map(row => row.id), data.experiments.map(e => e.id));
   const table = data.tables.find(entry => entry.href === '/assets/tables/complete_experiment_register.csv')!;
-  assert.deepEqual([table.rows, table.columns], [162, columns.length], 'the table catalog reports the regenerated size');
+  assert.deepEqual([table.rows, table.columns], [164, columns.length], 'the table catalog reports the regenerated size');
 });
 
 test('every CSV row carries its four-way outcome, kind and a separate Corrected column', () => {
@@ -37,9 +37,9 @@ test('every CSV row carries its four-way outcome, kind and a separate Corrected 
     assert.equal(row.area, record.area, row.id);
   }
   const count = (key: string, value: string) => rows.filter(row => row[key] === value).length;
-  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [144, 18, 35]);
-  assert.deepEqual(['success', 'fail', 'mixed', 'unresolved'].map(outcome => count('outcome', outcome)), [50, 41, 30, 23]);
+  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [146, 18, 35]);
+  assert.deepEqual(['success', 'fail', 'mixed', 'unresolved'].map(outcome => count('outcome', outcome)), [50, 41, 32, 23]);
   assert.deepEqual(['outcome', 'outcome_label'].map(key => rows.find(row => row.id === 'MT019')![key]), ['success', 'Goal met'], 'MT019 moved from Open at CORRECTIONS 229');
-  assert.deepEqual(rows.filter(row => /^MT2(1[2-9]|2[0-5])$/.test(row.id)).map(row => [row.id, row.master_table_line, row.outcome_label]),
-    [['MT212', '212', 'Goal met'], ['MT213', '213', 'Mixed'], ['MT214', '214', 'Goal met'], ['MT215', '215', 'Goal met'], ['MT216', '216', 'Goal met'], ['MT217', '217', 'Goal met'], ['MT218', '218', 'Mixed'], ['MT219', '219', 'Goal met'], ['MT220', '220', 'Mixed'], ['MT221', '221', 'Mixed'], ['MT222', '222', 'Goal met'], ['MT223', '223', 'Goal met'], ['MT224', '224', 'Mixed'], ['MT225', '225', 'Goal met']]);
+  assert.deepEqual(rows.filter(row => /^MT2(1[2-9]|2[0-7])$/.test(row.id)).map(row => [row.id, row.master_table_line, row.outcome_label]),
+    [['MT212', '212', 'Goal met'], ['MT213', '213', 'Mixed'], ['MT214', '214', 'Goal met'], ['MT215', '215', 'Goal met'], ['MT216', '216', 'Goal met'], ['MT217', '217', 'Goal met'], ['MT218', '218', 'Mixed'], ['MT219', '219', 'Goal met'], ['MT220', '220', 'Mixed'], ['MT221', '221', 'Mixed'], ['MT222', '222', 'Goal met'], ['MT223', '223', 'Goal met'], ['MT224', '224', 'Mixed'], ['MT225', '225', 'Goal met'], ['MT226', '226', 'Mixed'], ['MT227', '227', 'Mixed']]);
 });

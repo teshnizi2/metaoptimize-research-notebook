@@ -1,0 +1,1142 @@
+#!/usr/bin/env python3
+"""cvt9_attack_indep.py <runsdir> <scorer.py> <score.log> <cvt6_headpath.json> <all_runs.csv> <CORPUS-EXCLUSIONS.tsv>
+-- independent re-derivation of `cvt9` (CORRECTIONS 249): PlainNet18_c100, tensor 50's dose rungs and time windows,
+the complement forced onto HEADPATH in every held arm.
+
+Imports NOTHING from analysis/cVT9_dosewindow_score.py, analysis/corpus_exclusions.py or any other repo module and uses
+no regex.  Reads, by string splitting only: every raw cvt9-<arm>-s<seed>-<jobid>.out in <runsdir> (ARGS / ENV /
+PROBE_TENSOR / VOTE_W / BETA_HOLD / COMP_HOLD / WINDOW_HOLD lines, `Epoch` lines, RUN_DONE, Traceback);
+<runsdir>/cvt9/PARTITION-MANIFEST.txt and PROVENANCE.txt; each run's probe dir (probe_tensor.json, block_sizes.json,
+probe.jsonl); the replay file named on the command line (its sha checked against 242.3 / 249.3); for the scorer's
+BETWEEN-BATCH literals the raw cvt4 / cvt6 / cvt7 .out files in the same <runsdir>; and -- for the one corpus DISCLOSURE
+line only -- the CSV (csv module) and the exclusion TSV (split on tabs).
+plateau5 = mean TEST over the run's own epochs 95..99; TRAIN5 the same on the Train column.
+Every bar, witness (BUILT from mode / P / b0 / ms / window and from the replay file's own sha / knots), the frozen
+manifest (rebuilt from the PlainNet18_c100 architecture), both schedules (the max-rate triangle, cut to its window, and
+the linear-between-knots replay), G-BITE's clauses (249.6), LATE's onset-aware stall bar (249.3) and the branch order
+(249.6) are RE-TYPED from the registration text; nothing is copied from the scorer's code.
+
+CORPUS-DEPENDENT LINE, MADE EXPLICIT.  Exactly one rebuilt line depends on the corpus: the scorer's
+`corpus: N rows after corpus_exclusions.filter_rows, cvt9- excluded ...` disclosure, rebuilt from the CSV and TSV given
+on the command line (rows whose run starts `cvt9-` dropped, then every (run, job_id) key in the TSV dropped).  This
+parser was run against results/all_runs.csv sha 355c0977... (3,085 rows) and results/CORPUS-EXCLUSIONS.tsv sha
+d0b955cb... (75 rows): the corpus of commit 45eac02 (the cvt6 / cvt7 ingest), unchanged through 8af7ee2 (the commit this
+landing started from); cluster_b's ~/stage_cvt9 carries the same two shas.  After the cvt8 / cvt9 ingest that ONE line
+will no longer match: re-run with `git show 8af7ee2:results/all_runs.csv` and `git show
+8af7ee2:results/CORPUS-EXCLUSIONS.tsv`.  No bar, sigma, branch or stamp reads the line.
+
+HOST PATHS.  The scorer prints the manifest and provenance paths it resolved.  Those two lines are matched here by
+their host-independent suffix (`/cvt9/PARTITION-MANIFEST.txt (<runsdir>/cvt9/)` and `/cvt9/PROVENANCE.txt
+(<runsdir>/cvt9/)`), and no path is printed, so either host's log can be given on either host and the output is
+byte-comparable.
+
+AGREEMENT.  Every scorer line that carries a level, contrast, gate, G-BITE count, sigma, onset, branch, stamp, header
+literal or descriptive readout is RE-BUILT here in the scorer's printed format and precision from this file's own
+numbers and looked up VERBATIM in <score.log>.  A line not found is a VIOLATION.  FINAL is compared as one string and
+token by token.
+
+Sections:
+  [0] manifest (rebuilt byte for byte), provenance, scorer sha, replay file, corpus disclosure, header
+  [1] completeness; ARGS / ENV / PROBE_TENSOR / VOTE_W / BETA_HOLD / COMP_HOLD / WINDOW_HOLD per run
+  [2] levels: per-run plateau5 + TRAIN5, per-arm mean / sd / range, TEST OLS tail slope 80-99; G-FLOOR / G-CEIL
+  [3] G-BITE from the probe records (Lion on k01; 50's windowed schedule and HEADPATH in beta and beta_pre; the bh / ch /
+      wh audits; key hygiene), then a NON-VACUITY cross-read and the window cut's resolution on the record grid
+  [4] sigma, LATE's onset, every contrast, TEST beside TRAIN, per-seed pairs
+  [5] branch, states, stamps, every bar margin, per-seed states, account bands; FINAL compared with the scorer's
+  [6] the scorer's between-batch literals (re-derived from raw cvt4 / cvt6 / cvt7 .out) and descriptive readouts
+  [7] LINE-BY-LINE AGREEMENT with the scorer log; scorer lines NOT rebuilt are listed
+  DESCRIPTIVE, NOT REGISTERED (cannot move anything above):
+  [D1] TEST (TRAIN) after 15 / 17 / 19 / 30 / 50 / 100 epochs, arm mean and per seed
+  [D2] 50's applied beta at epochs 10 / 17 / 18.86 / 20 / 30 / 40 (record boundary stated)
+  [D3] per held arm, the Epoch line from which TEST stays > 2 pp below LOWHEADPATH (arm mean; same seed)
+  [D4] settle lines (defined)
+  [D5] dose-response table (peak log step size vs level) for LOWHEADPATH, MIDDOSE, RESDOSE, HIGHHEADPATH
+  [D6] the window halves: same-seed identity before the cut (LATE vs LOWHEADPATH, EARLY vs HIGHHEADPATH), integrated
+       step size per half, and the complement's schedule at the cut
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+
+PREFIX = "cvt9"
+NET = "PlainNet18_c100"
+SEEDS = [105, 106, 107]
+ARMS = ["k01", "LOWHEADPATH", "HIGHHEADPATH", "MIDDOSE", "RESDOSE", "EARLY", "LATE"]
+HELD = ARMS[1:]
+WIN = ["EARLY", "LATE"]
+CTL = "LOWHEADPATH"
+HEADSPEC = "sets:1-49,51-53/layer4.1.bn2.weight"
+SPEC = dict((a, HEADSPEC) for a in ARMS)
+SPEC["k01"] = "scalar"
+IDX50, NAME50 = 50, "layer4.1.bn2.weight"
+# 249.2 / 249.3, re-typed
+PH, PM, PR, NE = 9428, 7235, 8609, 9429
+HOLD50 = {"LOWHEADPATH": ("floor", None), "HIGHHEADPATH": ("tri", PH), "MIDDOSE": ("tri", PM), "RESDOSE": ("tri", PR),
+          "EARLY": ("tri", PH), "LATE": ("tri", PH)}
+WINDOWS = {"EARLY": (0, NE), "LATE": (NE, None)}
+ONSET_LINE = 17
+ENV_WANT = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+            "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 "
+            "EB_RHO=na EB_LOG=0")
+FIXED = {"optimizer": "HF", "alg-base": "SGDm", "momentum-param-base": "0.99", "weight-decay-base": "0.1",
+         "alg-meta": "Lion", "momentum-param-meta": "0.99", "Lion-beta2-meta": "0.9",
+         "weight-decay-meta": "0", "dataset": "CIFAR100", "batch-size": "100", "meta-stepsize": "1e-3",
+         "alpha0": "1e-6", "num-epochs": "100", "NN-name": NET, "gamma": "1"}
+# 249.6 / 249.7 frozen bars, re-typed
+SIGMA_PRIOR = 0.6881530279923828
+GAP_MIN, K01_MAX, MATCH, NULL, RESCUE, DIVERGED = 20.0, 20.0, 5.0, 2.0, 10.0, 5.0
+FLOOR_MIN, CEIL_MAX = 15.0, 90.0
+BH_TOL, TIE_REL, N_REC = 1e-5, 1e-12, 500
+MS, B2 = 1e-3, 0.9
+LO, HI = -15.0, -2.3026
+SPE = 500
+# sha literals recorded in CORRECTIONS 249.4 / 249.6 / 249.8 / 249.12
+PROV_WANT = {"BUILD_NETWORK_SHA256": "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b",
+             "HF_SHA256": "816e335777f7c0bb52747949dff81aa57fe0695bab2d61d984ae6ce9daab3a9d",
+             "RUNNER_SHA256": "0fe45b1d1d2cea28740c72e08193af7d5bab3819b397f59f580c71bb9fbf7849",
+             "REPLAY_SHA256": "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d"}
+REG_SCORER_SHA = "5c53a40dff7f8eebb80525f4d8ad38b682054b6185699b85620f13903588c2d7"
+MANIFEST_PREFIX, MANIFEST_BYTES = "995e4b93", 7720
+REPLAY_SHA = "74be71fa524ad0122d1408e01dd2b633b004b2e27228393fe6e593f494358a5d"
+CORPUS_SHA_PREFIX, TSV_SHA_PREFIX = "355c0977", "d0b955cb"
+# account bands (249.5), re-typed
+K01B, FREEB, PARTB, LATESTALLB = (8.0, 16.0), (56.0, 72.0), (20.0, 50.0), (10.0, 17.0)
+
+
+def f32(x):
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+B0 = f32(math.log(1e-6))
+
+
+def mean(v):
+    return math.fsum(v) / len(v)
+
+
+def sdev(v):
+    m = mean(v)
+    return math.sqrt(math.fsum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def ols(xs, ys):
+    xm, ym = mean(xs), mean(ys)
+    return math.fsum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / math.fsum((x - xm) ** 2 for x in xs)
+
+
+def sha(p):
+    return hashlib.sha256(open(p, "rb").read()).hexdigest()
+
+
+def sgn(x):
+    return (x > 0) - (x < 0)
+
+
+def tri_raw(n, P):
+    """237.3(1): u(n) = min(n-1, P) - max(0, n-1-P) for n >= 1, else 0; clamp(b0 + ms u) (double)."""
+    u = 0 if n <= 0 else min(n - 1, P) - max(0, n - 1 - P)
+    return min(HI, max(LO, B0 + MS * u))
+
+
+def tri(n, P):
+    return f32(tri_raw(n, P))
+
+
+def sched50(arm, n, cut=None):
+    """249.2 / 249.4: 50's applied value at update n: floor, or tri:P, or tri:9428 inside [n0, n1) and the floor outside."""
+    mode, P = HOLD50[arm]
+    if mode == "floor":
+        return f32(LO)
+    if arm in WINDOWS:
+        n0, n1 = WINDOWS[arm]
+        if cut is not None:
+            n0, n1 = (0, cut) if arm == "EARLY" else (cut, None)
+        inside = n >= n0 and (n1 is None or n < n1)
+        if not inside:
+            return f32(LO)
+    return tri(n, P)
+
+
+class Replay(object):
+    """242.3(2): b0 for n < n_0; v_k + (v_{k+1} - v_k)(n - n_k)/(n_{k+1} - n_k) on [n_k, n_{k+1}); v_last for
+    n >= n_last; clamped; float32."""
+
+    def __init__(self, path):
+        raw = open(path, "rb").read()
+        self.sha = hashlib.sha256(raw).hexdigest()
+        d = json.loads(raw.decode("utf-8"))
+        self.id = d["id"]
+        self.n = [int(x) for x in d["n"]]
+        self.v = [float(x) for x in d["v"]]
+
+    def __call__(self, n):
+        kn, kv = self.n, self.v
+        if n < kn[0]:
+            x = B0
+        elif n >= kn[-1]:
+            x = kv[-1]
+        else:
+            k = (n - kn[0]) // (kn[1] - kn[0])
+            while kn[k] > n:
+                k -= 1
+            while kn[k + 1] <= n:
+                k += 1
+            x = kv[k] + (kv[k + 1] - kv[k]) * (n - kn[k]) / float(kn[k + 1] - kn[k])
+        return f32(min(HI, max(LO, x)))
+
+
+def lion(bp, m, z):
+    """clamp(beta_pre - ms*sign(b2*mom_pre + (1-b2)*z_agg)); tie iff |L| <= TIE_REL of its parts."""
+    p, q = B2 * m, (1.0 - B2) * z
+    L = p + q
+    return max(LO, min(HI, bp - MS * sgn(L))), abs(L) <= TIE_REL * (abs(p) + abs(q))
+
+
+def witness_bh(arm):
+    if arm not in HOLD50:
+        return "BETA_HOLD: off"
+    mode, P = HOLD50[arm]
+    w = "BETA_HOLD: on type=blockwise group=1 groupsize=1 name=%s mode=%s" % (NAME50, mode)
+    if mode == "floor":
+        return w + " value=" + repr(LO)
+    return w + " P=%d b0=%s ms=%s lo=%s hi=%s peak=%s" % (P, repr(B0), repr(MS), repr(LO), repr(HI),
+                                                          repr(min(HI, max(LO, B0 + MS * P))))
+
+
+def witness_ch(arm, rep):
+    if arm not in HOLD50:
+        return "COMP_HOLD: off"
+    return ("COMP_HOLD: on type=blockwise group=0 groupsize=52 mode=rec id=%s sha256=%s knots=%d n0=%d n1=%d b0=%s lo=%s "
+            "hi=%s vmax=%s vlast=%s" % (rep.id, rep.sha, len(rep.n), rep.n[0], rep.n[-1], repr(B0), repr(LO), repr(HI),
+                                       repr(max(rep.v)), repr(rep.v[-1])))
+
+
+def witness_wh(arm):
+    if arm not in WINDOWS:
+        return "WINDOW_HOLD: off"
+    n0, n1 = WINDOWS[arm]
+    return ("WINDOW_HOLD: on type=blockwise group=1 name=%s base=tri P=%d n0=%d n1=%s outside=floor value=%s"
+            % (NAME50, PH, n0, "end" if n1 is None else str(n1), repr(LO)))
+
+
+def plainnet_tensors():
+    """PlainNet18_c100 = ResNet18_c100 without the 9 shortcut tensors (249.2 / 239 manifest), rebuilt here."""
+    t = [("conv1.weight", 3 * 64 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    cin = 64
+    for L, w in ((1, 64), (2, 128), (3, 256), (4, 512)):
+        for b in (0, 1):
+            ci = cin if b == 0 else w
+            p = "layer%d.%d." % (L, b)
+            t.append((p + "conv1.weight", ci * w * 9, "Conv2d"))
+            t.append((p + "bn1.weight", w, "BatchNorm2d"))
+            t.append((p + "bn1.bias", w, "BatchNorm2d"))
+            t.append((p + "conv2.weight", w * w * 9, "Conv2d"))
+            t.append((p + "bn2.weight", w, "BatchNorm2d"))
+            t.append((p + "bn2.bias", w, "BatchNorm2d"))
+        cin = w
+    t.append(("linear.weight", 512 * 100, "Linear"))
+    t.append(("linear.bias", 100, "Linear"))
+    return t
+
+
+def hold_label(arm):
+    if arm not in HOLD50:
+        return ""
+    mode, P = HOLD50[arm]
+    return NAME50 + ":" + ("floor" if mode == "floor" else "tri:%d" % P)
+
+
+def win_label(arm):
+    if arm not in WINDOWS:
+        return ""
+    n0, n1 = WINDOWS[arm]
+    return "%d:%s" % (n0, "end" if n1 is None else str(n1))
+
+
+def manifest_text(rep):
+    t = plainnet_tensors()
+    names = [x[0] for x in t]
+    numel = [x[1] for x in t]
+    L = ["NETWORK " + NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+         "NORM BatchNorm2d %d GroupNorm 0" % sum(1 for x in t if x[2] == "BatchNorm2d" and x[0].endswith("weight")),
+         "PARENT ResNet18_c100 62",
+         "PARENT_REMOVED " + " ".join("layer%d.0.shortcut.%s" % (s, k) for s in (2, 3, 4)
+                                      for k in ("0.weight", "1.weight", "1.bias")),
+         "CLIP_C -15:-2.3026", "EPOCHS 100", "META_STEPS %d" % (100 * SPE)]
+    for i, (n, q, o) in enumerate(t):
+        L.append("TENSOR %d %s %d %s" % (i + 1, n, q, o))
+    w512 = [(i + 1, n) for i, (n, q, o) in enumerate(t) if q == 512 and o == "BatchNorm2d" and n.startswith("layer4")
+            and n.endswith("weight")]
+    L.append("W512 " + ",".join("%d:%s" % x for x in w512))
+    L.append("REPLAY B0 %s MS %s P_HIGH %d P_MID %d P_RES %d N_E %d HEADPATH %s SHA256 %s KNOTS %d"
+             % (repr(B0), repr(MS), PH, PM, PR, NE, rep.id, rep.sha, len(rep.n)))
+    for a in ARMS:
+        if a == "k01":
+            L.append("ARMSPEC k01 SPEC scalar TYPE scalar M 1")
+        else:
+            gs = groups_of(SPEC[a], names)
+            L.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s" % (
+                a, SPEC[a], len(gs), ",".join(str(len(g)) for g in gs),
+                ",".join(str(sum(numel[i - 1] for i in g)) for g in gs), " ".join(names[i - 1] for i in gs[1])))
+        L.append("BETAHOLD %s %s" % (a, hold_label(a) or "off"))
+        L.append("COMPHOLD %s %s" % (a, ("rec:" + rep.id) if a in HOLD50 else "off"))
+        L.append("WINDOWHOLD %s %s" % (a, win_label(a) or "off"))
+        L.append("WITNESS %s %s" % (a, witness_bh(a)))
+        L.append("CWITNESS %s %s" % (a, witness_ch(a, rep)))
+        L.append("WWITNESS %s %s" % (a, witness_wh(a)))
+    return "\n".join(L) + "\n"
+
+
+def parse_out(path):
+    r = {"args": [], "env": [], "pt": [], "vw": [], "bh": [], "ch": [], "wh": [], "ep": {}, "done": False, "tb": 0,
+         "dup": 0}
+    for ln in open(path, errors="replace"):
+        s = ln.rstrip("\n")
+        if s.startswith("ARGS:"):
+            r["args"].append(s)
+        elif s.startswith("ENV:"):
+            r["env"].append(s)
+        elif s.startswith("PROBE_TENSOR:"):
+            r["pt"].append(s)
+        elif s.startswith("VOTE_W"):
+            r["vw"].append(s)
+        elif s.startswith("BETA_HOLD"):
+            r["bh"].append(s)
+        elif s.startswith("COMP_HOLD"):
+            r["ch"].append(s)
+        elif s.startswith("WINDOW_HOLD"):
+            r["wh"].append(s)
+        elif s.startswith("Epoch "):
+            p = s.split(",")
+            e = int(p[0].split()[1])
+            tr = float(p[1].split(":")[1].replace("%", "").strip())
+            te = float(p[2].split(":")[1].replace("%", "").strip())
+            r["dup"] += e in r["ep"]
+            r["ep"][e] = (tr, te)
+        elif s.strip() == "RUN_DONE":
+            r["done"] = True
+        if "Traceback (most recent call last)" in s:
+            r["tb"] += 1
+    return r
+
+
+def flags_of(line):
+    out = []
+    for t in line[len("ARGS:"):].split():
+        if t.startswith("--"):
+            out.append([t[2:], None])
+        elif out:
+            out[-1][1] = t if out[-1][1] is None else out[-1][1] + " " + t
+    return out
+
+
+def groups_of(spec, names):
+    if spec == "scalar":
+        return [list(range(1, len(names) + 1))]
+    gs = []
+    for g in spec[len("sets:"):].split("/"):
+        idx = []
+        for tok in g.split(","):
+            if tok.isdigit():
+                idx.append(int(tok))
+            elif "-" in tok and all(x.isdigit() for x in tok.split("-")):
+                a, b = tok.split("-")
+                idx.extend(range(int(a), int(b) + 1))
+            else:
+                idx.append(names.index(tok) + 1)
+        gs.append(sorted(idx))
+    return gs
+
+
+def load_recs(pdir):
+    out = []
+    for x in open(os.path.join(pdir, "probe.jsonl")):
+        if not x.strip():
+            continue
+        try:
+            v = json.loads(x)
+        except ValueError:
+            v = None
+        out.append(v if isinstance(v, dict) else None)
+    return out
+
+
+def plateau_of(path):
+    r = parse_out(path)
+    return mean([r["ep"][e][1] for e in range(95, 100)])
+
+
+def first_stays(vals, pred):
+    for e in range(len(vals)):
+        if all(pred(v) for v in vals[e:]):
+            return e
+    return None
+
+
+def main():
+    runsdir, scorer, slog, reppath, csvp, tsvp = sys.argv[1:7]
+    bad = []
+    expect = []
+
+    def viol(msg):
+        bad.append(msg)
+        print("  VIOLATION " + msg)
+
+    def exp(sec, line):
+        expect.append((sec, line))
+
+    base = os.path.join(runsdir, PREFIX)
+    rep = Replay(reppath)
+    # ---------------------------------------------------------------- [0]
+    mpath = os.path.join(base, "PARTITION-MANIFEST.txt")
+    mtext = open(mpath).read()
+    msha = sha(mpath)
+    mine = manifest_text(rep)
+    names = [x[0] for x in plainnet_tensors()]
+    numel = [x[1] for x in plainnet_tensors()]
+    ok_man = mtext == mine and msha.startswith(MANIFEST_PREFIX) and len(mtext.encode()) == MANIFEST_BYTES
+    print("[0] manifest: %d tensors, %d params; idx50 %s (%d); %d bytes, sha256 %s...; == the manifest rebuilt here from"
+          " the architecture, the registration tables and the replay file, byte for byte: %s; sha prefix / bytes as 249.8:"
+          " %s" % (len(names), sum(numel), names[IDX50 - 1], numel[IDX50 - 1], len(mtext.encode()), msha[:16],
+                   mtext == mine, msha.startswith(MANIFEST_PREFIX) and len(mtext.encode()) == MANIFEST_BYTES))
+    if not ok_man:
+        viol("manifest")
+    top = os.path.join(runsdir, PREFIX + "-PARTITION-MANIFEST.txt")
+    print("    <runsdir>/cvt9-PARTITION-MANIFEST.txt == <runsdir>/cvt9/PARTITION-MANIFEST.txt: %s"
+          % (os.path.exists(top) and sha(top) == msha))
+    spacing = sorted(set(rep.n[k + 1] - rep.n[k] for k in range(len(rep.n) - 1)))
+    ok_rep = (rep.sha == REPLAY_SHA and rep.id == "cvt6_headpath" and len(rep.n) == 500 and rep.n[0] == 2
+              and rep.n[-1] == 49902 and spacing == [100] and rep.v[-1] == -15.0 and all(LO <= x <= HI for x in rep.v))
+    print("    replay file: id %s sha256 %s... knots %d n0 %d n1 %d spacing %s vmax %s vlast %s -> as 242.3(2) / 249.3: %s"
+          % (rep.id, rep.sha[:16], len(rep.n), rep.n[0], rep.n[-1], spacing, repr(max(rep.v)), repr(rep.v[-1]), ok_rep))
+    if not ok_rep:
+        viol("replay file")
+    exp("G-REPLAY", "  PASS G-REPLAY patches/cvt6_headpath.json sha256 == HEADPATH_SHA, 500 knots")
+    prov = {}
+    for ln in open(os.path.join(base, "PROVENANCE.txt")):
+        p = ln.split(None, 1)
+        if len(p) == 2:
+            prov.setdefault(p[0], p[1].strip())
+    s_sha = sha(scorer)
+    ok_prov = (prov.get("MODE") == "submit" and all(prov.get(k) == v for k, v in PROV_WANT.items())
+               and prov.get("REPLAY_SHA256") == rep.sha and prov.get("SCORER_SHA256") == s_sha and s_sha == REG_SCORER_SHA)
+    print("    PROVENANCE MODE %s  BUILD %s...  HF %s...  RUNNER %s...  REPLAY %s... == file: %s  SCORER %s... == scorer"
+          " file: %s == 249.10: %s" % (
+              prov.get("MODE"), prov.get("BUILD_NETWORK_SHA256", "")[:8], prov.get("HF_SHA256", "")[:8],
+              prov.get("RUNNER_SHA256", "")[:8], prov.get("REPLAY_SHA256", "")[:8], prov.get("REPLAY_SHA256") == rep.sha,
+              prov.get("SCORER_SHA256", "")[:8], prov.get("SCORER_SHA256") == s_sha, s_sha == REG_SCORER_SHA))
+    if not ok_prov:
+        viol("provenance")
+    exp("G-STRUCT", "  PASS G-STRUCT byte-identical to synthetic_manifest_text() (53 tensors, HEAD [52,1], the three hold"
+        " tables)   %d vs %d bytes" % (len(mtext), len(mine)))
+    exp("G-PROV", "  PASS G-PROV MODE submit   submit")
+    b = prov["BUILD_NETWORK_SHA256"]
+    exp("G-PROV", "  PASS G-PROV build_network.py sha256 == POST_SHA %s...   %s" % (b[:12], b[:16]))
+    b = prov["HF_SHA256"]
+    exp("G-PROV", "  PASS G-PROV HF.py sha256 == HF_POST_SHA %s... (cvt9's PATCH_WINDOWHOLD tree)   %s" % (b[:12], b[:16]))
+    b = prov["RUNNER_SHA256"]
+    exp("G-PROV", "  PASS G-PROV RUNNER_SHA256 == cvt9's runner %s...   %s" % (b[:12], b[:16]))
+    exp("G-PROV", "  PASS G-PROV REPLAY_SHA256 == HEADPATH_SHA %s...   %s" % (rep.sha[:12], rep.sha[:16]))
+    exp("G-PROV", "  PASS G-PROV SCORER_SHA256 == this scorer's sha256 %s...   %s" % (s_sha[:12], s_sha[:16]))
+    # corpus disclosure (the one corpus-dependent line)
+    keys = set()
+    tl = [ln.rstrip("\n") for ln in open(tsvp) if ln.strip() and not ln.startswith("#")]
+    head = tl[0].split("\t")
+    for ln in tl[1:]:
+        f = dict(zip(head, ln.split("\t")))
+        keys.add((f["run"], f["job_id"]))
+    rows = [r for r in csv.DictReader(open(csvp)) if not r.get("run", "").startswith(PREFIX + "-")]
+    kept = [r for r in rows if (r.get("run"), r.get("job_id")) not in keys]
+    csha, tsha = sha(csvp), sha(tsvp)
+    print("    corpus (DISCLOSURE line only): csv sha %s rows %d, exclusion tsv sha %s keys %d -> %d rows (cvt9- dropped)"
+          % (csha[:16], len(rows), tsha[:16], len(keys), len(kept)))
+    print("    corpus files are the registration corpus (249.7 %s... / %s...), i.e. commit 45eac02 = 8af7ee2's: %s"
+          % (CORPUS_SHA_PREFIX, TSV_SHA_PREFIX, csha.startswith(CORPUS_SHA_PREFIX) and tsha.startswith(TSV_SHA_PREFIX)))
+    exp("CORPUS", "corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- no bar, sigma, "
+        "branch or stamp reads it)" % (len(kept), PREFIX))
+    # header literals (249.2)
+    exp("HEADER", " cvt9 -- PLAINNET TENSOR 50: WHEN (EARLY / LATE) AND HOW MUCH (MIDDOSE / RESDOSE)?  (PATCH_WINDOWHOLD)")
+    exp("HEADER", " %s / CIFAR100   100 epochs   seeds %s   AUGMENT=1  BETA_CLIP=-15:-2.3026  PROBE=100  PROBE_TENSOR=1"
+        % (NET, ",".join(str(s) for s in SEEDS)))
+    for a in ARMS:
+        exp("HEADER", "   %-12s %-38s BETA_HOLD %-30s COMP_HOLD %-18s WINDOW_HOLD %s" % (
+            a, SPEC[a], hold_label(a) or "(unset)", ("rec:" + rep.id) if a in HOLD50 else "(unset)",
+            win_label(a) or "(unset)"))
+    exp("HEADER", " CO-PRIMARY: P_MID, P_RES, P_EARLY, P_LATE (= LOWHEADPATH - arm), P_WIN = LATE - EARLY.")
+    exp("HEADER", " plateau5 = mean TEST over epochs 95..99 of each run's own .out.  BARS ARE FROZEN LITERALS (O2).")
+
+    # ---------------------------------------------------------------- [1]
+    print("\n[1] completeness and header lines (witnesses built from mode / P / b0 / ms / window / the replay file)")
+    files = {}
+    for fn in sorted(os.listdir(runsdir)):
+        if not (fn.startswith(PREFIX + "-") and fn.endswith(".out")):
+            continue
+        stem = fn[:-4].split("-")
+        if len(stem) != 4 or stem[1] not in ARMS:
+            continue
+        files.setdefault((stem[1], int(stem[2][1:])), []).append((int(stem[3]), fn))
+    R = {}
+    envs = set()
+    n_pt_ok = 0
+    exp("COMPLETE", "COMPLETE  21 runs, epochs 0..99, RUN_DONE, no traceback, finite plateau5")
+    for s in SEEDS:
+        for a in ARMS:
+            lst = files.get((a, s), [])
+            if len(lst) != 1:
+                viol("%s-s%d has %d .out files" % (a, s, len(lst)))
+                continue
+            jid, fn = lst[0]
+            r = parse_out(os.path.join(runsdir, fn))
+            r["jid"] = jid
+            R[(a, s)] = r
+            ok_ep = sorted(r["ep"]) == list(range(100)) and r["dup"] == 0
+            f = flags_of(r["args"][0]) if len(r["args"]) == 1 else []
+            ks = [k for k, _ in f]
+            fd = dict(f)
+            want = dict(FIXED)
+            want.update({"stepsize-groups": SPEC[a], "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s)})
+            wrong = [k for k, v in sorted(want.items()) if fd.get(k) != v]
+            rep_f = sorted(set(k for k in ks if ks.count(k) > 1))
+            env = [" ".join(t for t in e.split() if not t.startswith("PROBE_DIR=")) for e in r["env"]]
+            for e in env:
+                envs.add(e)
+            ptw = "PROBE_TENSOR: on every=100 type=%s tensors=53 " % ("scalar" if a == "k01" else "blockwise")
+            pt_ok = len(r["pt"]) == 1 and r["pt"][0].startswith(ptw)
+            n_pt_ok += pt_ok
+            complete = ok_ep and r["done"] and r["tb"] == 0
+            args_ok = len(r["args"]) == 1 and not wrong and not rep_f
+            vw_ok = r["vw"] == ["VOTE_W: off"]
+            bh_ok = r["bh"] == [witness_bh(a)]
+            ch_ok = r["ch"] == [witness_ch(a, rep)]
+            wh_ok = r["wh"] == [witness_wh(a)]
+            line_ok = complete and args_ok and env == [ENV_WANT] and pt_ok and vw_ok and bh_ok and ch_ok and wh_ok
+            print("  %-4s %-12s s%d job %d  epochs %d  RUN_DONE %s  tb %d  ARGS wrong %s rep %s  ENV %s  PT %s  VOTE_W %s"
+                  "  BETA_HOLD %s  COMP_HOLD %s  WINDOW_HOLD %s"
+                  % ("OK" if line_ok else "BAD", a, s, jid, len(r["ep"]), r["done"], r["tb"], wrong or "-", rep_f or "-",
+                     env == [ENV_WANT], pt_ok, vw_ok, bh_ok, ch_ok, wh_ok))
+            if not line_ok:
+                viol("%s-s%d header/completeness" % (a, s))
+            if args_ok:
+                exp("G-ARGS", "  PASS G-ARGS %s-s%d" % (a, s))
+            if vw_ok:
+                exp("G-VOTEW", "  PASS G-VOTEW %s-s%d" % (a, s))
+            if bh_ok:
+                exp("G-HOLDW", "  PASS G-HOLDW %s-s%d" % (a, s))
+            if ch_ok:
+                exp("G-CHOLDW", "  PASS G-CHOLDW %s-s%d" % (a, s))
+            if wh_ok:
+                exp("G-WHOLDW", "  PASS G-WHOLDW %s-s%d" % (a, s))
+    if envs == set([ENV_WANT]) and all(len(R[k]["env"]) == 1 for k in R):
+        exp("G-ENV", "  PASS G-ENV one distinct ENV line, one per run   1 distinct")
+        exp("G-ENV", "        " + ENV_WANT)
+        exp("G-ENV", "  PASS G-ENV the ENV line is cvt1's / cvt4's / cvt6's, byte for byte (PROBE_DIR stripped)")
+    if n_pt_ok == 21:
+        exp("G-ENV", "  PASS G-ENV every run printed ONE `PROBE_TENSOR: on every=100 type=<its arm's> tensors=53`   21 runs")
+    if len(R) != 21:
+        print("\nVIOLATIONS %d" % len(bad))
+        sys.exit(1)
+
+    # ---------------------------------------------------------------- [2]
+    print("\n[2] levels (plateau5 = mean TEST epochs 95..99; TRAIN5 beside)")
+    P, T = {}, {}
+    for a in ARMS:
+        v, t, sl = [], [], []
+        for s in SEEDS:
+            ep = R[(a, s)]["ep"]
+            v.append(mean([ep[e][1] for e in range(95, 100)]))
+            t.append(mean([ep[e][0] for e in range(95, 100)]))
+            xs = list(range(80, 100))
+            sl.append(ols(xs, [ep[e][1] for e in xs]))
+        P[a], T[a] = v, t
+        print("  %-12s TEST %.4f (sd %.4f, range %.4f)  TRAIN %.4f  seeds %s  train %s  slope80-99 %s"
+              % (a, mean(v), sdev(v), max(v) - min(v), mean(t), " / ".join("%.4f" % x for x in v),
+                 " / ".join("%.4f" % x for x in t), " / ".join("%+.3f" % x for x in sl)))
+        exp("LEVELS", "  %-12s TEST %.4f  sd %.4f  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+            % (a, mean(v), sdev(v), max(v) - min(v), mean(t), "/".join("%.3f" % x for x in sl)))
+        exp("LEVELS", "               seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    for s in SEEDS:
+        for j, a in enumerate(ARMS):
+            r = R[(a, s)]
+            exp("COMPLETE", "  OK   %s-%s-s%d  %d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %.4f (train %.4f)"
+                % (PREFIX, a, s, len(r["ep"]), r["done"], r["tb"] > 0, P[a][SEEDS.index(s)], T[a][SEEDS.index(s)]))
+    M = dict((a, mean(P[a])) for a in ARMS)
+    TM = dict((a, mean(T[a])) for a in ARMS)
+    hi = max(M.values())
+    exp("G-FLOOR", "  PASS G-FLOOR max arm mean >= 15.00 pp (chance 1.00)   max %.4f" % hi)
+    exp("G-CEIL", "  PASS G-CEIL max arm mean <= 90.00 pp   max %.4f" % hi)
+
+    # ---------------------------------------------------------------- [3]
+    print("\n[3] G-BITE re-derived from the raw probe records (249.6 (a)-(e)); non-vacuity cross-read; window resolution")
+    exp("G-BITE", "  (a) 500 records; (b) k01's beta == Lion recomputed (tol 1e-05); (c) every held arm: group 1 == 50's (windowed)")
+    exp("G-BITE", "  schedule and group 0 == HEADPATH, in beta (step+2) AND beta_pre (step+1); (d) bh_* / ch_* / wh_* audit;")
+    exp("G-BITE", "  (e) no hold key on k01, no wh_* key on a non-windowed arm.")
+    RECS = {}
+    bite_ok_all = True
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            pdir = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            gs = groups_of(SPEC[a], names)
+            ng = len(gs)
+            recs = load_recs(pdir)
+            RECS[(a, s)] = recs
+            ptj = json.load(open(os.path.join(pdir, "probe_tensor.json")))
+            bsz = json.load(open(os.path.join(pdir, "block_sizes.json")))
+            meta_ok = (ptj.get("n_tensors") == 53 and ptj.get("param_numels") == numel
+                       and bsz.get("n_b") == [sum(numel[i - 1] for i in g) for g in gs])
+            held, win = a in HOLD50, a in WINDOWS
+            c = dict(n=0, nonfin=0, badrec=0, badstep=0, lion=0, ties=0, s50=0, s50p=0, sc=0, scp=0, bh=0, ch=0, wh=0,
+                     ctl=0, act=0, cact=0, wact=0)
+            wl = w50 = wc = 0.0
+            last = {"bh": None, "ch": None, "wh": None}
+            prev = {"bh": -1, "ch": -1, "wh": -1}
+            for k, x in enumerate(recs):
+                if (x is None or type(x.get("step")) is not int or not isinstance(x.get("beta"), list)
+                        or len(x["beta"]) != ng):
+                    c["badrec"] += 1
+                    continue
+                try:
+                    beta = [float(v) for v in x["beta"]]
+                    bp = [float(v) for v in x["beta_pre"][0]]
+                    mo = [float(v) for v in x["mom_pre"][0]]
+                    za = [float(v) for v in x["z_agg"][0]]
+                except (KeyError, TypeError, ValueError, IndexError):
+                    c["badrec"] += 1
+                    continue
+                if not (len(x["beta_pre"]) == 1 and len(x["mom_pre"]) == 1 and len(x["z_agg"]) == 1
+                        and len(bp) == ng and len(mo) == ng and len(za) == ng):
+                    c["badrec"] += 1
+                    continue
+                if not all(math.isfinite(v) for v in beta + bp + mo + za):
+                    c["nonfin"] += 1
+                    continue
+                st = x["step"]
+                c["badstep"] += st != 100 * k
+                c["n"] += 1
+                n = st + 2
+                has = dict((p, any(key in x for key in (p + "_n", p + "_active", p + "_nat", p + "_held")))
+                           for p in ("bh", "ch", "wh"))
+                if not held:
+                    for g in range(ng):
+                        nat, tie = lion(bp[g], mo[g], za[g])
+                        if tie:
+                            c["ties"] += 1
+                            continue
+                        e = abs(nat - beta[g])
+                        wl = max(wl, e)
+                        c["lion"] += e > BH_TOL
+                    c["ctl"] += has["bh"] or has["ch"] or has["wh"]
+                    continue
+                if not win:
+                    c["ctl"] += has["wh"]
+                e1, e2 = abs(beta[1] - sched50(a, n)), abs(bp[1] - sched50(a, n - 1))
+                w50 = max(w50, e1, e2)
+                c["s50"] += e1 > BH_TOL
+                c["s50p"] += e2 > BH_TOL
+                e1, e2 = abs(beta[0] - rep(n)), abs(bp[0] - rep(n - 1))
+                wc = max(wc, e1, e2)
+                c["sc"] += e1 > BH_TOL
+                c["scp"] += e2 > BH_TOL
+                audits = [("bh", 1, True), ("ch", 0, True)] + ([("wh", 1, False)] if win else [])
+                for pfx, g, lion_nat in audits:
+                    try:
+                        an, aa, anat, aheld = (int(x[pfx + "_n"]), int(x[pfx + "_active"]), float(x[pfx + "_nat"]),
+                                               float(x[pfx + "_held"]))
+                    except (KeyError, TypeError, ValueError):
+                        c[pfx] += 1
+                        continue
+                    if lion_nat:
+                        want_nat, tie = lion(bp[g], mo[g], za[g])
+                    else:
+                        want_nat, tie = tri(n, PH), False
+                    good = (an == n and abs(aheld - beta[g]) <= BH_TOL and 0 <= aa <= an and aa >= prev[pfx]
+                            and (tie or abs(anat - want_nat) <= BH_TOL))
+                    c[pfx] += not good
+                    c[{"bh": "act", "ch": "cact", "wh": "wact"}[pfx]] += abs(anat - aheld) > BH_TOL
+                    prev[pfx] = max(prev[pfx], aa)
+                    last[pfx] = aa
+            ok = (meta_ok and len(recs) == N_REC and c["badrec"] == 0 and c["n"] + c["nonfin"] == N_REC
+                  and c["badstep"] == 0 and c["lion"] == 0 and c["ctl"] == 0)
+            if held:
+                ok = (ok and c["s50"] == 0 and c["s50p"] == 0 and c["bh"] == 0 and c["sc"] == 0 and c["scp"] == 0
+                      and c["ch"] == 0 and (last["ch"] is None or last["ch"] >= c["cact"]))
+                if not win:
+                    ok = ok and (last["bh"] is None or last["bh"] >= c["act"])
+            if win:
+                ok = ok and c["wh"] == 0 and last["wh"] is not None and last["wh"] >= c["wact"]
+            nonfin[(a, s)] = c["nonfin"]
+            bite_ok_all = bite_ok_all and ok
+            print("  %-4s %-12s s%d meta %s recs %d lion-mism %d ties %d worst %.1e | 50 %d/%d worst %.1e | C %d/%d worst %.1e"
+                  " | audits bh %d ch %d wh %d keys %d | active %d/%d/%d last %s/%s/%s"
+                  % ("PASS" if ok else "FAIL", a, s, meta_ok, len(recs), c["lion"], c["ties"], wl, c["s50"], c["s50p"], w50,
+                     c["sc"], c["scp"], wc, c["bh"], c["ch"], c["wh"], c["ctl"], c["act"], c["cact"], c["wact"],
+                     last["bh"], last["ch"], last["wh"]))
+            if not ok:
+                viol("G-BITE %s-s%d" % (a, s))
+            exp("G-BITE", "  %-4s G-BITE %-12s s%d  records %s  bad %d  nonfinite %d  lion-mismatch %d (ties %d, worst %.1e)  "
+                "sched50 %d/%d (worst %.1e)  schedC %d/%d (worst %.1e)  bh-audit %d  ch-audit %d  wh-audit %d  "
+                "keys-on-control %d  active %d/%d/%d  bh_active %s  ch_active %s  wh_active %s"
+                % ("PASS" if ok else "FAIL", a, s, len(recs), c["badrec"], c["nonfin"], c["lion"], c["ties"], wl,
+                   c["s50"], c["s50p"], w50, c["sc"], c["scp"], wc, c["bh"], c["ch"], c["wh"], c["ctl"], c["act"],
+                   c["cact"], c["wact"], last["bh"], last["ch"], last["wh"]))
+    print("  NON-VACUITY cross-read: records (of 500) on which 50 (group 1) FAILS each OTHER held arm's schedule (beta or"
+          " beta_pre); min over seeds, and the max |error|")
+    nv_ok = True
+    for a in HELD:
+        cells = []
+        for b_ in HELD:
+            cnt, mx = [], 0.0
+            for s in SEEDS:
+                nfail = 0
+                for x in RECS[(a, s)]:
+                    n = x["step"] + 2
+                    e1 = abs(float(x["beta"][1]) - sched50(b_, n))
+                    e2 = abs(float(x["beta_pre"][0][1]) - sched50(b_, n - 1))
+                    nfail += (e1 > BH_TOL) or (e2 > BH_TOL)
+                    mx = max(mx, e1, e2)
+                cnt.append(nfail)
+            if a == b_:
+                nv_ok = nv_ok and max(cnt) == 0
+                cells.append("%s own 0:%s" % (b_[:4], max(cnt) == 0))
+            else:
+                nv_ok = nv_ok and min(cnt) > 0
+                cells.append("%s %d (max %.3f)" % (b_[:4], min(cnt), mx))
+        print("  %-12s as %s" % (a, "  ".join(cells)))
+    print("  every held run passes its own 50 schedule on all 500 records and fails every other held arm's on >= 1: %s"
+          % nv_ok)
+    if not nv_ok:
+        viol("non-vacuity cross-read")
+    # window resolution on the record grid (251.6(a)): which cuts c would G-BITE's clause (c) also pass?
+    for a in WIN:
+        passing = []
+        for cut in range(9000, 10001):
+            okc = True
+            for s in SEEDS:
+                for x in RECS[(a, s)][88:103]:
+                    n = x["step"] + 2
+                    if (abs(float(x["beta"][1]) - sched50(a, n, cut)) > BH_TOL
+                            or abs(float(x["beta_pre"][0][1]) - sched50(a, n - 1, cut)) > BH_TOL):
+                        okc = False
+                        break
+                if not okc:
+                    break
+            if okc:
+                passing.append(cut)
+        contiguous = passing and passing == list(range(passing[0], passing[-1] + 1))
+        print("  window resolution, %s: of cuts 9000..10000 on 50's records 8800..10200, clause (c) passes cuts %s..%s"
+              " (%d, contiguous %s); the registered 9429 among them: %s"
+              % (a, passing[0] if passing else None, passing[-1] if passing else None, len(passing), bool(contiguous),
+                 NE in passing))
+
+    # ---------------------------------------------------------------- [4]
+    print("\n[4] sigma, onset and contrasts (within batch)")
+    ss = math.fsum((x - M[a]) ** 2 for a in ARMS for x in P[a])
+    df = len(ARMS) * (len(SEEDS) - 1)
+    sig_in = math.sqrt(ss / df)
+    sig = max(SIGMA_PRIOR, sig_in)
+    which = "SIGMA_PRIOR_frozen" if SIGMA_PRIOR >= sig_in else "SIGMA_INBATCH"
+    se = sig * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_INBATCH %.6f (df %d)  SIGMA_PRIOR %.6f  -> used %.6f (%s)  SE %.6f" % (sig_in, df, SIGMA_PRIOR, sig, which, se))
+    exp("SIGMA", "  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR))
+    exp("SIGMA", "  %-20s %.6f" % ("SIGMA_INBATCH", sig_in))
+    exp("SIGMA", "  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+    exp("SIGMA", "  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+    onv = [R[("LATE", s)]["ep"][ONSET_LINE][1] for s in SEEDS]
+    onset = mean(onv)
+    print("  ONSET = LATE's arm-mean TEST at Epoch line %d: %.4f (seeds %s); LOWHEADPATH at line %d: %.4f (seeds %s)"
+          % (ONSET_LINE, onset, " / ".join("%.3f" % v for v in onv), ONSET_LINE,
+             mean([R[(CTL, s)]["ep"][ONSET_LINE][1] for s in SEEDS]),
+             " / ".join("%.3f" % R[(CTL, s)]["ep"][ONSET_LINE][1] for s in SEEDS)))
+    exp("ONSET", "ONSET     LATE's own arm-mean TEST at Epoch line 17 (the last line wholly before update 9429): %.4f  (seeds %s)"
+        % (onset, " / ".join("%.3f" % v for v in onv)))
+    CO = [("P_MID", CTL, "MIDDOSE"), ("P_RES", CTL, "RESDOSE"), ("P_EARLY", CTL, "EARLY"), ("P_LATE", CTL, "LATE"),
+          ("P_WIN", "LATE", "EARLY")]
+    CT = {}
+    for lab, x, y in CO:
+        d, dt = M[x] - M[y], TM[x] - TM[y]
+        CT[lab] = (d, dt)
+        per = [P[x][j] - P[y][j] for j in range(3)]
+        print("  PRIMARY %-8s = %-11s - %-11s TEST %+9.4f pp = %+8.2f SE   TRAIN %+9.4f   per seed %s"
+              % (lab, x, y, d, d / se, dt, " / ".join("%+.4f" % v for v in per)))
+        exp("CONTRASTS", "  PRIMARY  %-7s = %-11s - %-11s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   seeds %s"
+            % (lab, x, y, d, d / se, dt, " / ".join("%+.3f" % v for v in per)))
+    D_CTL = (M[CTL] - M["k01"], TM[CTL] - TM["k01"])
+    R_HIGH = (M[CTL] - M["HIGHHEADPATH"], TM[CTL] - TM["HIGHHEADPATH"])
+    exp("CONTRASTS", "  KEY      D_CTL   = LOWHEADPATH - k01          = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [positive control]"
+        % (D_CTL[0], D_CTL[0] / se, D_CTL[1]))
+    exp("CONTRASTS", "  KEY      R_HIGH  = LOWHEADPATH - HIGHHEADPATH = %+.4f pp = %+.2f SE   (TRAIN %+.4f)  [cvt6's P_50, replicated]"
+        % (R_HIGH[0], R_HIGH[0] / se, R_HIGH[1]))
+    ADD = CT["P_EARLY"][0] + CT["P_LATE"][0] - R_HIGH[0]
+    exp("CONTRASTS", "  DESCR    ADD     = P_EARLY + P_LATE - R_HIGH  = %+.4f pp  [0 if the two halves' losses add up to the whole]" % ADD)
+    print("  KEY D_CTL %+.4f pp (%+.2f SE; TRAIN %+.4f)  R_HIGH %+.4f pp (%+.2f SE; TRAIN %+.4f; per seed %s)  ADD %+.4f"
+          % (D_CTL[0], D_CTL[0] / se, D_CTL[1], R_HIGH[0], R_HIGH[0] / se, R_HIGH[1],
+             " / ".join("%+.4f" % (P[CTL][j] - P["HIGHHEADPATH"][j]) for j in range(3)), ADD))
+    KEPT = {}
+    for a in HELD:
+        d, dt = M[a] - M["k01"], TM[a] - TM["k01"]
+        KEPT[a] = (M[a] - M["HIGHHEADPATH"]) / R_HIGH[0]
+        exp("CONTRASTS", "  KEY      D_%-12s = %-12s - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   kept fraction of R_HIGH %.3f"
+            % (a, a, d, d / se, dt, KEPT[a]))
+    exp("CONTRASTS", "  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE)"
+        % (GAP_MIN, GAP_MIN / se, MATCH, MATCH / se, NULL, NULL / se, RESCUE, RESCUE / se))
+    at_ctl, at_k01 = M[CTL] - MATCH, M["k01"] + NULL
+    bar_late = max(at_k01, onset + MATCH)
+    exp("CONTRASTS", "  state bars: AT-CTL / RESCUED iff L >= %.4f ; AT-K01 / STALLED(EARLY) iff L <= %.4f ; STALLED(LATE) iff L <= %.4f"
+        % (at_ctl, at_k01, bar_late))
+
+    # ---------------------------------------------------------------- [5]
+    print("\n[5] branch, states, stamps (249.6, re-typed; first match wins)")
+    div = [a for a in ARMS if max(P[a]) - min(P[a]) > DIVERGED]
+    exp("G-DIVERGE", "  %s every arm's seed range <= 5.0 pp" % ("PASS" if not div else "FAIL"))
+
+    def st_of(L):
+        if L >= at_ctl:
+            return "AT-CTL"
+        if L <= at_k01:
+            return "AT-K01"
+        return "BETWEEN"
+
+    def wst_of(arm, L):
+        if L >= at_ctl:
+            return "RESCUED"
+        if L <= (bar_late if arm == "LATE" else at_k01):
+            return "STALLED"
+        return "PARTIAL"
+
+    states = dict((a, st_of(M[a])) for a in ("HIGHHEADPATH", "MIDDOSE", "RESDOSE"))
+    wstates = dict((a, wst_of(a, M[a])) for a in WIN)
+    if not bite_ok_all:
+        branch = "PATCH-NOT-VERIFIED"
+    elif not (FLOOR_MIN <= hi <= CEIL_MAX):
+        branch = "HARNESS-UNSOUND"
+    elif div:
+        branch = "UNRESOLVED-DIVERGED"
+    elif M["k01"] > K01_MAX:
+        branch = "SCALAR-NOT-COLLAPSED"
+    elif D_CTL[0] < GAP_MIN:
+        branch = "CONTROL-FAILED"
+    elif states["HIGHHEADPATH"] != "AT-K01":
+        branch = "REPLICATE-FAILED"
+    else:
+        sm, sr = states["MIDDOSE"], states["RESDOSE"]
+        if M["RESDOSE"] - M["MIDDOSE"] > MATCH:
+            dose = "DOSE-NONMONOTONE"
+        else:
+            dose = {("AT-K01", "AT-K01"): "DOSE-ALL-STALL", ("AT-CTL", "AT-K01"): "DOSE-THRESHOLD",
+                    ("AT-CTL", "AT-CTL"): "DOSE-ONLY-HIGH-STALLS"}.get((sm, sr), "DOSE-GRADED")
+        if bar_late >= at_ctl:
+            window = "WINDOW-ONSET-UNRESOLVED"
+        else:
+            window = {("STALLED", "RESCUED"): "EARLY-WINDOW", ("RESCUED", "STALLED"): "LATE-WINDOW",
+                      ("STALLED", "STALLED"): "BOTH-WINDOWS", ("RESCUED", "RESCUED"): "NEITHER-WINDOW"}.get(
+                (wstates["EARLY"], wstates["LATE"]), "WINDOW-GRADED")
+        branch = dose + " | " + window
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "HOLD-FROM-INIT", "COMPLEMENT-ON-HEADPATH", "FORCED-ARMS-OPEN-LOOP",
+              "DOSE-IS-TRIANGLE-FAMILY", "WINDOW-CUT-AT-PEAK", "ONE-WINDOW-PAIR", "ONE-NETWORK-PLAINNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-" + "-".join(div))
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if D_CTL[0] >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if D_CTL[0] >= GAP_MIN:
+        stamps += ["%s-%s" % (a, states[a]) for a in ("HIGHHEADPATH", "MIDDOSE", "RESDOSE")]
+        stamps += ["%s-%s" % (a, wstates[a]) for a in WIN]
+    stamps.append("LATE-ONSET:%.2f" % onset)
+    for a in HELD:
+        if M[a] - M[CTL] > MATCH:
+            stamps.append(a + "-ABOVE-CTL")
+        if M[a] - M["k01"] < -NULL:
+            stamps.append(a + "-BELOW-K01")
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-" + a)
+    if any(abs(M[a] - M["k01"]) <= NULL for a in HELD):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    agree = all((CT[l][1] > 0) == (CT[l][0] > 0) for l, _x, _y in CO if abs(CT[l][0]) >= RESCUE)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("  dose states: %s;  window states: %s" % ("  ".join("%s %s" % (a, states[a]) for a in ("HIGHHEADPATH", "MIDDOSE", "RESDOSE")),
+                                                    "  ".join("%s %s" % (a, wstates[a]) for a in WIN)))
+    print("  " + final)
+    margins = [("D_CTL over GAP_MIN", D_CTL[0] - GAP_MIN), ("k01 under K01_MAX", K01_MAX - M["k01"]),
+               ("worst seed range under DIVERGED (%s)" % max(ARMS, key=lambda a: max(P[a]) - min(P[a])),
+                DIVERGED - max(max(P[a]) - min(P[a]) for a in ARMS)),
+               ("RESDOSE - MIDDOSE under the NONMONOTONE bar (5)", MATCH - (M["RESDOSE"] - M["MIDDOSE"])),
+               ("LATE stall bar under AT-CTL (ONSET-UNRESOLVED if < 0)", at_ctl - bar_late)]
+    for a in HELD:
+        margins.append(("%s: L - (CTL - MATCH)   (>= 0 is AT-CTL/RESCUED)" % a, M[a] - at_ctl))
+        margins.append(("%s: (k01 + NULL) - L    (>= 0 is AT-K01)" % a, at_k01 - M[a]))
+    margins.append(("LATE: stallbar(LATE) - L  (>= 0 is STALLED)", bar_late - M["LATE"]))
+    for k, v in margins:
+        print("    margin %-58s %+9.4f pp = %+.2f SE" % (k, v, v / se))
+    print("  bars in this batch: AT-CTL iff L >= %.4f; AT-K01 iff L <= %.4f; STALLED(LATE) iff L <= %.4f = max(k01 + 2, onset + 5)"
+          % (at_ctl, at_k01, bar_late))
+    print("  per-seed readings against the in-batch bars (descriptive; the branch reads arm means):")
+    for a in HELD:
+        rd = []
+        for j, s in enumerate(SEEDS):
+            L = P[a][j]
+            rd.append("s%d %.4f %s" % (s, L, wst_of(a, L) if a in WIN else st_of(L)))
+        print("    %-12s %s" % (a, " / ".join(rd)))
+
+    def miss(x, band):
+        return 0.0 if band[0] <= x <= band[1] else min(abs(x - band[0]), abs(x - band[1]))
+
+    print("  registered accounts (249.5), predicted bands (k01 K01, CTL FREE, HIGHHEADPATH K01 in every account):")
+    for nm, bm, br in (("DOSE-ALL-STALL", K01B, K01B), ("DOSE-THRESHOLD", FREEB, K01B), ("DOSE-ONLY-HIGH-STALLS", FREEB, FREEB),
+                       ("DOSE-GRADED", PARTB, PARTB), ("DOSE-NONMONOTONE", K01B, FREEB)):
+        print("    %-22s MIDDOSE %s  RESDOSE %s" % (nm, "hit" if miss(M["MIDDOSE"], bm) == 0 else "miss %.2f" % miss(M["MIDDOSE"], bm),
+                                                   "hit" if miss(M["RESDOSE"], br) == 0 else "miss %.2f" % miss(M["RESDOSE"], br)))
+    for nm, be, bl in (("EARLY-WINDOW", K01B, FREEB), ("LATE-WINDOW", FREEB, LATESTALLB), ("BOTH-WINDOWS", K01B, LATESTALLB),
+                       ("NEITHER-WINDOW", FREEB, FREEB), ("WINDOW-GRADED", PARTB, PARTB)):
+        print("    %-22s EARLY %s  LATE %s" % (nm, "hit" if miss(M["EARLY"], be) == 0 else "miss %.2f" % miss(M["EARLY"], be),
+                                             "hit" if miss(M["LATE"], bl) == 0 else "miss %.2f" % miss(M["LATE"], bl)))
+    print("    anchors: k01 %s  CTL %s  HIGHHEADPATH %s" % (
+        "hit" if miss(M["k01"], K01B) == 0 else "miss %.2f" % miss(M["k01"], K01B),
+        "hit" if miss(M[CTL], FREEB) == 0 else "miss %.2f" % miss(M[CTL], FREEB),
+        "hit" if miss(M["HIGHHEADPATH"], K01B) == 0 else "miss %.2f" % miss(M["HIGHHEADPATH"], K01B)))
+    logl = [ln.rstrip("\n") for ln in open(slog)]
+    fl = [ln for ln in logl if ln.startswith("FINAL:")]
+    print("  scorer log FINAL == this FINAL (whole string): %s" % (fl == [final]))
+    if fl:
+        toks = [t.strip() for t in fl[-1][len("FINAL:"):].split("|")]
+        minet = [t.strip() for t in final[len("FINAL:"):].split("|")]
+        print("  token lists equal: %s (scorer %d tokens, here %d)" % (toks == minet, len(toks), len(minet)))
+        if toks != minet or fl != [final]:
+            viol("FINAL differs: scorer-only %s / here-only %s" % (sorted(set(toks) - set(minet)), sorted(set(minet) - set(toks))))
+    else:
+        viol("no FINAL line in the scorer log")
+
+    # ---------------------------------------------------------------- [6]
+    print("\n[6] the scorer's between-batch literals (re-derived from the raw .out) and descriptive readouts")
+    allf = sorted(os.listdir(runsdir))
+
+    def arm_plateau(pfx, arm):
+        fs = [fn for fn in allf if fn.startswith("%s-%s-s" % (pfx, arm)) and fn.endswith(".out")
+              and len(fn[:-4].split("-")) == 4]
+        return mean([plateau_of(os.path.join(runsdir, fn)) for fn in fs]), len(fs)
+
+    btw = [("cvt6", [("k01", "k01"), ("LOWHEADPATH", "LOWHEADPATH"), ("HIGHHEADPATH", "HIGHHEADPATH"), ("HEAD", "HEAD")]),
+           ("cvt4", [("HOLDHEAD(tri:5041)", "HOLDHEAD"), ("HOLDHIGH(tri:9428)", "HOLDHIGH")]),
+           ("cvt7 (ResNet, carrier group)", [("HOLDHIGH(tri:8609)", "HOLDHIGH"), ("ISO", "ISO"), ("k01", "k01")])]
+    for lab, items in btw:
+        pfx = lab.split()[0]
+        vals = []
+        for shown, arm in items:
+            v, nf = arm_plateau(pfx, arm)
+            if nf != 3:
+                viol("between-batch %s %s has %d .out" % (pfx, arm, nf))
+            vals.append((shown, v))
+        exp("BETWEEN", "  %s: %s" % (lab, "  ".join("%s %.4f" % kv for kv in vals)))
+        print("  %s: %s   (plateau5 from %s's raw .out, 3 seeds each)" % (lab, "  ".join("%s %.4f" % kv for kv in vals), pfx))
+    exp("BETWEEN", "  cvt9 {105,106,107}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+    exp("DESCRIPTIVE", "DESCRIPTIVE, NON-GATING -- 50's beta from the runs' own probe.jsonl; r = exp(beta + 15) over epochs 5-18.86 / 18.86-41")
+    SUM = {}
+    for a in ARMS:
+        for s in SEEDS:
+            recs = RECS[(a, s)]
+            co = 0 if a == "k01" else 1
+            seq = [(x["step"], float(x["beta"][co])) for x in recs]
+            pk = seq[0]
+            for st, b in seq:
+                if b > pk[1]:
+                    pk = (st, b)
+            rE = mean([math.exp(b + 15.0) for st, b in seq if 5 * SPE <= st < 18.858 * SPE])
+            rL = mean([math.exp(b + 15.0) for st, b in seq if 18.858 * SPE <= st < 41 * SPE])
+            SUM[(a, s)] = (pk[1], pk[0] / float(SPE), rE, rL)
+            lastr = recs[-1]
+            act = " ".join("%s %s" % (k, lastr.get(k, "-")) for k in ("bh_active", "ch_active", "wh_active"))
+            line = "  %-12s s%d  %s peak %.3f @%.1f  r(5-18.9) %.0f  r(18.9-41) %.0f  %s" % (
+                a, s, "beta" if a == "k01" else "b50", pk[1], pk[0] / float(SPE), rE, rL, act)
+            print(line)
+            exp("DESCRIPTIVE", line)
+    EPL = (9, 14, 15, 16, 17, 18, 19, 20, 22, 24, 29, 39, 49, 99)
+    AM = dict((a, [mean([R[(a, s)]["ep"][e][1] for s in SEEDS]) for e in range(100)]) for a in ARMS)
+    AT = dict((a, [mean([R[(a, s)]["ep"][e][0] for s in SEEDS]) for e in range(100)]) for a in ARMS)
+    exp("DESCRIPTIVE", "DESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) at epoch lines %s" % " / ".join(str(e) for e in EPL))
+    for a in ARMS:
+        exp("DESCRIPTIVE", "  %-12s %s" % (a, " / ".join("%.1f (%.1f)" % (AM[a][e], AT[a][e]) for e in EPL)))
+    FIRST2 = {}
+    for y in HELD[1:]:
+        g = [AM[CTL][e] - AM[y][e] for e in range(100)]
+        first = first_stays(g, lambda v: v > 2.0)
+        FIRST2[y] = first
+        line = "  first epoch line from which arm-mean TEST %s - %s stays > 2 pp: %s" % (CTL, y, "never" if first is None else first)
+        print(line)
+        exp("DESCRIPTIVE", line)
+
+    # ---------------------------------------------------------------- [7]
+    print("\n[7] LINE-BY-LINE AGREEMENT with the scorer log (each re-built line looked up verbatim)")
+    logset = set(logl)
+    by = {}
+    for sec, line in expect:
+        hit = line in logset
+        by.setdefault(sec, [0, 0])
+        by[sec][0 if hit else 1] += 1
+        if not hit:
+            viol("line not in scorer log [%s]: %r" % (sec, line))
+    hp = [("  manifest: ", "/cvt9/PARTITION-MANIFEST.txt (<runsdir>/cvt9/)"),
+          ("  provenance: ", "/cvt9/PROVENANCE.txt (<runsdir>/cvt9/)")]
+    hp_lines = []
+    for pre, suf in hp:
+        got = [ln for ln in logl if ln.startswith(pre) and ln.endswith(suf)]
+        by.setdefault("HOSTPATH", [0, 0])
+        by["HOSTPATH"][0 if len(got) == 1 else 1] += 1
+        hp_lines += got
+        if len(got) != 1:
+            viol("host-path line %r...%r found %d times" % (pre, suf, len(got)))
+    for sec in ("HEADER", "CORPUS", "COMPLETE", "G-ARGS", "G-ENV", "G-VOTEW", "G-HOLDW", "G-CHOLDW", "G-WHOLDW", "G-STRUCT",
+                "G-PROV", "HOSTPATH", "G-REPLAY", "LEVELS", "G-FLOOR", "G-CEIL", "G-BITE", "SIGMA", "ONSET", "CONTRASTS",
+                "G-DIVERGE", "BETWEEN", "DESCRIPTIVE"):
+        h, m = by.get(sec, [0, 0])
+        print("  %-12s %3d lines found verbatim, %d not found" % (sec, h, m))
+    n_fail = sum(1 for ln in logl if ln.lstrip().startswith("FAIL"))
+    rebuilt = set(line for _s, line in expect) | set([final]) | set(hp_lines)
+    print("  total %d re-built lines (+ 2 host-path lines by suffix, + FINAL), %d found; FAIL lines in the scorer log: %d"
+          % (len(expect), sum(v[0] for k, v in by.items() if k != "HOSTPATH"), n_fail))
+    other = [ln for ln in logl if ln.strip() and ln not in rebuilt]
+    print("  scorer log: %d lines, %d blank, %d non-blank not re-built here (banners, section titles, the registered licence"
+          " text):" % (len(logl), sum(1 for ln in logl if not ln.strip()), len(other)))
+    for ln in other:
+        print("    | %s" % ln[:118])
+
+    # ================================================================ DESCRIPTIVE
+    print("\n" + "=" * 100)
+    print("DESCRIPTIVE, NOT REGISTERED -- nothing below can move a level, contrast, gate, branch or stamp above")
+    print("=" * 100)
+    print("\n[D1] TEST (TRAIN) after 15 / 17 / 19 / 30 / 50 / 100 completed epochs (Epoch lines 14 / 16 / 18 / 29 / 49 / 99):"
+          " arm mean, then TEST per seed")
+    for a in ARMS:
+        cells = ["%.2f (%.2f)" % (AM[a][e], AT[a][e]) for e in (14, 16, 18, 29, 49, 99)]
+        per = ["s%d %s" % (s, "/".join("%.2f" % R[(a, s)]["ep"][e][1] for e in (14, 16, 18, 29, 49, 99))) for s in SEEDS]
+        print("  %-12s %s" % (a, "  ".join(cells)))
+        print("  %-12s %s" % ("", "  ".join(per)))
+
+    print("\n[D2] 50's APPLIED beta (group 1; k01: the one shared beta) at epochs 10 / 17 / 18.86 / 20 / 30 / 40.")
+    print("     RECORD BOUNDARY: probe record k has step s = 100k and carries beta after update s+1, i.e. the value applied at")
+    print("     update n = s+2 (checked above in G-BITE).  Epoch e ends at update 500e, so 'at epoch e' = record k = 5e (n = 500e+2).")
+    print("     18.86 is not on the 100-step record grid: the cut n_E = 9429 falls between record 94 (s 9400, n 9402, epoch 18.8)")
+    print("     and record 95 (s 9500, n 9502, epoch 19.0); both are shown, with the schedule at n = 9428 / 9429.")
+    cols = [("10", 50), ("17", 85), ("18.8", 94), ("19.0", 95), ("20", 100), ("30", 150), ("40", 200)]
+    print("  %-26s %s" % ("arm (seed)", "  ".join("%9s" % c for c, _k in cols)) + "   sched n=9428 / 9429")
+    for a in ARMS:
+        vals_by_seed = []
+        for s in SEEDS:
+            rr = RECS[(a, s)]
+            row = []
+            for _c, k in cols:
+                if rr[k]["step"] != 100 * k:
+                    viol("record %d step" % k)
+                row.append(float(rr[k]["beta"][0 if a == "k01" else 1]))
+            vals_by_seed.append(row)
+        same = all(vals_by_seed[j] == vals_by_seed[0] for j in range(3))
+        if a == "k01" or not same:
+            for j, s in enumerate(SEEDS):
+                print("  %-26s %s" % ("%s s%d" % (a, s), "  ".join("%9.4f" % v for v in vals_by_seed[j])))
+        else:
+            sch = "  %9.4f / %9.4f" % (sched50(a, 9428), sched50(a, 9429))
+            print("  %-26s %s %s" % ("%s (x3, 0 diff)" % a, "  ".join("%9.4f" % v for v in vals_by_seed[0]), sch))
+        if a != "k01":
+            ok_s = all(abs(vals_by_seed[j][i] - sched50(a, 100 * k + 2)) <= BH_TOL for j in range(3)
+                       for i, (_c, k) in enumerate(cols))
+            if not ok_s:
+                viol("D2 %s off schedule" % a)
+    print("  %-26s %s" % ("HEADPATH (group 0)", "  ".join("%9.4f" % rep(100 * k + 2) for _c, k in cols)))
+    print("  %-26s %s" % ("r, HIGHHEADPATH 50", "  ".join(
+        "%9.0f" % math.exp(sched50("HIGHHEADPATH", 100 * k + 2) + 15.0) for _c, k in cols)))
+
+    print("\n[D3] the Epoch line from which TEST stays MORE than 2 pp BELOW LOWHEADPATH (to line 99; line n = after n+1 epochs)")
+    print("     arm mean = (arm-mean LOWHEADPATH curve) - (arm-mean held curve); per seed = same-seed LOWHEADPATH - arm; then TRAIN (arm mean)")
+    for y in HELD[1:]:
+        per = []
+        for s in SEEDS:
+            g = [R[(CTL, s)]["ep"][e][1] - R[(y, s)]["ep"][e][1] for e in range(100)]
+            per.append(first_stays(g, lambda v: v > 2.0))
+        tg = [AT[CTL][e] - AT[y][e] for e in range(100)]
+        g = [AM[CTL][e] - AM[y][e] for e in range(100)]
+        print("  %-12s arm mean %s   per seed s105 / s106 / s107 %s   TRAIN %s   gap at lines 14..22: %s" % (
+            y, FIRST2[y], " / ".join(str(v) for v in per), first_stays(tg, lambda v: v > 2.0),
+            " ".join("%d:%+.2f" % (e, g[e]) for e in range(14, 23))))
+
+    print("\n[D4] SETTLE LINE = the first Epoch line from which the curve stays within 0.5 pp of its own plateau5 through line 99")
+    print("     (arm mean: the arm-mean curve against the arm-mean plateau5; per seed: each run against its own; TRAIN likewise")
+    print("     against TRAIN5).  Line n = after n+1 epochs.")
+    for a in ARMS:
+        st_a = first_stays([v - M[a] for v in AM[a]], lambda v: abs(v) <= 0.5)
+        st_t = first_stays([v - TM[a] for v in AT[a]], lambda v: abs(v) <= 0.5)
+        ps = []
+        for j, s in enumerate(SEEDS):
+            ps.append(first_stays([R[(a, s)]["ep"][e][1] - P[a][j] for e in range(100)], lambda v: abs(v) <= 0.5))
+        print("  %-12s TEST settle %2d (per seed %s)   TRAIN settle %2d" % (a, st_a, " / ".join(str(x) for x in ps), st_t))
+
+    print("\n[D5] DOSE-RESPONSE over the triangle family (complement on HEADPATH in every arm).  peak = the schedule's own")
+    print("     maximum b0 + ms*P (log step size; LOWHEADPATH is the floor, -15); r_peak = exp(peak + 15); integrated")
+    print("     step size = sum over updates n = 1..50,000 of (exp(v(n) + 15) - 1), in units of the floor step; clamp epoch =")
+    print("     first update from which v stays at -15, / 500.  Levels are plateau5 arm means (TEST, TRAIN) and seeds.")
+    print("     'kept' = (L - HIGHHEADPATH) / (LOWHEADPATH - HIGHHEADPATH), as the scorer's kept fraction.")
+
+    def integ(arm):
+        tot = 0.0
+        clamp_from = None
+        for n in range(1, 50001):
+            v = sched50(arm, n)
+            tot += math.exp(v + 15.0) - 1.0
+            if v > LO:
+                clamp_from = None
+            elif clamp_from is None:
+                clamp_from = n
+        return tot, clamp_from
+
+    for a in ("LOWHEADPATH", "MIDDOSE", "RESDOSE", "HIGHHEADPATH", "EARLY", "LATE"):
+        mode, Pp = HOLD50[a]
+        pk = LO if mode == "floor" else min(HI, max(LO, B0 + MS * Pp))
+        tot, cf = integ(a)
+        print("  %-12s %-9s peak %8.4f  r_peak %8.0f  peak epoch %6s  integrated %.4e  clamp epoch %6s | TEST %.4f  TRAIN %.4f"
+              "  kept %.3f  seeds %s" % (
+                  a, "floor" if mode == "floor" else "tri:%d" % Pp, pk, math.exp(pk + 15.0),
+                  "-" if mode == "floor" else "%.2f" % ((Pp + 1) / float(SPE)), tot,
+                  "-" if (cf is None or cf <= 1) else "%.2f" % (cf / float(SPE)), M[a], TM[a], KEPT[a],
+                  " / ".join("%.4f" % v for v in P[a])))
+    xs = [LO, min(HI, B0 + MS * PM), min(HI, B0 + MS * PR), min(HI, B0 + MS * PH)]
+    ys = [M["LOWHEADPATH"], M["MIDDOSE"], M["RESDOSE"], M["HIGHHEADPATH"]]
+    print("  successive drops per log unit of peak: floor->MID %.2f pp over %.4f; MID->RES %.2f pp over %.4f; RES->HIGH %.2f pp over %.4f"
+          % (ys[0] - ys[1], xs[1] - xs[0], ys[1] - ys[2], xs[2] - xs[1], ys[2] - ys[3], xs[3] - xs[2]))
+    print("  per seed, monotone LOWHEADPATH > MIDDOSE > RESDOSE > HIGHHEADPATH: %s" % " / ".join(
+        str(P["LOWHEADPATH"][j] > P["MIDDOSE"][j] > P["RESDOSE"][j] > P["HIGHHEADPATH"][j]) for j in range(3)))
+
+    print("\n[D6] the window halves")
+    tE, _cE = integ("EARLY")
+    tL, _cL = integ("LATE")
+    tH, _cH = integ("HIGHHEADPATH")
+    part = all(abs((sched50("EARLY", n) if n < NE else sched50("LATE", n)) - sched50("HIGHHEADPATH", n)) == 0.0
+               for n in range(0, 50002))
+    print("  integrated (r - 1): EARLY %.5e  LATE %.5e  LATE/EARLY %.5f  EARLY+LATE == HIGHHEADPATH (%.5e): %s;"
+          " pointwise partition of tri:9428 at every update 0..50,001: %s" % (tE, tL, tL / tE, tH, abs(tE + tL - tH) < 1e-6 * tH, part))
+    for x, y in (("LATE", "LOWHEADPATH"), ("EARLY", "HIGHHEADPATH")):
+        cells = []
+        for s in SEEDS:
+            eqlines = [e for e in range(0, 18) if R[(x, s)]["ep"][e] == R[(y, s)]["ep"][e]]
+            first_diff = next((e for e in range(0, 100) if R[(x, s)]["ep"][e] != R[(y, s)]["ep"][e]), None)
+            mx = max(abs(R[(x, s)]["ep"][e][1] - R[(y, s)]["ep"][e][1]) for e in range(0, 18))
+            bx = [float(r_["beta"][0]) for r_ in RECS[(x, s)][:94]]
+            by_ = [float(r_["beta"][0]) for r_ in RECS[(y, s)][:94]]
+            cells.append("s%d identical (train, test) on %d of lines 0..17, first differing line %s, max |TEST diff| 0..17 %.3f,"
+                         " complement beta identical on records 0..93: %s" % (s, len(eqlines), first_diff, mx, bx == by_))
+        print("  %s vs %s (same schedules before update 9429):" % (x, y))
+        for c_ in cells:
+            print("    " + c_)
+    print("  LATE's onset gap: LOWHEADPATH - LATE arm-mean TEST at lines 16 / 17 / 18 / 19 / 20: %s" % " / ".join(
+        "%+.2f" % (AM[CTL][e] - AM["LATE"][e]) for e in (16, 17, 18, 19, 20)))
+    print("  EARLY - HIGHHEADPATH arm-mean TEST at lines 17 / 18 / 19 / 20 / 29 / 49 / 99: %s" % " / ".join(
+        "%+.2f" % (AM["EARLY"][e] - AM["HIGHHEADPATH"][e]) for e in (17, 18, 19, 20, 29, 49, 99)))
+    print("  ADD = P_EARLY + P_LATE - R_HIGH %+.4f pp: the two halves' losses (%.4f + %.4f = %.4f) exceed the whole's (%.4f)"
+          % (ADD, CT["P_EARLY"][0], CT["P_LATE"][0], CT["P_EARLY"][0] + CT["P_LATE"][0], R_HIGH[0]))
+
+    print("\nVIOLATIONS %d" % len(bad))
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()

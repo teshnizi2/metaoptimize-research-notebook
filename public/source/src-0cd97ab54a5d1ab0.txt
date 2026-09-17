@@ -16,7 +16,8 @@ From the command line:
 
   --check  every listed (run, job_id) is present EXACTLY once in results/all_runs.csv; no key is listed
            twice; with --runs, the run's own raw .out carries exactly the listed witness line (of the
-           intervention kind the witness names: VOTE_W, BETA_HOLD, GROUP_HOLD or COMP_HOLD, see KINDS), and
+           intervention kind the witness names: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD, REST_HOLD or WINDOW_HOLD, see
+           KINDS), and
            every OTHER .out of a listed batch carries that kind's `off` line (so the list is complete for that
            batch);
            COMPLETENESS (CORRECTIONS 239): every .out found under --runs that is a CSV row and prints an ON
@@ -25,6 +26,8 @@ From the command line:
            TWO-KIND RUNS (CORRECTIONS 245): a run whose registered design turns on two kinds (cvt6's forced
            arms: BETA_HOLD + COMP_HOLD) is listed ONCE, by either ON line, and must print exactly the lines
            MULTI_KIND registers for its (batch, arm) -- so its other ON line is verified, not skipped;
+           CORRECTIONS 251: any number of kinds, e.g. cvt8's forced arms (GROUP_HOLD + REST_HOLD), cvt9's held arms
+           (BETA_HOLD + COMP_HOLD) and its EARLY / LATE (+ WINDOW_HOLD, three kinds);
            then prints the noise-floor demonstration: the registered cvt1 sigmas (227.6) re-derived on
            the current corpus three ways -- as 227 did (every `cvt1-` row dropped), as a future
            registration should (only the listed rows dropped), and naively (nothing dropped).
@@ -105,9 +108,11 @@ KINDS = [
     ("BETA_HOLD", "BETA_HOLD: off"),  # patches/patch_betahold.py, CORRECTIONS 237 (cvt4, cvt6)
     ("GROUP_HOLD", "GROUP_HOLD: off"),  # patches/patch_grouphold.py, CORRECTIONS 243 (cvt7)
     ("COMP_HOLD", "COMP_HOLD: off"),  # patches/patch_comphold.py, CORRECTIONS 242 (cvt6)
+    ("REST_HOLD", "REST_HOLD: off"),  # patches/patch_resthold.py, CORRECTIONS 248 (cvt8); added at 251
+    ("WINDOW_HOLD", "WINDOW_HOLD: off"),  # patches/patch_windowhold.py, CORRECTIONS 249 (cvt9); added at 251
 ]
-# No prefix above is a prefix of another (their first letters V / B / G / C differ), so no line starts with two of them
-# and every `startswith` reader selects each line for ONE kind (CORRECTIONS 245); check() FAILs if an entry breaks it.
+# No prefix above is a prefix of another (their first letters V / B / G / C / R / W differ), so no line starts with two of
+# them and every `startswith` reader selects each line for ONE kind (CORRECTIONS 245); check() FAILs if an entry breaks it.
 
 # ---- --check only: runs whose registered design turns ON more than one kind (CORRECTIONS 245) ----------------------
 # A TSV row carries ONE witness.  Such a run is listed ONCE, by any one of its ON lines; each (batch, arm) below must
@@ -129,6 +134,37 @@ MULTI_KIND = {
     ("cvt6", "LOWMUTEPATH"): {"BETA_HOLD": _CVT6_BH_FLOOR, "COMP_HOLD": _CVT6_CH_TRI},
     ("cvt6", "LOWHEADPATH"): {"BETA_HOLD": _CVT6_BH_FLOOR, "COMP_HOLD": _CVT6_CH_REC},
 }
+# CORRECTIONS 251: cvt8 (248) and cvt9 (249), appended; the entries above are unchanged.  A (batch, arm) may register ANY
+# number of kinds -- check() already reads MULTI_KIND per kind -- and cvt9's EARLY / LATE register three.  Re-typed from
+# the registered scorers (NOT imported): analysis/cVT8_doseroute_score.py WITNESS_GH / WITNESS_RH for FORCED, and
+# analysis/cVT9_dosewindow_score.py WITNESS_BH / WITNESS_CH for FORCED (= HELD) + WITNESS_WH for WINDOWED.  cvt9's
+# BETA_HOLD tri:9428 / floor lines and its COMP_HOLD line are byte-identical to cvt6's (cVT9 selftest B), so they are reused.
+# tests/test_corpus_exclusions_check.py C23 pins every entry to the scorers' tables.
+_CVT8_GH = "GROUP_HOLD: on type=blockwise group=1 groupsize=3 names=layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight"
+_CVT8_GH_TRI_8609 = _CVT8_GH + " mode=tri P=8609 b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=-5.2065107498168945"
+_CVT8_GH_TRI_9428 = _CVT8_GH + " mode=tri P=9428 b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=-4.387510749816894"
+_CVT8_GH_FLOOR = _CVT8_GH + " mode=floor value=-15.0"
+_CVT8_RH_REC = ("REST_HOLD: on type=blockwise group=0 groupsize=59 mode=rec id=cvt8_isopath "
+                "sha256=08ab25f3a329cb260bb39fb72f3299c021e7169bf612fa27d539166296e28e70 knots=500 n0=2 n1=49902 "
+                "b0=-13.815510749816895 lo=-15.0 hi=-2.3026 vmax=-4.985378742218018 vlast=-14.924964427947998")
+_CVT9_BH_TRI_7235 = ("BETA_HOLD: on type=blockwise group=1 groupsize=1 name=layer4.1.bn2.weight mode=tri P=7235 "
+                     "b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=-6.580510749816894")
+_CVT9_BH_TRI_8609 = ("BETA_HOLD: on type=blockwise group=1 groupsize=1 name=layer4.1.bn2.weight mode=tri P=8609 "
+                     "b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=-5.2065107498168945")
+_CVT9_WH = "WINDOW_HOLD: on type=blockwise group=1 name=layer4.1.bn2.weight base=tri P=9428"
+_CVT9_WH_EARLY = _CVT9_WH + " n0=0 n1=9429 outside=floor value=-15.0"
+_CVT9_WH_LATE = _CVT9_WH + " n0=9429 n1=end outside=floor value=-15.0"
+MULTI_KIND.update({
+    ("cvt8", "HIGHISOPATH"): {"GROUP_HOLD": _CVT8_GH_TRI_8609, "REST_HOLD": _CVT8_RH_REC},
+    ("cvt8", "BIGISOPATH"): {"GROUP_HOLD": _CVT8_GH_TRI_9428, "REST_HOLD": _CVT8_RH_REC},
+    ("cvt8", "LOWISOPATH"): {"GROUP_HOLD": _CVT8_GH_FLOOR, "REST_HOLD": _CVT8_RH_REC},
+    ("cvt9", "LOWHEADPATH"): {"BETA_HOLD": _CVT6_BH_FLOOR, "COMP_HOLD": _CVT6_CH_REC},
+    ("cvt9", "HIGHHEADPATH"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC},
+    ("cvt9", "MIDDOSE"): {"BETA_HOLD": _CVT9_BH_TRI_7235, "COMP_HOLD": _CVT6_CH_REC},
+    ("cvt9", "RESDOSE"): {"BETA_HOLD": _CVT9_BH_TRI_8609, "COMP_HOLD": _CVT6_CH_REC},
+    ("cvt9", "EARLY"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "WINDOW_HOLD": _CVT9_WH_EARLY},
+    ("cvt9", "LATE"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "WINDOW_HOLD": _CVT9_WH_LATE},
+})
 
 
 def multi_kind_of(fn):
@@ -239,23 +275,30 @@ def check(runs_dirs):
         print("  completeness (%s): %d .out files print an ON line; %d are CSV rows, every one listed with its kind: %s;"
               " %d not in the CSV (not ingested, not required)"
               % (" / ".join(kd for kd, _off in KINDS if kd in used), n_on, n_csv, len(bad) == nb, n_on - n_csv))
+        # CORRECTIONS 251: 245's line names 245's four kinds, byte for byte; the kinds added since are named on the next line
         print("  kinds scanned (CORRECTIONS 245): %s; no prefix is a prefix of another, so no line is read as two kinds: %s"
-              % (" / ".join(kd for kd, _off in KINDS), not collide))
+              % (" / ".join(kd for kd, _off in KINDS[:4]), not collide))
+        print("  kinds scanned (CORRECTIONS 251): also %s, %d in all; no prefix of the %d is a prefix of another: %s"
+              % (" / ".join(kd for kd, _off in KINDS[4:]), len(KINDS), len(KINDS), not collide))
         # TWO-KIND RUNS (CORRECTIONS 245): a listed run of a MULTI_KIND (batch, arm) prints exactly its registered line of
         # every kind registered there -- the kind its witness names and the one the TSV row cannot carry.
         nb = len(bad)
         n_two = 0
+        n_by = {}  # CORRECTIONS 251: the same runs, by the number of kinds registered for them
         for fn in sorted(listed):
             des = multi_kind_of(fn)
             if des is None or fn not in wl:
                 continue
             n_two += 1
+            n_by[len(des)] = n_by.get(len(des), 0) + 1
             for kd, _off in KINDS:
                 if kd in des and wl[fn][kd] != [des[kd]]:
                     bad.append("%s is registered with %s ON but prints %r, not the registered line (MULTI_KIND)"
                                % (fn, kd, wl[fn][kd]))
         print("  two-kind runs (CORRECTIONS 245): %d listed runs of a registered two-kind (batch, arm), every one printing"
               " exactly its registered ON line of each kind: %s" % (n_two, len(bad) == nb))
+        print("  multi-kind runs (CORRECTIONS 251): those runs by the number of kinds MULTI_KIND registers for them: %s"
+              % ", ".join("%d kinds %d" % (n, n_by.get(n, 0)) for n in sorted(set(len(d) for d in MULTI_KIND.values()))))
     print("\nnoise-floor demonstration (227.6's definitions; cell = 15 CELLKEYS; complete, unsuperseded, std cell)")
     k = set(ks)
     variants = [("as 227 registered it: every cvt1- row dropped", [r for r in rows if not r["run"].startswith("cvt1-")]),
