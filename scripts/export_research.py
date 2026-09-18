@@ -49,6 +49,7 @@ CVT23_IDS = [register_model.partition_id(line) for line in range(register_model.
 CVT45_IDS = [register_model.partition_id(line) for line in range(register_model.CVT45_FIRST_ROW, register_model.CVT45_LAST_ROW + 1)]
 CVT67_IDS = [register_model.partition_id(line) for line in range(register_model.CVT67_FIRST_ROW, register_model.CVT67_LAST_ROW + 1)]
 CVT89_IDS = [register_model.partition_id(line) for line in range(register_model.CVT89_FIRST_ROW, register_model.CVT89_LAST_ROW + 1)]
+MUST_IDS = [register_model.partition_id(line) for line in range(register_model.MUST_FIRST_ROW, register_model.MUST_LAST_ROW + 1)]
 REGISTER_CSV = "complete_experiment_register.csv"
 RUN_INVENTORY_CSV = "complete_run_inventory.csv"
 # Summary tables derived from the register are regenerated from it, like the register table.
@@ -98,7 +99,7 @@ PHASE_LINKS = [
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
 PHASE_STARTS = ["2026-08-18", "2026-08-20", "2026-08-24", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-14"]
-EXPECTED_STATS = {"experiments": 164, "researchQuestions": 146, "methodChecks": 18, "runs": 3127, "figures": 54, "areas": 10}
+EXPECTED_STATS = {"experiments": 168, "researchQuestions": 150, "methodChecks": 18, "runs": 3181, "figures": 54, "areas": 10}
 CVK2_RUNS = 27
 
 
@@ -258,6 +259,12 @@ def warning_for(experiment):
         warnings.append({"id": f"warning-{experiment['id']}-intervention", "experimentId": experiment["id"], "severity": "caution",
                          "title": intervention["title"], "status": "documented",
                          "detail": intervention["note"] + " Intervention record: " + intervention["source"] + "."})
+    deviations = experiment.get("args_deviations")
+    if deviations:
+        # No patch ran: these arms deviate from the standard cell in a base-optimiser CLI flag alone (CORRECTIONS 263).
+        warnings.append({"id": f"warning-{experiment['id']}-args-deviation", "experimentId": experiment["id"], "severity": "caution",
+                         "title": deviations["title"], "status": "documented",
+                         "detail": deviations["note"] + " Exclusion record: " + deviations["source"] + "."})
     if experiment["corrected"] and experiment["kind"] == "research":
         warnings.append({"id": f"warning-{experiment['id']}-correction", "experimentId": experiment["id"], "severity": "correction",
                          "title": "A historical claim was corrected", "status": "resolved",
@@ -285,10 +292,12 @@ def build_experiments(register, source_links):
         }
         amendment = json.loads(row["amendment"]) if row.get("amendment") else None
         intervention = json.loads(row["intervention"]) if row.get("intervention") else None
+        deviations = json.loads(row["args_deviations"]) if row.get("args_deviations") else None
         later = json.loads(row["later_amendment"]) if row.get("later_amendment") else None
         further = json.loads(row["further_amendments"]) if row.get("further_amendments") else []
         registration = json.loads(row["registration_corrections"]) if row.get("registration_corrections") else []
-        for warning in warning_for({**experiment, "amendment": amendment, "intervention": intervention, "later_amendment": later, "further_amendments": further,
+        for warning in warning_for({**experiment, "amendment": amendment, "intervention": intervention, "args_deviations": deviations,
+                                    "later_amendment": later, "further_amendments": further,
                                     "registration_corrections": registration}):
             experiment["warningIds"].append(warning["id"])
             warnings.append(warning)
@@ -546,7 +555,20 @@ def make_runs(inventory, experiments, evidence, public, workspace, intervened=No
         if row.get("superseded") == "1":
             status = "superseded"
         params["runCompletion"] = "complete" if done else "incomplete or unknown in archived inventory"
-        if job_id in intervened:
+        if job_id in intervened and intervened[job_id]["argsDeviation"]:
+            # No patch ran: this run deviates from the standard cell in a base-optimiser CLI flag alone, which no column
+            # of the inventory carries, so the row keeps the plain arm's cell key (CORRECTIONS 255, 263).
+            listed = intervened[job_id]
+            if listed["run"] != row["run"]:
+                raise ValueError(f"Exclusion list names another run for job {job_id}")
+            kind, flag, value, standard = register_model.args_deviation(listed["intervention"], listed["witness"])
+            params["argsDeviation"] = f"{listed['arm']}: {listed['intervention']}"
+            params["argsDeviationKind"] = kind
+            params["argsDeviationWitness"] = listed["witness"]
+            params["argsDeviationNote"] = (f"Not a plain {listed['looks_like']} measurement at the standard cell: the inventory carries that arm's cell key "
+                                           f"because no column records the {register_model.args_phrase(kind)}, set to {value} here against the standard "
+                                           f"{standard}. Listed in {register_model.INTERVENTIONS_TSV} ({listed['registered_at']}); drop before pooling runs by cell.")
+        elif job_id in intervened:
             # The inventory's cell key hides this run's harness intervention (results/CORPUS-EXCLUSIONS.tsv).
             listed = intervened[job_id]
             if listed["run"] != row["run"]:
@@ -578,7 +600,14 @@ def make_runs(inventory, experiments, evidence, public, workspace, intervened=No
             params["archivedLogReferences"] = " | ".join(sanitize_text(str(path), workspace) for path in logs[job_id])
         else:
             raise ValueError(f"Required raw log is absent from the available local archive: {job_id}")
-        extra_holds = register_model.intervention_kinds(intervened[job_id]["intervention"])[1:] if job_id in intervened else []
+        listed = intervened.get(job_id)
+        if listed and listed["argsDeviation"]:
+            # The witness is the run's OWN ARGS line, read with argparse last-wins semantics; the published witness quotes
+            # the checked flag alone, because the raw line also carries the run's private save directory.
+            kind, flag, value, standard = register_model.args_deviation(listed["intervention"], listed["witness"])
+            log_lines = Path(source).read_text(encoding="utf-8", errors="replace").splitlines()
+            params["argsDeviationArgsWitness"] = register_model.args_witness_line(log_lines, flag, value, standard)
+        extra_holds = register_model.intervention_kinds(listed["intervention"])[1:] if listed and not listed["argsDeviation"] else []
         if extra_holds:
             # The list carries the first hold's witness only; every further hold must print exactly one matching ON line in the run's own log,
             # joined in the listed order (cvt9's EARLY / LATE: COMP_HOLD | WINDOW_HOLD).
@@ -617,7 +646,7 @@ def make_activity(timeline, snapshot_date, experiments, run_count):
         })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}, the {len(CVT45_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT45_FIRST_ROW}-{register_model.CVT45_LAST_ROW} at {register_model.CVT45_COMMIT[:7]} with the in-place row amendments of CORRECTIONS 244 at {register_model.C244_COMMIT[:7]}, the {len(CVT67_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT67_FIRST_ROW}-{register_model.CVT67_LAST_ROW} at {register_model.CVT67_COMMIT[:7]}, and the {len(CVT89_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT89_FIRST_ROW}-{register_model.CVT89_LAST_ROW} at {register_model.CVT89_COMMIT[:7]} with the in-place row amendment of CORRECTIONS 253.15 at {register_model.CVT89_AUDIT_COMMIT[:7]}), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}, the {len(CVT45_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT45_FIRST_ROW}-{register_model.CVT45_LAST_ROW} at {register_model.CVT45_COMMIT[:7]} with the in-place row amendments of CORRECTIONS 244 at {register_model.C244_COMMIT[:7]}, the {len(CVT67_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT67_FIRST_ROW}-{register_model.CVT67_LAST_ROW} at {register_model.CVT67_COMMIT[:7]}, the {len(CVT89_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT89_FIRST_ROW}-{register_model.CVT89_LAST_ROW} at {register_model.CVT89_COMMIT[:7]} with the in-place row amendment of CORRECTIONS 253.15 at {register_model.CVT89_AUDIT_COMMIT[:7]}, and the {len(MUST_IDS)} rows appended at MASTER-TABLE lines {register_model.MUST_FIRST_ROW}-{register_model.MUST_LAST_ROW} at {register_model.MUST_COMMIT[:7]}, which amended no earlier row), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -784,6 +813,17 @@ def validate(data, runs, public):
         verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"cvt8/cvt9 row has no research phase: line {line}")
         linked = [run for run in runs if eid in run["experimentIds"]]
         verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"cvt8/cvt9 row runs not linked: {eid}")
+    for line, (rule, section, batches, figures, _, _) in register_model.MUST_ROWS.items():
+        eid = register_model.partition_id(line)
+        row = by_id.get(eid, {})
+        verify(row.get("section") == section and row.get("area") == register_model.AREAS[section] and row.get("outcome") == register_model.RULE_OUTCOME[rule], f"MUST-tier MASTER-TABLE row missing or remapped: line {line}")
+        verify(row.get("batches") == batches and set(figures) <= set(row.get("figureIds", [])), f"MUST-tier row links: line {line}")
+        verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"MUST-tier row has no research phase: line {line}")
+        verify(not row.get("corrected"), f"MUST-tier row must carry no Corrected badge: line {line}")
+        linked = [run for run in runs if eid in run["experimentIds"]]
+        verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"MUST-tier row runs not linked: {eid}")
+    verify(not any(w["id"].startswith(tuple(f"warning-{eid}-registration" for eid in MUST_IDS)) for w in data["warnings"]), "The MUST-tier landings corrected no registration text")
+    verify(not any(w["id"].startswith(tuple(f"warning-{eid}-amendment" for eid in MUST_IDS)) for w in data["warnings"]), "The MUST-tier landings amended no row")
     for eid, spec in {**register_model.CVT67_REGISTRATION_CORRECTIONS, **register_model.CVT89_REGISTRATION_CORRECTIONS}.items():
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-registration-{spec['number']}"), {})
         verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []) and f"CORRECTIONS {spec['entry']}" in warning.get("detail", ""), f"Registration correction warning missing: {eid}")
@@ -819,6 +859,18 @@ def validate(data, runs, public):
         verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []), f"Intervention warning missing: {eid}")
         marked = [run for run in runs if run["batch"] == spec["batch"] and "intervention" in run["parameters"]]
         verify(sorted(run["parameters"]["intervention"].split(":")[0] for run in marked) == sorted(arm for arm, n in spec["arms"].items() for _ in range(n)), f"Intervened runs not marked: {eid}")
+    for eid, spec in register_model.MUST_ARGS_DEVIATIONS.items():
+        # The ARGS-value rows carry their own mark, so the patch-intervention count above is unchanged by this landing.
+        warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-args-deviation"), {})
+        verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []), f"ARGS-value deviation warning missing: {eid}")
+        marked = [run for run in runs if run["batch"] == spec["batch"] and "argsDeviation" in run["parameters"]]
+        verify(sorted(run["parameters"]["argsDeviation"].split(":")[0] for run in marked) == sorted(arm for arm, n in spec["arms"].items() for _ in range(n)), f"ARGS-value rows not marked: {eid}")
+        for run in marked:
+            kind = run["parameters"]["argsDeviationKind"]
+            flag, standard, _name = register_model.ARGS_KINDS[kind]
+            verify(run["parameters"]["argsDeviationWitness"].startswith(f"{kind}: {flag}="), f"ARGS-value witness malformed: {run['id']}")
+            verify(run["parameters"]["argsDeviationArgsWitness"].startswith(f"{register_model.ARGS_LINE_PREFIX} --{flag} "), f"ARGS line witness missing: {run['id']}")
+            verify("intervention" not in run["parameters"], f"An ARGS-value row must not be marked as a patch intervention: {run['id']}")
     for eid, (line, previous, outcome, _, batches, _, _) in register_model.ROW_AMENDMENTS.items():
         row = by_id.get(eid, {})
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-amendment"), {})
@@ -911,7 +963,7 @@ def export(workspace, public, snapshot_date, audit_path=None, run_inventory=None
     tables, table_receipts = publish_tables(workspace, public, experiments, register, figures, areas, run_inventory)
     intervened = register_model.intervened_runs(repository_path)
     runs, log_receipts = make_runs(inventory, experiments, evidence, public, workspace, intervened)
-    missing = set(intervened) - {run["jobId"] for run in runs if "intervention" in run["parameters"]}
+    missing = set(intervened) - {run["jobId"] for run in runs if "intervention" in run["parameters"] or "argsDeviation" in run["parameters"]}
     if missing:
         raise ValueError(f"Intervened runs absent from the run inventory: {sorted(missing)}")
     activity = make_activity(read_csv(table_root / "research_timeline.csv"), snapshot_date, experiments, len(runs))
@@ -921,10 +973,10 @@ def export(workspace, public, snapshot_date, audit_path=None, run_inventory=None
     commit = subprocess.check_output(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True).strip()
     input_paths = [table_root / REGISTER_CSV, run_inventory, table_root / "complete_figure_index.csv"]
     # The pinned MASTER-TABLE bytes and the mapping module are inputs too.
-    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + register_model.AMENDMENT_MASTER_TABLE_SHA256 + register_model.LANDED_MASTER_TABLE_SHA256 + register_model.INTERVENTIONS_TSV_SHA256 + register_model.CGN3_MASTER_TABLE_SHA256 + register_model.CVT23_MASTER_TABLE_SHA256 + register_model.CVT23_INTERVENTIONS_TSV_SHA256 + register_model.CVT45_MASTER_TABLE_SHA256 + register_model.CVT45_INTERVENTIONS_TSV_SHA256 + register_model.C244_MASTER_TABLE_SHA256 + register_model.CVT67_MASTER_TABLE_SHA256 + register_model.CVT67_INTERVENTIONS_TSV_SHA256 + register_model.CVT67_CORRECTIONS_SHA256 + register_model.CVT89_MASTER_TABLE_SHA256 + register_model.CVT89_INTERVENTIONS_TSV_SHA256 + register_model.CVT89_CORRECTIONS_SHA256 + register_model.CVT89_AUDIT_MASTER_TABLE_SHA256 + register_model.CVT89_AUDIT_CORRECTIONS_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
+    fingerprint = hashlib.sha256(("".join(digest(path) for path in input_paths) + register_model.MASTER_TABLE_SHA256 + register_model.APPENDED_MASTER_TABLE_SHA256 + register_model.AMENDMENT_MASTER_TABLE_SHA256 + register_model.LANDED_MASTER_TABLE_SHA256 + register_model.INTERVENTIONS_TSV_SHA256 + register_model.CGN3_MASTER_TABLE_SHA256 + register_model.CVT23_MASTER_TABLE_SHA256 + register_model.CVT23_INTERVENTIONS_TSV_SHA256 + register_model.CVT45_MASTER_TABLE_SHA256 + register_model.CVT45_INTERVENTIONS_TSV_SHA256 + register_model.C244_MASTER_TABLE_SHA256 + register_model.CVT67_MASTER_TABLE_SHA256 + register_model.CVT67_INTERVENTIONS_TSV_SHA256 + register_model.CVT67_CORRECTIONS_SHA256 + register_model.CVT89_MASTER_TABLE_SHA256 + register_model.CVT89_INTERVENTIONS_TSV_SHA256 + register_model.CVT89_CORRECTIONS_SHA256 + register_model.CVT89_AUDIT_MASTER_TABLE_SHA256 + register_model.CVT89_AUDIT_CORRECTIONS_SHA256 + register_model.MUST_MASTER_TABLE_SHA256 + register_model.MUST_CORRECTIONS_SHA256 + register_model.MUST_INTERVENTIONS_TSV_SHA256 + digest(Path(register_model.__file__))).encode()).hexdigest()[:16]
     data = {
         "meta": {"title": "MetaOptimize Research Notebook", "asOf": snapshot_date, "generatedAt": datetime.now(timezone.utc).isoformat(), "snapshotId": snapshot_date + "-" + fingerprint, "repositoryCommit": commit, "stats": {"experiments": len(experiments), "researchQuestions": sum(e["kind"] == "research" for e in experiments), "methodChecks": sum(e["kind"] == "method-check" for e in experiments), "runs": len(runs), "figures": len(figures), "areas": len(areas)}, "downloads": {"pdf": "/assets/report.pdf", "bundle": "/assets/charts-and-tables.zip"},
-                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256, "amendmentCommit": register_model.AMENDMENT_COMMIT, "amendmentMasterTableSha256": register_model.AMENDMENT_MASTER_TABLE_SHA256, "landedRowsCommit": register_model.LANDED_COMMIT, "landedMasterTableSha256": register_model.LANDED_MASTER_TABLE_SHA256, "cgn3LandingCommit": register_model.CGN3_COMMIT, "cgn3LandingMasterTableSha256": register_model.CGN3_MASTER_TABLE_SHA256, "cvt23LandingCommit": register_model.CVT23_COMMIT, "cvt23LandingMasterTableSha256": register_model.CVT23_MASTER_TABLE_SHA256, "cvt45LandingCommit": register_model.CVT45_COMMIT, "cvt45LandingMasterTableSha256": register_model.CVT45_MASTER_TABLE_SHA256, "c244AmendmentCommit": register_model.C244_COMMIT, "c244AmendmentMasterTableSha256": register_model.C244_MASTER_TABLE_SHA256, "cvt67LandingCommit": register_model.CVT67_COMMIT, "cvt67LandingMasterTableSha256": register_model.CVT67_MASTER_TABLE_SHA256, "cvt89LandingCommit": register_model.CVT89_COMMIT, "cvt89LandingMasterTableSha256": register_model.CVT89_MASTER_TABLE_SHA256, "cvt89AuditCommit": register_model.CVT89_AUDIT_COMMIT, "cvt89AuditMasterTableSha256": register_model.CVT89_AUDIT_MASTER_TABLE_SHA256}},
+                 "outcomeModel": {"outcomes": register_model.OUTCOME_LABELS, "badge": "corrected", "kinds": {"research": "Research question", "method-check": "Method check"}, "mapping": "scripts/register_model.py", "partitionAuditCommit": register_model.PARTITION_AUDIT_COMMIT, "masterTableSha256": register_model.MASTER_TABLE_SHA256, "appendedRowsCommit": register_model.APPENDED_COMMIT, "appendedMasterTableSha256": register_model.APPENDED_MASTER_TABLE_SHA256, "amendmentCommit": register_model.AMENDMENT_COMMIT, "amendmentMasterTableSha256": register_model.AMENDMENT_MASTER_TABLE_SHA256, "landedRowsCommit": register_model.LANDED_COMMIT, "landedMasterTableSha256": register_model.LANDED_MASTER_TABLE_SHA256, "cgn3LandingCommit": register_model.CGN3_COMMIT, "cgn3LandingMasterTableSha256": register_model.CGN3_MASTER_TABLE_SHA256, "cvt23LandingCommit": register_model.CVT23_COMMIT, "cvt23LandingMasterTableSha256": register_model.CVT23_MASTER_TABLE_SHA256, "cvt45LandingCommit": register_model.CVT45_COMMIT, "cvt45LandingMasterTableSha256": register_model.CVT45_MASTER_TABLE_SHA256, "c244AmendmentCommit": register_model.C244_COMMIT, "c244AmendmentMasterTableSha256": register_model.C244_MASTER_TABLE_SHA256, "cvt67LandingCommit": register_model.CVT67_COMMIT, "cvt67LandingMasterTableSha256": register_model.CVT67_MASTER_TABLE_SHA256, "cvt89LandingCommit": register_model.CVT89_COMMIT, "cvt89LandingMasterTableSha256": register_model.CVT89_MASTER_TABLE_SHA256, "cvt89AuditCommit": register_model.CVT89_AUDIT_COMMIT, "cvt89AuditMasterTableSha256": register_model.CVT89_AUDIT_MASTER_TABLE_SHA256, "mustTierLandingCommit": register_model.MUST_COMMIT, "mustTierMasterTableSha256": register_model.MUST_MASTER_TABLE_SHA256, "mustTierIngestCommit": register_model.MUST_INGEST_COMMIT}},
         "areas": areas, "experiments": experiments, "figures": figures, "sources": sources,
         "tables": tables, "warnings": warnings, "activity": activity,
         "latest": {"experimentId": "CVK2", "peakSet": cvk["peak_cuts"], "predictedCut": cvk["predicted_peak_cut"], "bestCut": cvk["best_mean_cut"], "bar": cvk["peak_bar_pp"], "cells": [{key: row[key] for key in ["arm", "cut", "mean", "sem", "n"]} for row in cvk["cells"]]},

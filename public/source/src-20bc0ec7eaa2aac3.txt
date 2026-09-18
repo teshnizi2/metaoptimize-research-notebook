@@ -1,0 +1,583 @@
+#!/bin/bash
+# =============================================================================
+# cSV1_shadowvote.sh -- `csv1`: N1 (LIMITS-PREP 5.1) -- IS A LARGE APPLIED STEP SIZE ON idx 50 NECESSARY FOR THE STALL,
+#   WITH ITS VOTE KEPT IN THE SHARED SUM?  ONE SUBMISSION, 18 JOBS, 100 EPOCHS, SEEDS {136,137,138,139},
+#   PlainNet18_c100 / CIFAR-100, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.  CORRECTIONS 262.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here touches the other account; every guard
+# and scancel line is filtered on `csv1-`.
+#
+# REGISTERED SCORER: analysis/cSV1_shadowvote_score.py, committed BEFORE this batch is submitted (RULE 21).
+#     DOCUMENTED INVOCATION:  python3 analysis/cSV1_shadowvote_score.py <runsdir>
+#
+# NEW HARNESS CODE, ISOLATED AND OPT-IN.  The batch runs from $WS/harness_csv1/cifar10 = cvt9's tree (unchanged,
+# re-verified by bin/cVT9_stage_harness.sh) + PATCH_SHADOWVOTE (patches/patch_shadowvote.py) in HF.py, built and verified
+# by bin/cSV1_stage_harness.sh, and the runner $WS/jobs/run_cifar_csv1.sh (run_cifar.sh, cd line changed; archived as
+# jobs/run_cifar_csv1.sh).  SHADOW_VOTE unset == bitwise cvt9's tree; guard 4f requires the inertness / bite log
+# (tests/test_shadowvote.py + tests/test_shadowvote_realrun.py, bin/cSV1_realrun_inertness.sbatch) on THIS HF.py and
+# THIS scorer.
+#
+# THE ARMS (scalar grouping except HEAD)                                                           seeds
+#   k01        scalar                                                                          136 137 138
+#   INERT      scalar  SHADOW_VOTE=shadow:shared:layer4.1.bn2.weight                           136
+#   SHADOWLOW  scalar  SHADOW_VOTE=shadow:floor:layer4.1.bn2.weight                            136 137 138 139
+#   NAIVELOW   scalar  SHADOW_VOTE=natural:floor:layer4.1.bn2.weight                           136 137 138 139
+#   MUTE       scalar  VOTE_W=layer4.1.bn2.weight:0                                            136 137 138
+#   HEAD       sets:1-49,51-53/layer4.1.bn2.weight                                             136 137 138
+#
+# RULE 20.  Every ARGS value is ONE shell token; every scalar arm's ARGS line is k01's except the run name.  SHADOW_VOTE
+# and VOTE_W ride sbatch's --export list (value class [A-Za-z0-9_.:/], no comma) and CANNOT ride the runner's ENV line:
+# the patches print a witness line of each kind at construction on EVERY run, which the separate ENV audit and the
+# scorer's G-SVW / G-VOTEW gates read.  analysis/argsline_guard.py IS NOT EDITED.
+#
+# COST.  cvt6 / cvt9 by sacct: 0.67 GPU-h per PlainNet run; 0.83 including [HOST_3c1b003035].  18 jobs ~= 12.1 GPU-h expected
+# (14.9 at 0.83); HARD BOUND = WALL x 18 = 54 GPU-h (WALL 03:00:00).
+#
+# USAGE   bash bin/cSV1_shadowvote.sh [--dry-run]   |   bash bin/cSV1_shadowvote.sh --submit   (the ONLY submitting form)
+# ENV     CSV1_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+if [ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${COMP_HOLD+x}" ] && [ -z "${WINDOW_HOLD+x}" ] && [ -z "${SHADOW_VOTE+x}" ] && [ -z "${GROUP_HOLD+x}" ]; then
+  G0B="guard 0b: VOTE_W, BETA_HOLD, COMP_HOLD, WINDOW_HOLD, GROUP_HOLD and SHADOW_VOTE are UNSET in the launcher's environment"
+else
+  G0B=""
+fi
+unset VOTE_W BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD SHADOW_VOTE
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HARN=$WS/harness_csv1/cifar10
+HARN9=$WS/harness_cvt9/cifar10
+HARN6=$WS/harness_cvt6/cifar10
+HARN4=$WS/harness_cvt4/cifar10
+HARN1=$WS/harness_cvt1/cifar10
+RUNNER=$WS/jobs/run_cifar_csv1.sh
+SAVE=$WS/runs/csv1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=PlainNet18_c100
+SEEDS="136 137 138 139"
+MST=1e-3
+A0=1e-6
+NTENS=53
+TOTPAR=11046308
+G_K01='scalar'
+G_HEAD='sets:1-49,51-53/layer4.1.bn2.weight'
+S_INERT='shadow:shared:layer4.1.bn2.weight'
+S_SHADOW='shadow:floor:layer4.1.bn2.weight'
+S_NAIVE='natural:floor:layer4.1.bn2.weight'
+V_MUTE='layer4.1.bn2.weight:0'
+ARMS="k01 INERT SHADOWLOW NAIVELOW MUTE HEAD"
+NJOBS=18
+WALL=03:00:00
+POST_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_CVT1_SHA=3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52
+HF_CVT4_SHA=84b345adf6df8024bbe4c694fcbbaffc6211d1c7b7ae4b9ae933e353298a3d96
+HF_CVT6_SHA=f1b9c8aa87953c2fd3f64145126591608d332812183911a39ce9f525101edd2e
+HF_PRE_SHA=816e335777f7c0bb52747949dff81aa57fe0695bab2d61d984ae6ce9daab3a9d
+HF_POST_SHA=fc9bfb878afe3ded17f8e8475f31bb6811ee5fc25c8e11d189e299f761a61774
+RUNNER_SHA=60ac417bd4811a2a8132a8f74470a14265fd03c31d8c161c9bf7dfb0d1103c5d
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cSV1_shadowvote_score.py"
+SELF="$REPO/bin/cSV1_shadowvote.sh"
+DERIV="$REPO/analysis/csv1_registration_derivations.py"
+DERIV4="$REPO/analysis/cvt4_registration_derivations.py"
+SC9="$REPO/analysis/cVT9_dosewindow_score.py"
+SC1="$REPO/analysis/cVT1_voteweight_score.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+RRSB="$REPO/bin/cSV1_realrun_inertness.sbatch"
+TESTS="$REPO/tests/test_shadowvote.py"
+TESTSR="$REPO/tests/test_shadowvote_realrun.py"
+STAGES="$REPO/bin/cSV1_stage_harness.sh"
+STAGE9="$REPO/bin/cVT9_stage_harness.sh"
+STAGE6="$REPO/bin/cVT6_stage_harness.sh"
+STAGE4="$REPO/bin/cVT4_stage_harness.sh"
+STAGE1="$REPO/bin/cVT1_stage_harness.sh"
+PATCHS="$REPO/patches/patch_shadowvote.py"
+PATCHW="$REPO/patches/patch_windowhold.py"
+TESTW="$REPO/tests/test_windowhold.py"
+TESTR="$REPO/tests/test_voteweight_realrun.py"
+TESTT="$REPO/tests/test_probe_tensor.py"
+TESTF="$REPO/tests/test_plainnet.py"
+ARCHR="$REPO/jobs/run_cifar_csv1.sh"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+HFH="$HARN/Optimizers/HF.py"
+HFSV="$HARN/Optimizers/HF.py.pre_shadowvote"
+HFWH="$HARN/Optimizers/HF.py.pre_windowhold"
+HFCH="$HARN/Optimizers/HF.py.pre_comphold"
+HFBH="$HARN/Optimizers/HF.py.pre_betahold"
+HFVW="$HARN/Optimizers/HF.py.pre_voteweight"
+HFPRE="$HARN/Optimizers/HF.py.pre_probe_tensor"
+BNH="$HARN/build_network.py"
+ILOG="$SAVE/inertness_shadowvote.log"
+
+echo "=============================================================="
+echo " csv1 -- N1: is a large APPLIED step on PlainNet idx 50 necessary for the stall, with its vote kept?  (PATCH_SHADOWVOTE)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C   ms=$MST alpha0=$A0  $EPOCHS epochs"
+echo "   k01        $G_K01                                          seeds 136 137 138"
+echo "   INERT      scalar  SHADOW_VOTE=$S_INERT        seed  136"
+echo "   SHADOWLOW  scalar  SHADOW_VOTE=$S_SHADOW         seeds 136 137 138 139"
+echo "   NAIVELOW   scalar  SHADOW_VOTE=$S_NAIVE        seeds 136 137 138 139"
+echo "   MUTE       scalar  VOTE_W=$V_MUTE                      seeds 136 137 138"
+echo "   HEAD       $G_HEAD             seeds 136 137 138"
+echo " $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN (cvt9's + PATCH_SHADOWVOTE)   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cSV1_shadowvote_score.py <runsdir>"
+echo "=============================================================="
+
+[ -n "$G0B" ] && echo "$G0B" || guard_fail "guard 0b: a hold / vote variable was set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$SELF" "$DERIV" "$DERIV4" "$SC9" "$SC1" "$EXCL" "$EXCLT" "$RRSB" "$TESTS" "$TESTSR" "$STAGES" "$STAGE9" "$STAGE6" \
+         "$STAGE4" "$STAGE1" "$PATCHS" "$PATCHW" "$TESTW" "$TESTR" "$TESTT" "$TESTF" "$ARCHR" "$LIBF" "$AGF" "$CSVP" \
+         "$RUNNER" "$HFH" "$HFSV" "$HFWH" "$HFCH" "$HFBH" "$HFVW" "$HFPRE" "$BNH"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cSV1_shadowvote_score.py bin/cSV1_shadowvote.sh analysis/csv1_registration_derivations.py bin/cSV1_realrun_inertness.sbatch tests/test_shadowvote.py tests/test_shadowvote_realrun.py patches/patch_shadowvote.py bin/cSV1_stage_harness.sh jobs/run_cifar_csv1.sh"
+REUSEF="analysis/cvt4_registration_derivations.py analysis/cVT9_dosewindow_score.py analysis/cVT1_voteweight_score.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv patches/patch_windowhold.py tests/test_windowhold.py tests/test_voteweight_realrun.py tests/test_probe_tensor.py tests/test_plainnet.py bin/cVT9_stage_harness.sh bin/cVT6_stage_harness.sh bin/cVT4_stage_harness.sh bin/cVT1_stage_harness.sh bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the nine registration files and sixteen reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CSV1_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CSV1_REGISTERED_COMMIT"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CSV1_REGISTERED_COMMIT is unset"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CSV1_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+[ "$(sha "$ARCHR")" = "$RUNNER_SHA" ] && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] \
+  && echo "guard 1b2: the archived jobs/run_cifar_csv1.sh == \$WS/jobs/run_cifar_csv1.sh == $RUNNER_SHA" \
+  || guard_fail "guard 1b2: the archived runner or the live runner is not $RUNNER_SHA"
+
+SELFT=/tmp/csv1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION' "$SELFT" | head -20; tail -5 "$SELFT"; }
+grep -qE "^  PASS O2 NECESSARY +real\+invented " "$SELFT" && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cSV1_shadowvote_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows carry seed 136, 137, 138 or 139" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed check ran and passed" || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS B HEADSPEC, cvt9's HF and runner shas == cVT9's registered literals" "$SELFT" && grep -q "^  PASS B MUTE's VOTE_W witness appears in cVT1's" "$SELFT" \
+  && echo "guard 1c5: HEADSPEC and the base tree == cvt9's registered literals; MUTE's witness == cvt1's" || guard_fail "guard 1c5: cvt9 / cvt1 identity not proved"
+grep -q "^  PASS B G-BITE (Lion, z_agg, no keys) PASSES the 12 landed" "$SELFT" && grep -q "^  PASS B the 3 landed cvt1 MUTE runs PASS" "$SELFT" \
+  && grep -q "^  PASS B the 6 landed cvt1 / cvt4 HEAD runs PASS" "$SELFT" && grep -q "^  PASS B THE BROKEN-PATCH NULL ON REAL RECORDS" "$SELFT" \
+  && grep -q "^  PASS B landed MUTE read as k01 FAILS" "$SELFT" && grep -q "^  PASS B the landed k01 vote share re-derived" "$SELFT" \
+  && echo "guard 1c6: G-BITE passes 12 landed k01, 3 MUTE, 6 HEAD; FAILS 36 real-record BROKEN-PATCH nulls and 3 MUTE-as-k01; the share prior re-derived ON THIS HOST" \
+  || guard_fail "guard 1c6: the real-record checks did not pass"
+grep -q "^  PASS SIGMA_PLAIN: the FROZEN literal 0.45952937882142003 IS the FILTERED value" "$SELFT" \
+  && grep -q "^  PASS SIGMA_R18ALL: the FROZEN literal 0.68119834093519049 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c8: OPERATIONS 36 -- both frozen floors ARE the corpus_exclusions.filter_rows values, not the naive ones" \
+  || guard_fail "guard 1c8: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS E BROKEN PATCH: SHADOWLOW / NAIVELOW records carry no sv keys" "$SELFT" && grep -q "^  PASS E BROKEN SHADOW: SHADOWLOW's vote trace is the natural one" "$SELFT" \
+  && grep -q "^  PASS E BROKEN PHYSICS: NAIVELOW's weights moved at the shared step" "$SELFT" && grep -q "^  PASS E BROKEN APPLIED: SHADOWLOW applied the shared step" "$SELFT" \
+  && echo "guard 1c9: the broken-patch null, the broken-shadow null, a shared-step physical move and a shared applied step reach PATCH-NOT-VERIFIED" \
+  || guard_fail "guard 1c9: G-BITE break cases did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+DOUT=/tmp/csv1_deriv.$$
+python3 "$DERIV" "$WS/runs" "$CSVP" >"$DOUT" 2>&1 \
+  && grep -q "(literal LANDED_SHARE_MIN 0.5115: True)" "$DOUT" && grep -q "SIGMA_PLAIN   FILTERED 0.4595293788214" "$DOUT" \
+  && grep -q "SIGMA_R18ALL  FILTERED 0.6811983409351905 " "$DOUT" && grep -q "corpus rows carrying seed 136 / 137 / 138 / 139: 0 ; csv1- rows: 0" "$DOUT" \
+  && echo "guard 1d: analysis/csv1_registration_derivations.py reproduces the share prior, the floor and freshness on this host (output sha $(sha "$DOUT"))" \
+  || { guard_fail "guard 1d: the derivation did not reproduce"; tail -5 "$DOUT"; }
+
+grep -q '^csv1-' "$CSVP" && guard_fail "guard 2: csv1-* already in the CSV" || echo "guard 2: no csv1-* row in the corpus"
+python3 - "$CSVP" "$SEEDS" "$NET" <<'PYEOF' || guard_fail "guard 2a/2c: corpus premise failed"
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+seeds = set(sys.argv[2].split())
+hit = [r["run"] for r in rows if r.get("seed") in seeds]
+gn = sorted({r["run"].split("-")[0] for r in rows if r.get("network") == sys.argv[3]})
+print("guard 2c: rows carrying seed %s: %d" % ("/".join(sorted(seeds)), len(hit)))
+print("guard 2a: %s appears under prefixes %s (csv1 absent)" % (sys.argv[3], gn))
+raise SystemExit(1 if hit or "csv1" in gn else 0)
+PYEOF
+NOUT=$(ls "$WS/runs"/csv1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no csv1-*.out on disk" || guard_fail "guard 2b: $NOUT csv1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (136|137|138|139)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 136/137/138/139" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 136-139"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^csv1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 csv1-* jobs" || guard_fail "guard 2e: sacct shows $NS csv1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^csv1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 csv1-* in squeue" || guard_fail "guard 2f: $NQ csv1-* already queued"
+fi
+
+# ---- guard 3/4a: the registered trees unchanged; csv1's tree consistent -----------
+for pair in "4a:$STAGE1:cvt1" "4a1:$STAGE4:cvt4" "4a2:$STAGE6:cvt6" "4a3:$STAGE9:cvt9" "4a4:$STAGES:csv1"; do
+  g=${pair%%:*}; rest=${pair#*:}; scr=${rest%:*}; nm=${rest##*:}
+  bash "$scr" >/tmp/csv1_stage_$nm.$$ 2>&1 \
+    && { echo "guard $g: $(basename "$scr") (verify mode) VERIFIES $nm's tree:"; grep -E 'V-h|V-d|V-f|V-g|VERIFIED' /tmp/csv1_stage_$nm.$$ | sed 's/^/          /'; } \
+    || { guard_fail "guard $g: $nm's tree is NOT consistent"; tail -20 /tmp/csv1_stage_$nm.$$; }
+done
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$BNH")" = "$POST_SHA" ] && echo "guard 3b: build_network.py == cpl1's POST_SHA" || guard_fail "guard 3b: build_network.py is not POST_SHA"
+[ "$(sha "$HFH")" = "$HF_POST_SHA" ] && [ "$(sha "$HFSV")" = "$HF_PRE_SHA" ] && [ "$(sha "$HARN9/Optimizers/HF.py")" = "$HF_PRE_SHA" ] \
+  && [ "$(sha "$HFWH")" = "$HF_CVT6_SHA" ] && [ "$(sha "$HARN6/Optimizers/HF.py")" = "$HF_CVT6_SHA" ] \
+  && [ "$(sha "$HFCH")" = "$HF_CVT4_SHA" ] && [ "$(sha "$HARN4/Optimizers/HF.py")" = "$HF_CVT4_SHA" ] \
+  && [ "$(sha "$HFBH")" = "$HF_CVT1_SHA" ] && [ "$(sha "$HARN1/Optimizers/HF.py")" = "$HF_CVT1_SHA" ] \
+  && [ "$(sha "$HFVW")" = "$HF_LIVE_SHA" ] && [ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] \
+  && [ "$(sha "$HFPRE")" = "$(sha "$LIVE/Optimizers/HF.py.pre_probe_tensor")" ] \
+  && echo "guard 3c: HF.py == HF_POST_SHA fc9bfb87...; .pre_shadowvote == cvt9's == 816e3357...; .pre_windowhold == cvt6's; .pre_comphold == cvt4's; .pre_betahold == cvt1's; .pre_voteweight == LIVE; .pre_probe_tensor == live" \
+  || guard_fail "guard 3c: the tree's HF files are not the pinned ones (or a registered tree's / the live HF.py moved)"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == 60ac417b... (run_cifar.sh with the cd line changed)" || guard_fail "guard 3e: runner sha"
+grep -q -E 'PATCH_SHADOWVOTE|SHADOW_VOTE' "$LIVE/Optimizers/HF.py" "$HARN1/Optimizers/HF.py" "$HARN4/Optimizers/HF.py" "$HARN6/Optimizers/HF.py" "$HARN9/Optimizers/HF.py" \
+  && guard_fail "guard 3d: a registered tree's HF.py carries PATCH_SHADOWVOTE" \
+  || echo "guard 3d: neither the LIVE HF.py nor cvt1's / cvt4's / cvt6's / cvt9's carries PATCH_SHADOWVOTE"
+
+# ---- guard 4b/4f: structural proofs; the inertness / bite log ----
+python3 "$TESTT" --pre "$HFPRE" --post "$HFVW" --structural-only >/tmp/csv1_struct.$$ 2>&1 \
+   && echo "guard 4b: PATCH_PROBE_TENSOR structural R0 PASSES" || { guard_fail "guard 4b: R0 FAILED"; tail -8 /tmp/csv1_struct.$$; }
+python3 "$TESTW" --pre "$HFWH" --post "$HFSV" --structural-only >/tmp/csv1_wh0.$$ 2>&1 \
+   && echo "guard 4b1: PATCH_WINDOWHOLD structural W0 PASSES on the base (HF.py.pre_shadowvote == cvt6's HF.py + PATCH_WINDOWHOLD)" \
+   || { guard_fail "guard 4b1: W0 FAILED"; tail -8 /tmp/csv1_wh0.$$; }
+python3 "$TESTS" --pre "$HFSV" --post "$HFH" --structural-only >/tmp/csv1_sv0.$$ 2>&1 \
+   && echo "guard 4b2: PATCH_SHADOWVOTE structural S0 PASSES (deleting the five regions == cvt9's HF.py, byte for byte)" \
+   || { guard_fail "guard 4b2: S0 FAILED"; tail -8 /tmp/csv1_sv0.$$; }
+HFSHA=$(sha "$HFH"); BNSHA=$(sha "$BNH"); SCSHA=$(sha "$SC")
+if [ -f "$ILOG" ] && grep -q "^TEST_SHADOWVOTE_RC 0$" "$ILOG" && grep -q "^REALRUN_RC 0$" "$ILOG" \
+   && [ "$(grep -c '^ALL PASS$' "$ILOG")" = 2 ] && [ "$(grep -c '^  FAIL' "$ILOG")" = 0 ] \
+   && grep -q "^TREE_POST $HARN HF $HFSHA build_network $BNSHA" "$ILOG" && grep -q "^SCORER_SHA256 $SCSHA$" "$ILOG" \
+   && grep -q "^DRIVER_SHA256 $(sha "$TESTSR")$" "$ILOG" && grep -q "^REGISTERED_TEST_SHA256 $(sha "$TESTR")$" "$ILOG" \
+   && grep -q "^$(sha "$TESTS")  tests/test_shadowvote.py$" "$ILOG" && grep -q "^$(sha "$PATCHS")  patches/patch_shadowvote.py$" "$ILOG" \
+   && grep -q "PASS RR0 unpatched k01 vs itself: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR1 MUTE  SHADOW_VOTE unset: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR1 k01   SHADOW_VOTE empty: probe.jsonl BYTE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR2 INERT    every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR2 INERTNAT probe records EQUAL to cvt9's k01 records after deleting the sv_\* keys" "$ILOG" \
+   && grep -q "PASS RR3 SHADOWLOW the scorer's G-BITE passes on the real records" "$ILOG" \
+   && grep -q "PASS RR3 NAIVELOW  the scorer's G-BITE passes on the real records" "$ILOG" \
+   && grep -q "PASS S3 SCHED='none' shadow :floor  every step" "$ILOG"; then
+  echo "guard 4f: the inertness / bite log ALL PASS on THIS HF, THIS scorer: $(grep -c '^  PASS' "$ILOG") PASS / $(grep -c '^  FAIL' "$ILOG") FAIL (sha $(sha "$ILOG" | cut -c1-8))"
+else
+  guard_fail "guard 4f: no ALL PASS inertness log for HF $HFSHA and scorer $SCSHA at $ILOG -- sbatch $RRSB, then copy its .out there"
+fi
+
+# ---- guard 4c': the launcher's literals == the scorer's (imported) and the stage script's ------
+python3 - "$SC" "$G_K01" "$G_HEAD" "$S_INERT" "$S_SHADOW" "$S_NAIVE" "$V_MUTE" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" \
+          "$POST_SHA" "$HF_PRE_SHA" "$HF_POST_SHA" "$RUNNER_SHA" "$STAGES" "$ARMS" "$NJOBS" <<'PYEOF' \
+  || guard_fail "guard 4c': launcher / scorer / stage-script literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("csv1sc", sys.argv[1]); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+(g_k01, g_head, si, ss, sn, vm, net, ntens, totpar, seeds, post, pre, hpost, runner, stage, arms, njobs) = sys.argv[2:19]
+bad = []
+arms = arms.split()
+if tuple(arms) != S.ARMS: bad.append("ARMS")
+if dict((a, g_head if a == "HEAD" else g_k01) for a in arms) != S.SPEC: bad.append("SPEC")
+if {"k01": "", "INERT": si, "SHADOWLOW": ss, "NAIVELOW": sn, "MUTE": "", "HEAD": ""} != S.SHADOWVOTE: bad.append("SHADOWVOTE")
+if dict((a, vm if a == "MUTE" else "") for a in arms) != S.VOTEW: bad.append("VOTEW")
+if net != S.NET or int(ntens) != S.NTENS or int(totpar) != S.TOTPAR: bad.append("NET/NTENS/TOTPAR")
+if tuple(int(x) for x in seeds.split()) != S.SEEDS or int(njobs) != S.N_JOBS: bad.append("SEEDS/NJOBS")
+st = open(stage).read()
+for name, v in (("POST_SHA", post), ("HF_PRE_SHA", pre), ("HF_POST_SHA", hpost), ("RUNNER_SHA", runner)):
+    b = re.search(r"^%s=([0-9a-f]{64})$" % name, st, re.M)
+    if getattr(S, name) != v or not b or b.group(1) != v: bad.append(name)
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': ARMS, spec strings, SHADOW_VOTE / VOTE_W values, NET, NTENS, TOTPAR, SEEDS, NJOBS, the tree / runner shas agree in launcher / scorer / csv1 stage script")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, built from csv1's tree, per arm ----
+mkdir -p "$SAVE"
+MTMP=/tmp/csv1_manifest.$$
+python3 - "$HARN" "$MTMP" "$NTENS" "$TOTPAR" "$NET" "$SC" <<'PYEOF' || guard_fail "guard 4: live partition / witness / source check FAILED"
+import sys, os, io, inspect, re, operator, contextlib, importlib.util
+harn, out, ntens, totpar, net_name, scp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+spm = importlib.util.spec_from_file_location("csv1sc", scp); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn, torch.fx
+torch.set_num_threads(2)
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu"); par = build_network(S.PARENT, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+pnames = [n for n, _ in par.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+T, tot = len(nps), sum(numel); bad = 0
+print("guard 4: live %s from csv1's tree -- %d tensors, %d parameters (parent %s: %d)" % (net_name, T, tot, S.PARENT, len(pnames)))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d" % (T, tot)); raise SystemExit(1)
+removed = [n for n in pnames if n not in names]
+if removed != list(S.SHORTCUT_9): bad += 1
+def adds(m):
+    g = torch.fx.symbolic_trace(m).graph
+    return sum(1 for nd in g.nodes if (nd.op == "call_function" and nd.target in (operator.add, operator.iadd, torch.add))
+               or (nd.op == "call_method" and nd.target in ("add", "add_", "__add__", "__iadd__")))
+na, nr = adds(net), adds(par)
+print("guard 4: torch.fx add ops -- %s %d, %s %d" % (net_name, na, S.PARENT, nr))
+if na != 0 or nr != 8: bad += 1
+nbn = sum(isinstance(m, nn.BatchNorm2d) for m in net.modules()); ngn = sum(isinstance(m, nn.GroupNorm) for m in net.modules())
+if (nbn, ngn) != (S.N_BATCHNORM, 0) or names != S.NAMES: bad += 1
+print("guard 4: idx 50 on the live model = %s (%s, numel %d)" % (names[49], own[names[49]], numel[49]))
+if names[49] != S.NAME_HEAD or own[names[49]] != "BatchNorm2d" or numel[49] != 512: bad += 1
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "NORM BatchNorm2d %d GroupNorm %d" % (nbn, ngn),
+         "PARENT %s %d" % (S.PARENT, len(pnames)), "PARENT_REMOVED %s" % " ".join(removed), "CLIP_C %s" % S.CLIP,
+         "EPOCHS %d" % S.EPOCHS, "META_STEPS %d" % (S.EPOCHS * (50000 // S.BATCH))]
+lines += ["TENSOR %d %s %d %s" % (i + 1, names[i], numel[i], own[names[i]]) for i in range(T)]
+w512 = [(i + 1, names[i]) for i in range(T) if numel[i] == 512 and names[i].endswith(".weight") and len(nps[i][1]) == 1]
+lines.append("W512 %s" % ",".join("%d:%s" % x for x in w512))
+import numpy as np
+fa = float(np.exp(np.asarray(-15.0, dtype=np.float32)))
+lines.append("SHADOW B0 %r LO %r FLOOR_ALPHA %r IDX %d NAME %s" % (float(torch.log(torch.tensor(1e-6))), -15.0, fa, names.index(S.NAME_HEAD) + 1, S.NAME_HEAD))
+KEYS = ("VOTE_W", "BETA_HOLD", "COMP_HOLD", "WINDOW_HOLD", "GROUP_HOLD", "SHADOW_VOTE")
+for arm in S.ARMS:
+    spec = S.SPEC[arm]
+    for k in KEYS:
+        os.environ.pop(k, None)
+    for k, v in (("SHADOW_VOTE", S.SHADOWVOTE[arm]), ("VOTE_W", S.VOTEW[arm])):
+        if v:
+            os.environ[k] = v
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    o.args_base = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"; o._sched = "none"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, spec, nps, 1e-6)
+    for k in KEYS:
+        os.environ.pop(k, None)
+    L = buf.getvalue().splitlines()
+    got = dict((k, [ln for ln in L if ln.startswith(k)]) for k in KEYS if k != "GROUP_HOLD")
+    shp = [tuple(b.shape) for b in o.beta]
+    ok = (got["SHADOW_VOTE"] == [S.WITNESS_SV[arm]] and got["VOTE_W"] == [S.WITNESS_VW[arm]] and got["BETA_HOLD"] == ["BETA_HOLD: off"]
+          and got["COMP_HOLD"] == ["COMP_HOLD: off"] and got["WINDOW_HOLD"] == ["WINDOW_HOLD: off"] and o.stepsize_type == S.PT_TYPE[arm]
+          and bool(o._sv_on) == bool(S.SHADOWVOTE[arm]) and bool(o._vw_on) == bool(S.VOTEW[arm]) and not getattr(o, "_rednorm", False))
+    if arm in S.MODE:
+        ok = ok and (o._sv_vote, o._sv_applied) == S.MODE[arm] and o._sv_idx == [49] and \
+             (o._sv_floor_alpha is None if S.MODE[arm][1] == "shared" else float(o._sv_floor_alpha) == S.FLOOR_ALPHA)
+    print("guard 4: %-10s %-38s type=%s beta %s  witnesses (SHADOW_VOTE/VOTE_W/holds off) and state == registered: %s" % (arm, spec, o.stepsize_type, shp, ok))
+    if not ok:
+        print("!!! guard 4: %s does not construct as registered: %r" % (arm, got)); bad += 1
+    if spec == "scalar":
+        if shp != [()]: bad += 1
+        lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % arm)
+    else:
+        g = HF.polish_the_stepsize_groups(None, spec, nps)
+        sizes = [len(x) for x in g]; pc = [sum(numel[names.index(n)] for n in x) for x in g]
+        g1 = list(g[1])
+        if sizes != S.HEAD_SIZES or pc != S.HEAD_PARAMS or g1 != [S.NAME_HEAD] or shp != [(2,)]:
+            print("!!! guard 4: %s is not the registered [52,1] partition" % arm); bad += 1
+        lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                     % (arm, spec, len(g), ",".join(str(s) for s in sizes), ",".join(str(s) for s in pc), " ".join(g1)))
+    lines.append("SEEDS %s %s" % (arm, ",".join(str(s) for s in S.SEEDS_OF[arm])))
+    lines.append("SHADOWVOTE %s %s" % (arm, S.SHADOWVOTE[arm] or "off"))
+    lines.append("VOTEW %s %s" % (arm, S.VOTEW[arm] or "off"))
+    lines.append("SVWITNESS %s %s" % (arm, got["SHADOW_VOTE"][0] if got["SHADOW_VOTE"] else "(none)"))
+    lines.append("VWWITNESS %s %s" % (arm, got["VOTE_W"][0] if got["VOTE_W"] else "(none)"))
+st = inspect.getsource(HF.step)
+idx = [st.find(x) for x in ("self.block_product(self.h_condenced, g)", "self._pt_capture(self.h_condenced, g, HtT_gradft)", "self._sv_pre(net, g)",
+                            "self.base_update(net,g)", "self._sv_post(net)", "self.meta_update(HtT_gradft)", "self._probe(HtT_gradft)")]
+ok_st = all(0 <= idx[i] < idx[i + 1] for i in range(6)) and st.count("self._sv_pre(net, g)") == 1 and st.count("self._sv_post(net)") == 1
+print("guard 4f: step() order block_product < _pt_capture < _sv_pre < base_update < _sv_post < meta_update < _probe, once each: %s" % ok_st)
+if not ok_st: bad += 1
+pr = inspect.getsource(HF._probe)
+ok_pr = pr.count("self._sv_attach(rec)") == 1 and pr.find("self._wh_attach(rec)") < pr.find("self._sv_attach(rec)") < pr.find("self._pt_attach(rec)")
+print("guard 4f: _probe attaches sv_* keys once, after wh_* and before PROBE_TENSOR's keys: %s" % ok_pr)
+if not ok_pr: bad += 1
+sg = inspect.getsource(HF.SGDm_base_update)
+ok_sg = ("delta = a * (self.momentum_base[i] + self.args_base['weight_decay']*w.data)" in sg
+         and "self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta" in sg)
+pp = inspect.getsource(HF._sv_post)
+ok_pp = ("delta = a_sh * (mp + wd*wp)" in pp and "self.h_condenced[i] = self.gamma*(1-wd*a_sh)*hp - delta" in pp)
+print("guard 4f: _sv_post rebuilds the slot with SGDm_base_update's own expression at a_sh: %s" % (ok_sg and ok_pp))
+if not (ok_sg and ok_pp): bad += 1
+cap = inspect.getsource(HF._pt_capture)
+ok_cap = "'beta_pre': _bp" in cap and "'z_tensor': zt.clone()" in cap
+print("guard 4f: PROBE_TENSOR records beta_pre and z_tensor (G-BITE's Lion and vote-term checks): %s" % ok_cap)
+if not ok_cap: bad += 1
+txt = "\n".join(lines) + "\n"
+if txt != S.synthetic_manifest_text():
+    a_, b_ = txt.splitlines(), S.synthetic_manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("!!! guard 4d: live manifest differs at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "")[:200], (b_[k] if k < len(b_) else "")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/csv1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $BNSHA"
+  echo "HF_SHA256 $HFSHA"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "SCORER_SHA256 $SCSHA"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "DERIVATIONS_SHA256 $(sha "$DERIV")"
+  echo "REGISTERED_COMMIT ${CSV1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "HF_PRE_SHADOWVOTE_SHA256 $(sha "$HFSV")"
+  echo "CVT9_HF_SHA256 $(sha "$HARN9/Optimizers/HF.py")"
+  echo "CVT6_HF_SHA256 $(sha "$HARN6/Optimizers/HF.py")"
+  echo "CVT4_HF_SHA256 $(sha "$HARN4/Optimizers/HF.py")"
+  echo "CVT1_HF_SHA256 $(sha "$HARN1/Optimizers/HF.py")"
+  echo "LIVE_HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "PATCH_SHADOWVOTE_SHA256 $(sha "$PATCHS")"
+  echo "INERTNESS_SHADOWVOTE_LOG_SHA256 $(sha "$ILOG" 2>/dev/null)"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_csv1/STAGE-MANIFEST.txt")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS k01=136,137,138 INERT=136 SHADOWLOW=136-139 NAIVELOW=136-139 MUTE=136,137,138 HEAD=136,137,138"
+  echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "SHADOW_VOTE INERT=$S_INERT SHADOWLOW=$S_SHADOW NAIVELOW=$S_NAIVE others=unset"
+  echo "VOTE_W MUTE=$V_MUTE others=unset"
+  echo "BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD unset on every arm"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/csv1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("csv1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01)       G=$G_K01;  WANTS="";          WANTV="";        SS="136 137 138" ;;
+      INERT)     G=$G_K01;  WANTS="$S_INERT";  WANTV="";        SS="136" ;;
+      SHADOWLOW) G=$G_K01;  WANTS="$S_SHADOW"; WANTV="";        SS="136 137 138 139" ;;
+      NAIVELOW)  G=$G_K01;  WANTS="$S_NAIVE";  WANTV="";        SS="136 137 138 139" ;;
+      MUTE)      G=$G_K01;  WANTS="";          WANTV="$V_MUTE"; SS="136 137 138" ;;
+      HEAD)      G=$G_HEAD; WANTS="";          WANTV="";        SS="136 137 138" ;;
+    esac
+    case " $SS " in *" $S "*) ;; *) continue ;; esac
+    SV=""; [ -n "$WANTS" ] && SV=",SHADOW_VOTE=$WANTS"
+    VW=""; [ -n "$WANTV" ] && VW=",VOTE_W=$WANTV"
+    RN="csv1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR$SV$VW \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    for KV in "SHADOW_VOTE:$WANTS" "VOTE_W:$WANTV"; do
+      K=${KV%%:*}; W=${KV#*:}
+      GOT=$(printf '%s\n' "$CMD" | grep -o "[ ,]$K=[^ ,]*" | sed 's/^[ ,]//')
+      NK=$(printf '%s\n' "$GOT" | grep -c "^$K=")
+      if [ -z "$W" ]; then
+        [ "$NK" = 0 ] || { echo "!!! $RN carries a $K"; BAD=$((BAD+1)); }
+      else
+        [ "$NK" = 1 ] && [ "$GOT" = "$K=$W" ] || { echo "!!! $RN carries $NK $K or not its own string"; BAD=$((BAD+1)); }
+      fi
+    done
+    NVW=$(printf '%s\n' "$CMD" | grep -c 'BETA_HOLD=\|COMP_HOLD=\|WINDOW_HOLD=\|GROUP_HOLD=\|REST_HOLD=\|natural:shared')
+    [ "$NVW" = 0 ] || { echo "!!! $RN carries a hold variable or a test-only string"; BAD=$((BAD+1)); }
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / SHADOW_VOTE / VOTE_W pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'csv1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "csv1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- csv1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "csv1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no csv1 job started inside the window" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^csv1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 18/18 RUN_DONE):  python3 $REPO/analysis/cSV1_shadowvote_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cSV1_shadowvote.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

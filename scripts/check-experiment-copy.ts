@@ -16,7 +16,7 @@ async function main(){
   const match=/^MT(\d+)$/.exec(experiment.id);
   return Boolean(match&&Number(match[1])>=175);
  });
- console.log(`Experiment copy check passed: ${ids.length} editorial records; all ${required.length} required MASTER-TABLE records (MT175–MT227) are covered.`);
+ console.log(`Experiment copy check passed: ${ids.length} editorial records; all ${required.length} required MASTER-TABLE records (MT175–MT231) are covered.`);
 }
 
 main().catch(error=>{

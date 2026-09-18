@@ -1,0 +1,1168 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cMG1_mergecarrier_score.py -- THE REGISTERED SCORER FOR `cmg1` (CORRECTIONS 259, Track D, LIMITS-PREP 5.1 N3):
+#   INSIDE THE HEALTHY SINGLETON GROUPING, IS KEEPING THE THREE CARRIERS OUT OF A SHARED STEP-SIZE GROUP NECESSARY?
+#   ONE SUBMISSION, 12 JOBS (3 arms x 4 seeds), 100 EPOCHS, SEEDS {124,125,126,127}, ResNet18_c100 / CIFAR-100 at the
+#   mechanism cell (SGDm 0.99 / wd 0.1 + Lion 0.99 / 0.9, meta step 1e-3, alpha0 1e-6, clip -15:-2.3026, AUGMENT=1,
+#   batch 100), PROBE=100, PROBE_TENSOR=1 on every arm, run from the LIVE shared harness UNPATCHED (no new code, no
+#   intervention switch: the science is carried entirely by --stepsize-groups, i.e. by the CSV `granularity` column).
+#
+# Committed BEFORE any cmg1 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cMG1_mergecarrier_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# THE ARMS (1-based tensor indices on the live 62-tensor ResNet18_c100; every arm on the blockwise code path)
+#   KLS   sets:1/2/.../62                                    62 singleton groups = layerwise's grouping (the reference)
+#   MCAR  singletons except G* = N u C = {46,49-55,57-60}     51 groups; the three CARRIERS merged with N
+#   MCTL  singletons except G* = N u T = {46-49,51-52,54-58,60} 51 groups; the matched CONTROL triple merged with N
+#   N = {46,49,51,52,54,55,57,58,60}: every layer4 tensor that is neither a carrier nor in T (5 convs + the shortcut
+#       conv + the 4 BN biases 51,54,57,60 -- 8,390,656 parameters); C = {50,53,59} the carriers (ctd1 / ciso1);
+#       T = {47,48,56} = cdep1's DEPTH triple (count 3, numel 1,536, width 512, depth layer4, BatchNorm2d; 188.1).
+#   MCAR and MCTL have IDENTICAL group count (51), group sizes and per-group numel; they differ ONLY in which triple
+#   joins N.  KLS runs the same code path, so no arm differs from another by implementation (259.2).
+#
+# PRIMARY (in batch, bounded in neither direction):  DELTA_ID = MCTL - MCAR
+# KEY:  D_CAR = KLS - MCAR ; D_CTL = KLS - MCTL
+# BRANCH MAP (decide(); first match wins; M = MARGIN = 5.0 pp, the program's pre-registered +-5 pp):
+#   gates: INCOMPLETE (exit 2) -> HARNESS-UNSOUND (exit 1) -> PARTITION-NOT-VERIFIED (exit 1) ->
+#          UNRESOLVED-DIVERGED (an arm's seed range > 5) -> UNRESOLVED-REFERENCE-UNHEALTHY (KLS < REF_MIN 64.4166)
+#   CARRIER-MERGE-HARMS        D_CAR >= M and DELTA_ID >= M and D_CTL <  M
+#   BOTH-HARM-CARRIER-MORE     D_CAR >= M and DELTA_ID >= M and D_CTL >= M
+#   BOTH-HARM-ALIKE            D_CAR >= M and D_CTL >= M and |DELTA_ID| < M
+#   CONTROL-MERGE-HARMS-MORE   D_CTL >= M and DELTA_ID <= -M
+#   NO-MERGE-HARMS             D_CAR <  M and D_CTL <  M and |DELTA_ID| < M
+#   UNRESOLVED-PARTIAL         anything else
+# The BROKEN-PARTITION null (a `sets:` string silently parsed to another grouping, or MCAR / MCTL swapped) predicts levels
+# the accounts cannot tell apart; G-PARTITION separates it from the probe records BEFORE any level is read.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+PREFIX = "cmg1"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+PROBE = 100
+N_RECORDS = 500                       # steps 0, 100, ..., 49900
+SEEDS = (124, 125, 126, 127)
+ARMS = ("KLS", "MCAR", "MCTL")
+NTENS = 62
+TOTPAR = 11220132
+
+N_SET = (46, 49, 51, 52, 54, 55, 57, 58, 60)
+C_SET = (50, 53, 59)
+T_SET = (47, 48, 56)
+
+
+def _spec(groups):
+    return "sets:" + "/".join(groups)
+
+
+SPEC = {
+    "KLS": _spec([str(i) for i in range(1, 63)]),
+    "MCAR": _spec([str(i) for i in range(1, 46)] + ["46,49-55,57-60", "47", "48", "56", "61", "62"]),
+    "MCTL": _spec([str(i) for i in range(1, 46)] + ["46-49,51-52,54-58,60", "50", "53", "59", "61", "62"]),
+}
+
+# ---- the live model's tensors, re-typed (guard 4 of the launcher proves them against build_network) --------------
+_NUMEL = [1728, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64, 73728, 128, 128, 147456, 128, 128,
+          8192, 128, 128, 147456, 128, 128, 147456, 128, 128, 294912, 256, 256, 589824, 256, 256, 32768, 256, 256, 589824,
+          256, 256, 589824, 256, 256, 1179648, 512, 512, 2359296, 512, 512, 131072, 512, 512, 2359296, 512, 512, 2359296,
+          512, 512, 51200, 100]
+
+
+def r18_tensors():
+    out = [("conv1.weight", "Conv2d"), ("bn1.weight", "BatchNorm2d"), ("bn1.bias", "BatchNorm2d")]
+    for L, down in ((1, False), (2, True), (3, True), (4, True)):
+        for b in (0, 1):
+            p = "layer%d.%d." % (L, b)
+            out += [(p + "conv1.weight", "Conv2d"), (p + "bn1.weight", "BatchNorm2d"), (p + "bn1.bias", "BatchNorm2d"),
+                    (p + "conv2.weight", "Conv2d"), (p + "bn2.weight", "BatchNorm2d"), (p + "bn2.bias", "BatchNorm2d")]
+            if down and b == 0:
+                out += [(p + "shortcut.0.weight", "Conv2d"), (p + "shortcut.1.weight", "BatchNorm2d"),
+                        (p + "shortcut.1.bias", "BatchNorm2d")]
+    out += [("linear.weight", "Linear"), ("linear.bias", "Linear")]
+    return [(n, _NUMEL[i], t) for i, (n, t) in enumerate(out)]
+
+
+NAMES = [n for n, _k, _t in r18_tensors()]
+
+
+def parse_sets(spec, names=NAMES):
+    """Re-typed PATCH_NAMESETS grammar: -> list of lists of 1-based indices.  Raises on anything the harness rejects."""
+    if not spec.startswith("sets:"):
+        raise ValueError("not a sets: spec")
+    idx = dict((n, i + 1) for i, n in enumerate(names))
+    out, seen = [], set()
+    for g in spec[5:].split("/"):
+        if not g:
+            raise ValueError("empty group")
+        cur = []
+        for it in g.split(","):
+            m = re.match(r"^(\d+)-(\d+)$", it)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                if not 1 <= a <= b <= len(names):
+                    raise ValueError("bad range %s" % it)
+                cur += list(range(a, b + 1))
+            elif re.match(r"^\d+$", it):
+                cur.append(int(it))
+            elif it in idx:
+                cur.append(idx[it])
+            else:
+                raise ValueError("unknown item %s" % it)
+        for i in cur:
+            if i in seen or not 1 <= i <= len(names):
+                raise ValueError("index %d repeated or out of range" % i)
+            seen.add(i)
+        out.append(sorted(cur))
+    if seen != set(range(1, len(names) + 1)):
+        raise ValueError("not total")
+    return out
+
+
+def groups_of(arm):
+    if arm == "KLS":
+        return [[i] for i in range(1, 63)]
+    merged = sorted(N_SET + (C_SET if arm == "MCAR" else T_SET))
+    single = T_SET if arm == "MCAR" else C_SET
+    return [[i] for i in range(1, 46)] + [merged] + [[i] for i in single] + [[61], [62]]
+
+
+MERGED_G = 45                           # 0-based position of G* in MCAR / MCTL
+NGROUPS = {"KLS": 62, "MCAR": 51, "MCTL": 51}
+
+# ---- the harness this batch runs (the LIVE tree, unpatched) ---------------------------------------------------------
+LIVE_HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+LIVE_BN_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"      # $WS/jobs/run_cifar.sh
+
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default COS_WARMUP=default "
+                "SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+FOREIGN_PREFIXES = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD", "SHADOW_VOTE",
+                    "DECAY_MASK")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=100 type=(\w+) tensors=62 meta_alg=Lion momentum_param=0\.99 Lion_beta2=0\.9 "
+                   r"dir=(\S+)$")
+OUT_RE = re.compile(r"^cmg1-(KLS|MCAR|MCTL)-s(\d+)-(\d+)\.out$")
+EPTR_RE = re.compile(r"^Epoch (\d+), Train Accuracy: ([-\d.naninf]+) %, Test Accuracy: ([-\d.naninf]+) %", re.M)
+
+# ---- FROZEN BARS (O2) -- every one a literal -------------------------------------------------------------------------
+SIGMA_PRIOR = 0.6811983409351905      # 227.6's SIGMA_R18ALL through corpus_exclusions.filter_rows, registration corpus
+SIGMA_PRIOR_DF = 221
+SIGMA_NAIVE = 7.155901812067415       # the trap (nothing filtered) -- selftest proves the literal is NOT this
+REG_ROWS = 3127
+REG_CORPUS_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"   # header + first 3127 data rows
+MARGIN = 5.0                          # the +-5 pp margin of LIMITS-PREP 5 conventions
+READ_SE = 2.0                         # AT-KLS iff |D| <= 2 SE (stamp only)
+DIVERGED_BAR = 5.0                    # an arm's seed range
+LAYERWISE_MEAN = 69.4166              # filtered corpus, mechanism cell, `layerwise`, n 32 (259.3)
+LAYERWISE_SD = 0.5020
+REF_MIN = 64.4166                     # = LAYERWISE_MEAN - MARGIN: KLS below this is not a healthy reference
+SAT_BAND = (21.0940, 27.9520)         # 188.4(3)'s floor saturation band (stamp only)
+PIN_LO = -14.999                      # beta_pre at or below this counts as at the clamp floor (-15)
+PIN_LATE_STEP = 40000                 # epochs 80-99
+PIN_YES, PIN_NO = 0.90, 0.10
+TOL_SINGLE = 1e-6                     # relative, a singleton group's z_agg vs its tensor's z_tensor
+TOL_MERGED = 1e-2                     # relative, a multi-tensor group's z_agg vs the float64 sum of its members
+FLOOR_MIN, CEIL_MAX = 2.0, 99.0
+
+# ---- ACCOUNTS (259.5) -- predicted plateau5, every arm, every account ----------------------------------------------
+ACCOUNTS = {
+    # premise S (the scalar trajectory = a shared step size): adding C to N flips N's sum on 0.887 of records, T on 0.000
+    "A1-IDENTITY-AT-SHARED-STEP": {"KLS": 69.4166, "MCAR": 59.9980, "MCTL": 68.4166},
+    # premise L (the layerwise trajectory): C and T both vote beta down (0.931 / 0.891) and both flip N (0.391 / 0.353)
+    "A2-DOWNVOTER-GENERIC": {"KLS": 69.4166, "MCAR": 59.9980, "MCTL": 60.9980},
+    # the merged group pins or not, but N's step size does not matter at this cell / horizon
+    "A3-MERGE-HARMLESS": {"KLS": 69.4166, "MCAR": 68.4166, "MCTL": 68.4166},
+}
+ACCOUNT_BRANCH = {"A1-IDENTITY-AT-SHARED-STEP": "CARRIER-MERGE-HARMS", "A2-DOWNVOTER-GENERIC": "BOTH-HARM-ALIKE",
+                  "A3-MERGE-HARMLESS": "NO-MERGE-HARMS"}
+BROKEN_NULL = "BROKEN-PARTITION (MCAR/MCTL built as another grouping): levels unconstrained; excluded ONLY by G-PARTITION"
+
+BRANCHES = ("CARRIER-MERGE-HARMS", "BOTH-HARM-CARRIER-MORE", "BOTH-HARM-ALIKE", "CONTROL-MERGE-HARMS-MORE",
+            "NO-MERGE-HARMS", "UNRESOLVED-PARTIAL", "UNRESOLVED-DIVERGED", "UNRESOLVED-REFERENCE-UNHEALTHY")
+
+LICENSE = {
+    "CARRIER-MERGE-HARMS": [
+        "At this cell (ResNet18_c100, SGDm 0.99 / wd 0.1 + Lion, meta 1e-3, alpha0 1e-6, clip, aug, bs 100, 100 epochs),",
+        "starting from the singleton (layerwise) grouping, putting the three carriers into ONE step-size group with the nine",
+        "layer4 tensors N costs >= 5 pp of plateau5, and >= 5 pp MORE than putting the count / numel / width / depth /",
+        "norm-layer matched non-carrier triple {47,48,56} into the same N, which costs < 5 pp.  Sentence licensed: 'keeping",
+        "the carriers out of a shared step-size group with N is NECESSARY for the layerwise level at this cell'.",
+        "Necessity is relative to THIS ONE merge (this N, this size); it is a necessity of SEPARATION, not of any step size."],
+    "BOTH-HARM-CARRIER-MORE": [
+        "Both merges cost >= 5 pp and the carrier merge costs >= 5 pp more.  Licensed: 'merging N with a BN triple harms at",
+        "this cell, and merging it with the carriers harms more'; separation of the carriers is necessary for the layerwise",
+        "level at this merge, but so is separation of the control triple -- the carrier-specific part is the excess only."],
+    "BOTH-HARM-ALIKE": [
+        "Both merges cost >= 5 pp and they differ by < 5 pp.  Licensed: 'at this cell, merging N with either BN-scale triple",
+        "costs >= 5 pp; this merge does NOT single out the carriers' -- the harm is generic to putting N on a shared vote",
+        "with 512-wide layer4 BN parameters (premise L's account), NOT carrier identity.  No carrier-necessity sentence."],
+    "CONTROL-MERGE-HARMS-MORE": [
+        "The control merge costs >= 5 pp and >= 5 pp more than the carrier merge.  Licensed: 'at this merge the carriers are",
+        "LESS harmful to share a group with than the matched control'.  Contrary to both registered premises; no",
+        "carrier-necessity sentence; the probe readout must be read before any mechanism is named."],
+    "NO-MERGE-HARMS": [
+        "Neither merge moves plateau5 by >= 5 pp and they differ by < 5 pp.  Licensed: 'at this cell, keeping the carriers",
+        "out of a shared group with N is NOT necessary for the layerwise level (within +-5 pp)'.  Read WITH the G* pin",
+        "stamps: if MCAR's G* PINS, N's own step size does not matter here; if it is FREE, the carriers did not capture the",
+        "merged vote.  It does NOT say separation is never necessary: larger merges ([50,12], scalar) collapse (147, 184)."],
+    "UNRESOLVED-PARTIAL": [
+        "A pattern between the registered bars (e.g. the carrier merge costs >= 5 pp but the control is between).  The",
+        "contrasts are printed; no necessity sentence and no generic-harm sentence may be written from this batch."],
+    "UNRESOLVED-DIVERGED": ["An arm's seed range exceeds 5 pp; no contrast is read."],
+    "UNRESOLVED-REFERENCE-UNHEALTHY": [
+        "KLS (layerwise's grouping on the blockwise path) is below 64.4166 = the corpus layerwise mean - 5 pp; the premise",
+        "'inside the HEALTHY layerwise grouping' fails, so no necessity reading is possible."],
+    "INCOMPLETE": ["Not all 12 runs are complete; no branch, no number quotable."],
+    "HARNESS-UNSOUND": ["A run's ARGS / ENV / PROBE_TENSOR / foreign-switch / manifest / provenance check failed; no number read."],
+    "PARTITION-NOT-VERIFIED": ["A run's probe records do not decompose into its registered groups; no number read."],
+}
+NOT_LICENSED = [
+    "* Any other merge (another neighbour set, size or position), grouping family, cell, network or horizon.",
+    "* That the carriers' step size (large or small) is what harms: no step size is manipulated here; the merged group's",
+    "  step size is whatever the shared Lion vote makes it (the G* pin stamps are DESCRIPTIVE).",
+    "* Identity vs MAGNITUDE (188.3): at a shared step size the carriers' |L| exceeds T's by x100+ (premise S), so a",
+    "  carrier-specific result does not separate which tensors from how large their terms are.",
+    "* Necessity for the scalar collapse, or sufficiency statements beyond 187 / 193 / 240-253.",
+    "* A point reading for an arm AT KLS: |D| < 5 pp is a BOUND ('costs < 5 pp'), not 'costs nothing' (164.6).",
+]
+
+GATE_FAIL = []
+
+
+# =============================================================================
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label):
+    print("  NOTE %s" % label)
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def mean(v):
+    return sum(v) / len(v)
+
+
+def sd(v):
+    if len(v) < 2:
+        return float("nan")
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for b in iter(lambda: fh.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def compose_sigma(sigma_in):
+    """O2: max(frozen prior, in-batch pooled SD).  ONE argument; no corpus."""
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+def expected_args(arm, seed, save="/cluster/account_b/metaopt/runs/cmg1"):
+    return ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion "
+            "--momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset CIFAR100 --NN-name %s "
+            "--batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 "
+            "--stepsize-groups %s --seed %d --save-directory %s --run-name %s-%s-s%d"
+            % (NET, SPEC[arm], seed, save, PREFIX, arm, seed))
+
+
+def synthetic_manifest_text():
+    t = r18_tensors()
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(k for _n, k, _t in t)]
+    lines += ["TENSOR %d %s %d %s" % (i + 1, n, k, ty) for i, (n, k, ty) in enumerate(t)]
+    lines.append("SET N %s" % ",".join(str(i) for i in N_SET))
+    lines.append("SET C %s" % ",".join(str(i) for i in C_SET))
+    lines.append("SET T %s" % ",".join(str(i) for i in T_SET))
+    for a in ARMS:
+        g = groups_of(a)
+        lines.append("ARMSPEC %s TYPE blockwise M %d SPEC %s" % (a, len(g), SPEC[a]))
+        lines.append("ARMSIZES %s %s" % (a, ",".join(str(len(x)) for x in g)))
+        lines.append("ARMPARAMS %s %s" % (a, ",".join(str(sum(_NUMEL[i - 1] for i in x)) for x in g)))
+        for x in g:
+            if len(x) > 1:
+                lines.append("ARMMERGED %s %s" % (a, " ".join(NAMES[i - 1] for i in x)))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    dup = False
+    for a, b, c in EPTR_RE.findall(txt):
+        if int(a) in eps:
+            dup = True
+        try:
+            eps[int(a)] = (float(b), float(c))
+        except ValueError:
+            eps[int(a)] = (float("nan"), float("nan"))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps), "dup_epoch": dup,
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "foreign": [ln for ln in lines if ln.startswith(FOREIGN_PREFIXES)],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"] and not rec["traceback"]
+                       and rec["plateau5"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    """(arm, seed) -> the run.  The highest job id among COMPLETE runs wins."""
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s" % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def load_probe(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        d = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, arm, seed))
+        p = os.path.join(d, "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            meta = {}
+            for fn in ("probe_tensor.json", "block_sizes.json"):
+                try:
+                    meta[fn] = json.load(open(os.path.join(d, fn)))
+                except Exception:
+                    meta[fn] = None
+            return recs, meta
+    return None, {}
+
+
+# =============================================================================
+# G-PARTITION -- the registered grouping reached the optimizer
+# =============================================================================
+def partition_ok(rec, arm):
+    """One record: z_agg / mom_pre / beta_pre have the arm's group count, and every group's z_agg and mom_pre equal the
+    sum of its registered members' z_tensor / m_tensor (singletons at TOL_SINGLE, merged at TOL_MERGED)."""
+    try:
+        g = groups_of(arm)
+        za, ma, bp = rec["z_agg"][0], rec["mom_pre"][0], rec["beta_pre"][0]
+        z, m = rec["z_tensor"], rec["m_tensor"]
+        if not (len(za) == len(ma) == len(bp) == len(g)) or len(z) != NTENS or len(m) != NTENS:
+            return False
+        for k, grp in enumerate(g):
+            tol = TOL_SINGLE if len(grp) == 1 else TOL_MERGED
+            for agg, per in ((za, z), (ma, m)):
+                s = sum(per[i - 1] for i in grp)
+                if not (math.isfinite(s) and math.isfinite(agg[k])):
+                    return False
+                if abs(s - agg[k]) > tol * max(abs(agg[k]), abs(s), 1e-30):
+                    return False
+        return True
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def partition_check(arm, recs, meta):
+    d = {"n": 0 if recs is None else len(recs), "bad": 0, "steps_ok": False, "meta_ok": False, "why": ""}
+    if recs is None:
+        d["why"] = "probe absent"
+        return False, d
+    good = [r for r in recs if isinstance(r, dict)]
+    steps = [r.get("step") for r in good]
+    d["steps_ok"] = len(recs) == N_RECORDS and steps == list(range(0, N_RECORDS * PROBE, PROBE))
+    d["bad"] = sum(1 for r in recs if not (isinstance(r, dict) and partition_ok(r, arm)))
+    pt, bs = meta.get("probe_tensor.json"), meta.get("block_sizes.json")
+    want_nb = [sum(_NUMEL[i - 1] for i in x) for x in groups_of(arm)]
+    d["meta_ok"] = (isinstance(pt, dict) and pt.get("stepsize_type") == "blockwise" and pt.get("n_tensors") == NTENS
+                    and pt.get("param_numels") == _NUMEL and isinstance(bs, dict) and bs.get("n_b") == want_nb)
+    ok = d["steps_ok"] and d["bad"] == 0 and d["meta_ok"]
+    if not ok:
+        d["why"] = "steps %s, bad records %d, meta %s" % (d["steps_ok"], d["bad"], d["meta_ok"])
+    return ok, d
+
+
+def pin_fraction(recs, arm, gpos, lo_step=PIN_LATE_STEP, hi_step=None):
+    v = [r["beta_pre"][0][gpos] <= PIN_LO for r in recs if isinstance(r, dict)
+         and r.get("step", -1) >= lo_step and (hi_step is None or r["step"] < hi_step)]
+    return (sum(v) / len(v)) if v else float("nan")
+
+
+def pin_word(f):
+    if f != f:
+        return "NA"
+    return "PINS" if f >= PIN_YES else ("FREE" if f <= PIN_NO else "NEITHER")
+
+
+# =============================================================================
+def decide(M, diverged=False):
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["KLS"] < REF_MIN:
+        return "UNRESOLVED-REFERENCE-UNHEALTHY"
+    d_car, d_ctl = M["KLS"] - M["MCAR"], M["KLS"] - M["MCTL"]
+    did = M["MCTL"] - M["MCAR"]
+    if d_car >= MARGIN and did >= MARGIN and d_ctl < MARGIN:
+        return "CARRIER-MERGE-HARMS"
+    if d_car >= MARGIN and did >= MARGIN and d_ctl >= MARGIN:
+        return "BOTH-HARM-CARRIER-MORE"
+    if d_car >= MARGIN and d_ctl >= MARGIN and abs(did) < MARGIN:
+        return "BOTH-HARM-ALIKE"
+    if d_ctl >= MARGIN and did <= -MARGIN:
+        return "CONTROL-MERGE-HARMS-MORE"
+    if d_car < MARGIN and d_ctl < MARGIN and abs(did) < MARGIN:
+        return "NO-MERGE-HARMS"
+    return "UNRESOLVED-PARTIAL"
+
+
+def arm_state(D, se):
+    if abs(D) <= READ_SE * se:
+        return "AT-KLS"
+    if D >= MARGIN:
+        return "BELOW-KLS"
+    if D <= -MARGIN:
+        return "ABOVE-KLS"
+    return "NEAR-KLS-BELOW" if D > 0 else "NEAR-KLS-ABOVE"
+
+
+def corpus_disclosure(csvpath):
+    """NON-GATING: the corpus row count and the filtered layerwise mean at the cell.  No bar reads it."""
+    if not csvpath or not os.path.exists(csvpath):
+        return "not readable"
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions as CE
+    finally:
+        sys.path.pop(0)
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    filt = CE.filter_rows(rows)
+    v = [float(r["plateau5"]) for r in filt if r.get("network") == NET and r.get("dataset") == DSET
+         and r.get("granularity") == "layerwise" and r.get("epochs_requested") == "100" and r.get("meta_stepsize") == "1e-3"
+         and r.get("alpha0") == "1e-6" and r.get("augment") == "1" and r.get("beta_clip") == "-15:-2.3026"
+         and r.get("batch_size") == "100" and r.get("complete") == "1" and (r.get("plateau5") or "").strip()
+         and r.get("hier", "") == "" and r.get("superseded") == "0" and r.get("collapsed") == "0"]
+    return "%d rows after filter_rows (%s- excluded); layerwise at the cell n %d mean %s" % (
+        len(filt), PREFIX, len(v), ("%.4f" % mean(v)) if v else "-")
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL).  rc 0 branch taken; 1 harness-unsound / partition-not-verified; 2 incomplete."""
+    print("=" * 78)
+    print(" cmg1 -- ResNet18_c100: IS KEEPING THE CARRIERS APART NECESSARY INSIDE THE LAYERWISE GROUPING?  (N3, 259)")
+    print(" %s / %s  %d epochs  seeds %s  AUGMENT=1 BETA_CLIP=-15:-2.3026 PROBE=100 PROBE_TENSOR=1  LIVE harness"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS)))
+    print("   KLS   62 singletons                MCAR  G* = N u {50,53,59}      MCTL  G* = N u {47,48,56}")
+    print(" PRIMARY DELTA_ID = MCTL - MCAR; KEY D_CAR = KLS - MCAR, D_CTL = KLS - MCTL.  MARGIN %.1f pp (frozen, O2)." % MARGIN)
+    print("=" * 78)
+    try:
+        disc = corpus_disclosure(csvpath)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, branch or stamp reads it)" % disc)
+
+    runs, rnotes = read_runs(runsdir)
+    print("\nCOMPLETE  %d runs, epochs 0..%d once each, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s, "absent" if r is None else
+                  "%d epoch lines, RUN_DONE=%s, traceback=%s" % (r["n_epochs"], r["run_done"], r["traceback"])))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (12 - len(missing), 12, ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line == the registered line (save-directory any path ending /cmg1)")
+    save_dirs = set()
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            ok = len(r["args"]) == 1
+            if ok:
+                m = re.search(r"--save-directory (\S+) ", r["args"][0])
+                sv = m.group(1) if m else ""
+                save_dirs.add(sv)
+                ok = sv.endswith("/" + PREFIX) and r["args"][0] == expected_args(a, s, sv)
+            hchk(ok, "G-ARGS %s-s%d" % (a, s), "" if ok else "got %r" % (r["args"][:1],))
+    hchk(len(save_dirs) == 1, "G-ARGS one save-directory for the batch", str(sorted(save_dirs)))
+
+    print("\nG-ENV     one ENV line per run == the registered one (PROBE_DIR stripped); PROBE_DIR == <save>/probe_<run>")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            ok = len(r["env"]) == 1
+            if ok:
+                m = re.search(r" PROBE_DIR=(\S*)", r["env"][0])
+                pdir = m.group(1) if m else ""
+                ok = (re.sub(r" PROBE_DIR=\S*", "", r["env"][0]) == ENV_EXPECTED and len(save_dirs) == 1
+                      and pdir == "%s/probe_%s-%s-s%d" % (next(iter(save_dirs)), PREFIX, a, s))
+            hchk(ok, "G-ENV %s-s%d" % (a, s), "" if ok else "got %r" % (r["env"][:1],))
+
+    print("\nG-PT      ONE `PROBE_TENSOR: on every=100 type=blockwise tensors=62 ...` per run; NO foreign intervention line")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            m = PT_RE.match(r["pt"][0]) if len(r["pt"]) == 1 else None
+            hchk(m is not None and m.group(1) == "blockwise", "G-PT %s-s%d" % (a, s), "" if m else "got %r" % (r["pt"][:1],))
+            hchk(not r["foreign"], "G-FOREIGN %s-s%d no %s line" % (a, s, "/".join(FOREIGN_PREFIXES)),
+                 "" if not r["foreign"] else "got %r" % (r["foreign"][:2],))
+
+    print("\nG-STRUCT  the batch's PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(), "G-STRUCT byte-identical to synthetic_manifest_text()",
+             "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("HF_SHA256") == LIVE_HF_SHA, "G-PROV HF.py == the LIVE, unpatched %s..." % LIVE_HF_SHA[:12],
+             str(prov.get("HF_SHA256"))[:16])
+        hchk(prov.get("BUILD_NETWORK_SHA256") == LIVE_BN_SHA, "G-PROV build_network.py == LIVE %s..." % LIVE_BN_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        hchk(prov.get("RUNNER_SHA256") == RUNNER_SHA, "G-PROV runner == run_cifar.sh %s..." % RUNNER_SHA[:12],
+             str(prov.get("RUNNER_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    hi = max(max(v) for v in arm_v.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max run >= %.1f pp" % FLOOR_MIN, "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max run <= %.1f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split(" ")[0] + " " + h.split(" ")[1] for h in harness[:6]))
+        print("\n" + "=" * 78 + "\n" + final + "\n" + "=" * 78)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-PARTITION  every record's z_agg / mom_pre / beta_pre decompose into the arm's REGISTERED groups")
+    print("  (500 records at steps 0..49900; singleton groups at rel %.0e, the merged group at rel %.0e; probe_tensor.json"
+          % (TOL_SINGLE, TOL_MERGED))
+    print("   blockwise / 62 tensors / numels; block_sizes.json n_b == the registered per-group numel)")
+    probes, pfail = {}, []
+    for s in SEEDS:
+        for a in ARMS:
+            recs, meta = load_probe(runsdir, a, s)
+            ok, d = partition_check(a, recs, meta)
+            probes[(a, s)] = recs
+            print("  %-4s G-PARTITION %-4s s%d  records %d  bad %d  steps %s  meta %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, d["n"], d["bad"], d["steps_ok"], d["meta_ok"],
+                     ("  (%s)" % d["why"]) if d["why"] else ""))
+            if not ok:
+                pfail.append("%s-s%d" % (a, s))
+    if pfail:
+        final = "FINAL: PARTITION-NOT-VERIFIED | G-PARTITION failed on %s" % ",".join(pfail)
+        print("\n" + "=" * 78 + "\n" + final + "\n" + "=" * 78)
+        for ln in LICENSE["PARTITION-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN5, IN BATCH")
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        print("  %-5s TEST %.4f  sd %.4f  range %.4f   TRAIN %.4f   seeds %s" % (a, mean(v), sd(v), max(v) - min(v), mean(t),
+              ", ".join("s%d %.4f/%.4f" % (s, x, y) for s, x, y in zip(SEEDS, v, t))))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+
+    print("\nSIGMA     O2: max(frozen prior, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    which, sig, cands = compose_sigma(math.sqrt(ss / df))
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sig * math.sqrt(2.0 / len(SEEDS))
+    print("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/4)" % se)
+
+    did, dcar, dctl = M["MCTL"] - M["MCAR"], M["KLS"] - M["MCAR"], M["KLS"] - M["MCTL"]
+    print("\nCONTRASTS (within batch)")
+    print("  PRIMARY  DELTA_ID = MCTL - MCAR = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (did, did / se, T["MCTL"] - T["MCAR"]))
+    print("  KEY      D_CAR    = KLS - MCAR  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (dcar, dcar / se, T["KLS"] - T["MCAR"]))
+    print("  KEY      D_CTL    = KLS - MCTL  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (dctl, dctl / se, T["KLS"] - T["MCTL"]))
+    pairs = [runs[("MCTL", s)]["plateau5"] - runs[("MCAR", s)]["plateau5"] for s in SEEDS]
+    print("  same-seed DELTA_ID: %s" % ", ".join("s%d %+.4f" % (s, x) for s, x in zip(SEEDS, pairs)))
+    print("  bars: MARGIN %.1f pp (%.2f SE) | AT-KLS stamp |D| <= %.1f SE = %.4f pp | REF_MIN %.4f"
+          % (MARGIN, MARGIN / se, READ_SE, READ_SE * se, REF_MIN))
+
+    print("\nACCOUNTS (259.5) -- predicted levels; the observed branch is compared with each account's registered branch")
+    for acc, lv in ACCOUNTS.items():
+        print("  %-28s KLS %.4f MCAR %.4f MCTL %.4f -> %s%s" % (acc, lv["KLS"], lv["MCAR"], lv["MCTL"], ACCOUNT_BRANCH[acc],
+              ""))
+    print("  %s" % BROKEN_NULL)
+
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("\nG-DIVERGE (branch condition): %s" % ("PASS" if not div else "FAIL %s" % div))
+    branch = decide(M, bool(div))
+
+    stamps = ["HARNESS-LIVE-UNPATCHED", "PARTITION-VERIFIED", "ONE-MERGE-SET-N9", "CONTROL-TRIPLE-47-48-56",
+              "REFERENCE-SINGLETON-SETS", "ONE-NETWORK-RESNET18", "ONE-CELL", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH", "MAGNITUDE-NOT-SEPARATED"]
+    stamps.append("MCAR-%s" % arm_state(dcar, se))
+    stamps.append("MCTL-%s" % arm_state(dctl, se))
+    stamps.append("KLS-IN-LAYERWISE-BAND" if abs(M["KLS"] - LAYERWISE_MEAN) <= 4 * LAYERWISE_SD else "KLS-OUT-OF-LAYERWISE-BAND")
+    stamps.append("SEEDS-AGREE" if (all(x > 0 for x in pairs) or all(x < 0 for x in pairs)) else "SEEDS-SPLIT")
+    for a in ("MCAR", "MCTL"):
+        f = mean([pin_fraction(probes[(a, s)], a, MERGED_G) for s in SEEDS])
+        stamps.append("%s-GSTAR-%s" % (a, pin_word(f)))
+    if any(SAT_BAND[0] <= M[a] <= SAT_BAND[1] for a in ARMS):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    qual = [(did, T["MCTL"] - T["MCAR"]), (dcar, T["KLS"] - T["MCAR"]), (dctl, T["KLS"] - T["MCTL"])]
+    stamps.append("TRAIN-AGREES" if all((t > 0) == (p > 0) for p, t in qual if abs(p) >= MARGIN) else "TRAIN-DISAGREES")
+    match = [acc for acc, b in ACCOUNT_BRANCH.items() if b == branch]
+    stamps.append("ACCOUNT-%s" % (match[0] if match else "NONE"))
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78 + "\n" + final + "\n" + "=" * 78)
+
+    print("\nDESCRIPTIVE PROBE READOUT (NOT GATING): fraction of records at the clamp floor (beta_pre <= %.3f)" % PIN_LO)
+    for a in ARMS:
+        for s in SEEDS:
+            recs = probes[(a, s)]
+            if a == "KLS":
+                parts = ["t%d late %.3f" % (i, pin_fraction(recs, a, i - 1)) for i in C_SET + T_SET + (46, 49, 55, 58)]
+            else:
+                parts = ["G* early(<10000) %.3f late(>=40000) %.3f" % (pin_fraction(recs, a, MERGED_G, 0, 10000),
+                                                                       pin_fraction(recs, a, MERGED_G))]
+                parts += ["single t%d late %.3f" % (i, pin_fraction(recs, a, MERGED_G + 1 + k))
+                          for k, i in enumerate(T_SET if a == "MCAR" else C_SET)]
+            print("  %-4s s%d  %s" % (a, s, "; ".join(parts)))
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE.get(branch, []):
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    for ln in NOT_LICENSED:
+        print("  " + ln)
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_SAVE = "/cluster/account_b/metaopt/runs/cmg1"
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, args=None, env=None, pt=None, foreign=None, jitter=0.0):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid),
+             args if args is not None else expected_args(arm, s, _E_SAVE),
+             env if env is not None else ENV_EXPECTED.replace(" EB_RHO", " PROBE_DIR=%s/probe_%s EB_RHO" % (_E_SAVE, rn)),
+             "NVIDIA L4, 23034 MiB", "Files already downloaded and verified",
+             pt if pt is not None else ("PROBE_TENSOR: on every=100 type=blockwise tensors=62 meta_alg=Lion momentum_param=0.99 "
+                                        "Lion_beta2=0.9 dir=%s/probe_%s" % (_E_SAVE, rn))]
+    if foreign:
+        lines.append(foreign)
+    lv = level + jitter
+    for e in range(n_ep):
+        te = lv if e >= EPOCHS - 5 else lv * (1 - math.exp(-(e + 1) / 12.0))
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.4f %%" % (e, min(99.0, te + 20.0), te))
+    lines.append("44  minutes")
+    if run_done:
+        lines.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_probe_dir(cache, arm, as_arm, pin):
+    """A cached synthetic probe dir: records for `arm`'s levels but grouped as `as_arm`; G* pinned late iff pin."""
+    key = (arm, as_arm, pin)
+    if key in cache:
+        return cache[key]
+    d = os.path.join(cache["_root"], "probe_%s_%s_%s" % key)
+    os.makedirs(d)
+    rng = random.Random(sum(ord(ch) * (k + 1) for k, ch in enumerate("%s|%s|%s" % key)))
+    g = groups_of(as_arm)
+    with open(os.path.join(d, "probe.jsonl"), "w") as fh:
+        for k in range(N_RECORDS):
+            z = [round(rng.uniform(-1, 1), 3) for _ in range(NTENS)]
+            m = [round(rng.uniform(-1, 1), 3) for _ in range(NTENS)]
+            step = k * PROBE
+            bp = []
+            for gi, grp in enumerate(g):
+                if len(grp) > 1:
+                    bp.append(-15.0 if (pin and step >= 20000) else -8.0)
+                else:
+                    bp.append(-9.0)
+            rec = {"step": step, "z_tensor": z, "m_tensor": m, "z_agg": [[sum(z[i - 1] for i in grp) for grp in g]],
+                   "mom_pre": [[sum(m[i - 1] for i in grp) for grp in g]], "beta_pre": [bp]}
+            fh.write(json.dumps(rec) + "\n")
+    json.dump({"PROBE_TENSOR": 1, "every": 100, "stepsize_type": "blockwise", "n_tensors": NTENS, "param_numels": _NUMEL},
+              open(os.path.join(d, "probe_tensor.json"), "w"))
+    json.dump({"stepsize_type": "blockwise", "n_b": [sum(_NUMEL[i - 1] for i in x) for x in g]},
+              open(os.path.join(d, "block_sizes.json"), "w"))
+    cache[key] = d
+    return d
+
+
+def _e_build(root, cache, levels, jit=(0.3, -0.3, 0.1, -0.1), drop=None, over=None, probe_as=None, no_manifest=False,
+             bad_manifest=False, prov_mode="submit", resubmit=None, pin=None):
+    d = tempfile.mkdtemp(dir=root)
+    os.makedirs(os.path.join(d, PREFIX))
+    jid = 9000000
+    for s_i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            if drop == (a, s):
+                continue
+            kw = (over or {}).get((a, s), {})
+            _e_write(d, a, s, jid, levels[a], jitter=jit[s_i], **kw)
+            if resubmit == (a, s):
+                _e_write(d, a, s, jid - 5000, levels[a], n_ep=40, run_done=False, jitter=jit[s_i])
+            src = _e_probe_dir(cache, a, (probe_as or {}).get((a, s), a), bool((pin or {}).get(a, a == "MCAR")))
+            os.symlink(src, os.path.join(d, PREFIX, "probe_%s-%s-s%d" % (PREFIX, a, s)))
+    if not no_manifest:
+        txt = synthetic_manifest_text()
+        open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(txt + ("X\n" if bad_manifest else ""))
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nHF_SHA256 %s\nBUILD_NETWORK_SHA256 %s\nRUNNER_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (prov_mode, LIVE_HF_SHA, LIVE_BN_SHA, RUNNER_SHA, file_sha(os.path.abspath(__file__))))
+    return d
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": "1e-3", "alpha0": "1e-6", "gamma": "1",
+            "augment": "1", "beta_clip": "-15:-2.3026", "batch_size": "100", "epochs_requested": "100", "hier": "",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1", "network": NET}
+    inv = []
+    for i, (gran, v) in enumerate([("layerwise", 1.0), ("layerwise", 99.0), (SPEC["KLS"], 3.0), (SPEC["MCAR"], 90.0),
+                                   (SPEC["MCTL"], 2.0), ("scalar", 95.0)]):
+        inv.append(dict(base, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i), job_id=str(9990000 + i),
+                        seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        with open(p, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=hdr, extrasaction="ignore")
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+            for r in inv:
+                w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "plateau5", "granularity"] + list(base.keys())
+    p = os.path.join(dst_dir, "minimal.csv")
+    with open(p, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in inv:
+            w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _levels(k, car, ctl):
+    return {"KLS": k, "MCAR": car, "MCTL": ctl}
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cMG1 --selftest: design and spec strings, the frozen manifest, frozen bars (O2), the noise floor through")
+    print("corpus_exclusions.filter_rows, the accounts and the 164.6 floor table, G-PARTITION on synthetic AND real records,")
+    print("the REAL score() on synthetic runs, corpus invariance, and the documented one-argument invocation.\n")
+
+    print("A. DESIGN")
+    t = r18_tensors()
+    chk(len(t) == NTENS and sum(k for _n, k, _t in t) == TOTPAR, "62 tensors, 11,220,132 parameters (re-typed)")
+    chk([NAMES[i - 1] for i in C_SET] == ["layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight"],
+        "C = the carriers {50,53,59} (184 / 187)")
+    chk([NAMES[i - 1] for i in T_SET] == ["layer4.0.bn1.weight", "layer4.0.bn1.bias", "layer4.1.bn1.weight"],
+        "T = cdep1's DEPTH triple {47,48,56} (188.1)")
+    chk(sum(_NUMEL[i - 1] for i in C_SET) == sum(_NUMEL[i - 1] for i in T_SET) == 1536
+        and all(t[i - 1][2] == "BatchNorm2d" and _NUMEL[i - 1] == 512 for i in C_SET + T_SET),
+        "C and T: count 3, numel 1,536, each 512-wide BatchNorm2d, all in layer4")
+    l4 = [i for i in range(1, 63) if NAMES[i - 1].startswith("layer4.")]
+    chk(sorted(N_SET + C_SET + T_SET) == l4 and len(N_SET) == 9, "N u C u T = layer4's 15 tensors exactly; N has 9",
+        "N numel %d" % sum(_NUMEL[i - 1] for i in N_SET))
+    for a in ARMS:
+        try:
+            g = parse_sets(SPEC[a])
+            chk(g == groups_of(a), "%s spec parses (re-typed PATCH_NAMESETS grammar) to the registered %d groups" % (a, len(g)))
+        except ValueError as ex:
+            chk(False, "%s spec parses" % a, str(ex))
+        chk(re.match(r"^[A-Za-z0-9_.,:/-]+$", SPEC[a]) is not None, "%s spec is ONE shell token of the NAMESETS alphabet" % a)
+    gc, gt = groups_of("MCAR"), groups_of("MCTL")
+    chk([len(x) for x in gc] == [len(x) for x in gt] and
+        [sum(_NUMEL[i - 1] for i in x) for x in gc] == [sum(_NUMEL[i - 1] for i in x) for x in gt],
+        "MCAR and MCTL: identical group count, sizes and per-group numel (51 groups; G* 12 tensors, 8,392,192 params)")
+    chk(set(gc[MERGED_G]) - set(gt[MERGED_G]) == set(C_SET) and set(gt[MERGED_G]) - set(gc[MERGED_G]) == set(T_SET),
+        "G*(MCAR) and G*(MCTL) differ exactly by C vs T")
+    chk(SPEC["MCAR"] != SPEC["MCTL"] != SPEC["KLS"], "three distinct CSV granularity strings (corpus-separable)")
+    for bad in ("sets:1-62/1", "sets:1-61", "sets:1-62/", "sets:foo/1-62"):
+        try:
+            parse_sets(bad)
+            chk(False, "parse_sets rejects %r" % bad)
+        except ValueError:
+            chk(True, "parse_sets rejects %r" % bad)
+    txt = synthetic_manifest_text()
+    chk(txt.count("\nTENSOR ") == 62 and "ARMMERGED MCAR layer4.0.conv1.weight layer4.0.conv2.weight layer4.0.bn2.weight" in txt,
+        "synthetic manifest carries 62 TENSOR lines and the merged-group NAMES", "%d bytes, sha %s" % (len(txt), hashlib.sha256(txt.encode()).hexdigest()[:16]))
+    chk(all(not p.startswith(q) and not q.startswith(p) for p in FOREIGN_PREFIXES for q in FOREIGN_PREFIXES if p != q),
+        "no foreign witness prefix is a prefix of another")
+
+    print("\nB. THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36), registration corpus")
+    if csvpath and os.path.exists(csvpath):
+        raw = open(csvpath, newline="").read().splitlines(True)
+        if len(raw) - 1 >= REG_ROWS:
+            blob = (raw[0] + "".join(raw[1:1 + REG_ROWS])).encode()
+            chk(hashlib.sha256(blob).hexdigest() == REG_CORPUS_SHA, "the CSV's first %d data rows ARE the registration corpus" % REG_ROWS)
+            sys.path.insert(0, HERE)
+            try:
+                import corpus_exclusions as CE
+            finally:
+                sys.path.pop(0)
+            rows = list(csv.DictReader([raw[0]] + raw[1:1 + REG_ROWS]))
+            filt = CE._pooled(CE.filter_rows(rows), NET)
+            naive = CE._pooled(rows, NET)
+            chk(abs(filt[0] - SIGMA_PRIOR) < 1e-12 and filt[1] == SIGMA_PRIOR_DF,
+                "SIGMA_PRIOR: the FROZEN literal %r IS the FILTERED value" % SIGMA_PRIOR, "%r df %d" % (filt[0], filt[1]))
+            chk(abs(naive[0] - SIGMA_NAIVE) < 1e-9 and abs(naive[0] - SIGMA_PRIOR) > 1.0, "... and is NOT the naive (unfiltered) value",
+                "naive %r" % naive[0])
+            lw = [float(r["plateau5"]) for r in CE.filter_rows(rows) if r["network"] == NET and r["granularity"] == "layerwise"
+                  and r["epochs_requested"] == "100" and r["meta_stepsize"] == "1e-3" and r["alpha0"] == "1e-6"
+                  and r["augment"] == "1" and r["beta_clip"] == "-15:-2.3026" and r["batch_size"] == "100"
+                  and r["complete"] == "1" and r["hier"] == "" and r["superseded"] == "0" and r["collapsed"] == "0"
+                  and r["dataset"] == DSET and r["base"] == "SGDm" and r["meta"] == "Lion"]
+            chk(len(lw) == 32 and abs(mean(lw) - LAYERWISE_MEAN) < 5e-5 and abs(sd(lw) - LAYERWISE_SD) < 5e-5,
+                "LAYERWISE_MEAN / SD re-derived (filtered, n 32)", "%.6f / %.6f" % (mean(lw), sd(lw)))
+            chk(not any(r["run"].startswith(PREFIX + "-") or r["seed"] in ("124", "125", "126", "127")
+                        for r in csv.DictReader(open(csvpath))), "ZERO corpus rows are cmg1- or carry seed 124-127")
+        else:
+            skip("registration corpus", "CSV shorter than %d rows" % REG_ROWS)
+    else:
+        skip("noise floor", "no CSV")
+    chk(abs(REF_MIN - (LAYERWISE_MEAN - MARGIN)) < 1e-9, "REF_MIN = LAYERWISE_MEAN - MARGIN")
+
+    print("\nC. ACCOUNTS AND THE 164.6 FLOOR TABLE")
+    se0 = SIGMA_PRIOR * math.sqrt(0.5)
+    for acc, lv in ACCOUNTS.items():
+        b = decide(lv)
+        chk(b == ACCOUNT_BRANCH[acc], "%s predicts %s" % (acc, ACCOUNT_BRANCH[acc]), "decide() -> %s" % b)
+        print("        KLS %.4f MCAR %.4f MCTL %.4f | DELTA_ID %+.4f (%+.1f SE) D_CAR %+.4f D_CTL %+.4f"
+              % (lv["KLS"], lv["MCAR"], lv["MCTL"], lv["MCTL"] - lv["MCAR"], (lv["MCTL"] - lv["MCAR"]) / se0,
+                 lv["KLS"] - lv["MCAR"], lv["KLS"] - lv["MCTL"]))
+        chk(all(not (SAT_BAND[0] <= v <= SAT_BAND[1]) for v in lv.values()), "%s: no arm predicted inside the floor saturation band" % acc)
+    a1, a2, a3 = (ACCOUNTS[k] for k in ACCOUNTS)
+    sep12 = abs((a1["MCTL"] - a1["MCAR"]) - (a2["MCTL"] - a2["MCAR"])) / se0
+    chk(sep12 >= 10, "the PRIMARY separates A1 from A2 by >= 10 SE (not floor-bounded)", "%.1f SE" % sep12)
+    sep13 = abs((a1["KLS"] - a1["MCAR"]) - (a3["KLS"] - a3["MCAR"])) / se0
+    chk(sep13 >= 10, "D_CAR separates A1/A2 from A3 by >= 10 SE", "%.1f SE" % sep13)
+    chk(all(abs(abs(v) - MARGIN) >= 1.0 for lv in ACCOUNTS.values() for v in
+            (lv["MCTL"] - lv["MCAR"], lv["KLS"] - lv["MCAR"], lv["KLS"] - lv["MCTL"])),
+        "no account predicts a contrast within 1 pp of a bar")
+    chk("BOUND" in " ".join(NOT_LICENSED) and "164.6" in " ".join(NOT_LICENSED), "an AT-KLS reading is registered as a BOUND (164.6)")
+
+    print("\nD. decide() TOTALITY and every branch reachable")
+    rng = random.Random(259)
+    seen = set()
+    for _ in range(20000):
+        M = {"KLS": rng.uniform(55, 75), "MCAR": rng.uniform(40, 75), "MCTL": rng.uniform(40, 75)}
+        b = decide(M, rng.random() < 0.01)
+        seen.add(b)
+        if b not in BRANCHES:
+            chk(False, "decide() returned an unregistered branch", b)
+            break
+    chk(seen == set(BRANCHES), "all %d registered branches reached over 20,000 draws" % len(BRANCHES), str(sorted(set(BRANCHES) - seen)))
+    chk(all(b in LICENSE for b in BRANCHES), "every branch has a licence")
+
+    print("\nE. G-PARTITION ON REAL RECORDS (the landed ciso1 / cdep1 / ciso2 layerwise runs' per-tensor terms)")
+    real = sorted(set(os.path.join(runsdir, b, "probe_%s-k62-s%d" % (b, s)) for b, ss in
+                      (("ciso1", (21, 22, 23)), ("cdep1", (24, 25, 26)), ("ciso2", (31, 32, 33))) for s in ss))
+    real = [p for p in real if os.path.exists(os.path.join(p, "probe.jsonl"))]
+    if real:
+        nrec, own, cross = 0, 0, 0
+        for p in real:
+            for ln in open(os.path.join(p, "probe.jsonl")):
+                r = json.loads(ln)
+                z, m = r["z_agg"][0], r["mom_pre"][0]
+                nrec += 1
+                for a in ARMS:
+                    g = groups_of(a)
+                    syn = {"z_tensor": z, "m_tensor": m, "z_agg": [[sum(z[i - 1] for i in x) for x in g]],
+                           "mom_pre": [[sum(m[i - 1] for i in x) for x in g]], "beta_pre": [[-9.0] * len(g)]}
+                    own += partition_ok(syn, a)
+                    cross += sum(partition_ok(syn, b) for b in ARMS if b != a)
+        chk(len(real) == 9, "9 landed layerwise PROBE_TENSOR runs found", str(len(real)))
+        chk(own == 3 * nrec, "every real-record synthetic record passes as its own arm", "%d / %d" % (own, 3 * nrec))
+        chk(cross == 0, "NO real-record synthetic record passes as either other arm (the broken-partition null is excluded)",
+            "%d of %d cross reads pass" % (cross, 6 * nrec))
+        recs0, meta0 = [], {}
+        for ln in open(os.path.join(real[0], "probe.jsonl")):
+            recs0.append(json.loads(ln))
+        for fn in ("probe_tensor.json", "block_sizes.json"):
+            p0 = os.path.join(real[0], fn)
+            meta0[fn] = json.load(open(p0)) if os.path.exists(p0) else None
+        ok0, d0 = partition_check("KLS", recs0, meta0)
+        chk(not ok0 and not d0["meta_ok"], "a real LAYERWISE run (type=layerwise) is NOT accepted as KLS: the code-path check bites",
+            "records bad %d, meta_ok %s" % (d0["bad"], d0["meta_ok"]))
+    else:
+        skip("real-record G-PARTITION", "no landed k62 probe records under %s" % runsdir)
+
+    print("\nF. THE REAL score() ON SYNTHETIC RUNS (every number invented)")
+    root = tempfile.mkdtemp(prefix="cmg1_selftest_")
+    cache = {"_root": os.path.join(root, "_cache")}
+    os.makedirs(cache["_root"])
+    csvs = _e_csv_variants(csvpath, root)
+    cases = [
+        ("CARRIER-MERGE-HARMS", _levels(69.5, 60.0, 68.5), {}, 0),
+        ("BOTH-HARM-CARRIER-MORE", _levels(69.5, 52.0, 63.0), {}, 0),
+        ("BOTH-HARM-ALIKE", _levels(69.5, 60.0, 61.0), {}, 0),
+        ("CONTROL-MERGE-HARMS-MORE", _levels(69.5, 68.0, 60.0), {}, 0),
+        ("NO-MERGE-HARMS", _levels(69.5, 68.5, 68.8), {}, 0),
+        ("UNRESOLVED-PARTIAL", _levels(69.5, 63.0, 66.0), {}, 0),
+        ("UNRESOLVED-REFERENCE-UNHEALTHY", _levels(62.0, 50.0, 61.0), {}, 0),
+        ("CARRIER-MERGE-HARMS", _levels(69.5, 64.4, 69.45), {}, 0),               # near bars: D_CAR 5.1, DELTA 5.05
+        ("NO-MERGE-HARMS", _levels(69.5, 64.6, 69.45), {}, 0),                    # D_CAR 4.9, DELTA 4.85: just under
+        ("UNRESOLVED-PARTIAL", _levels(69.5, 64.4, 67.0), {}, 0),                 # D_CAR 5.1, DELTA 2.6, D_CTL 2.5
+        ("NO-MERGE-HARMS", _levels(69.5, 64.6, 64.6), {}, 0),                     # both 4.9 below
+        ("BOTH-HARM-ALIKE", _levels(69.5, 64.4, 64.4), {}, 0),
+    ]
+    reached = set()
+    for want, lv, kw, rc_want in cases:
+        d = _e_build(root, cache, lv, **kw)
+        rc, fin, out = _e_score(d, csvs.get("real", csvs["minimal-invented"]))
+        got = (fin or "").split(" | ")[0].replace("FINAL: ", "")
+        reached.add(got)
+        chk(rc == rc_want and got == want, "score() on %s -> %s" % (lv, want), "rc %s, %s" % (rc, (fin or "")[:120]))
+    chk("MCAR-GSTAR-PINS" in _e_score(_e_build(root, cache, _levels(69.5, 60.0, 68.5)), csvs["no-corpus"])[1]
+        and "MCTL-GSTAR-FREE" in _e_score(_e_build(root, cache, _levels(69.5, 60.0, 68.5)), csvs["no-corpus"])[1],
+        "the G* pin stamps read the probe (MCAR PINS, MCTL FREE in the synthetic records)")
+    # divergence
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), jit=(3.0, -3.0, 0.0, 0.0))
+    rc, fin, out = _e_score(d, csvs["no-corpus"])
+    chk(rc == 0 and fin.startswith("FINAL: UNRESOLVED-DIVERGED"), "a seed range > 5 pp -> UNRESOLVED-DIVERGED", fin[:80])
+    # dropped run
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), drop=("MCTL", 126))
+    rc, fin, out = _e_score(d, csvs["no-corpus"])
+    chk(rc == 2 and fin.startswith("FINAL: INCOMPLETE") and "MCTL-s126" in fin, "a dropped run -> INCOMPLETE, exit 2", fin[:80])
+    # truncated run
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), over={("KLS", 124): {"n_ep": 97}})
+    rc, fin, out = _e_score(d, csvs["no-corpus"])
+    chk(rc == 2 and "KLS-s124" in fin, "a truncated run (97 epochs) -> INCOMPLETE", fin[:80])
+    # truncated resubmission beside a complete run
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), resubmit=("MCAR", 125))
+    rc, fin, out = _e_score(d, csvs["no-corpus"])
+    chk(rc == 0 and fin.startswith("FINAL: CARRIER-MERGE-HARMS") and "has 2 files (1 complete)" in out,
+        "a truncated resubmission beside the complete run: the complete one is used and disclosed", fin[:60])
+    # harness breaks
+    breaks = [
+        ("wrong spec on the ARGS line (MCAR ran MCTL's)", {"over": {("MCAR", 124): {"args": expected_args("MCTL", 124, _E_SAVE).replace("cmg1-MCTL", "cmg1-MCAR")}}}),
+        ("repeated flag", {"over": {("KLS", 125): {"args": expected_args("KLS", 125, _E_SAVE) + " --alpha0 1e-3"}}}),
+        ("momentum 0.9 on one run", {"over": {("MCTL", 127): {"args": expected_args("MCTL", 127, _E_SAVE).replace("--momentum-param-base 0.99", "--momentum-param-base 0.9")}}}),
+        ("ENV BETA_CLIP none", {"over": {("KLS", 126): {"env": ENV_EXPECTED.replace("BETA_CLIP=-15:-2.3026", "BETA_CLIP=none").replace(" EB_RHO", " PROBE_DIR=%s/probe_cmg1-KLS-s126 EB_RHO" % _E_SAVE)}}}),
+        ("PROBE_DIR of another run", {"over": {("KLS", 126): {"env": ENV_EXPECTED.replace(" EB_RHO", " PROBE_DIR=%s/probe_cmg1-MCAR-s126 EB_RHO" % _E_SAVE)}}}),
+        ("PROBE_TENSOR missing", {"over": {("MCAR", 126): {"pt": "Files already downloaded and verified"}}}),
+        ("PROBE_TENSOR type=layerwise", {"over": {("KLS", 124): {"pt": "PROBE_TENSOR: on every=100 type=layerwise tensors=62 meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 dir=/x"}}}),
+        ("a VOTE_W witness (wrong tree)", {"over": {("MCTL", 125): {"foreign": "VOTE_W: off"}}}),
+        ("a SHADOW_VOTE witness", {"over": {("MCTL", 125): {"foreign": "SHADOW_VOTE: on x"}}}),
+        ("a DECAY_MASK witness", {"over": {("KLS", 127): {"foreign": "DECAY_MASK: off"}}}),
+        ("manifest absent", {"no_manifest": True}),
+        ("manifest altered", {"bad_manifest": True}),
+        ("provenance dry-run", {"prov_mode": "dry-run"}),
+    ]
+    for lab, kw in breaks:
+        d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), **kw)
+        rc, fin, out = _e_score(d, csvs["no-corpus"])
+        chk(rc == 1 and fin.startswith("FINAL: HARNESS-UNSOUND"), "HARNESS break: %s -> HARNESS-UNSOUND, exit 1" % lab, (fin or "")[:90])
+    pbreaks = [
+        ("MCAR's records grouped as MCTL (swapped)", {("MCAR", 124): "MCTL"}),
+        ("MCTL's records grouped as MCAR", {("MCTL", 127): "MCAR"}),
+        ("KLS's records grouped as MCAR", {("KLS", 125): "MCAR"}),
+        ("MCAR's records grouped as KLS (sets: silently singletons)", {("MCAR", 126): "KLS"}),
+    ]
+    for lab, pa in pbreaks:
+        d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), probe_as=pa)
+        rc, fin, out = _e_score(d, csvs["no-corpus"])
+        chk(rc == 1 and fin.startswith("FINAL: PARTITION-NOT-VERIFIED"), "PARTITION break: %s -> PARTITION-NOT-VERIFIED" % lab, (fin or "")[:90])
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5))
+    pd = os.path.join(d, PREFIX, "probe_cmg1-MCTL-s125")
+    os.unlink(pd)
+    shutil.copytree(_e_probe_dir(cache, "MCTL", "MCTL", False), pd)
+    lines = open(os.path.join(pd, "probe.jsonl")).read().splitlines()[:-1]
+    open(os.path.join(pd, "probe.jsonl"), "w").write("\n".join(lines) + "\n")
+    rc, fin, out = _e_score(d, csvs["no-corpus"])
+    chk(rc == 1 and fin.startswith("FINAL: PARTITION-NOT-VERIFIED"), "a probe with 499 records -> PARTITION-NOT-VERIFIED", fin[:80])
+
+    print("\nG. O2 -- the FINAL line and every bar line are invariant across four corpora (injected rows at cmg1's cells)")
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5))
+    finals, bars, discs = {}, {}, {}
+    for nm, p in csvs.items():
+        rc, fin, out = _e_score(d, p)
+        finals[nm] = fin
+        bars[nm] = [ln for ln in out.splitlines() if ln.startswith(("  SIGMA_USED", "  SE_ARM_DIFF", "  bars:", "  PRIMARY", "  KEY"))]
+        discs[nm] = [ln for ln in out.splitlines() if ln.startswith("corpus:")]
+    chk(len(set(finals.values())) == 1, "O2 CARRIER-MERGE-HARMS FINAL identical across %s" % ", ".join(sorted(finals)))
+    chk(len(set(tuple(v) for v in bars.values())) == 1, "O2 bar / contrast lines identical across the corpora")
+    chk(len(set(tuple(v) for v in discs.values())) > 1, "O2 non-vacuity: the corpus disclosure line DOES change with the injected rows")
+
+    print("\nH. THE DOCUMENTED ONE-ARGUMENT INVOCATION")
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5))
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), d], capture_output=True, text=True)
+    chk(p.returncode == 0 and "FINAL: CARRIER-MERGE-HARMS" in p.stdout, "`python3 cMG1_mergecarrier_score.py <runsdir>` exits 0 on synthetic runs")
+    d = _e_build(root, cache, _levels(69.5, 60.0, 68.5), drop=("KLS", 127))
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), d], capture_output=True, text=True)
+    chk(p.returncode == 2 and "FINAL: INCOMPLETE" in p.stdout, "... and on a dropped run exits 2")
+    shutil.rmtree(root, ignore_errors=True)
+
+    print("\nI. RULE 21 PREMISE: no cmg1 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cmg1-*.out under %s" % runsdir, "%d found" % len(runs))
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cmg1 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cMG1_mergecarrier_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cmg1/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

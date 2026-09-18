@@ -1,0 +1,459 @@
+#!/bin/bash
+# =============================================================================
+# cWD1_normwd.sh -- `cwd1`: ResNet18_c100 -- DOES THE SCALAR COLLAPSE NEED COUPLED WEIGHT DECAY ON THE NORMALISATION
+#   SCALES?  ONE SUBMISSION, 9 JOBS (3 arms x 3 seeds), 100 EPOCHS, SEEDS {128,129,130}, ResNet18_c100 / CIFAR-100,
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.  CORRECTIONS 260 (LIMITS-PREP 5.1 S1b).
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Every guard and scancel line is filtered on `cwd1-`.
+#
+# REGISTERED SCORER: analysis/cWD1_normwd_score.py (+ analysis/cwd_design.py, analysis/cwd_common.py), committed BEFORE
+# this batch is submitted (RULE 21).   DOCUMENTED INVOCATION:  python3 analysis/cWD1_normwd_score.py <runsdir>
+#
+# NEW HARNESS CODE, ISOLATED AND OPT-IN.  The batch runs from $WS/harness_cwd1/cifar10 = cvt8's tree (unchanged, re-verified
+# by bin/cVT8_stage_harness.sh) + PATCH_DECAYMASK (patches/patch_decaymask.py) in HF.py, built and verified by
+# bin/cWD_stage_harness.sh cwd1, and the runner $WS/jobs/run_cifar_cwd1.sh (run_cifar.sh, cd line changed; archived as
+# jobs/run_cifar_cwd1.sh).  DECAY_MASK unset == bitwise cvt8's tree; guard 4f requires the inertness / bite log
+# (tests/test_decaymask.py + tests/test_decaymask_realrun.py, bin/cWD_realrun_inertness.sbatch cwd1) on THIS HF.py, THIS
+# design module and THIS patch.
+#
+# THE ARMS (no hold patch is on in any arm; normscale = the 20 BatchNorm scales, 4,800 parameters)
+#   k01      scalar      DECAY_MASK unset
+#   k01NWD   scalar      DECAY_MASK=normscale
+#   kLNWD    layerwise   DECAY_MASK=normscale
+#
+# RULE 20.  Every ARGS value is ONE shell token.  DECAY_MASK rides sbatch's --export list and CANNOT ride the runner's ENV
+# line: the patch prints a witness line at construction on EVERY run, which the separate ENV audit and the scorer's
+# G-WITNESS read.  analysis/argsline_guard.py IS NOT EDITED.  WEIGHT DECAY ON THE NORM SCALES IS NOT A CSV COLUMN: the 6
+# masked runs go to results/CORPUS-EXCLUSIONS.tsv at landing (260.7).
+#
+# COST.  cvt8 by sacct: ~0.8-0.92 GPU-h per ResNet18_c100 run.  9 jobs ~= 7.7 GPU-h expected; HARD BOUND = WALL x 9 = 27 GPU-h.
+#
+# USAGE   bash bin/cWD1_normwd.sh [--dry-run]   |   bash bin/cWD1_normwd.sh --submit   (the ONLY submitting form)
+# ENV     CWD1_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD REST_HOLD DECAY_MASK
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+B=cwd1
+HARN=$WS/harness_cwd1/cifar10
+HPAR=$WS/harness_cvt8/cifar10
+RUNNER=$WS/jobs/run_cifar_cwd1.sh
+SAVE=$WS/runs/cwd1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="128 129 130"
+MST=1e-3
+A0=1e-6
+NTENS=62
+TOTPAR=11220132
+G_K01='scalar'
+G_KL='layerwise'
+M_NS='normscale'
+ARMS="k01 k01NWD kLNWD"
+NJOBS=9
+WALL=03:00:00
+BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+HF_PRE_SHA=5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9
+HF_POST_SHA=94aedc33046afb12782ffb7f2eb729bafc7fcba5f42227fec373fa67b6f58ebf
+RUNNER_SHA=34a8c90ee3a0bee00aa2d0b4a3ad5d16d461fbf5a1f0cda5797e44e44c158371
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cWD1_normwd_score.py"
+DES="$REPO/analysis/cwd_design.py"
+COM="$REPO/analysis/cwd_common.py"
+SELF="$REPO/bin/cWD1_normwd.sh"
+SC9="$REPO/analysis/cVT9_dosewindow_score.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+RRSB="$REPO/bin/cWD_realrun_inertness.sbatch"
+TESTD="$REPO/tests/test_decaymask.py"
+TESTDR="$REPO/tests/test_decaymask_realrun.py"
+TESTR="$REPO/tests/test_grouphold_realrun.py"
+STAGEW="$REPO/bin/cWD_stage_harness.sh"
+STAGE8="$REPO/bin/cVT8_stage_harness.sh"
+PATCHD="$REPO/patches/patch_decaymask.py"
+ARCHR="$REPO/jobs/run_cifar_cwd1.sh"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+HFH="$HARN/Optimizers/HF.py"
+HFDM="$HARN/Optimizers/HF.py.pre_decaymask"
+BNH="$HARN/build_network.py"
+ILOG="$SAVE/inertness_decaymask.log"
+
+echo "=============================================================="
+echo " cwd1 -- ResNet18_c100: does the scalar collapse need coupled WD on the normalisation scales?  (PATCH_DECAYMASK)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C   ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   k01      $G_K01"
+echo "   k01NWD   $G_K01      DECAY_MASK=$M_NS"
+echo "   kLNWD    $G_KL   DECAY_MASK=$M_NS"
+echo " 3 arms x 3 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN (cvt8's + PATCH_DECAYMASK)   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cWD1_normwd_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] && [ -z "${DECAY_MASK+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, REST_HOLD and DECAY_MASK are UNSET in the launcher's environment" \
+  || guard_fail "guard 0b: a hold / mask variable is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$DES" "$COM" "$SELF" "$SC9" "$EXCL" "$EXCLT" "$RRSB" "$TESTD" "$TESTDR" "$TESTR" "$STAGEW" "$STAGE8" "$PATCHD" \
+         "$ARCHR" "$LIBF" "$AGF" "$CSVP" "$RUNNER" "$HFH" "$HFDM" "$BNH"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cWD1_normwd_score.py analysis/cwd_design.py analysis/cwd_common.py bin/cWD1_normwd.sh bin/cWD_realrun_inertness.sbatch tests/test_decaymask.py tests/test_decaymask_realrun.py patches/patch_decaymask.py bin/cWD_stage_harness.sh jobs/run_cifar_cwd1.sh"
+REUSEF="analysis/cVT9_dosewindow_score.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv tests/test_grouphold_realrun.py bin/cVT8_stage_harness.sh bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the registration files and reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CWD1_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CWD1_REGISTERED_COMMIT"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CWD1_REGISTERED_COMMIT is unset"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CWD1_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+[ "$(sha "$ARCHR")" = "$RUNNER_SHA" ] && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] \
+  && echo "guard 1b2: the archived jobs/run_cifar_cwd1.sh == \$WS/jobs/run_cifar_cwd1.sh == $RUNNER_SHA" \
+  || guard_fail "guard 1b2: the archived runner or the live runner is not $RUNNER_SHA"
+
+SELFT=/tmp/cwd1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION' "$SELFT" | head -20; tail -5 "$SELFT"; }
+[ "$(grep -c '^  SKIP' "$SELFT")" = 0 ] && echo "guard 1c1: no SKIP (real records and the corpus were found on this host)" || guard_fail "guard 1c1: the selftest SKIPPED a section"
+grep -qE "^  PASS O2 PERSISTS +real\+invented " "$SELFT" && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cWD1_normwd_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows carry seed 128, 129 or 130" "$SELFT" && echo "guard 1c4: the scorer's own fresh-seed check ran and passed" \
+  || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS B THE BROKEN-MASK NULL ON REAL RECORDS" "$SELFT" && grep -q "^  PASS B the 3 landed cvt8 k01 runs PASS" "$SELFT" \
+  && grep -q "^  PASS B the Lion recompute is exact on 62 groups" "$SELFT" && grep -q "^  PASS E the BROKEN-MASK null's LEVELS block is BYTE-IDENTICAL" "$SELFT" \
+  && echo "guard 1c5: G-BITE passes 3 landed cvt8 k01 runs and 3 landed 62-group layerwise runs, FAILS the broken-mask null on 3 landed records; the null's levels == the base case's" \
+  || guard_fail "guard 1c5: the real-record G-BITE / broken-mask null checks did not pass"
+grep -q "^  PASS SIGMA_R18ALL: the FROZEN literal 0.6811983409351905 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c6: OPERATIONS 36 -- the frozen floor IS the corpus_exclusions.filter_rows value, not the naive one" \
+  || guard_fail "guard 1c6: the frozen floor was not shown to be the filtered value"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+grep -q '^cwd1-' "$CSVP" && guard_fail "guard 2: cwd1-* already in the CSV" || echo "guard 2: no cwd1-* row in the corpus"
+NOUT=$(ls "$WS/runs"/cwd1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cwd1-*.out on disk" || guard_fail "guard 2b: $NOUT cwd1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (128|129|130)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 128/129/130" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 128/129/130"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cwd1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cwd1-* jobs" || guard_fail "guard 2e: sacct shows $NS cwd1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cwd1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cwd1-* in squeue" || guard_fail "guard 2f: $NQ cwd1-* already queued"
+fi
+
+# ---- guard 4a: cvt8's tree unchanged; cwd1's tree consistent -----------
+bash "$STAGE8" >/tmp/cwd1_stage8.$$ 2>&1 \
+  && { echo "guard 4a: cVT8_stage_harness.sh (verify mode) VERIFIES cvt8's tree:"; grep -E 'V-h|V-d|VERIFIED' /tmp/cwd1_stage8.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4a: cvt8's tree is NOT consistent"; tail -20 /tmp/cwd1_stage8.$$; }
+bash "$STAGEW" cwd1 >/tmp/cwd1_stagew.$$ 2>&1 \
+  && { echo "guard 4a1: cWD_stage_harness.sh cwd1 (verify mode) VERIFIES cwd1's tree:"; grep -E 'V-a|V-h|V-d|V-f|VERIFIED' /tmp/cwd1_stagew.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4a1: cwd1's tree is NOT consistent"; tail -20 /tmp/cwd1_stagew.$$; }
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$BNH")" = "$BN_SHA" ] && echo "guard 3b: build_network.py == cvt8's ($BN_SHA)" || guard_fail "guard 3b: build_network.py"
+[ "$(sha "$HFH")" = "$HF_POST_SHA" ] && [ "$(sha "$HFDM")" = "$HF_PRE_SHA" ] && [ "$(sha "$HPAR/Optimizers/HF.py")" = "$HF_PRE_SHA" ] \
+  && echo "guard 3c: HF.py == $HF_POST_SHA; .pre_decaymask == cvt8's HF.py == $HF_PRE_SHA" \
+  || guard_fail "guard 3c: the tree's HF files are not the pinned ones (or cvt8's HF.py moved)"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == $RUNNER_SHA (run_cifar.sh with the cd line changed)" || guard_fail "guard 3e: runner sha"
+
+# ---- guard 4b/4f: structural proof; the inertness / bite log ----
+python3 "$TESTD" --pre "$HFDM" --post "$HFH" --structural-only >/tmp/cwd1_d0.$$ 2>&1 \
+   && echo "guard 4b: PATCH_DECAYMASK structural D0 PASSES (deleting the three regions == cvt8's HF.py, byte for byte)" \
+   || { guard_fail "guard 4b: D0 FAILED"; tail -8 /tmp/cwd1_d0.$$; }
+if [ -f "$ILOG" ] && grep -q "^TEST_DECAYMASK_RC 0$" "$ILOG" && grep -q "^REALRUN_RC 0$" "$ILOG" \
+   && [ "$(grep -c '^ALL PASS$' "$ILOG")" = 2 ] && [ "$(grep -c '^  FAIL' "$ILOG")" = 0 ] && grep -q "^BATCH cwd1$" "$ILOG" \
+   && grep -q "^TREE_POST $HARN HF $(sha "$HFH") build_network $(sha "$BNH")$" "$ILOG" \
+   && grep -q "^DESIGN_SHA256 $(sha "$DES")$" "$ILOG" && grep -q "^DRIVER_SHA256 $(sha "$TESTDR")$" "$ILOG" \
+   && grep -q "^PATCH_SHA256 $(sha "$PATCHD")$" "$ILOG" && grep -q "^REGISTERED_TEST_SHA256 $(sha "$TESTR")$" "$ILOG" \
+   && grep -q "^$(sha "$TESTD")  tests/test_decaymask.py$" "$ILOG" \
+   && grep -q "PASS RR0 parent k01 vs itself: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR1 layerwise    DECAY_MASK empty: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR1 k01          DECAY_MASK unset: every parameter and buffer after the last step BITWISE-IDENTICAL" "$ILOG" \
+   && grep -q "PASS RR2 kLNWD        at every probe record dm_n == step+2" "$ILOG" \
+   && grep -q "PASS RR3 kLNWD        w', h', m' BITWISE the formula" "$ILOG" && grep -q "PASS RR3 NON-VACUITY (test-only" "$ILOG" \
+   && grep -q "PASS D3(b) masked tensors" "$ILOG"; then
+  echo "guard 4f: the inertness / bite log ALL PASS on THIS HF, THIS design, THIS patch: $(grep -c '^  PASS' "$ILOG") PASS / $(grep -c '^  FAIL' "$ILOG") FAIL (sha $(sha "$ILOG" | cut -c1-8))"
+else
+  guard_fail "guard 4f: no ALL PASS inertness log for HF $(sha "$HFH") / design $(sha "$DES") at $ILOG -- sbatch -J cwdinert1 $RRSB cwd1, then copy its .out there"
+fi
+
+# ---- guard 4c': the launcher's literals == the design module's and the stage script's ------
+python3 - "$DES" "$G_K01" "$G_KL" "$M_NS" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" "$ARMS" \
+          "$BN_SHA" "$HF_PRE_SHA" "$HF_POST_SHA" "$RUNNER_SHA" "$STAGEW" <<'PYEOF' || guard_fail "guard 4c': launcher / design / stage-script literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("cwd_design", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+Bm = Dm.CWD1
+(g_k01, g_kl, ns, net, ntens, totpar, seeds, arms, bn, pre, post, runner, stage) = sys.argv[2:15]
+bad = []
+if tuple(arms.split()) != Bm.ARMS: bad.append("ARMS")
+if {"k01": g_k01, "k01NWD": g_k01, "kLNWD": g_kl} != Bm.SPEC: bad.append("SPEC")
+if {"k01": "", "k01NWD": ns, "kLNWD": ns} != Bm.DMASK: bad.append("DMASK")
+if net != Bm.NET or int(ntens) != Bm.NTENS or int(totpar) != Bm.TOTPAR: bad.append("NET/NTENS/TOTPAR")
+if tuple(int(x) for x in seeds.split()) != Bm.SEEDS: bad.append("SEEDS")
+if (bn, pre, post, runner) != (Bm.BN_SHA, Bm.HF_PARENT_SHA, Bm.HF_POST_SHA, Bm.RUNNER_SHA): bad.append("SHAS")
+st = open(stage).read()
+blk = st[st.index("  cwd1) "):st.index(";;", st.index("  cwd1) "))]
+for name, v in (("BN_SHA", bn), ("HF_PRE_SHA", pre), ("HF_POST_SHA", post), ("RUNNER_SHA", runner)):
+    m = re.search(r"%s=([0-9a-f]{64})" % name, blk)
+    if not m or m.group(1) != v: bad.append("stage " + name)
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': ARMS, spec strings, DECAY_MASK values, NET, NTENS, TOTPAR, SEEDS and the tree / runner shas agree in launcher / design / stage script")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, built from cwd1's tree, per arm with every witness ----
+mkdir -p "$SAVE"
+MTMP=/tmp/cwd1_manifest.$$
+python3 - "$HARN" "$MTMP" "$DES" <<'PYEOF' || guard_fail "guard 4: live partition / witness / manifest check FAILED"
+import sys, os, io, re, inspect, contextlib, importlib.util
+harn, out, desp = sys.argv[1], sys.argv[2], sys.argv[3]
+spm = importlib.util.spec_from_file_location("cwd_design", desp); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+Bm = Dm.CWD1
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(Bm.NET, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+bad = 0
+T, tot = len(nps), sum(numel)
+print("guard 4: live %s from cwd1's tree -- %d tensors, %d parameters; carriers %s" % (Bm.NET, T, tot, [(names.index(c) + 1, own[c], numel[names.index(c)]) for c in Bm.CARRIERS]))
+if T != Bm.NTENS or tot != Bm.TOTPAR or names != Bm.NAMES or [names.index(c) + 1 for c in Bm.CARRIERS] != [50, 53, 59]:
+    bad += 1
+lines = ["NETWORK %s" % Bm.NET, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "CLIP_C %s" % Dm.CLIP, "EPOCHS %d" % Dm.EPOCHS,
+         "META_STEPS %d" % (Dm.EPOCHS * Dm.STEPS_PER_EPOCH), "WD_BASE %r" % Dm.WD_BASE]
+lines += ["TENSOR %d %s %d %s ndim=%d" % (i + 1, names[i], numel[i], own[names[i]], len(nps[i][1])) for i in range(T)]
+ns = [i for i in range(T) if names[i].endswith(".weight") and len(nps[i][1]) == 1]
+if [i for i in range(T) if names[i].endswith(".weight") and own[names[i]] in ("BatchNorm2d", "GroupNorm")] != ns or tuple(i + 1 for i in ns) != Bm.NORMSCALE_IDX or sum(numel[i] for i in ns) != Bm.NORMSCALE_NUMEL: bad += 1
+print("guard 4: normscale on the live model = %d BatchNorm2d scales (by module type), %d parameters, idx %s" % (len(ns), sum(numel[i] for i in ns), ",".join("%d" % (i + 1) for i in ns)))
+lines.append("NORMSCALE %s" % ",".join("%d:%s" % (i + 1, names[i]) for i in ns))
+KEYS = ("VOTE_W", "BETA_HOLD", "COMP_HOLD", "WINDOW_HOLD", "GROUP_HOLD", "REST_HOLD", "DECAY_MASK")
+for arm in Bm.ARMS:
+    for k in KEYS:
+        os.environ.pop(k, None)
+    for k, v in (("DECAY_MASK", Bm.DMASK[arm]),):
+        if v:
+            os.environ[k] = v
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o.args_base = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"
+    o.base_update = o.SGDm_base_update
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, Bm.SPEC[arm], nps, 1e-6)
+    for k in KEYS:
+        os.environ.pop(k, None)
+    L = buf.getvalue().splitlines()
+    got = dict((k, [ln for ln in L if ln.startswith(k)]) for k in ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK"))
+    ok = (all(got[k] == [w] for k, w in zip(Bm.OFF_KINDS, Bm.OFF_LINES)) and got["COMP_HOLD"] == [] and got["WINDOW_HOLD"] == []
+          and got["DECAY_MASK"] == [Bm.WITNESS_DM[arm]] and o.stepsize_type == Bm.PT_TYPE[arm]
+          and (o.base_update.__func__ is HF._dm_SGDm_base_update) == bool(Bm.DMASK[arm]))
+    if Bm.DMASK[arm]:
+        ok = ok and o._dm_idx == list(ns)
+    print("guard 4: %-12s %-38s type=%s  witnesses (VOTE_W/BETA_HOLD/GROUP_HOLD/REST_HOLD off; no COMP/WINDOW; DECAY_MASK) == registered, base_update bound as registered: %s"
+          % (arm, Bm.SPEC[arm], o.stepsize_type, ok))
+    if not ok:
+        print("!!! guard 4: %s does not construct as registered: %r" % (arm, got)); bad += 1
+    lines.append("ARMSPEC %s SPEC %s TYPE %s" % (arm, Bm.SPEC[arm], o.stepsize_type))
+    _m = re.search(r" spec=(\S+) ", got["DECAY_MASK"][0]) if got["DECAY_MASK"] else None
+    lines.append("DECAYMASK %s %s" % (arm, _m.group(1) if _m else "off"))
+    lines.append("DWITNESS %s %s" % (arm, got["DECAY_MASK"][0] if got["DECAY_MASK"] else "(none)"))
+st = inspect.getsource(HF.step)
+ok_st = st.count("self.base_update(net,g)") == 1 and st.find("self.base_update(net,g)") < st.find("self.meta_update(HtT_gradft)")
+print("guard 4f: step() calls self.base_update(net,g) once, before the meta update: %s" % ok_st)
+bad += not ok_st
+pr = inspect.getsource(HF._probe)
+ok_pr = pr.count("self._dm_attach(rec)") == 1 and pr.find("self._dm_attach(rec)") < pr.find("self._pt_attach(rec)") and pr.find("self._rh_attach(rec)") < pr.find("self._dm_attach(rec)")
+print("guard 4f: _probe attaches dm_* keys once, after rh_* and before PROBE_TENSOR's keys: %s" % ok_pr)
+bad += not ok_pr
+txt = "\n".join(lines) + "\n"
+if txt != Dm.manifest_text(Bm):
+    a_, b_ = txt.splitlines(), Dm.manifest_text(Bm).splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("!!! guard 4d: live manifest differs at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "")[:200], (b_[k] if k < len(b_) else "")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to cwd_design.manifest_text(CWD1) (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cwd1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $(sha "$BNH")"
+  echo "HF_SHA256 $(sha "$HFH")"
+  echo "HF_PRE_DECAYMASK_SHA256 $(sha "$HFDM")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "DESIGN_SHA256 $(sha "$DES")"
+  echo "COMMON_SHA256 $(sha "$COM")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "REGISTERED_COMMIT ${CWD1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "CVT8_HF_SHA256 $(sha "$HPAR/Optimizers/HF.py")"
+  echo "LIVE_HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "PATCH_DECAYMASK_SHA256 $(sha "$PATCHD")"
+  echo "INERTNESS_DECAYMASK_LOG_SHA256 $(sha "$ILOG" 2>/dev/null)"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cwd1/STAGE-MANIFEST.txt")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "DECAY_MASK k01NWD,kLNWD=$M_NS k01=unset"
+  echo "VOTE_W BETA_HOLD GROUP_HOLD REST_HOLD unset on every arm"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cwd1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 60 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cwd1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01)     G=$G_K01; WANTM="" ;;
+      k01NWD)  G=$G_K01; WANTM="$M_NS" ;;
+      kLNWD)   G=$G_KL;  WANTM="$M_NS" ;;
+    esac
+    DM=""; [ -n "$WANTM" ] && DM=",DECAY_MASK=$WANTM"
+    RN="cwd1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR$DM \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    for KV in "DECAY_MASK:$WANTM"; do
+      K=${KV%%:*}; W=${KV#*:}
+      GOT=$(printf '%s\n' "$CMD" | grep -o "[ ,]$K=[^ ,]*" | sed 's/^[ ,]//')
+      NK=$(printf '%s\n' "$GOT" | grep -c "^$K=")
+      if [ -z "$W" ]; then
+        [ "$NK" = 0 ] || { echo "!!! $RN carries a $K"; BAD=$((BAD+1)); }
+      else
+        [ "$NK" = 1 ] && [ "$GOT" = "$K=$W" ] || { echo "!!! $RN carries $NK $K or not its own string"; BAD=$((BAD+1)); }
+      fi
+    done
+    NVW=$(printf '%s\n' "$CMD" | grep -c 'VOTE_W=\|BETA_HOLD=\|GROUP_HOLD=\|REST_HOLD=\|COMP_HOLD=\|WINDOW_HOLD=\|layer4.1.bn2.weight\|alpha0 1e-2')
+    [ "$NVW" = 0 ] || { echo "!!! $RN carries a hold variable, a carrier-only mask or a test-only string"; BAD=$((BAD+1)); }
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / DECAY_MASK pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cwd1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cwd1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cwd1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cwd1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cwd1 job started inside the window" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cwd1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 9/9 RUN_DONE):  python3 $REPO/analysis/cWD1_normwd_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cWD1_normwd.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

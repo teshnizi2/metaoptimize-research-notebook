@@ -1,0 +1,384 @@
+#!/bin/bash
+# =============================================================================
+# cMG1_mergecarrier.sh -- `cmg1` (CORRECTIONS 259, Track D, LIMITS-PREP 5.1 N3): ResNet18_c100 -- INSIDE THE HEALTHY
+#   SINGLETON (LAYERWISE) GROUPING, IS KEEPING THE THREE CARRIERS OUT OF A SHARED STEP-SIZE GROUP NECESSARY?
+#   ONE SUBMISSION, 12 JOBS (3 arms x 4 seeds), 100 EPOCHS, SEEDS {124,125,126,127}, the mechanism cell,
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here touches the other account; every guard
+# and scancel line is filtered on `cmg1-`.
+#
+# REGISTERED SCORER: analysis/cMG1_mergecarrier_score.py, committed BEFORE this batch is submitted (RULE 21).
+#     DOCUMENTED INVOCATION:  python3 analysis/cMG1_mergecarrier_score.py <runsdir>
+#
+# NO NEW HARNESS CODE.  The batch runs from the LIVE shared tree, UNPATCHED and UNCHANGED (HF.py 4732b74a...,
+# build_network.py c7998883...), with the LIVE runner $WS/jobs/run_cifar.sh (archived byte-identical as
+# jobs/run_cifar_cmg1.sh).  No environment intervention switch exists or is set: the arms differ ONLY in
+# --stepsize-groups, which the CSV carries in its `granularity` column (corpus-separable, no exclusion row owed).
+#
+# THE ARMS (1-based indices on the live 62-tensor model; all on the blockwise path through PATCH_NAMESETS)
+#   KLS   sets:1/2/.../62                              62 singletons (layerwise's grouping)
+#   MCAR  45 singletons / 46,49-55,57-60 / 47/48/56/61/62      G* = N u {50,53,59} (the carriers)
+#   MCTL  45 singletons / 46-49,51-52,54-58,60 / 50/53/59/61/62 G* = N u {47,48,56} (cdep1's matched triple)
+#
+# RULE 20.  Every ARGS value is ONE shell token.  analysis/argsline_guard.py IS NOT EDITED.
+#
+# COST.  cvt8 / cvt9 batch means 0.79-0.82 GPU-h per 100-epoch ResNet18_c100 run (LIMITS-PREP 2.4): 12 jobs ~= 9.8 GPU-h
+# expected; HARD BOUND = WALL x 12 = 36 GPU-h (WALL 03:00:00).
+#
+# USAGE   bash bin/cMG1_mergecarrier.sh               # dry run: every guard, every composed line printed; submits nothing
+#         bash bin/cMG1_mergecarrier.sh --submit      # the ONLY submitting form
+# ENV     CMG1_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+SWITCHES="VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD WINDOW_HOLD SHADOW_VOTE DECAY_MASK"
+SETSW=""; for v in $SWITCHES; do [ -n "${!v+x}" ] && SETSW="$SETSW $v"; done
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cmg1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="124 125 126 127"
+MST=1e-3
+A0=1e-6
+ARMS="KLS MCAR MCTL"
+NJOBS=12
+WALL=03:00:00
+LIVE_HF_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+LIVE_BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+RUNNER_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cMG1_mergecarrier_score.py"
+SELF="$REPO/bin/cMG1_mergecarrier.sh"
+DERIV="$REPO/analysis/cmg1_registration_derivations.py"
+ARCH="$REPO/jobs/run_cifar_cmg1.sh"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+HFL="$LIVE/Optimizers/HF.py"
+BNL="$LIVE/build_network.py"
+
+# the spec strings are READ FROM THE SCORER (one source of truth), then checked by guard 4
+G_KLS=$(python3 -c "import importlib.util as u,sys;s=u.spec_from_file_location('m',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m);print(m.SPEC['KLS'])" "$SC")
+G_MCAR=$(python3 -c "import importlib.util as u,sys;s=u.spec_from_file_location('m',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m);print(m.SPEC['MCAR'])" "$SC")
+G_MCTL=$(python3 -c "import importlib.util as u,sys;s=u.spec_from_file_location('m',sys.argv[1]);m=u.module_from_spec(s);s.loader.exec_module(m);print(m.SPEC['MCTL'])" "$SC")
+
+echo "=============================================================="
+echo " cmg1 -- ResNet18_c100: merge the carriers inside the layerwise grouping (N3; LIVE harness, no patch)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C  ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   KLS   $G_KLS"
+echo "   MCAR  $G_MCAR"
+echo "   MCTL  $G_MCTL"
+echo " 3 arms x 4 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " live tree $LIVE   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " PRIMARY: DELTA_ID = MCTL - MCAR; KEY: D_CAR = KLS - MCAR, D_CTL = KLS - MCTL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cMG1_mergecarrier_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "$SETSW" ] && echo "guard 0b: $SWITCHES are UNSET in the launcher's environment" \
+  || guard_fail "guard 0b: intervention switch(es) set in the launcher's environment:$SETSW"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$SELF" "$DERIV" "$ARCH" "$EXCL" "$EXCLT" "$LIBF" "$AGF" "$CSVP" "$RUNNER" "$HFL" "$BNL"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cMG1_mergecarrier_score.py bin/cMG1_mergecarrier.sh analysis/cmg1_registration_derivations.py jobs/run_cifar_cmg1.sh"
+REUSEF="analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the four registration files and four reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CMG1_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CMG1_REGISTERED_COMMIT"
+    echo "          (RULE 21 is re-verified by wall clock: that commit's %ct vs the earliest sacct Submit)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CMG1_REGISTERED_COMMIT is unset -- declare the commit whose tree was staged"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CMG1_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+cmp -s "$RUNNER" "$ARCH" && echo "guard 1b2: the archived jobs/run_cifar_cmg1.sh is BYTE-IDENTICAL to the live runner the batch uses" \
+  || guard_fail "guard 1b2: jobs/run_cifar_cmg1.sh differs from $RUNNER"
+
+# ---- guard 1c: the scorer selftest ----------------------------------------------
+SELFT=/tmp/cmg1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION\|Traceback' "$SELFT" | head -20; tail -5 "$SELFT"; }
+grep -q "^  SKIP" "$SELFT" && guard_fail "guard 1c1: a selftest section SKIPPED on this host (every section must run here)" \
+  || echo "guard 1c1: no selftest section skipped on this host"
+grep -q "^  PASS O2 CARRIER-MERGE-HARMS FINAL identical across minimal-invented, no-corpus, real, real+invented" "$SELFT" \
+  && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus"
+grep -q "^  PASS .python3 cMG1_mergecarrier_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows are cmg1- or carry seed 124-127" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed check ran and passed" || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS SIGMA_PRIOR: the FROZEN literal 0.6811983409351905 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c5: OPERATIONS 36 -- the frozen floor IS the corpus_exclusions.filter_rows value on the registration corpus" \
+  || guard_fail "guard 1c5: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS NO real-record synthetic record passes as either other arm" "$SELFT" \
+  && grep -q "^  PASS a real LAYERWISE run (type=layerwise) is NOT accepted as KLS" "$SELFT" \
+  && echo "guard 1c6: G-PARTITION's broken-partition null is excluded on 6,750 REAL records; a real layerwise run is not KLS" \
+  || guard_fail "guard 1c6: the real-record G-PARTITION checks did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+rm -f "$SELFT"
+
+# ---- guard 1d: the derivation reproduces the floor and both premises on THIS host ----------
+DOUT=/tmp/cmg1_deriv.$$
+python3 "$DERIV" "$WS/runs" "$CSVP" >"$DOUT" 2>&1 \
+  && grep -q "^  SIGMA_R18ALL  FILTERED 0.6811983409351905 (df 221, 46 cells)$" "$DOUT" \
+  && grep -qE "^  POOLED +6750 +0\.391 +0\.353 +0\.470 +0\.861 +0\.824 +0\.931 +0\.891$" "$DOUT" \
+  && grep -qE "^  POOLED +6750 +0\.887 +0\.000 +0\.000 +0\.887 +0\.000 +0\.931 +0\.891$" "$DOUT" \
+  && [ "$(grep -c 'passes on 0 / 6750   (must be 0)' "$DOUT")" = 6 ] \
+  && echo "guard 1d: analysis/cmg1_registration_derivations.py reproduces the filtered floor, PREMISE L, PREMISE S and the G-PARTITION non-vacuity on this host (output sha $(sha "$DOUT"))" \
+  || { guard_fail "guard 1d: the derivation did not reproduce the floor / premises"; grep -E "SIGMA_R18ALL|POOLED|must be 0" "$DOUT"; tail -3 "$DOUT"; }
+rm -f "$DOUT"
+
+# ---- guard 2: RULE 21 premise -- nothing of this batch exists yet ----------------
+grep -q '^cmg1-' "$CSVP" && guard_fail "guard 2: cmg1-* already in the CSV" || echo "guard 2: no cmg1-* row in the corpus"
+python3 - "$CSVP" "$SEEDS" <<'PYEOF' || guard_fail "guard 2c: corpus premise failed"
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+seeds = set(sys.argv[2].split())
+hit = [r["run"] for r in rows if r.get("seed") in seeds]
+print("guard 2c: rows carrying seed %s: %d" % ("/".join(sorted(seeds)), len(hit)))
+raise SystemExit(1 if hit else 0)
+PYEOF
+NOUT=$(ls "$WS/runs"/cmg1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cmg1-*.out on disk" || guard_fail "guard 2b: $NOUT cmg1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (124|125|126|127)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 124-127" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 124-127"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cmg1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cmg1-* jobs" || guard_fail "guard 2e: sacct shows $NS cmg1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cmg1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cmg1-* in squeue" || guard_fail "guard 2f: $NQ cmg1-* already queued"
+fi
+
+# ---- guard 3: the LIVE tree and runner are the pinned, unpatched ones ------------
+[ -d "$LIVE/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $LIVE/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$HFL")" = "$LIVE_HF_SHA" ] && echo "guard 3a: LIVE HF.py == 4732b74a... (unchanged)" || guard_fail "guard 3a: LIVE HF.py is not 4732b74a..."
+[ "$(sha "$BNL")" = "$LIVE_BN_SHA" ] && echo "guard 3b: LIVE build_network.py == c7998883..." || guard_fail "guard 3b: build_network.py is not c7998883..."
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3c: runner == a0d0a1b9... (the live run_cifar.sh)" || guard_fail "guard 3c: $RUNNER is not a0d0a1b9..."
+MARK=$(grep -c 'PATCH_VOTEWEIGHT\|PATCH_BETAHOLD\|PATCH_GROUPHOLD\|PATCH_COMPHOLD\|PATCH_RESTHOLD\|PATCH_WINDOWHOLD\|SHADOW_VOTE\|DECAY_MASK' "$HFL")
+[ "$MARK" = 0 ] && grep -q "PATCH_NAMESETS" "$HFL" && grep -q "PATCH_PROBE_TENSOR" "$HFL" \
+  && echo "guard 3d: the LIVE HF.py carries PATCH_NAMESETS and PATCH_PROBE_TENSOR and NO intervention patch" \
+  || guard_fail "guard 3d: LIVE HF.py markers unexpected ($MARK intervention markers)"
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, per arm, from the LIVE tree ----------------
+mkdir -p "$SAVE"
+MTMP=/tmp/cmg1_manifest.$$
+python3 - "$LIVE" "$MTMP" "$SC" <<'PYEOF' 2> >(grep -v Warning >&2) || guard_fail "guard 4: live partition check FAILED"
+import sys, os, io, contextlib, importlib.util
+harn, out, scp = sys.argv[1], sys.argv[2], sys.argv[3]
+spm = importlib.util.spec_from_file_location("cmg1sc", scp); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+sys.path.insert(0, harn); os.chdir(harn)
+import torch
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(S.NET, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+live = [(n, int(p.numel()), own[n]) for n, p in net.named_parameters()]
+bad = 0
+print("guard 4: live %s -- %d tensors, %d parameters" % (S.NET, len(live), sum(k for _n, k, _t in live)))
+if live != S.r18_tensors():
+    print("!!! guard 4: the LIVE (name, numel, module) list is NOT the scorer's r18_tensors()"); bad += 1
+else:
+    print("guard 4: the LIVE (name, numel, module type) list == the scorer's re-typed r18_tensors(), all 62")
+for lab, st in (("C", S.C_SET), ("T", S.T_SET), ("N", S.N_SET)):
+    print("guard 4: %s = %s" % (lab, ", ".join("%d:%s" % (i, live[i - 1][0]) for i in st)))
+for arm in S.ARMS:
+    spec = S.SPEC[arm]
+    o = HF.__new__(HF); o.num_layers = len(nps); o._device = torch.device("cpu")
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, spec, nps, 1e-6)
+    L = [ln for ln in buf.getvalue().splitlines() if ln.startswith(S.FOREIGN_PREFIXES)]
+    pgi = [[i + 1 for i in g] for g in o.param_groups_indices]
+    shp = [tuple(b.shape) for b in o.beta]
+    g_names = HF.polish_the_stepsize_groups(None, spec, nps)
+    ok = (o.stepsize_type == "blockwise" and shp == [(S.NGROUPS[arm],)] and pgi == S.groups_of(arm)
+          and [[[n for n, _ in nps].index(x) + 1 for x in g] for g in g_names] == S.groups_of(arm) and not L
+          and all(abs(float(v) - float(torch.log(torch.tensor(1e-6)))) < 1e-6 for v in o.beta[0]))
+    merged = [g for g in pgi if len(g) > 1]
+    print("guard 4: %-4s type=%s beta %s groups %d merged %s foreign lines %d -> %s"
+          % (arm, o.stepsize_type, shp, len(pgi), merged, len(L), "AS REGISTERED" if ok else "NOT AS REGISTERED"))
+    if not ok:
+        bad += 1
+txt = S.synthetic_manifest_text()
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+print("guard 4d: every arm constructs as registered on the LIVE tree; manifest = the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cmg1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+rm -f "$MTMP"
+
+# ---- guard 4g: provenance (the scored file ONLY on --submit) ---------------------
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "HF_SHA256 $(sha "$HFL")"
+  echo "BUILD_NETWORK_SHA256 $(sha "$BNL")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "DERIVATIONS_SHA256 $(sha "$DERIV")"
+  echo "REGISTERED_COMMIT ${CMG1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $LIVE"
+  echo "TRAIN_SHA256 $(sha "$LIVE/train.py")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "SPEC_KLS $G_KLS"; echo "SPEC_MCAR $G_MCAR"; echo "SPEC_MCTL $G_MCTL"
+  echo "SWITCHES none set: $SWITCHES"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cmg1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions ----------------------------------
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest -----------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cmg1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+# ---- guard 9: the harness the guards tested IS the harness the runner runs ---------
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$LIVE" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $LIVE but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+# ---- compose, guard each line under RULE 20, then (only with --submit) submit ----
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      KLS)  G=$G_KLS ;;
+      MCAR) G=$G_MCAR ;;
+      MCTL) G=$G_MCTL ;;
+    esac
+    RN="cmg1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    NSW=0; for v in $SWITCHES; do printf '%s\n' "$CMD" | grep -q "$v=" && NSW=$((NSW+1)); done
+    [ "$NSW" = 0 ] || { echo "!!! $RN carries an intervention switch"; BAD=$((BAD+1)); }
+    # the composed train.py half must equal the scorer's expected ARGS line, byte for byte
+    python3 - "$SC" "$ARM" "$S" "$SAVE" "$CMD" <<'PYEOF' >/dev/null 2>&1 || { echo "!!! $RN: composed args != the scorer's expected ARGS line"; BAD=$((BAD+1)); }
+import sys, importlib.util
+s = importlib.util.spec_from_file_location("m", sys.argv[1]); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+cmd = " ".join(sys.argv[5].replace("\\\n", " ").split())
+tail = cmd.split("run_cifar.sh ", 1)[1]
+raise SystemExit(0 if "ARGS: " + tail == m.expected_args(sys.argv[2], int(sys.argv[3]), sys.argv[4]) else 1)
+PYEOF
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / switch / expected-ARGS pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cmg1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cmg1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cmg1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cmg1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cmg1 job started inside the window.  Re-check with:"
+       echo "         python3 $AGF $WS/runs --name cmg1- --batch-consistency --vary stepsize-groups --vary seed --vary run-name" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cmg1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 12/12 RUN_DONE, after RULE 20 at full coverage):"
+  echo "    python3 $REPO/analysis/cMG1_mergecarrier_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cMG1_mergecarrier.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

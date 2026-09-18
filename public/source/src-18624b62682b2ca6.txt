@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""cmg1_attack_indep.py <runsdir> <score.log> [corpus.csv] [exclusions.tsv]
+   -- independent re-derivation of `cmg1` (CORRECTIONS 259), written to attack the registered scorer's output.
+
+Imports NOTHING from analysis/cMG1_mergecarrier_score.py, analysis/corpus_exclusions.py or any other repo module, and
+uses no regular expressions.  Reads, by string splitting and json only:
+
+  * every raw `cmg1-<arm>-s<seed>-<jobid>.out` in <runsdir> (the ARGS / ENV / PROBE_TENSOR lines, the foreign-switch
+    prefixes, the `Epoch` lines, RUN_DONE, Traceback);
+  * <runsdir>/cmg1/PARTITION-MANIFEST.txt and <runsdir>/cmg1/PROVENANCE.txt;
+  * each run's probe directory (probe.jsonl, probe_tensor.json, block_sizes.json);
+  * the corpus CSV and results/CORPUS-EXCLUSIONS.tsv, to re-derive the scorer's corpus DISCLOSURE line with its own
+    re-typed `filter_rows` (a (run, job_id) membership test) -- that line feeds no bar, sigma, branch or stamp.
+
+CORPUS COMMIT.  The corpus read here is `results/all_runs.csv` at repo commit 1cb52f7 (the registration corpus of
+259.3), sha256 1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a, header + 3,127 data rows, with
+`results/CORPUS-EXCLUSIONS.tsv` sha256 ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191 (108 listed
+rows).  Both shas are asserted here; a different corpus is a VIOLATION, not a silent substitution.
+
+WHAT IS RE-TYPED, WHAT IS DERIVED.  The design (arms, seeds, the sets N / C / T, the spec grammar), the frozen bars
+(MARGIN 5.0, SIGMA_PRIOR, REF_MIN, LAYERWISE_MEAN / SD, the AT-KLS 2-SE stamp bar, the pin bars, the partition
+tolerances, the floor / ceiling, the saturation band), the account levels (259.5) and the licence paragraphs are
+RE-TYPED from CORRECTIONS 259; nothing is imported.  Every number, gate token, stamp and verdict is DERIVED HERE from
+the raw files and then looked up VERBATIM in <score.log>.  plateau5 = the mean TEST accuracy of the run's OWN epochs
+95..99 read from the RAW .out (the CSV `plateau` column is never read); TRAIN5 the same on the Train column.
+
+OUTPUT is byte-identical on cluster_b and on the Mac: no path, host, time or environment value is printed (path-bearing
+scorer lines are compared with their path field replaced by the basename).
+"""
+import csv as _csv          # stdlib only (no repo import); the CSV has quoted fields that plain splitting would lose
+import hashlib
+import json
+import math
+import os
+import sys
+
+# ---- design, re-typed from CORRECTIONS 259 --------------------------------------------------------------------
+PREFIX = "cmg1"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+SEEDS = [124, 125, 126, 127]
+ARMS = ["KLS", "MCAR", "MCTL"]
+NTENS = 62
+N_SET = [46, 49, 51, 52, 54, 55, 57, 58, 60]
+C_SET = [50, 53, 59]
+T_SET = [47, 48, 56]
+MERGED_G = 45                       # 0-based position of G* in MCAR / MCTL
+N_RECORDS, PROBE_EVERY = 500, 100
+# ---- frozen bars, re-typed (259.3, 259.6) --------------------------------------------------------------------
+MARGIN = 5.0
+SIGMA_PRIOR = 0.6811983409351905
+READ_SE = 2.0
+DIVERGED_BAR = 5.0
+LAYERWISE_MEAN, LAYERWISE_SD = 69.4166, 0.5020
+REF_MIN = 64.4166
+SAT_BAND = (21.0940, 27.9520)
+PIN_LO, PIN_LATE_STEP, PIN_YES, PIN_NO = -14.999, 40000, 0.90, 0.10
+TOL_SINGLE, TOL_MERGED = 1e-6, 1e-2
+FLOOR_MIN, CEIL_MAX = 2.0, 99.0
+MANIFEST_BYTES, MANIFEST_SHA = 5268, "54dd0241c8b29e87aa559856d3ca8eb60e88a843f07d27b2c6cab3295c425e98"
+SCORER_SHA = "bdd212d41796538876e9f6622e66e97d9f6f474b587c3f46782d8bdb178efd97"
+LIVE_HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+LIVE_BN_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+CORPUS_COMMIT = "1cb52f7"
+CORPUS_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+EXCL_SHA = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+ACCOUNTS = [("A1-IDENTITY-AT-SHARED-STEP", 69.4166, 59.9980, 68.4166, "CARRIER-MERGE-HARMS"),
+            ("A2-DOWNVOTER-GENERIC", 69.4166, 59.9980, 60.9980, "BOTH-HARM-ALIKE"),
+            ("A3-MERGE-HARMLESS", 69.4166, 68.4166, 68.4166, "NO-MERGE-HARMS")]
+ENV_WANT = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default COS_WARMUP=default "
+            "SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+PT_WANT = ("PROBE_TENSOR: on every=100 type=blockwise tensors=62 meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 "
+           "dir=")
+FOREIGN = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD", "SHADOW_VOTE", "DECAY_MASK")
+FIXED_FLAGS = [("--optimizer", "HF"), ("--alg-base", "SGDm"), ("--momentum-param-base", "0.99"),
+               ("--weight-decay-base", "0.1"), ("--alg-meta", "Lion"), ("--momentum-param-meta", "0.99"),
+               ("--Lion-beta2-meta", "0.9"), ("--weight-decay-meta", "0"), ("--dataset", DSET), ("--NN-name", NET),
+               ("--batch-size", "100"), ("--max-time", "999:00:00"), ("--gamma", "1"), ("--meta-stepsize", "1e-3"),
+               ("--alpha0", "1e-6"), ("--num-epochs", "100")]
+
+BAD = []
+
+
+def viol(msg):
+    BAD.append(msg)
+    print("  VIOLATION: %s" % msg)
+
+
+def mean(v):
+    return sum(v) / len(v)
+
+
+def sd(v):
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for b in iter(lambda: fh.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---- the spec strings, BUILT here (not copied): compress an index set the way the launcher wrote it -------------
+def compress(idxs):
+    out, i = [], 0
+    xs = sorted(idxs)
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append("%d" % xs[i] if j == i else "%d-%d" % (xs[i], xs[j]))
+        i = j + 1
+    return ",".join(out)
+
+
+def groups_of(arm):
+    if arm == "KLS":
+        return [[i] for i in range(1, NTENS + 1)]
+    merged = sorted(N_SET + (C_SET if arm == "MCAR" else T_SET))
+    single = T_SET if arm == "MCAR" else C_SET
+    return [[i] for i in range(1, 46)] + [merged] + [[i] for i in single] + [[61], [62]]
+
+
+def spec_of(arm):
+    return "sets:" + "/".join(compress(g) for g in groups_of(arm))
+
+
+def parse_sets(spec):
+    """Re-typed grammar: a total, non-overlapping partition of 1..62 written as groups of items and a-b ranges."""
+    if not spec.startswith("sets:"):
+        raise ValueError("not a sets: spec")
+    out, seen = [], set()
+    for g in spec[5:].split("/"):
+        cur = []
+        for it in g.split(","):
+            if "-" in it:
+                a, b = it.split("-")
+                cur += list(range(int(a), int(b) + 1))
+            else:
+                cur.append(int(it))
+        for i in cur:
+            if i in seen or not 1 <= i <= NTENS:
+                raise ValueError("repeated or out of range: %d" % i)
+            seen.add(i)
+        out.append(sorted(cur))
+    if seen != set(range(1, NTENS + 1)):
+        raise ValueError("not total")
+    return out
+
+
+def expected_args(arm, seed, save):
+    parts = ["ARGS:"]
+    for f, v in FIXED_FLAGS:
+        parts += [f, v]
+    parts += ["--stepsize-groups", spec_of(arm), "--seed", str(seed), "--save-directory", save,
+              "--run-name", "%s-%s-s%d" % (PREFIX, arm, seed)]
+    return " ".join(parts)
+
+
+# ---- run files -------------------------------------------------------------------------------------------------
+def read_out(path):
+    d = {"ep": {}, "run_done": False, "tb": 0, "args": [], "env": [], "pt": [], "foreign": [], "dup": False}
+    for ln in open(path, errors="replace"):
+        ln = ln.rstrip("\n")
+        if ln.startswith("Epoch "):
+            try:
+                head, rest = ln.split(",", 1)
+                e = int(head.split(" ")[1])
+                tr = rest.split("Train Accuracy:")[1].split("%")[0].strip()
+                te = rest.split("Test Accuracy:")[1].split("%")[0].strip()
+            except (ValueError, IndexError):
+                continue
+            if e in d["ep"]:
+                d["dup"] = True
+            d["ep"][e] = (float(tr), float(te))
+        elif ln.startswith("ARGS:"):
+            d["args"].append(ln)
+        elif ln.startswith("ENV:"):
+            d["env"].append(ln)
+        elif ln.startswith("PROBE_TENSOR:"):
+            d["pt"].append(ln)
+        elif ln.startswith(FOREIGN):
+            d["foreign"].append(ln)
+        elif ln.strip() == "RUN_DONE":
+            d["run_done"] = True
+        elif "Traceback (most recent call last)" in ln:
+            d["tb"] += 1
+    return d
+
+
+def find_runs(runsdir):
+    runs, jobs = {}, {}
+    for fn in sorted(os.listdir(runsdir)):
+        if not (fn.startswith(PREFIX + "-") and fn.endswith(".out")):
+            continue
+        stem = fn[:-4].split("-")
+        if len(stem) != 4:
+            continue
+        _p, arm, sseed, jid = stem
+        if arm not in ARMS or not sseed.startswith("s"):
+            continue
+        key = (arm, int(sseed[1:]))
+        d = read_out(os.path.join(runsdir, fn))
+        if key in runs:
+            viol("more than one .out for %s-s%d (resubmission): %s" % (key[0], key[1], fn))
+        runs[key] = d
+        jobs[key] = int(jid)
+    return runs, jobs
+
+
+def load_probe(runsdir, arm, seed):
+    d = os.path.join(runsdir, PREFIX, "probe_%s-%s-s%d" % (PREFIX, arm, seed))
+    recs = []
+    with open(os.path.join(d, "probe.jsonl"), errors="replace") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if ln:
+                recs.append(json.loads(ln))
+    pt = json.load(open(os.path.join(d, "probe_tensor.json")))
+    bs = json.load(open(os.path.join(d, "block_sizes.json")))
+    return recs, pt, bs
+
+
+def partition_bad(recs, arm, numels):
+    """Records whose z_agg / mom_pre / beta_pre do NOT decompose into `arm`'s registered groups."""
+    g = groups_of(arm)
+    bad = 0
+    for r in recs:
+        try:
+            za, ma, bp = r["z_agg"][0], r["mom_pre"][0], r["beta_pre"][0]
+            z, m = r["z_tensor"], r["m_tensor"]
+            ok = len(za) == len(ma) == len(bp) == len(g) and len(z) == NTENS and len(m) == NTENS
+            if ok:
+                for k, grp in enumerate(g):
+                    tol = TOL_SINGLE if len(grp) == 1 else TOL_MERGED
+                    for agg, per in ((za, z), (ma, m)):
+                        s = math.fsum(per[i - 1] for i in grp)
+                        if not (math.isfinite(s) and math.isfinite(agg[k])):
+                            ok = False
+                            break
+                        if abs(s - agg[k]) > tol * max(abs(agg[k]), abs(s), 1e-30):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+        except (KeyError, IndexError, TypeError):
+            ok = False
+        bad += not ok
+    _ = numels
+    return bad
+
+
+def pin_frac(recs, gpos, lo=PIN_LATE_STEP, hi=None):
+    v = [r["beta_pre"][0][gpos] <= PIN_LO for r in recs
+         if r.get("step", -1) >= lo and (hi is None or r["step"] < hi)]
+    return (sum(v) / len(v)) if v else float("nan")
+
+
+def pin_word(f):
+    return "PINS" if f >= PIN_YES else ("FREE" if f <= PIN_NO else "NEITHER")
+
+
+def arm_state(D, se):
+    if abs(D) <= READ_SE * se:
+        return "AT-KLS"
+    if D >= MARGIN:
+        return "BELOW-KLS"
+    if D <= -MARGIN:
+        return "ABOVE-KLS"
+    return "NEAR-KLS-BELOW" if D > 0 else "NEAR-KLS-ABOVE"
+
+
+def decide(M, diverged):
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["KLS"] < REF_MIN:
+        return "UNRESOLVED-REFERENCE-UNHEALTHY"
+    d_car, d_ctl, did = M["KLS"] - M["MCAR"], M["KLS"] - M["MCTL"], M["MCTL"] - M["MCAR"]
+    if d_car >= MARGIN and did >= MARGIN and d_ctl < MARGIN:
+        return "CARRIER-MERGE-HARMS"
+    if d_car >= MARGIN and did >= MARGIN and d_ctl >= MARGIN:
+        return "BOTH-HARM-CARRIER-MORE"
+    if d_car >= MARGIN and d_ctl >= MARGIN and abs(did) < MARGIN:
+        return "BOTH-HARM-ALIKE"
+    if d_ctl >= MARGIN and did <= -MARGIN:
+        return "CONTROL-MERGE-HARMS-MORE"
+    if d_car < MARGIN and d_ctl < MARGIN and abs(did) < MARGIN:
+        return "NO-MERGE-HARMS"
+    return "UNRESOLVED-PARTIAL"
+
+
+# ---- the corpus disclosure, re-derived with a re-typed filter_rows ----------------------------------------------
+def corpus_line(csvpath, tsvpath):
+    excl = set()
+    lines = [ln.rstrip("\n") for ln in open(tsvpath) if ln.strip() and not ln.startswith("#")]
+    head = lines[0].split("\t")
+    ri, ji = head.index("run"), head.index("job_id")
+    for ln in lines[1:]:
+        f = ln.split("\t")
+        excl.add((f[ri], f[ji]))
+    with open(csvpath, newline="") as fh:
+        rd = _csv.reader(fh)
+        hdr = next(rd)
+        rows = [dict(zip(hdr, f)) for f in rd if len(f) == len(hdr)]
+    kept = [r for r in rows if r.get("run", "").startswith(PREFIX + "-") is False and (r["run"], r["job_id"]) not in excl]
+    # the scorer drops cmg1- rows BEFORE filter_rows; the filtered count it prints is of the same set
+    n_filt = len(kept)
+    v = [float(r["plateau5"]) for r in kept if r.get("network") == NET and r.get("dataset") == DSET
+         and r.get("granularity") == "layerwise" and r.get("epochs_requested") == "100"
+         and r.get("meta_stepsize") == "1e-3" and r.get("alpha0") == "1e-6" and r.get("augment") == "1"
+         and r.get("beta_clip") == "-15:-2.3026" and r.get("batch_size") == "100" and r.get("complete") == "1"
+         and (r.get("plateau5") or "").strip() and r.get("hier", "") == "" and r.get("superseded") == "0"
+         and r.get("collapsed") == "0"]
+    return n_filt, len(v), mean(v), len(rows)
+
+
+def main():
+    runsdir = sys.argv[1]
+    logpath = sys.argv[2]
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    csvpath = sys.argv[3] if len(sys.argv) > 3 else os.path.join(repo, "results", "all_runs.csv")
+    tsvpath = sys.argv[4] if len(sys.argv) > 4 else os.path.join(repo, "results", "CORPUS-EXCLUSIONS.tsv")
+    want = []                                   # lines this parser asserts are in the scorer log, verbatim
+
+    print("cmg1_attack_indep -- INDEPENDENT re-derivation of CORRECTIONS 259's scorer output")
+    print("  corpus commit %s  all_runs.csv %s  CORPUS-EXCLUSIONS.tsv %s" % (CORPUS_COMMIT, CORPUS_SHA[:12],
+                                                                            EXCL_SHA[:12]))
+
+    print("\n[0] the batch's own PARTITION-MANIFEST.txt and PROVENANCE.txt")
+    mpath = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt")
+    mraw = open(mpath, "rb").read()
+    msha = hashlib.sha256(mraw).hexdigest()
+    print("  manifest %d bytes sha %s...  == the registered 5268 / 54dd0241: %s"
+          % (len(mraw), msha[:12], len(mraw) == MANIFEST_BYTES and msha == MANIFEST_SHA))
+    if not (len(mraw) == MANIFEST_BYTES and msha == MANIFEST_SHA):
+        viol("manifest is not the registered file")
+    mt = mraw.decode().splitlines()
+    mnum = dict((int(l.split(" ")[1]), (l.split(" ")[2], int(l.split(" ")[3]), l.split(" ")[4]))
+                for l in mt if l.startswith("TENSOR "))
+    numels = [mnum[i][1] for i in range(1, NTENS + 1)]
+    msets = dict((l.split(" ")[1], [int(x) for x in l.split(" ")[2].split(",")]) for l in mt if l.startswith("SET "))
+    print("  manifest: %d TENSOR lines, total %d params; SET N %s C %s T %s" %
+          (len(mnum), sum(numels), msets["N"] == N_SET, msets["C"] == C_SET, msets["T"] == T_SET))
+    for a in ARMS:
+        g = groups_of(a)
+        want_spec = "ARMSPEC %s TYPE blockwise M %d SPEC %s" % (a, len(g), spec_of(a))
+        want_sizes = "ARMSIZES %s %s" % (a, ",".join(str(len(x)) for x in g))
+        want_par = "ARMPARAMS %s %s" % (a, ",".join(str(sum(numels[i - 1] for i in x)) for x in g))
+        ok = all(x in mt for x in (want_spec, want_sizes, want_par))
+        print("  %-4s ARMSPEC / ARMSIZES / ARMPARAMS rebuilt here and found in the manifest: %s  (groups %d)"
+              % (a, ok, len(g)))
+        if not ok:
+            viol("manifest does not carry %s's rebuilt ARMSPEC / ARMSIZES / ARMPARAMS" % a)
+        if parse_sets(spec_of(a)) != g:
+            viol("%s's spec does not re-parse to its groups" % a)
+    if sorted(N_SET + C_SET) != sorted(x for x in groups_of("MCAR")[MERGED_G]):
+        viol("MCAR's merged group is not N u C")
+    if sorted(N_SET + T_SET) != sorted(x for x in groups_of("MCTL")[MERGED_G]):
+        viol("MCTL's merged group is not N u T")
+    sz = [len(groups_of("MCAR")[k]) for k in range(51)], [len(groups_of("MCTL")[k]) for k in range(51)]
+    pr = ([sum(numels[i - 1] for i in g) for g in groups_of("MCAR")],
+          [sum(numels[i - 1] for i in g) for g in groups_of("MCTL")])
+    print("  MCAR / MCTL matched: group count %d == %d, sizes identical %s, per-group numel identical %s"
+          % (len(groups_of("MCAR")), len(groups_of("MCTL")), sz[0] == sz[1], pr[0] == pr[1]))
+    if not (sz[0] == sz[1] and pr[0] == pr[1]):
+        viol("MCAR and MCTL are not matched in group count / sizes / numels")
+    prov = {}
+    for ln in open(os.path.join(runsdir, PREFIX, "PROVENANCE.txt")):
+        f = ln.rstrip("\n").split(" ", 1)
+        if len(f) == 2:
+            prov[f[0]] = f[1]
+    pok = (prov.get("MODE") == "submit" and prov.get("HF_SHA256") == LIVE_HF_SHA
+           and prov.get("BUILD_NETWORK_SHA256") == LIVE_BN_SHA and prov.get("RUNNER_SHA256") == RUNNER_SHA
+           and prov.get("SCORER_SHA256") == SCORER_SHA)
+    print("  PROVENANCE MODE %s  HF %s...  build_network %s...  runner %s...  scorer %s...  all as registered: %s"
+          % (prov.get("MODE"), str(prov.get("HF_SHA256"))[:8], str(prov.get("BUILD_NETWORK_SHA256"))[:8],
+             str(prov.get("RUNNER_SHA256"))[:8], str(prov.get("SCORER_SHA256"))[:8], pok))
+    if not pok:
+        viol("PROVENANCE.txt does not match the registered shas")
+    want += ["  PASS G-STRUCT byte-identical to synthetic_manifest_text()   %d vs %d bytes"
+             % (MANIFEST_BYTES, MANIFEST_BYTES),
+             "  PASS G-PROV MODE submit   submit",
+             "  PASS G-PROV HF.py == the LIVE, unpatched %s...   %s" % (LIVE_HF_SHA[:12], LIVE_HF_SHA[:16]),
+             "  PASS G-PROV build_network.py == LIVE %s...   %s" % (LIVE_BN_SHA[:12], LIVE_BN_SHA[:16]),
+             "  PASS G-PROV runner == run_cifar.sh %s...   %s" % (RUNNER_SHA[:12], RUNNER_SHA[:16]),
+             "  PASS G-PROV SCORER_SHA256 == this scorer %s...   %s" % (SCORER_SHA[:12], SCORER_SHA[:16])]
+
+    print("\n[1] completeness and the four audited header lines, per run (ARGS rebuilt from the re-typed design)")
+    runs, jobs = find_runs(runsdir)
+    saves = set()
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            if r is None:
+                viol("no .out for %s-s%d" % (a, s))
+                continue
+            sv = ""
+            if len(r["args"]) == 1:
+                tk = r["args"][0].split(" ")
+                sv = tk[tk.index("--save-directory") + 1]
+                saves.add(sv)
+            ok_args = len(r["args"]) == 1 and sv.endswith("/" + PREFIX) and r["args"][0] == expected_args(a, s, sv)
+            pdir = ""
+            ok_env = len(r["env"]) == 1
+            if ok_env:
+                toks = [t for t in r["env"][0].split(" ") if t.startswith("PROBE_DIR=")]
+                pdir = toks[0][len("PROBE_DIR="):] if toks else ""
+                stripped = " ".join(t for t in r["env"][0].split(" ") if not t.startswith("PROBE_DIR="))
+                ok_env = stripped == ENV_WANT and pdir == "%s/probe_%s-%s-s%d" % (sv, PREFIX, a, s)
+            ok_pt = len(r["pt"]) == 1 and r["pt"][0] == PT_WANT + pdir
+            ok_for = not r["foreign"]
+            ok_ep = sorted(r["ep"]) == list(range(EPOCHS)) and not r["dup"]
+            print("  %-4s %s-%-4s s%d job %d  epochs %d  RUN_DONE %s  traceback %d  ARGS %s  ENV %s  PT %s  FOREIGN-none %s"
+                  % ("OK" if (ok_args and ok_env and ok_pt and ok_for and ok_ep and r["run_done"] and not r["tb"])
+                     else "BAD", PREFIX, a, s, jobs[(a, s)], len(r["ep"]), r["run_done"], r["tb"],
+                     ok_args, ok_env, ok_pt, ok_for))
+            for lab, c in (("ARGS", ok_args), ("ENV", ok_env), ("PROBE_TENSOR", ok_pt), ("foreign-line", ok_for),
+                           ("epochs 0..99 once", ok_ep), ("RUN_DONE", r["run_done"]), ("no traceback", not r["tb"])):
+                if not c:
+                    viol("%s-s%d: %s" % (a, s, lab))
+            want += ["  OK   %s-%s-s%d  %d epoch lines, RUN_DONE=%s, traceback=%s"
+                     % (PREFIX, a, s, len(r["ep"]), r["run_done"], bool(r["tb"])),
+                     "  PASS G-ARGS %s-s%d" % (a, s), "  PASS G-ENV %s-s%d" % (a, s), "  PASS G-PT %s-s%d" % (a, s),
+                     "  PASS G-FOREIGN %s-s%d no %s line" % (a, s, "/".join(FOREIGN))]
+    print("  one save-directory for the batch: %s ; 12 runs found: %s" % (len(saves) == 1, len(runs) == 12))
+    if len(saves) != 1 or len(runs) != 12:
+        viol("save-directory / run count")
+
+    print("\n[2] levels -- plateau5 = mean TEST of the run's OWN epochs 95..99 from the RAW .out; TRAIN5 beside it")
+    V, T = {}, {}
+    for a in ARMS:
+        V[a] = [mean([runs[(a, s)]["ep"][e][1] for e in range(95, 100)]) for s in SEEDS]
+        T[a] = [mean([runs[(a, s)]["ep"][e][0] for e in range(95, 100)]) for s in SEEDS]
+        line = ("  %-5s TEST %.4f  sd %.4f  range %.4f   TRAIN %.4f   seeds %s"
+                % (a, mean(V[a]), sd(V[a]), max(V[a]) - min(V[a]), mean(T[a]),
+                   ", ".join("s%d %.4f/%.4f" % (s, x, y) for s, x, y in zip(SEEDS, V[a], T[a]))))
+        print(line)
+        want.append(line)
+    M = dict((a, mean(V[a])) for a in ARMS)
+    TM = dict((a, mean(T[a])) for a in ARMS)
+    hi = max(max(V[a]) for a in ARMS)
+    want += ["  PASS G-FLOOR max run >= %.1f pp   max %.4f" % (FLOOR_MIN, hi),
+             "  PASS G-CEIL max run <= %.1f pp   max %.4f" % (CEIL_MAX, hi)]
+    if not (FLOOR_MIN <= hi <= CEIL_MAX):
+        viol("floor / ceiling")
+
+    print("\n[3] sigma and the contrasts (O2: max(frozen prior, in-batch); the corpus is not read for any of this)")
+    ss = sum(sum((x - M[a]) ** 2 for x in V[a]) for a in ARMS)
+    df = sum(len(V[a]) - 1 for a in ARMS)
+    sin = math.sqrt(ss / df)
+    which, sig = ("SIGMA_PRIOR_frozen", SIGMA_PRIOR) if SIGMA_PRIOR >= sin else ("SIGMA_INBATCH", sin)
+    se = sig * math.sqrt(2.0 / len(SEEDS))
+    did, dcar, dctl = M["MCTL"] - M["MCAR"], M["KLS"] - M["MCAR"], M["KLS"] - M["MCTL"]
+    pairs = [mean([runs[("MCTL", s)]["ep"][e][1] for e in range(95, 100)])
+             - mean([runs[("MCAR", s)]["ep"][e][1] for e in range(95, 100)]) for s in SEEDS]
+    lines = ["  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR), "  %-20s %.6f" % ("SIGMA_INBATCH", sin),
+             "  SIGMA_USED           %.6f  (= %s)" % (sig, which),
+             "  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/4)" % se,
+             "  PRIMARY  DELTA_ID = MCTL - MCAR = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+             % (did, did / se, TM["MCTL"] - TM["MCAR"]),
+             "  KEY      D_CAR    = KLS - MCAR  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+             % (dcar, dcar / se, TM["KLS"] - TM["MCAR"]),
+             "  KEY      D_CTL    = KLS - MCTL  = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+             % (dctl, dctl / se, TM["KLS"] - TM["MCTL"]),
+             "  same-seed DELTA_ID: %s" % ", ".join("s%d %+.4f" % (s, x) for s, x in zip(SEEDS, pairs)),
+             "  bars: MARGIN %.1f pp (%.2f SE) | AT-KLS stamp |D| <= %.1f SE = %.4f pp | REF_MIN %.4f"
+             % (MARGIN, MARGIN / se, READ_SE, READ_SE * se, REF_MIN)]
+    for ln in lines:
+        print(ln)
+    want += lines
+    print("  margins to the nearest bar: D_CAR is %.4f pp BELOW the %.1f pp margin (%.2f SE); |DELTA_ID| %.4f pp below;"
+          " D_CTL %.4f pp below" % (MARGIN - dcar, MARGIN, (MARGIN - dcar) / se, MARGIN - abs(did), MARGIN - dctl))
+    print("  KLS - REF_MIN = %+.4f pp; KLS vs the layerwise band %.4f +- %.4f: |dev| %.4f pp"
+          % (M["KLS"] - REF_MIN, LAYERWISE_MEAN, 4 * LAYERWISE_SD, abs(M["KLS"] - LAYERWISE_MEAN)))
+
+    print("\n[4] G-PARTITION re-derived from the probe records, and a NON-VACUITY cross-read")
+    P = {}
+    cross = []
+    for s in SEEDS:
+        for a in ARMS:
+            recs, pt, bs = load_probe(runsdir, a, s)
+            P[(a, s)] = recs
+            steps_ok = len(recs) == N_RECORDS and [r["step"] for r in recs] == list(
+                range(0, N_RECORDS * PROBE_EVERY, PROBE_EVERY))
+            bad = partition_bad(recs, a, numels)
+            want_nb = [sum(numels[i - 1] for i in g) for g in groups_of(a)]
+            meta_ok = (pt.get("stepsize_type") == "blockwise" and pt.get("n_tensors") == NTENS
+                       and pt.get("param_numels") == numels and bs.get("n_b") == want_nb)
+            print("  %-4s %-4s s%d  records %d  bad %d  steps %s  meta %s"
+                  % ("PASS" if (steps_ok and bad == 0 and meta_ok) else "FAIL", a, s, len(recs), bad, steps_ok, meta_ok))
+            if not (steps_ok and bad == 0 and meta_ok):
+                viol("G-PARTITION %s-s%d" % (a, s))
+            want.append("  %-4s G-PARTITION %-4s s%d  records %d  bad %d  steps %s  meta %s"
+                        % ("PASS", a, s, len(recs), bad, steps_ok, meta_ok))
+            for b in ARMS:
+                if b != a:
+                    cross.append((a, b, partition_bad(recs, b, numels)))
+    npass = sum(1 for _a, _b, bad in cross if bad == 0)
+    print("  cross-read: every run's records read as each OTHER arm's grouping -- %d reads, %d pass (0 expected),"
+          " min bad %d of %d records" % (len(cross), npass, min(b for _x, _y, b in cross), N_RECORDS))
+    if npass:
+        viol("the partition check is vacuous: %d cross-reads passed" % npass)
+
+    print("\n[5] branch, stamps and FINAL")
+    div = [a for a in ARMS if max(V[a]) - min(V[a]) > DIVERGED_BAR]
+    branch = decide(M, bool(div))
+    stamps = ["HARNESS-LIVE-UNPATCHED", "PARTITION-VERIFIED", "ONE-MERGE-SET-N9", "CONTROL-TRIPLE-47-48-56",
+              "REFERENCE-SINGLETON-SETS", "ONE-NETWORK-RESNET18", "ONE-CELL", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH", "MAGNITUDE-NOT-SEPARATED",
+              "MCAR-%s" % arm_state(dcar, se), "MCTL-%s" % arm_state(dctl, se),
+              "KLS-IN-LAYERWISE-BAND" if abs(M["KLS"] - LAYERWISE_MEAN) <= 4 * LAYERWISE_SD else
+              "KLS-OUT-OF-LAYERWISE-BAND",
+              "SEEDS-AGREE" if (all(x > 0 for x in pairs) or all(x < 0 for x in pairs)) else "SEEDS-SPLIT"]
+    for a in ("MCAR", "MCTL"):
+        stamps.append("%s-GSTAR-%s" % (a, pin_word(mean([pin_frac(P[(a, s)], MERGED_G) for s in SEEDS]))))
+    if any(SAT_BAND[0] <= M[a] <= SAT_BAND[1] for a in ARMS):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    qual = [(did, TM["MCTL"] - TM["MCAR"]), (dcar, TM["KLS"] - TM["MCAR"]), (dctl, TM["KLS"] - TM["MCTL"])]
+    stamps.append("TRAIN-AGREES" if all((t > 0) == (p > 0) for p, t in qual if abs(p) >= MARGIN) else "TRAIN-DISAGREES")
+    acc = [nm for nm, _k, _c, _t, b in ACCOUNTS if b == branch]
+    stamps.append("ACCOUNT-%s" % (acc[0] if acc else "NONE"))
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("  G-DIVERGE (max seed range %.4f pp, bar %.1f): %s" % (max(max(V[a]) - min(V[a]) for a in ARMS),
+                                                                  DIVERGED_BAR, "PASS" if not div else "FAIL"))
+    print("  %s" % final)
+    want += ["G-DIVERGE (branch condition): %s" % ("PASS" if not div else "FAIL %s" % div), final]
+    for nm, k, c, t, b in ACCOUNTS:
+        want.append("  %-28s KLS %.4f MCAR %.4f MCTL %.4f -> %s" % (nm, k, c, t, b))
+    print("  accounts: observed levels KLS %.4f MCAR %.4f MCTL %.4f; the account whose branch is taken: %s"
+          % (M["KLS"], M["MCAR"], M["MCTL"], acc[0] if acc else "NONE"))
+
+    print("\n[6] the DESCRIPTIVE pin readout, re-derived (fraction of records with beta_pre <= %.3f)" % PIN_LO)
+    for a in ARMS:
+        for s in SEEDS:
+            recs = P[(a, s)]
+            if a == "KLS":
+                parts = ["t%d late %.3f" % (i, pin_frac(recs, i - 1)) for i in C_SET + T_SET + [46, 49, 55, 58]]
+            else:
+                parts = ["G* early(<10000) %.3f late(>=40000) %.3f"
+                         % (pin_frac(recs, MERGED_G, 0, 10000), pin_frac(recs, MERGED_G))]
+                parts += ["single t%d late %.3f" % (i, pin_frac(recs, MERGED_G + 1 + k))
+                          for k, i in enumerate(T_SET if a == "MCAR" else C_SET)]
+            line = "  %-4s s%d  %s" % (a, s, "; ".join(parts))
+            print(line)
+            want.append(line)
+
+    print("\n[7] the corpus DISCLOSURE line, re-derived with a re-typed filter_rows (no bar reads it)")
+    csha, tsha = sha256(csvpath), sha256(tsvpath)
+    if csha != CORPUS_SHA or tsha != EXCL_SHA:
+        viol("corpus / exclusions sha is not the registered one (%s / %s)" % (csha[:12], tsha[:12]))
+    n_filt, nlay, mlay, nrows = corpus_line(csvpath, tsvpath)
+    print("  corpus commit %s: %d data rows, %d after filter_rows with cmg1- excluded; layerwise at the cell n %d"
+          " mean %.4f" % (CORPUS_COMMIT, nrows, n_filt, nlay, mlay))
+    want.append("corpus: %d rows after filter_rows (%s- excluded); layerwise at the cell n %d mean %.4f"
+                "  (DISCLOSURE ONLY -- no bar, branch or stamp reads it)" % (n_filt, PREFIX, nlay, mlay))
+
+    print("\n[8] AGREEMENT -- every rebuilt line looked up VERBATIM in the scorer's log")
+    log = [ln.rstrip("\n") for ln in open(logpath, errors="replace")]
+    logset = set(log)
+    miss = [w for w in want if w not in logset]
+    print("  %d rebuilt lines, %d found verbatim, %d MISSING" % (len(want), len(want) - len(miss), len(miss)))
+    for w in miss:
+        viol("not in the scorer log: %r" % w)
+    ftok = [ln for ln in log if ln.startswith("FINAL: ")]
+    print("  the log's FINAL line count %d; token-by-token identical to this parser's: %s"
+          % (len(ftok), len(ftok) == 1 and [t.strip() for t in ftok[0].split("|")] == [t.strip() for t in final.split("|")]))
+    if not (len(ftok) == 1 and ftok[0] == final):
+        viol("FINAL differs")
+    # every log line that carries a digit must be one this parser rebuilt, or one of the re-typed text lines below
+    STATIC = set([
+        "==============================================================================",
+        " cmg1 -- ResNet18_c100: IS KEEPING THE CARRIERS APART NECESSARY INSIDE THE LAYERWISE GROUPING?  (N3, 259)",
+        " ResNet18_c100 / CIFAR100  100 epochs  seeds 124,125,126,127  AUGMENT=1 BETA_CLIP=-15:-2.3026 PROBE=100"
+        " PROBE_TENSOR=1  LIVE harness",
+        "   KLS   62 singletons                MCAR  G* = N u {50,53,59}      MCTL  G* = N u {47,48,56}",
+        " PRIMARY DELTA_ID = MCTL - MCAR; KEY D_CAR = KLS - MCAR, D_CTL = KLS - MCTL.  MARGIN 5.0 pp (frozen, O2).",
+        "COMPLETE  12 runs, epochs 0..99 once each, RUN_DONE, no traceback, finite plateau5",
+        "G-ARGS    every run's OWN ARGS line == the registered line (save-directory any path ending /cmg1)",
+        "G-ENV     one ENV line per run == the registered one (PROBE_DIR stripped); PROBE_DIR == <save>/probe_<run>",
+        "G-PT      ONE `PROBE_TENSOR: on every=100 type=blockwise tensors=62 ...` per run; NO foreign intervention line",
+        "G-STRUCT  the batch's PARTITION-MANIFEST.txt == the frozen manifest, byte for byte",
+        "G-PROV    PROVENANCE.txt",
+        "G-FLOOR / G-CEIL",
+        "G-PARTITION  every record's z_agg / mom_pre / beta_pre decompose into the arm's REGISTERED groups",
+        "  (500 records at steps 0..49900; singleton groups at rel 1e-06, the merged group at rel 1e-02;"
+        " probe_tensor.json",
+        "   blockwise / 62 tensors / numels; block_sizes.json n_b == the registered per-group numel)",
+        "LEVELS    plateau5 (TEST) and TRAIN5, IN BATCH",
+        "SIGMA     O2: max(frozen prior, in-batch) -- nothing from the corpus",
+        "CONTRASTS (within batch)",
+        "ACCOUNTS (259.5) -- predicted levels; the observed branch is compared with each account's registered branch",
+        "  BROKEN-PARTITION (MCAR/MCTL built as another grouping): levels unconstrained; excluded ONLY by G-PARTITION",
+        "DESCRIPTIVE PROBE READOUT (NOT GATING): fraction of records at the clamp floor (beta_pre <= -14.999)",
+        "WHAT THIS DECIDES -- as registered, before any run existed:",
+        "WHAT IT DOES NOT LICENSE, UNCONDITIONALLY:",
+        "  Neither merge moves plateau5 by >= 5 pp and they differ by < 5 pp.  Licensed: 'at this cell, keeping the"
+        " carriers",
+        "  out of a shared group with N is NOT necessary for the layerwise level (within +-5 pp)'.  Read WITH the G* pin",
+        "  stamps: if MCAR's G* PINS, N's own step size does not matter here; if it is FREE, the carriers did not"
+        " capture the",
+        "  merged vote.  It does NOT say separation is never necessary: larger merges ([50,12], scalar) collapse"
+        " (147, 184).",
+        "  * Any other merge (another neighbour set, size or position), grouping family, cell, network or horizon.",
+        "  * That the carriers' step size (large or small) is what harms: no step size is manipulated here; the merged"
+        " group's",
+        "    step size is whatever the shared Lion vote makes it (the G* pin stamps are DESCRIPTIVE).",
+        "  * Identity vs MAGNITUDE (188.3): at a shared step size the carriers' |L| exceeds T's by x100+ (premise S),"
+        " so a",
+        "    carrier-specific result does not separate which tensors from how large their terms are.",
+        "  * Necessity for the scalar collapse, or sufficiency statements beyond 187 / 193 / 240-253.",
+        "  * A point reading for an arm AT KLS: |D| < 5 pp is a BOUND ('costs < 5 pp'), not 'costs nothing' (164.6).",
+    ])
+    PATHY = ("  manifest: ", "  provenance: ", "  PASS G-ARGS one save-directory")
+    unacc = [ln for ln in log if ln.strip() and any(c.isdigit() for c in ln) and ln not in logset - set()
+             and ln not in STATIC and ln not in set(want) and not ln.startswith(PATHY)]
+    print("  log lines carrying a digit that this parser neither rebuilt nor re-typed: %d" % len(unacc))
+    for ln in unacc:
+        viol("unaccounted scorer line: %r" % ln)
+    print("  path-bearing lines compared by basename only: %d" % sum(1 for ln in log if ln.startswith(PATHY)))
+
+    print("\nVIOLATIONS %d" % len(BAD))
+    return 1 if BAD else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

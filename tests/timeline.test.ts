@@ -21,11 +21,11 @@ test('newest-first timeline retains documented windows and every original CSV ob
   const { researchTimeline } = await helpers();
   const rows = researchTimeline(data.activity, data.experiments);
   const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;
-  assert.equal(rows.length, 9);
-  assert.deepEqual(rows.map(row => row.id), Array.from({ length: 9 }, (_, i) => `phase-0${9 - i}`));
+  assert.equal(rows.length, 10);
+  assert.deepEqual(rows.map(row => row.id), ['phase-10', ...Array.from({ length: 9 }, (_, i) => `phase-0${9 - i}`)]);
   assert.equal(csv.length, 8, 'the campaign timeline CSV is published unchanged');
-  // phase-09 is added by the notebook register (scripts/register_model.py ADDED_PHASES), not by the CSV.
-  rows.filter(row => row.id !== 'phase-09').forEach(row => {
+  // phase-09 and phase-10 are added by the notebook register (scripts/register_model.py ADDED_PHASES), not by the CSV.
+  rows.filter(row => !['phase-09', 'phase-10'].includes(row.id)).forEach(row => {
     const original = csv.find(entry => entry.phase.split('\n')[1] === row.title)!;
     assert.ok(original, `${row.title} must preserve a recorded CSV phase`);
     const [period, title] = original.phase.split('\n');
@@ -42,8 +42,8 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   const rows = researchTimeline(data.activity, data.experiments);
   const phaseIds = new Set(rows.flatMap(row => row.experiments.map(entry => entry.id)));
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 85);
-  assert.equal(phaseIds.size, 84);
+  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 89);
+  assert.equal(phaseIds.size, 88);
   assert.equal(unlinked.length, 80);
   assert.ok(unlinked.every(entry => !phaseIds.has(entry.id)));
   assert.equal(phaseIds.size + unlinked.length, data.experiments.length);

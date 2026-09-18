@@ -22,7 +22,7 @@ const CVT7_FINAL = ['TRANSFERS-GRADED', 'HARNESS-CLEAN', 'PATCH-BITES', 'HOLD-FR
 
 test('MT224 (cvt6) is Mixed and MT225 (cvt7) Goal met under the documented rules, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(160, 162).map(e => e.id), ['MT224', 'MT225'], 'appended after every record that existed before them, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [164, 146, 18, 3127]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [168, 150, 18, 3181]);
   assert.equal(CVT6_FINAL.length, 18);
   assert.equal(CVT7_FINAL.length, 15);
   const cases: [string, string, string[], number, string, string][] = [
@@ -98,7 +98,7 @@ test('the intervention warnings name every intervened arm, both holds of the for
 });
 
 test('the 36 runs link to MT224 / MT225 with sanitized logs; the 24 intervened runs are marked, two-kind runs with both witnesses', () => {
-  assert.equal(runs.length, 3127);
+  assert.equal(runs.length, 3181);
   const batches: [string, string, string[], number, string, string, Record<string, [number, string[], string]>][] = [
     ['cvt6', 'MT224', ['96', '97', '98'], 21, 'PlainNet18_c100', 'HEAD', {
       HOLDLOW: [3, ['BETA_HOLD'], 'step-size hold intervention'], HOLDHIGH: [3, ['BETA_HOLD'], 'step-size hold intervention'],

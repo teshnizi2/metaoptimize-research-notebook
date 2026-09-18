@@ -1,0 +1,913 @@
+#!/usr/bin/env python3
+"""cmo1_attack_indep.py <runsdir> <scorer.py> <score.log> [<all_runs.csv> [<CORPUS-EXCLUSIONS.tsv>]]
+-- independent re-derivation of `cmo1` (CORRECTIONS 255, +255.10, +255.11): ResNet18_c100 / CIFAR-100 at `ciso1`'s
+mechanism cell, 9 arms x 3 seeds, the LIVE shared harness with NO patch -- the two factors (SGDm base momentum 0.9,
+base weight decay 0) are train.py CLI flags only.
+
+IMPORTS NOTHING from analysis/cMO1_momwd_score.py, analysis/corpus_exclusions.py, analysis/argsline_guard.py or any
+other repo module, and uses NO regular expressions.  Stdlib only (csv, hashlib, json, math, os, struct, sys).
+It reads, by string splitting and byte framing alone:
+
+  * every raw `cmo1-<arm>-s<seed>-<jobid>.out` under <runsdir> (the `ARGS:` line, the `ENV:` line, the
+    `PROBE_TENSOR:` line, any intervention-switch line, the `Epoch` lines, `RUN_DONE`, `Traceback`);
+  * <runsdir>/cmo1/PARTITION-MANIFEST.txt and <runsdir>/cmo1/PROVENANCE.txt;
+  * each run's OWN TensorBoard events file under <runsdir>/cmo1/Tensorboard_outputs/<run>/ -- read as TFRecord
+    frames (8-byte little-endian length, masked CRC-32C of the length, payload, masked CRC-32C of the payload; BOTH
+    CRCs are verified here, which the scorer does not do), the `|key|value|` rows then split out of the payload
+    bytes; this is the flag witness that separates the BROKEN-FLAG null;
+  * each scalar arm's probe records <runsdir>/cmo1/probe_<run>/probe.jsonl (the `z_tensor` vector) for the
+    DESCRIPTIVE carrier-share readout;
+  * for the ONE corpus disclosure line only: results/all_runs.csv (csv module) and results/CORPUS-EXCLUSIONS.tsv
+    (split on tabs).
+
+plateau5 = mean TEST over the run's own epochs 95..99 read from the RAW `.out` (the CSV `plateau` column is never
+read); TRAIN5 is the same on the Train column.  Every bar (GAP_MIN 20, K01_MAX 30, REF_MIN 45, R50 0.5, MATCH 5,
+RESCUE 10, NULL 2, DIVERGED 5, FLOOR_MIN 15, CEIL_MAX 90), the frozen noise floor 0.6811983409351905, the live file
+sha256s, the ENV line, the ISO spec, the manifest (rebuilt from the ResNet18_c100 architecture), the branch map and
+every licence word are RE-TYPED from CORRECTIONS 255; nothing is copied from the scorer's code.
+
+CORPUS-DEPENDENT LINE, MADE EXPLICIT.  Exactly one rebuilt line depends on the corpus: the scorer's
+`corpus: N rows after corpus_exclusions.filter_rows, cmo1- excluded` disclosure, rebuilt here from the CSV and TSV
+(rows whose `run` starts with `cmo1-` dropped, then every (run, job_id) pair listed in the TSV dropped).  This parser
+was run against results/all_runs.csv sha256 18012454... (3,127 data rows) and results/CORPUS-EXCLUSIONS.tsv sha256
+ff953334... (108 listed rows): THE CORPUS OF COMMIT 1cb52f7 (the cvt8 / cvt9 ingest), unchanged through 1abe44a (the commit this landing
+started from) and through 8e341e4, and identical on cluster_b (~/stage_cmo1) and on the Mac.  When the 27 cmo1 rows are
+ingested that ONE line will no longer match: re-run with `git show 1cb52f7:results/all_runs.csv` and
+`git show 1cb52f7:results/CORPUS-EXCLUSIONS.tsv`.  No bar, sigma, branch or stamp reads that line.
+
+HOST PATHS.  The scorer prints the manifest and provenance paths it resolved.  Those two lines are matched here by
+their host-independent suffix (`/cmo1/PARTITION-MANIFEST.txt (<runsdir>/cmo1/)` and `/cmo1/PROVENANCE.txt
+(<runsdir>/cmo1/)`) and no path is printed by this parser, so either host's scorer log can be given on either host
+and this parser's own output is byte-comparable across hosts.
+
+AGREEMENT.  Every scorer line -- header, gate, level, sigma, contrast, stamp, FINAL, between-batch literal,
+descriptive readout and licence line -- is REBUILT here in the scorer's printed format and precision from this
+file's own numbers and compared to <score.log> IN ORDER.  A rebuilt line that differs, and any scorer line this
+parser did not rebuild, is a VIOLATION.  Exit 0 iff 0 violations.
+
+Sections:
+  [0] provenance, scorer sha, the manifest rebuilt byte for byte, the corpus disclosure
+  [1] completeness; per run the ARGS / ENV / PROBE_TENSOR / no-switch witnesses (the ARGS witness per arm is
+      printed in [D1] for the corpus-exclusion stage)
+  [2] levels: per-run plateau5 and TRAIN5, per-arm mean / sd / range, TEST OLS tail slope 80-99, floor / ceiling
+  [3] the flag witness: TFRecord frames + masked CRC-32C, the parsed-args table, per run
+  [4] sigma (frozen floor vs in-batch), every contrast, TRAIN beside TEST
+  [5] branch, stamps, FINAL -- rebuilt from the re-typed branch map and compared with the scorer's
+  [6] between-batch literals and the descriptive carrier-share readout
+  [7] LINE-BY-LINE AGREEMENT with the scorer log
+  DESCRIPTIVE / UNSURE, NOT REGISTERED (cannot move anything above):
+  [D1] the per-arm ARGS witness (the exact `--momentum-param-base` / `--weight-decay-base` values as the argparse
+       line carries them) and the 18 exclusion rows the ingest stage owes (255.7)
+  [D2] does k01 still collapse at M9 / W0, and does ISO still rescue -- the same numbers, stated in words
+  [D3] carrier nomination from the probe records: the top tensors of the scalar vote at each configuration
+  [D4] TEST (TRAIN) at epochs 9 / 19 / 49 / 99 per arm (record boundary: the run's own `Epoch <n>` lines; the final
+       epoch line is printed twice by the harness and is read once)
+"""
+import csv
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+
+# ---------------------------------------------------------------- re-typed from CORRECTIONS 255
+PREFIX = "cmo1"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = [108, 109, 110]
+AUG = "1"
+CLIP = "-15:-2.3026"
+PROBE = 100
+NTENS = 62
+TOTPAR = 11220132
+N_BN = 20
+ARMS = ["k01", "kL", "ISO", "M9k01", "M9kL", "M9ISO", "W0k01", "W0kL", "W0ISO"]
+BASEARMS = ["k01", "kL", "ISO"]
+FACTORS = ["M9", "W0"]
+ISOSPEC = ("sets:1-49,51-52,54-58,60-62/"
+           "layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight")
+GRAN = {"k01": "scalar", "kL": "layerwise", "ISO": ISOSPEC}
+PTTYPE = {"k01": "scalar", "kL": "layerwise", "ISO": "blockwise"}
+MOM_OF = {"": "0.99", "M9": "0.9", "W0": "0.99"}
+WD_OF = {"": "0.1", "M9": "0.1", "W0": "0"}
+TB_MOM = {"0.99": "0.99", "0.9": "0.9"}
+TB_WD = {"0.1": "0.1", "0": "0.0"}
+CARRIER_IDX = [50, 53, 59]
+CARRIERS = ["layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight"]
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+SWITCHES = ["VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD", "DECAY_MASK", "SHADOW_VOTE"]
+LIVE_BN_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+LIVE_HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+LIVE_TRAIN_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+LIVE_RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+REG_SCORER_SHA = "2548ee1b562aa06a6c0cf75f0cd291438e6433783f5e71b7d3d4df29f0ca6582"
+SIGMA_PRIOR = 0.6811983409351905
+GAP_MIN, K01_MAX, REF_MIN, R50 = 20.0, 30.0, 45.0, 0.5
+MATCH_BAR, NULL_BAR, RESCUE_BAR, DIVERGED_BAR = 5.0, 2.0, 10.0, 5.0
+FLOOR_MIN, CEIL_MAX, CHANCE = 15.0, 90.0, 1.0
+BETWEEN = [("cvt8", [("k01", 23.06), ("ISO", 70.26)]),
+           ("ciso1", [("k01", 23.2807), ("ISO", 70.2113)]),
+           ("cdep1", [("k01", 23.3520), ("ISO", 70.0440)]),
+           ("corpus (254 census)", [("k01", 22.96), ("kL", 69.42)])]
+CORPUS_COMMIT = "1cb52f7"
+LANDING_COMMIT = "8e341e4"
+
+VIOL = []
+
+
+def bad(msg, extra=""):
+    VIOL.append(msg)
+    print("  VIOLATION  %s%s" % (msg, ("   " + extra) if extra else ""))
+
+
+def ok(msg, extra=""):
+    print("  ok  %s%s" % (msg, ("   " + extra) if extra else ""))
+
+
+def factor_of(a):
+    return a[:2] if a[:2] in FACTORS else ""
+
+
+def base_of(a):
+    return a[2:] if factor_of(a) else a
+
+
+SPEC = dict((a, GRAN[base_of(a)]) for a in ARMS)
+MOM = dict((a, MOM_OF[factor_of(a)]) for a in ARMS)
+WDC = dict((a, WD_OF[factor_of(a)]) for a in ARMS)
+PT = dict((a, PTTYPE[base_of(a)]) for a in ARMS)
+
+
+def run_name(a, s):
+    return "%s-%s-s%d" % (PREFIX, a, s)
+
+
+def mean(v):
+    return sum(v) / float(len(v))
+
+
+def sdev(v):
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    fh = open(path, "rb")
+    while True:
+        b = fh.read(1 << 20)
+        if not b:
+            break
+        h.update(b)
+    fh.close()
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- the network, rebuilt
+def r18():
+    """ResNet-18 for CIFAR (3x3 stem, no maxpool, 100-way head): (name, numel, kind) in named_parameters order."""
+    t = [("conv1.weight", 64 * 3 * 3 * 3, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    cin = 64
+    for li, w in ((1, 64), (2, 128), (3, 256), (4, 512)):
+        for b in (0, 1):
+            pre = "layer%d.%d." % (li, b)
+            fin = cin if b == 0 else w
+            stride = 2 if (li > 1 and b == 0) else 1
+            t.append((pre + "conv1.weight", w * fin * 3 * 3, "Conv2d"))
+            t.append((pre + "bn1.weight", w, "BatchNorm2d"))
+            t.append((pre + "bn1.bias", w, "BatchNorm2d"))
+            t.append((pre + "conv2.weight", w * w * 3 * 3, "Conv2d"))
+            t.append((pre + "bn2.weight", w, "BatchNorm2d"))
+            t.append((pre + "bn2.bias", w, "BatchNorm2d"))
+            if stride != 1 or fin != w:
+                t.append((pre + "shortcut.0.weight", w * fin, "Conv2d"))
+                t.append((pre + "shortcut.1.weight", w, "BatchNorm2d"))
+                t.append((pre + "shortcut.1.bias", w, "BatchNorm2d"))
+        cin = w
+    t.append(("linear.weight", 512 * 100, "Linear"))
+    t.append(("linear.bias", 100, "Linear"))
+    return t
+
+
+TENS = r18()
+NAMES = [n for n, _q, _k in TENS]
+NUMEL = [q for _n, q, _k in TENS]
+
+
+def iso_groups():
+    """The ISO spec, expanded without regex: one complement group and the three carriers."""
+    body = ISOSPEC[len("sets:"):]
+    out = []
+    for grp in body.split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if tok and tok[0].isdigit() and "-" in tok:
+                a, b = tok.split("-")
+                idx.extend(range(int(a), int(b) + 1))
+            elif tok and tok[0].isdigit():
+                idx.append(int(tok))
+            else:
+                idx.append(NAMES.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def manifest_text():
+    L = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(TENS), "TOTAL_PARAMS %d" % sum(NUMEL),
+         "NORM BatchNorm2d %d GroupNorm 0" % N_BN, "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS,
+         "META_STEPS %d" % (EPOCHS * (50000 // BATCH))]
+    for i, (n, q, k) in enumerate(TENS, 1):
+        L.append("TENSOR %d %s %d %s" % (i, n, q, k))
+    L.append("CARRIERS %s" % ",".join("%d:%s" % (i, n) for i, n in zip(CARRIER_IDX, CARRIERS)))
+    g = iso_groups()
+    for a in ARMS:
+        if SPEC[a] == "scalar":
+            L.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        elif SPEC[a] == "layerwise":
+            L.append("ARMSPEC %s SPEC layerwise TYPE layerwise M %d" % (a, len(TENS)))
+        else:
+            L.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                     % (a, ISOSPEC, len(g), ",".join(str(len(x)) for x in g),
+                        ",".join(str(sum(NUMEL[i - 1] for i in x)) for x in g),
+                        " ".join(NAMES[i - 1] for i in g[1])))
+        L.append("BASEFLAGS %s momentum-param-base %s weight-decay-base %s" % (a, MOM[a], WDC[a]))
+    return "\n".join(L) + "\n"
+
+
+def expected_args(a, s, savedir):
+    return ("--optimizer HF --alg-base SGDm --momentum-param-base %s --weight-decay-base %s "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 "
+            "--dataset CIFAR100 --NN-name ResNet18_c100 --batch-size 100 --max-time 999:00:00 --gamma 1 "
+            "--meta-stepsize 1e-3 --alpha0 1e-6 --num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory %s --run-name %s" % (MOM[a], WDC[a], SPEC[a], s, savedir, run_name(a, s)))
+
+
+def expected_tb(a, s):
+    return {"momentum_param_base": TB_MOM[MOM[a]], "weight_decay_base": TB_WD[WDC[a]],
+            "alg_base": "SGDm", "alg_meta": "Lion", "momentum_param_meta": "0.99", "weight_decay_meta": "0.0",
+            "Lion_beta2_meta": "0.9", "meta_stepsize": "0.001", "alpha0": "1e-06", "gamma": "1.0",
+            "stepsize_groups": SPEC[a], "seed": str(s), "run_name": run_name(a, s), "NN_name": NET,
+            "dataset": DSET, "num_epochs": str(EPOCHS), "batch_size": str(BATCH)}
+
+
+# ---------------------------------------------------------------- raw .out reader (string splitting only)
+def read_out(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    rec = {"args": [], "env": [], "pt": [], "sw": [], "run_done": False,
+           "traceback": ("Traceback (most recent call last)" in txt)}
+    for ln in txt.splitlines():
+        if ln.startswith("ARGS:"):
+            rec["args"].append(ln)
+        elif ln.startswith("ENV:"):
+            rec["env"].append(ln)
+        elif ln.startswith("PROBE_TENSOR:"):
+            rec["pt"].append(ln)
+        elif ln.strip() == "RUN_DONE":
+            rec["run_done"] = True
+        else:
+            for sw in SWITCHES:
+                if ln.startswith(sw):
+                    rec["sw"].append(ln)
+                    break
+        if ln.startswith("Epoch "):
+            f = ln.split(",")
+            if len(f) >= 3 and "Train Accuracy:" in f[1] and "Test Accuracy:" in f[2]:
+                try:
+                    e = int(f[0].split()[1])
+                    tr = float(f[1].split(":")[1].strip().split()[0])
+                    te = float(f[2].split(":")[1].strip().split()[0])
+                except (ValueError, IndexError):
+                    continue
+                eps[e] = (tr, te)
+    rec["eps"] = eps
+    rec["n_epochs"] = len(eps)
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    else:
+        rec["plateau5"] = rec["train5"] = None
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"] and not rec["traceback"]
+                       and rec["plateau5"] is not None)
+    return rec
+
+
+def split_args(line):
+    """`ARGS: --a 1 --b x y` -> {a: '1', b: 'x y'} plus the count of repeats. No regex."""
+    toks = line[len("ARGS:"):].split()
+    flags, order, cur = {}, [], None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            order.append(cur)
+            flags[cur] = None
+        elif cur is not None:
+            flags[cur] = t if flags[cur] is None else flags[cur] + " " + t
+    dup = sorted(set(k for k in order if order.count(k) > 1))
+    return flags, dup
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# ---------------------------------------------------------------- TFRecord + masked CRC-32C (independent)
+_CRC_TABLE = []
+
+
+def _crc_table():
+    if not _CRC_TABLE:
+        poly = 0x82F63B78
+        for i in range(256):
+            c = i
+            for _ in range(8):
+                c = (c >> 1) ^ (poly if (c & 1) else 0)
+            _CRC_TABLE.append(c)
+    return _CRC_TABLE
+
+
+def crc32c(data):
+    tab = _crc_table()
+    c = 0xFFFFFFFF
+    for b in data:
+        c = tab[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c ^ 0xFFFFFFFF
+
+
+def unmask(m):
+    m = (m - 0xA282EAD8) & 0xFFFFFFFF
+    return ((m >> 17) | (m << 15)) & 0xFFFFFFFF
+
+
+def tfrecords(path):
+    """Yield (payload, crc_len_ok, crc_data_ok) for every frame of a TFRecord file."""
+    data = open(path, "rb").read()
+    off = 0
+    while off + 12 <= len(data):
+        (ln,) = struct.unpack("<Q", data[off:off + 8])
+        (mlen,) = struct.unpack("<I", data[off + 8:off + 12])
+        end = off + 12 + ln
+        if end + 4 > len(data):
+            return
+        payload = data[off + 12:end]
+        (mdat,) = struct.unpack("<I", data[end:end + 4])
+        yield payload, (unmask(mlen) == crc32c(data[off:off + 8])), (unmask(mdat) == crc32c(payload))
+        off = end + 4
+
+
+def tb_table(runsdir, a, s):
+    """key -> set of values, read out of the run's own events file(s); plus (n_files, n_frames, n_crc_bad)."""
+    d = os.path.join(runsdir, PREFIX, "Tensorboard_outputs", run_name(a, s))
+    files = sorted(f for f in os.listdir(d) if f.startswith("events.out.tfevents.")) if os.path.isdir(d) else []
+    out, frames, crcbad = {}, 0, 0
+    for f in files:
+        for payload, c1, c2 in tfrecords(os.path.join(d, f)):
+            frames += 1
+            if not (c1 and c2):
+                crcbad += 1
+                continue
+            if b"|" not in payload:
+                continue
+            for raw in payload.split(b"\n"):
+                if raw.count(b"|") != 3 or not raw.startswith(b"|") or not raw.endswith(b"|"):
+                    continue
+                parts = raw.split(b"|")
+                k = parts[1].decode("utf-8", "replace")
+                v = parts[2].decode("utf-8", "replace")
+                out.setdefault(k, set()).add(v)
+    return out, len(files), frames, crcbad
+
+
+# ---------------------------------------------------------------- the branch map, re-typed
+def collapse_word(k, l):
+    if l < REF_MIN:
+        return "REF-UNHEALTHY"
+    if l - k <= MATCH_BAR:
+        return "COLLAPSE-IS-CONFIG"
+    if k <= R50 * l and l - k >= GAP_MIN:
+        return "COLLAPSE-PERSISTS"
+    return "COLLAPSE-ATTENUATED"
+
+
+def iso_word(k, l, i, cw):
+    if cw in ("REF-UNHEALTHY", "COLLAPSE-IS-CONFIG") or l - k <= RESCUE_BAR:
+        return "ISO-UNREADABLE"
+    if i >= l - MATCH_BAR:
+        return "ISO-RESCUES"
+    if i <= k + MATCH_BAR:
+        return "ISO-FAILS"
+    return "ISO-PARTIAL"
+
+
+def decide(M, div):
+    if any(a in div for a in BASEARMS):
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX or M["kL"] - M["k01"] < GAP_MIN or M["ISO"] - M["k01"] < GAP_MIN:
+        return "ANCHOR-FAILED"
+    halves = []
+    for X in FACTORS:
+        if any((X + b) in div for b in BASEARMS):
+            halves.append("%s:DIVERGED" % X)
+            continue
+        k, l, i = M[X + "k01"], M[X + "kL"], M[X + "ISO"]
+        cw = collapse_word(k, l)
+        halves.append("%s:%s/%s" % (X, cw, iso_word(k, l, i, cw)))
+    return "+".join(halves)
+
+
+FACTOR_TEXT = {
+    "M9": ("SGDm momentum 0.9 (the parent's value; EMA form, so the averaging window shrinks 100 -> 10 steps while "
+           "the step scale is unchanged)"),
+    "W0": ("base weight decay 0 (removed from every tensor, the BN gammas included, AND from the meta trace h; the "
+           "two routes are not separated)"),
+}
+VALUE_TEXT = {"M9": "SGDm momentum 0.99", "W0": "coupled base weight decay"}
+ROUTE_TEXT = {"M9": "window vs lag of the base average", "W0": "WD on the weights (gammas) vs WD in the meta trace"}
+READING = "LIMITS-PREP L1 (every carrier claim sits at SGDm 0.99 / coupled WD 0.1)"
+LIC_C = {
+    "COLLAPSE-PERSISTS": [
+        "{X}:COLLAPSE-PERSISTS: with {F}, the scalar arm still sits at <= half its own layerwise reference and >= 20 pp below",
+        "  it.  Licensed: 'at this cell the scalar collapse does not require {V}'.  Not licensed: the size of the gap at the",
+        "  parent's full configuration (alpha0 1e-6 here, not 1e-5; CIFAR-100, not ImageNet); other networks; interactions."],
+    "COLLAPSE-IS-CONFIG": [
+        "{X}:COLLAPSE-IS-CONFIG: with {F}, the scalar arm recovers to within 5 pp of its own layerwise reference.",
+        "  Licensed: 'at this cell the scalar collapse requires {V}'; the carrier account is then a mechanism OF THAT",
+        "  CONFIGURATION and must be stated so (LIMITS-PREP section 6).  Not licensed: which route ({R});",
+        "  that the carriers play no role at {X} (ISO is unreadable without a gap)."],
+    "COLLAPSE-ATTENUATED": [
+        "{X}:COLLAPSE-ATTENUATED: with {F}, a scalar-vs-layerwise gap of more than 5 pp remains but the R50 / 20 pp",
+        "  collapse criterion is not met.  Licensed: '{V} deepens the collapse at this cell; it is not required for a gap'.",
+        "  Not licensed: a dose-response in momentum or weight decay (one value each)."],
+    "REF-UNHEALTHY": [
+        "{X}:REF-UNHEALTHY: with {F}, the LAYERWISE reference itself is below 45 pp, so 'collapse' has no reference.",
+        "  Licensed: '{V} is needed for this harness to train layerwise at this cell'.  No collapse or rescue sentence."],
+    "DIVERGED": ["{X}:DIVERGED: an arm of this half is bimodal across seeds (range > 5 pp); the seeds are reported, no half",
+                 "  sentence."],
+}
+LIC_I = {
+    "ISO-RESCUES": [
+        "  {X} ISO-RESCUES: isolating ciso1's three carriers lifts the scalar arm to within 5 pp of layerwise with {F}.",
+        "  Licensed: 'and isolating the carriers still rescues'.  Not licensed: specificity (no matched control at {X}; the",
+        "  CTL arm is SHOULD-tier S4); that the SAME tensors dominate the vote at {X} (descriptive probe readout only)."],
+    "ISO-FAILS": [
+        "  {X} ISO-FAILS: the collapse is there but isolating ciso1's carriers leaves the scalar arm within 5 pp.",
+        "  Licensed: 'at {X} the collapse does not run through THESE carriers' -- the carrier account is configuration-bound",
+        "  even though the collapse is not.  Not licensed: that no other small set carries it at {X} (not re-nominated)."],
+    "ISO-PARTIAL": [
+        "  {X} ISO-PARTIAL: isolating the carriers recovers more than 5 pp but stays more than 5 pp below layerwise.",
+        "  Licensed: 'the carriers carry part of the collapse at {X}'.  No full-rescue sentence."],
+    "ISO-UNREADABLE": ["  {X} ISO-UNREADABLE: no gap (or no healthy reference) to rescue; ISO's level is stamped, not read."],
+}
+
+
+def licence_lines(branch):
+    out = []
+    for X, h in zip(FACTORS, branch.split("+")):
+        body = h[len(X) + 1:]
+        sub = {"X": X, "F": FACTOR_TEXT[X], "V": VALUE_TEXT[X], "R": ROUTE_TEXT[X]}
+        if body == "DIVERGED":
+            out += [ln.format(**sub) for ln in LIC_C["DIVERGED"]]
+            continue
+        c, i = body.split("/", 1)
+        out += [ln.format(**sub) for ln in LIC_C[c]] + [ln.format(**sub) for ln in LIC_I[i]]
+    out += ["EFFECT ON " + READING + ": as the two halves say, ONE value per factor, one factor at a time, at ciso1's cell only",
+            "(ResNet18_c100, CIFAR-100, Lion meta, meta step 1e-3, alpha0 1e-6, clip, 100 epochs).  Readings at k01 are LOCATIONS."]
+    return out
+
+
+# ---------------------------------------------------------------- main
+def main(argv):
+    if len(argv) < 4:
+        print(__doc__)
+        return 2
+    runsdir, scorer, logpath = argv[1], argv[2], argv[3]
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    csvpath = argv[4] if len(argv) > 4 else os.path.join(repo, "results", "all_runs.csv")
+    tsvpath = argv[5] if len(argv) > 5 else os.path.join(repo, "results", "CORPUS-EXCLUSIONS.tsv")
+    L = []          # the rebuilt scorer output, in order
+
+    def emit(s=""):
+        L.append(s)
+
+    print("=" * 100)
+    print("cmo1_attack_indep -- independent re-derivation of CORRECTIONS 255 (cmo1).  No repo import, no regex.")
+    print("=" * 100)
+
+    # ---------------- [0] provenance, scorer, manifest, corpus
+    print("\n[0] PROVENANCE, SCORER, MANIFEST, CORPUS")
+    prov = {}
+    ppath = os.path.join(runsdir, PREFIX, "PROVENANCE.txt")
+    for ln in open(ppath):
+        f = ln.split()
+        if len(f) >= 2 and f[0] not in prov:
+            prov[f[0]] = " ".join(f[1:])
+    for key, want in (("MODE", "submit"), ("BUILD_NETWORK_SHA256", LIVE_BN_SHA), ("HF_SHA256", LIVE_HF_SHA),
+                      ("TRAIN_SHA256", LIVE_TRAIN_SHA), ("RUNNER_SHA256", LIVE_RUNNER_SHA),
+                      ("SCORER_SHA256", REG_SCORER_SHA)):
+        (ok if prov.get(key) == want else bad)("PROVENANCE %s == %s" % (key, want[:16] if len(want) > 16 else want))
+    sc_sha = sha256_of(scorer)
+    (ok if sc_sha == REG_SCORER_SHA else bad)("the scorer given on the command line is the REGISTERED one (sha256 %s...)" % sc_sha[:16])
+    mtxt = open(os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt")).read()
+    mine = manifest_text()
+    (ok if mtxt == mine else bad)("PARTITION-MANIFEST.txt rebuilt byte for byte from the ResNet18_c100 architecture",
+                                  "%d bytes, %d tensors, %d params, ISO groups %s"
+                                  % (len(mine), len(TENS), sum(NUMEL), [len(g) for g in iso_groups()]))
+    g = iso_groups()
+    (ok if [len(x) for x in g] == [59, 3] and [sum(NUMEL[i - 1] for i in x) for x in g] == [TOTPAR - 1536, 1536] else bad)(
+        "ISO = 59 + 3 tensors, %d + 1536 params, carriers %s" % (TOTPAR - 1536, ",".join(CARRIERS)))
+    rows = list(csv.DictReader(open(csvpath)))
+    exc = set()
+    tl = [ln.rstrip("\n") for ln in open(tsvpath) if ln.strip() and not ln.startswith("#")]
+    head = tl[0].split("\t")
+    for ln in tl[1:]:
+        d = dict(zip(head, ln.split("\t")))
+        exc.add((d.get("run"), d.get("job_id")))
+    keep = [r for r in rows if not (r.get("run", "").startswith(PREFIX + "-")
+                                    or (r.get("run"), r.get("job_id")) in exc)]
+    print("  corpus files: all_runs.csv sha256 %s... (%d data rows); CORPUS-EXCLUSIONS.tsv sha256 %s... (%d listed)"
+          % (sha256_of(csvpath)[:16], len(rows), sha256_of(tsvpath)[:16], len(exc)))
+    print("  corpus commit %s (the cvt8 / cvt9 ingest), unchanged through %s; %d rows survive the filter"
+          % (CORPUS_COMMIT, LANDING_COMMIT, len(keep)))
+
+    # the scorer header
+    emit("=" * 78)
+    emit(" cmo1 -- ResNet18_c100: does the scalar collapse and the carrier rescue survive momentum 0.9 / weight decay 0?")
+    emit(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1  LIVE harness"
+         % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        emit("   %-6s %-9s momentum-param-base %-5s weight-decay-base %s"
+             % (a, SPEC[a] if SPEC[a] != ISOSPEC else "ISO", MOM[a], WDC[a]))
+    emit(" CO-PRIMARY (X in M9, W0): G_X = XkL - Xk01; R_X = XISO - Xk01; L_X = Xk01 - k01.")
+    emit(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)." % (EPOCHS - 5, EPOCHS - 1))
+    emit("=" * 78)
+    emit("corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)"
+         % (len(keep), PREFIX))
+
+    # ---------------- [1] completeness and witnesses
+    print("\n[1] COMPLETENESS AND PER-RUN WITNESSES (raw .out only)")
+    runs, files = {}, {}
+    for fn in sorted(os.listdir(runsdir)):
+        if not (fn.startswith(PREFIX + "-") and fn.endswith(".out")):
+            continue
+        stem = fn[:-4].split("-")
+        if len(stem) != 4 or stem[0] != PREFIX or not stem[2].startswith("s"):
+            continue
+        a, s, jid = stem[1], int(stem[2][1:]), int(stem[3])
+        if a not in ARMS or s not in SEEDS:
+            bad("unexpected run file %s" % fn)
+            continue
+        if (a, s) in runs:
+            bad("more than one .out for %s-s%d (resubmission shadowing)" % (a, s))
+        runs[(a, s)] = read_out(os.path.join(runsdir, fn))
+        runs[(a, s)]["job"] = jid
+        files[(a, s)] = fn
+    (ok if len(runs) == len(ARMS) * len(SEEDS) else bad)("exactly one .out per arm and seed", "%d files" % len(runs))
+    emit("")
+    emit("COMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            emit("  %-4s %s  %d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %.4f (train %.4f)"
+                 % ("OK" if r["complete"] else "MISS", run_name(a, s), r["n_epochs"], r["run_done"], r["traceback"],
+                    r["plateau5"], r["train5"]))
+    nbad = [k for k, r in runs.items() if not r["complete"]]
+    (ok if not nbad else bad)("all 27 runs complete (100 epoch lines, RUN_DONE, no traceback)", "" if not nbad else str(nbad))
+
+    savedir = None
+    argswit = {}
+    emit("")
+    emit("G-ARGS    every run's OWN ARGS line says what its file name registers (momentum and WD included)")
+    nargs = 0
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            good = len(r["args"]) == 1
+            if good:
+                f, dup = split_args(r["args"][0])
+                sd_ = f.get("save-directory")
+                if savedir is None:
+                    savedir = sd_
+                want, _d = split_args("ARGS: " + expected_args(a, s, sd_ or ""))
+                wrong = sorted(k for k in want if f.get(k) != want[k])
+                extra = sorted(set(f) - set(want))
+                good = not dup and not wrong and not extra
+                argswit[a] = (f.get("momentum-param-base"), f.get("weight-decay-base"), f.get("stepsize-groups"))
+                if not good:
+                    bad("ARGS %s-s%d dup=%s wrong=%s extra=%s" % (a, s, dup, wrong, extra))
+            else:
+                bad("ARGS %s-s%d has %d ARGS lines" % (a, s, len(r["args"])))
+            nargs += 1 if good else 0
+            emit("  PASS G-ARGS %s-s%d" % (a, s))
+    ok("every run's ARGS line equals the registered expected_args(arm, seed), flag by flag", "%d/27" % nargs)
+
+    envs = sorted(set(" ".join(t for t in ln.split() if not t.startswith("PROBE_DIR=")) for r in runs.values() for ln in r["env"]))
+    (ok if envs == [ENV_EXPECTED] else bad)("one distinct ENV line across 27 runs == ciso1's, byte for byte (PROBE_DIR stripped)")
+    pd_bad = []
+    for (a, s), r in runs.items():
+        want = "PROBE_DIR=%s/probe_%s" % (savedir, run_name(a, s))
+        if len(r["env"]) != 1 or want not in r["env"][0].split():
+            pd_bad.append(run_name(a, s))
+    (ok if not pd_bad else bad)("every run printed exactly one ENV line whose PROBE_DIR is its own",
+                                "" if not pd_bad else str(pd_bad))
+    ptbad = [run_name(a, s) for (a, s), r in runs.items()
+             if len(r["pt"]) != 1 or not r["pt"][0].startswith("PROBE_TENSOR: on every=%d type=%s tensors=%d " % (PROBE, PT[a], NTENS))]
+    (ok if not ptbad else bad)("every run printed ONE PROBE_TENSOR line of its own arm's type (scalar/layerwise/blockwise 9/9/9)",
+                               "" if not ptbad else str(ptbad))
+    swbad = [run_name(a, s) for (a, s), r in runs.items() if r["sw"]]
+    (ok if not swbad else bad)("no run printed a %s line" % "/".join(SWITCHES), "" if not swbad else str(swbad))
+    emit("")
+    emit("G-ENV     the environment rode the ENV line on every run; PROBE_TENSOR on; NO intervention switch line")
+    emit("  PASS G-ENV one distinct ENV line, one per run   %d distinct" % len(envs))
+    for ln in envs:
+        emit("        %s" % ln)
+    emit("  PASS G-ENV the ENV line is ciso1's / cdep1's / cvt8's, byte for byte (PROBE_DIR stripped)")
+    emit("  PASS G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`   %d runs"
+         % (PROBE, NTENS, len(runs)))
+    emit("  PASS G-NOSWITCH no run printed a %s line (the LIVE harness prints none)" % "/".join(SWITCHES))
+    emit("")
+    emit("G-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    emit("@SUFFIX@/%s/PARTITION-MANIFEST.txt (<runsdir>/%s/)" % (PREFIX, PREFIX))
+    emit("  PASS G-STRUCT byte-identical to synthetic_manifest_text() (62 tensors, ISO [59,3], base flags)   %d vs %d bytes"
+         % (len(mtxt), len(mine)))
+    emit("")
+    emit("G-PROV    PROVENANCE.txt")
+    emit("@SUFFIX@/%s/PROVENANCE.txt (<runsdir>/%s/)" % (PREFIX, PREFIX))
+    emit("  PASS G-PROV MODE submit   submit")
+    for key, want in (("BUILD_NETWORK_SHA256", LIVE_BN_SHA), ("HF_SHA256", LIVE_HF_SHA),
+                      ("TRAIN_SHA256", LIVE_TRAIN_SHA), ("RUNNER_SHA256", LIVE_RUNNER_SHA)):
+        emit("  PASS G-PROV %s == the LIVE %s...   %s" % (key, want[:12], want[:16]))
+    emit("  PASS G-PROV SCORER_SHA256 == this scorer's sha256 %s...   %s" % (sc_sha[:12], sc_sha[:16]))
+
+    # ---------------- [2] levels
+    print("\n[2] LEVELS -- plateau5 from the RAW .out (mean TEST over epochs 95..99); TRAIN beside it")
+    V = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    T = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    M = dict((a, mean(V[a])) for a in ARMS)
+    MT = dict((a, mean(T[a])) for a in ARMS)
+    emit("")
+    emit("LEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    for a in ARMS:
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        emit("  %-6s TEST %.4f  sd %.4f  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+             % (a, M[a], sdev(V[a]), max(V[a]) - min(V[a]), MT[a], "/".join("%.3f" % x for x in sl)))
+        emit("         seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, V[a], T[a])))
+        print("  %-6s TEST %8.4f  sd %.4f  range %.4f   TRAIN %8.4f   seeds %s"
+              % (a, M[a], sdev(V[a]), max(V[a]) - min(V[a]), MT[a], " ".join("%.4f" % x for x in V[a])))
+    hi = max(M.values())
+    emit("")
+    emit("G-FLOOR / G-CEIL")
+    emit("  PASS G-FLOOR max arm mean >= %.2f pp (chance %.2f)   max %.4f" % (FLOOR_MIN, CHANCE, hi))
+    emit("  PASS G-CEIL max arm mean <= %.2f pp   max %.4f" % (CEIL_MAX, hi))
+    (ok if FLOOR_MIN <= hi <= CEIL_MAX else bad)("floor / ceiling", "max arm mean %.4f" % hi)
+
+    # ---------------- [3] the flag witness
+    print("\n[3] FLAG WITNESS -- each run's OWN TensorBoard table, TFRecord frames with masked CRC-32C verified")
+    tbfail, frames_tot, crcbad_tot = [], 0, 0
+    emit("")
+    emit("G-TBARGS  the run's OWN TensorBoard hyper-parameter table (written by train.py from vars(args)) carries the")
+    emit("          registered base momentum, base WD and every other registered key, once-valued, on every run")
+    for s in SEEDS:
+        for a in ARMS:
+            got, nf, frames, crcbad = tb_table(runsdir, a, s)
+            frames_tot += frames
+            crcbad_tot += crcbad
+            want = expected_tb(a, s)
+            wrong = ["%s=%s (want %s)" % (k, sorted(got.get(k, [])), v) for k, v in want.items() if got.get(k) != set([v])]
+            if wrong or nf != 1:
+                tbfail.append((run_name(a, s), nf, wrong))
+            emit("  PASS G-TBARGS %-6s s%-3d momentum_param_base=%s weight_decay_base=%s  %d events file(s); every registered key once-valued and right"
+                 % (a, s, TB_MOM[MOM[a]], TB_WD[WDC[a]], nf))
+    (ok if not tbfail else bad)("all 27 runs: one events file, every registered key once-valued and equal to the registration",
+                                "" if not tbfail else str(tbfail[:3]))
+    (ok if crcbad_tot == 0 else bad)("TFRecord framing: %d frames read, masked CRC-32C of length and payload verified" % frames_tot,
+                                     "%d bad" % crcbad_tot)
+    print("  M9 arms read 0.9 and W0 arms read 0.0 from their own events file; anchors read 0.99 / 0.1")
+
+    # ---------------- [4] sigma and contrasts
+    print("\n[4] SIGMA AND CONTRASTS (every contrast WITHIN batch)")
+    ss = sum(sum((x - M[a]) ** 2 for x in V[a]) for a in ARMS)
+    df = sum(len(V[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used = ("SIGMA_PRIOR_frozen", SIGMA_PRIOR) if SIGMA_PRIOR >= sigma_in else ("SIGMA_INBATCH", sigma_in)
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    emit("")
+    emit("SIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    emit("  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR))
+    emit("  %-20s %.6f" % ("SIGMA_INBATCH", sigma_in))
+    emit("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    emit("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+    C = []
+    for X in FACTORS:
+        C += [("G_" + X, X + "kL", X + "k01"), ("R_" + X, X + "ISO", X + "k01"), ("L_" + X, X + "k01", "k01")]
+    K = [("G_A", "kL", "k01"), ("R_A", "ISO", "k01")]
+    for X in FACTORS:
+        K += [("DL_" + X, X + "kL", "kL"), ("DI_" + X, X + "ISO", "ISO")]
+    emit("")
+    emit("CONTRASTS (every one WITHIN batch)")
+    for nm, x, y in C:
+        v = M[x] - M[y]
+        emit("  PRIMARY  %-6s = %-6s - %-6s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, MT[x] - MT[y]))
+        print("  PRIMARY  %-6s = %+9.4f pp = %+7.2f SE   (TRAIN %+.4f)" % (nm, v, v / se, MT[x] - MT[y]))
+    for nm, x, y in K:
+        v = M[x] - M[y]
+        emit("  KEY      %-6s = %-6s - %-6s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, MT[x] - MT[y]))
+    for X in FACTORS:
+        ig = (M[X + "kL"] - M[X + "k01"]) - (M["kL"] - M["k01"])
+        ir = (M[X + "ISO"] - M[X + "k01"]) - (M["ISO"] - M["k01"])
+        emit("  KEY      IG_%s = G_%s - G_A = %+.4f pp;  IR_%s = R_%s - R_A = %+.4f pp;  ratio Xk01/XkL = %.4f (anchor %.4f)"
+             % (X, X, ig, X, X, ir, M[X + "k01"] / M[X + "kL"], M["k01"] / M["kL"]))
+    emit("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE) | NULL %.1f pp | REF_MIN %.1f | R50 %.2f | K01_MAX %.1f"
+         % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, RESCUE_BAR, RESCUE_BAR / se, NULL_BAR, REF_MIN, R50, K01_MAX))
+
+    # ---------------- [5] branch, stamps, FINAL
+    print("\n[5] BRANCH AND STAMPS (the map re-typed from 255.4; first match wins)")
+    div = [a for a in ARMS if max(V[a]) - min(V[a]) > DIVERGED_BAR]
+    emit("")
+    emit("G-DIVERGE (a branch condition, not a harness gate)")
+    emit("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR,
+                                                       "" if not div else "  diverged: %s" % div))
+    branch = decide(M, div)
+    stamps = ["HARNESS-CLEAN", "FLAGS-WITNESSED", "LIVE-HARNESS", "ONE-VALUE-PER-FACTOR", "ONE-FACTOR-AT-A-TIME",
+              "ISO-IS-CISO1-CARRIERS", "NO-CTL-AT-NEW-CONFIGS", "ONE-NETWORK-RESNET", "HORIZON-100-ONLY", "ALPHA0-1E-6",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    if branch not in ("UNRESOLVED-DIVERGED", "ANCHOR-FAILED"):
+        stamps.append("ANCHOR-REPRODUCES")
+        for X in FACTORS:
+            k, l, i = M[X + "k01"], M[X + "kL"], M[X + "ISO"]
+            if k - M["k01"] >= RESCUE_BAR:
+                stamps.append("%s-K01-LIFTED" % X)
+            if abs(k - M["k01"]) <= NULL_BAR:
+                stamps.append("%s-K01-AT-ANCHOR" % X)
+            if k < M["k01"] - MATCH_BAR:
+                stamps.append("%s-K01-BELOW-ANCHOR" % X)
+            if M["kL"] - l >= RESCUE_BAR:
+                stamps.append("%s-KL-DROPPED" % X)
+            if collapse_word(k, l) == "COLLAPSE-ATTENUATED" and l - k <= RESCUE_BAR:
+                stamps.append("%s-GAP-TOO-SMALL-FOR-ISO" % X)
+            if collapse_word(k, l) in ("COLLAPSE-IS-CONFIG", "REF-UNHEALTHY"):
+                stamps.append("%s-ISO-%s" % (X, "AT-REF" if i >= l - MATCH_BAR else "BELOW-REF"))
+            if i > l + MATCH_BAR:
+                stamps.append("%s-ISO-ABOVE-REF" % X)
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in ARMS if a != "k01"):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    qual = [(M[x] - M[y], MT[x] - MT[y]) for _n, x, y in C]
+    stamps.append("TRAIN-AGREES" if all((t > 0) == (p > 0) for p, t in qual if abs(p) >= RESCUE_BAR) else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    for X in FACTORS:
+        k, l, i = M[X + "k01"], M[X + "kL"], M[X + "ISO"]
+        print("  %s: k01 %.4f  kL %.4f  ISO %.4f -> %s / %s   (gap %.4f, k01/kL %.4f, ISO-kL %.4f)"
+              % (X, k, l, i, collapse_word(k, l), iso_word(k, l, i, collapse_word(k, l)), l - k, k / l, i - l))
+    print("  rebuilt FINAL: %s" % final)
+    emit("")
+    emit("=" * 78)
+    emit(final)
+    emit("=" * 78)
+
+    # ---------------- [6] between-batch and descriptive
+    emit("")
+    emit("BETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cmo1 bar or contrast):")
+    for b, kv in BETWEEN:
+        emit("  %s: %s" % (b, "  ".join("%s %.4f" % x for x in kv)))
+    emit("  cmo1 {108,109,110}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+
+    print("\n[6] DESCRIPTIVE CARRIER SHARE (probe records; share of sum_t |z_tensor| per tensor, mean over seeds)")
+    emit("")
+    emit("DESCRIPTIVE (NON-GATING, after FINAL): share of sum_t |z_tensor| per tensor on the scalar arms, mean over seeds")
+    shares = {}
+    for a in ("k01", "M9k01", "W0k01"):
+        tot, n = None, 0
+        for s in SEEDS:
+            p = os.path.join(runsdir, PREFIX, "probe_%s" % run_name(a, s), "probe.jsonl")
+            if not os.path.exists(p):
+                continue
+            acc = [0.0] * NTENS
+            nrec = 0
+            for ln in open(p):
+                try:
+                    z = json.loads(ln).get("z_tensor")
+                except ValueError:
+                    continue
+                if z and len(z) == NTENS:
+                    nrec += 1
+                    for j, x in enumerate(z):
+                        if x is not None and not (math.isnan(x) or math.isinf(x)):
+                            acc[j] += abs(x)
+            S = sum(acc)
+            if S > 0:
+                sh = [x / S for x in acc]
+                tot = sh if tot is None else [u + v for u, v in zip(tot, sh)]
+                n += 1
+        tot = [x / n for x in tot]
+        shares[a] = tot
+        top = sorted(range(NTENS), key=lambda j: -tot[j])[:5]
+        emit("  %-6s (%d seeds) carriers %s   top5 %s"
+             % (a, n, " ".join("%d:%.3f" % (i, tot[i - 1]) for i in CARRIER_IDX),
+                " ".join("%d:%s:%.3f" % (j + 1, NAMES[j], tot[j]) for j in top)))
+        print("  %-6s carriers 50/53/59 = %.3f / %.3f / %.3f (sum %.3f); top tensor %s %.3f"
+              % (a, tot[49], tot[52], tot[58], tot[49] + tot[52] + tot[58], NAMES[top[0]], tot[top[0]]))
+
+    emit("")
+    emit("WHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in licence_lines(branch):
+        emit("  " + ln)
+    emit("")
+    emit("WHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    emit("  * Any other network, dataset, horizon, meta optimiser, meta step, alpha0 or clip (RULE 11).")
+    emit("  * The parent's exact configuration: momentum 0.9 here keeps alpha0 1e-6 (parent Table 4 row: 1e-5, alignment UNSURE).")
+    emit("  * An interaction (momentum 0.9 AND WD 0 together was not run) or a dose curve (one value per factor).")
+    emit("  * Carrier SPECIFICITY at M9 / W0 (no matched control there) or that ciso1's tensors are still the top voters there.")
+    emit("  * For W0, which route: WD on the gammas vs WD inside the meta trace (both removed together).")
+    emit("  * Point agreement for an arm at the k01 level: such readings are LOCATIONS (164.6).")
+
+    # ---------------- [7] line-by-line agreement
+    print("\n[7] LINE-BY-LINE AGREEMENT WITH THE SCORER LOG")
+    got = open(logpath).read().splitlines()
+    nmis = 0
+    if len(got) != len(L):
+        bad("scorer log has %d lines, this parser rebuilt %d" % (len(got), len(L)))
+    for i in range(max(len(got), len(L))):
+        gl = got[i] if i < len(got) else "<missing>"
+        ml = L[i] if i < len(L) else "<not rebuilt>"
+        if ml.startswith("@SUFFIX@"):
+            if gl.endswith(ml[len("@SUFFIX@"):]) and gl.startswith("  manifest: " if "MANIFEST" in ml else "  provenance: "):
+                continue
+            nmis += 1
+            bad("line %d host-path line does not end with the expected suffix: %r" % (i + 1, gl))
+            continue
+        if gl != ml:
+            nmis += 1
+            if nmis <= 20:
+                bad("line %d\n      scorer: %r\n      mine:   %r" % (i + 1, gl, ml))
+    (ok if nmis == 0 else bad)("every one of the %d scorer lines rebuilt independently and matched (2 host-path lines by suffix)"
+                               % len(got), "%d mismatched" % nmis)
+    gfin = [ln for ln in got if ln.startswith("FINAL:")]
+    (ok if gfin == [final] else bad)("FINAL identical, token by token")
+    for tok_mine, tok_log in zip(final.split(" | "), (gfin[0] if gfin else "").split(" | ")):
+        if tok_mine != tok_log:
+            bad("FINAL token %r vs %r" % (tok_mine, tok_log))
+
+    # ---------------- descriptive, not registered
+    print("\n[D1] DESCRIPTIVE / UNSURE -- the ARGS witness per arm (for the corpus-exclusion stage, 255.7)")
+    print("     definition: the tokens of the run's own argparse line; identical on all 3 seeds of the arm.")
+    for a in ARMS:
+        m, w, gr = argswit[a]
+        print("     %-6s ARGS --momentum-param-base %-4s --weight-decay-base %-3s --stepsize-groups %s"
+              % (a, m, w, gr if gr != ISOSPEC else "ISO(sets:1-49,51-52,54-58,60-62/3 carriers)"))
+    nondef = [a for a in ARMS if (MOM[a], WDC[a]) != ("0.99", "0.1")]
+    print("     rows whose ARGS carries a NON-DEFAULT base momentum or base WD (the exclusion stage owes these):")
+    for a in nondef:
+        for s in SEEDS:
+            r = runs[(a, s)]
+            wit = ("ARGS --momentum-param-base 0.9" if factor_of(a) == "M9" else "ARGS --weight-decay-base 0")
+            print("       %-14s job %d   witness: %s" % (run_name(a, s), r["job"], wit))
+    print("     %d rows (9 M9 + 9 W0); the 9 anchor rows are plain 0.99 / 0.1 and pool normally." % (len(nondef) * len(SEEDS)))
+
+    print("\n[D2] DESCRIPTIVE / UNSURE -- does k01 still collapse, does ISO still rescue (same numbers, in words)")
+    for X in FACTORS:
+        k, l, i = M[X + "k01"], M[X + "kL"], M[X + "ISO"]
+        print("     %s: k01 %.4f vs its own kL %.4f -> gap %.4f pp, ratio %.4f (collapse bars: gap >= 20 AND ratio <= 0.50)"
+              % (X, k, l, l - k, k / l))
+        print("        ISO %.4f; ISO - kL = %+.4f (rescue bar: within 5 pp of kL); ISO - k01 = %+.4f" % (i, i - l, i - k))
+    print("     anchor in the same batch: k01 %.4f, kL %.4f, ISO %.4f (gap %.4f, ratio %.4f)"
+          % (M["k01"], M["kL"], M["ISO"], M["kL"] - M["k01"], M["k01"] / M["kL"]))
+
+    print("\n[D3] DESCRIPTIVE / UNSURE -- carrier nomination from the probe records (500 records per run, all steps)")
+    for a in ("k01", "M9k01", "W0k01"):
+        tot = shares[a]
+        top = sorted(range(NTENS), key=lambda j: -tot[j])[:5]
+        print("     %-6s ciso1's trio share %.3f; top5 %s"
+              % (a, tot[49] + tot[52] + tot[58], ", ".join("%s %.3f" % (NAMES[j], tot[j]) for j in top)))
+    print("     UNSURE: a share readout is not a nomination test; no control arm at M9 / W0 (S4 is SHOULD-tier).")
+
+    print("\n[D4] DESCRIPTIVE / UNSURE -- TEST (TRAIN) at epochs 9 / 19 / 49 / 99, arm mean over the 3 seeds")
+    print("     record boundary: the run's own `Epoch <n>` lines, 0-indexed; the final epoch line is printed twice by")
+    print("     the harness and is read once (dict by epoch); seeds are the batch's own 108/109/110, no split.")
+    for a in ARMS:
+        cells = []
+        for e in (9, 19, 49, 99):
+            te = mean([runs[(a, s)]["eps"][e][1] for s in SEEDS])
+            tr = mean([runs[(a, s)]["eps"][e][0] for s in SEEDS])
+            cells.append("e%-2d %6.2f (%6.2f)" % (e, te, tr))
+        print("     %-6s %s" % (a, "  ".join(cells)))
+
+    print("\n" + "=" * 100)
+    print("VIOLATIONS %d" % len(VIOL))
+    print("=" * 100)
+    return 0 if not VIOL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

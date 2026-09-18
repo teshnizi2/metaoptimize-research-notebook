@@ -1,0 +1,1773 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cVT10_onevsthree_score.py -- THE REGISTERED SCORER FOR `cvt10`:
+#   ResNet18_c100: ONE CARRIER vs THREE AT PlainNet's DOSE.  (CORRECTIONS 258; LIMITS-PREP 5.1 R1, refined)
+#   ONE SUBMISSION, 30 JOBS (10 arms x 3 seeds), 100 EPOCHS, SEEDS {120,121,122}, ResNet18_c100 / CIFAR-100, ciso1's cell,
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM, run from the EXISTING isolated tree $WS/harness_cvt8 (UNCHANGED; HF.py
+#   5197dc2e...; every switch OFF unless set) with cvt8's runner $WS/jobs/run_cifar_cvt8.sh (UNCHANGED).  NO NEW HARNESS
+#   CODE: PATCH_GROUPHOLD (243) names a group by its COMPLETE membership, one or more names, and any group index.
+#
+# Committed BEFORE any cvt10 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cVT10_onevsthree_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# FROZEN BARS (O2).  Every bar, sigma and tolerance score() uses is a LITERAL here; score() reads the corpus ONLY for a
+# row-count disclosure.  The only data-dependent term that can enter a bar is SIGMA_INBATCH through compose_sigma()
+# (ONE argument).  --selftest proves the FINAL line invariant across four corpora.  The noise floor is read through
+# analysis/corpus_exclusions.filter_rows (OPERATIONS 36).
+#
+# THE ARMS (the carriers: 50 layer4.0.bn2.weight, 53 layer4.0.shortcut.1.weight, 59 layer4.1.bn2.weight; every held arm
+# holds GROUP 1 on tri:9428 = PlainNet's dose, bitwise cvt4 / cvt6 / cvt8's schedule; everything else is Lion)
+#   k01        scalar                                         floor anchor
+#   ISO        [59,3]   {50,53,59} free                       positive control (byte-identical to ciso1 / cdep1 / cvt8)
+#   HOLDBIG3   [59,3]   {50,53,59} held tri:9428              cvt8 HOLDBIG replicate (the three-carrier stall, in batch)
+#   ONE50      [61,1]   {50} free                             ciso1 / cdep1 ONE, byte-identical (rescued 64.2-65.4)
+#   ONE50BIG   [61,1]   {50} held tri:9428
+#   ONE59      [61,1]   {59} free                             never run
+#   ONE59BIG   [61,1]   {59} held tri:9428
+#   ONE53      [61,1]   {53} free                             never run (the shortcut BN, Kim et al.'s gamma_down)
+#   ONE53BIG   [61,1]   {53} held tri:9428
+#   ISOSPLIT   [59,1,2] {50} held tri:9428, {53,59} free in their own group   (no free twin run: NO-FREE-SPLIT-CONTROL)
+#   tri:<P>: u(n) = min(n-1, P) - max(0, n-1-P); beta = min(hi, max(lo, b0 + ms u(n))).
+#
+# CO-PRIMARY (in batch; bounded in neither direction):
+#   P_ONE50 = ONE50 - ONE50BIG;  P_ONE59 = ONE59 - ONE59BIG;  P_ONE53 = ONE53 - ONE53BIG
+# KEY: D_ISO = ISO - k01; R_HB3 = ISO - HOLDBIG3; P_SPLIT = ISO - ISOSPLIT; Q_SPLIT = ISOSPLIT - ONE50BIG;
+#      E_<s> = ONE<s>BIG - HOLDBIG3; D_<arm> = arm - k01.   DESCRIPTIVE: L_LAST_DOWN = mean(P_ONE50, P_ONE59) - P_ONE53.
+#
+# BRANCH MAP (decide(); first match wins):
+#   UNRESOLVED-DIVERGED (a seed range > 5) -> SCALAR-NOT-COLLAPSED (k01 > 30) -> POSITIVE-CONTROL-FAILED (ISO-k01 < 20)
+#   -> REPLICATE-FAILED (HOLDBIG3 > k01 + 2: cvt8's DOSE-FULL criterion, not reproduced at new seeds)
+#   otherwise FIVE words "<SUMMARY>+ONE50-<W>+ONE59-<W>+ONE53-<W>+SPLIT-<W>":
+#     ONE<s>-<W>  ONE<s> < k01 + 10 -> UNREADABLE (the singleton's own isolation does not rescue enough to read a hold);
+#                 ONE<s>BIG <= k01 + 2 -> STALLS; ONE<s>BIG >= ONE<s> - 5 -> NO-EFFECT; else PARTIAL
+#     SPLIT-<W>   ISOSPLIT <= k01 + 2 -> STALLS; >= ISO - 5 -> NO-EFFECT; else PARTIAL
+#     SUMMARY     any ONE<s>-STALLS -> ONE-SUFFICES; else ONE50 and ONE59 both readable -> NO-ONE-SUFFICES; else ONE-UNRESOLVED
+# The BROKEN-SINGLETON-HOLD null (a hold that never bit on a one-tensor group) predicts every ONE<s>BIG == ONE<s> and
+# ISOSPLIT at ISO, i.e. NO-ONE-SUFFICES+...-NO-EFFECT x3+SPLIT-NO-EFFECT EXACTLY: G-BITE separates it, before any level.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import inspect
+import io
+import json
+import math
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+PREFIX = "cvt10"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (120, 121, 122)
+SEED_BLOCK = (120, 121, 122, 123)       # pre-assigned; 123 is NOT used (3 seeds / arm, LIMITS-PREP 5 conventions)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+ARMS = ("k01", "ISO", "HOLDBIG3", "ONE50", "ONE50BIG", "ONE59", "ONE59BIG", "ONE53", "ONE53BIG", "ISOSPLIT")
+HELD = ("HOLDBIG3", "ONE50BIG", "ONE59BIG", "ONE53BIG", "ISOSPLIT")
+SINGLES = ((50, "ONE50", "ONE50BIG"), (59, "ONE59", "ONE59BIG"), (53, "ONE53", "ONE53BIG"))
+FREE_TWIN = {"HOLDBIG3": "ISO", "ONE50BIG": "ONE50", "ONE59BIG": "ONE59", "ONE53BIG": "ONE53"}
+
+CARRIER_IDX = (50, 53, 59)
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+NAME_OF = dict(zip(CARRIER_IDX, CARRIERS))
+ISOSPEC = "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight"
+ONE50SPEC = "sets:1-49,51-62/layer4.0.bn2.weight"
+ONE59SPEC = "sets:1-58,60-62/layer4.1.bn2.weight"
+ONE53SPEC = "sets:1-52,54-62/layer4.0.shortcut.1.weight"
+SPLITSPEC = "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight/layer4.0.shortcut.1.weight,layer4.1.bn2.weight"
+SPEC = {"k01": "scalar", "ISO": ISOSPEC, "HOLDBIG3": ISOSPEC, "ONE50": ONE50SPEC, "ONE50BIG": ONE50SPEC,
+        "ONE59": ONE59SPEC, "ONE59BIG": ONE59SPEC, "ONE53": ONE53SPEC, "ONE53BIG": ONE53SPEC, "ISOSPLIT": SPLITSPEC}
+PT_TYPE = dict((a, "scalar" if SPEC[a] == "scalar" else "blockwise") for a in ARMS)
+HOLD_IDX = {"HOLDBIG3": (50, 53, 59), "ONE50BIG": (50,), "ONE59BIG": (59,), "ONE53BIG": (53,), "ISOSPLIT": (50,)}
+SIZES = {"k01": [62], "ISO": [59, 3], "HOLDBIG3": [59, 3], "ONE50": [61, 1], "ONE50BIG": [61, 1], "ONE59": [61, 1],
+         "ONE59BIG": [61, 1], "ONE53": [61, 1], "ONE53BIG": [61, 1], "ISOSPLIT": [59, 1, 2]}
+P_BIG = 9428                           # 237.3 RULE P on PlainNet MUTE's shared beta; cvt4 / cvt6 / cvt8 HOLDBIG's schedule
+P_HIGH_CVT8 = 8609                     # cvt8's HOLDHIGH (k01's own dose on ResNet) -- selftest only, never an arm here
+MS = 1e-3
+B2 = 0.9
+LO, HI = -15.0, -2.3026
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+B0 = f32(math.log(1e-6))               # -13.815510749816895
+
+
+def grouphold_of(arm):
+    if arm not in HOLD_IDX:
+        return ""
+    return "%s:tri:%d" % ("+".join(NAME_OF[i] for i in sorted(HOLD_IDX[arm])), P_BIG)
+
+
+def witness_gh_of(idx, P=P_BIG, g=1):
+    if idx is None:
+        return "GROUP_HOLD: off"
+    names = "+".join(NAME_OF[i] for i in sorted(idx))
+    return ("GROUP_HOLD: on type=blockwise group=%d groupsize=%d names=%s mode=tri P=%d b0=%r ms=%r lo=%r hi=%r peak=%r"
+            % (g, len(idx), names, P, B0, MS, LO, HI, min(HI, max(LO, B0 + MS * P))))
+
+
+GROUPHOLD = dict((a, grouphold_of(a)) for a in ARMS)
+WITNESS_GH = dict((a, witness_gh_of(HOLD_IDX.get(a))) for a in ARMS)
+WITNESS_VW = "VOTE_W: off"
+WITNESS_BH = "BETA_HOLD: off"
+WITNESS_RH = "REST_HOLD: off"          # cvt8's tree prints it on every run; REST_HOLD is never set here
+
+NTENS = 62
+TOTPAR = 11220132
+N_BATCHNORM = 20
+LIVE_BN_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+HF_LIVE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+HF_CVT7_SHA = "2396f2be8102724c120ea5271d2d84acf3835ffb9a5c7947fc282121cf2a588f"      # cvt7's tree (PATCH_GROUPHOLD)
+HF_POST_SHA = "5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9"     # cvt8's tree: THE tree this batch runs
+RUNNER_SHA = "1dbe4ff52eccbbb1c9936f4a687ed88172dd41c48b14ae60eb353b45f766f5e0"      # $WS/jobs/run_cifar_cvt8.sh
+CVT7_RUNNER_SHA = "805267e4cbcc64172d79824d553a2577ef7cdd55fb8f5e7731c0ea3251a04c56"
+LIVE_RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+HF_CVT9_SHA = "816e3357"               # prefix only, printed in selftest E as a wrong-tree provenance
+
+# ---- the noise floor, FROZEN (O2), through corpus_exclusions.filter_rows (selftest C re-derives it) --------
+SIGMA_R18ALL = 0.6811983409351905      # ResNet18_c100 std cell, any granularity, FILTERED, cvt10 excluded; df 221, 46 cells
+SIGMA_R18ALL_DF = 221
+SIGMA_R18ALL_NAIVE = 7.155901812067415  # UNFILTERED (OPERATIONS 36 trap) -- disclosure only
+SIGMA_PRIOR = 0.6811983409351905
+SE_PRIOR = 0.556197                    # SIGMA_PRIOR * sqrt(2/3)
+REG_CORPUS_SHA256 = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+REG_CORPUS_ROWS = 3127
+REG_EXCLUSIONS_SHA256 = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+
+# ---- the bars, FROZEN -----------------------------------------------------------------
+GAP_MIN = 20.0
+K01_MAX = 30.0
+RESCUE_BAR = 10.0                      # TRAIN agreement only
+NULL_BAR = 2.0
+MATCH_BAR = 5.0
+READ_MARGIN = 10.0                     # a singleton's free arm must sit >= 10 pp above k01 for its hold to be read
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+TIE_REL = 1e-12
+STEPS_PER_EPOCH = 50000 // BATCH
+N_RECORDS = EPOCHS * STEPS_PER_EPOCH // PROBE      # 500
+
+# ---- between-batch references, NON-GATING ----------------------------------------------
+R_BETWEEN = {"cvt8": {"k01": 23.0553, "ISO": 70.2613, "HOLDBIG": 19.3780},
+             "ciso1": {"k01": 23.2807, "ISO": 70.2113, "ONE": 64.7500}, "cdep1": {"k01": 23.3520, "ISO": 70.0440, "ONE": 64.8267}}
+R18_PER_RUN_GPUH = 0.82                # cvt8 sacct: 17.30 GPU-h / 21 runs
+
+# ---- the floor table (UNSURE) -----------------------------------------------------------------
+K01_PL = (18.0, 28.0)
+ISO_PL = (62.0, 78.0)
+STALL_PL = (14.0, 26.0)                # at or below the k01 location (cvt8 HOLDBIG 19.38)
+ONEF_PL = (56.0, 72.0)                 # a rescuing singleton (ciso1 / cdep1 ONE 64.2-65.4)
+PART_PL = (34.0, 48.0)
+SPART_PL = (34.0, 56.0)
+
+
+def _acc(hb3=STALL_PL, f50=ONEF_PL, b50=STALL_PL, f59=ONEF_PL, b59=STALL_PL, f53=ONEF_PL, b53=STALL_PL, split=STALL_PL):
+    return {"k01": K01_PL, "ISO": ISO_PL, "HOLDBIG3": hb3, "ONE50": f50, "ONE50BIG": b50, "ONE59": f59, "ONE59BIG": b59,
+            "ONE53": f53, "ONE53BIG": b53, "ISOSPLIT": split}
+
+
+ACCOUNTS = {
+    "EVERY SINGLE CARRIER SUFFICES": _acc(),
+    "GAMMA_LAST ONLY (Kim: last-in-branch, not shortcut)": _acc(b53=ONEF_PL),
+    "ONE50 ONLY": _acc(b59=PART_PL, b53=ONEF_PL),
+    "HELD SET NEEDED, EACH SINGLE PARTIAL": _acc(b50=PART_PL, b59=PART_PL, b53=PART_PL, split=SPART_PL),
+    "HELD SET NEEDED, NO SINGLE BITES": _acc(b50=ONEF_PL, b59=ONEF_PL, b53=ONEF_PL, split=ISO_PL),
+    "SINGLE STALLS ONLY WITH THE OTHERS VOTING IN THE COMPLEMENT": _acc(split=ISO_PL),
+    "ONLY THE SPLIT STALLS": _acc(b50=PART_PL, b59=PART_PL, b53=ONEF_PL),
+    "SHORTCUT ISOLATION DOES NOT RESCUE": _acc(f53=K01_PL, b53=K01_PL),
+    "ONE59 ISOLATION DOES NOT RESCUE": _acc(b50=PART_PL, f59=K01_PL, b59=K01_PL, b53=ONEF_PL, split=SPART_PL),
+    "HOLDBIG3 DOES NOT REPLICATE": _acc(hb3=PART_PL),
+    "BROKEN-SINGLETON-HOLD (null)": _acc(b50=ONEF_PL, b59=ONEF_PL, b53=ONEF_PL, split=ISO_PL),
+}
+EXPECTED_BRANCH = {
+    "EVERY SINGLE CARRIER SUFFICES": "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-STALLS+SPLIT-STALLS",
+    "GAMMA_LAST ONLY (Kim: last-in-branch, not shortcut)": "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-NO-EFFECT+SPLIT-STALLS",
+    "ONE50 ONLY": "ONE-SUFFICES+ONE50-STALLS+ONE59-PARTIAL+ONE53-NO-EFFECT+SPLIT-STALLS",
+    "HELD SET NEEDED, EACH SINGLE PARTIAL": "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-PARTIAL+ONE53-PARTIAL+SPLIT-PARTIAL",
+    "HELD SET NEEDED, NO SINGLE BITES": "NO-ONE-SUFFICES+ONE50-NO-EFFECT+ONE59-NO-EFFECT+ONE53-NO-EFFECT+SPLIT-NO-EFFECT",
+    "SINGLE STALLS ONLY WITH THE OTHERS VOTING IN THE COMPLEMENT": "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-STALLS+SPLIT-NO-EFFECT",
+    "ONLY THE SPLIT STALLS": "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-PARTIAL+ONE53-NO-EFFECT+SPLIT-STALLS",
+    "SHORTCUT ISOLATION DOES NOT RESCUE": "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-UNREADABLE+SPLIT-STALLS",
+    "ONE59 ISOLATION DOES NOT RESCUE": "ONE-UNRESOLVED+ONE50-PARTIAL+ONE59-UNREADABLE+ONE53-NO-EFFECT+SPLIT-PARTIAL",
+    "HOLDBIG3 DOES NOT REPLICATE": "REPLICATE-FAILED",
+    "BROKEN-SINGLETON-HOLD (null)": "NO-ONE-SUFFICES+ONE50-NO-EFFECT+ONE59-NO-EFFECT+ONE53-NO-EFFECT+SPLIT-NO-EFFECT",
+}
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^cvt10-(k01|ISO|HOLDBIG3|ONE50|ONE50BIG|ONE59|ONE59BIG|ONE53|ONE53BIG|ISOSPLIT)-s(\d+)-(\d+)\.out$")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=%d type=(scalar|layerwise|blockwise) tensors=%d " % (PROBE, NTENS))
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =============================================================================
+# the schedule and the Lion recomputation -- pure functions
+# =============================================================================
+def u_of(n, P):
+    if n <= 0:
+        return 0
+    return min(n - 1, P) - max(0, n - 1 - P)
+
+
+def v_of(n, P=P_BIG, b0=B0):
+    return f32(min(HI, max(LO, b0 + MS * u_of(n, P))))
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    a, b = B2 * mom_pre, (1 - B2) * z
+    L = a + b
+    tie = abs(L) <= TIE_REL * (abs(a) + abs(b))
+    s = (L > 0) - (L < 0)
+    return max(LO, min(HI, beta_pre - MS * s)), tie
+
+
+def hold_value(arm, n):
+    return v_of(n, P_BIG)
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+# =============================================================================
+# the frozen manifest (no torch).  The launcher's guard 4d proves the LIVE manifest BYTE-IDENTICAL.
+# =============================================================================
+def r18_tensors():
+    t = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [(pre + "conv1.weight", w * cin * 9, "Conv2d"), (pre + "bn1.weight", w, "BatchNorm2d"),
+                  (pre + "bn1.bias", w, "BatchNorm2d"), (pre + "conv2.weight", w * w * 9, "Conv2d"),
+                  (pre + "bn2.weight", w, "BatchNorm2d"), (pre + "bn2.bias", w, "BatchNorm2d")]
+            if stride != 1 or cin != w:
+                t += [(pre + "shortcut.0.weight", w * cin, "Conv2d"), (pre + "shortcut.1.weight", w, "BatchNorm2d"),
+                      (pre + "shortcut.1.bias", w, "BatchNorm2d")]
+        inp = w
+    return t + [("linear.weight", 512 * 100, "Linear"), ("linear.bias", 100, "Linear")]
+
+
+NAMES = [n for n, _q, _o in r18_tensors()]
+
+
+def parse_sets(spec, names):
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def arm_groups(arm, names=None):
+    names = names or NAMES
+    if SPEC[arm] == "scalar":
+        return [list(range(1, len(names) + 1))]
+    return parse_sets(SPEC[arm], names)
+
+
+def synthetic_manifest_text():
+    t = r18_tensors()
+    names = [n for n, _q, _o in t]
+    numel = [q for _n, q, _o in t]
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(t), "TOTAL_PARAMS %d" % sum(numel),
+             "NORM BatchNorm2d %d GroupNorm 0" % N_BATCHNORM,
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH)]
+    for i, (n, q, o) in enumerate(t, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("CARRIERS %s" % ",".join("%d:%s" % x for x in zip(CARRIER_IDX, CARRIERS)))
+    lines.append("HOLD B0 %r MS %r P_BIG %d" % (B0, MS, P_BIG))
+    for a in ARMS:
+        g = arm_groups(a, names)
+        if SPEC[a] == "scalar":
+            lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        else:
+            lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUPS1+ %s"
+                         % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                            ",".join(str(sum(numel[i - 1] for i in x)) for x in g),
+                            " / ".join(" ".join(names[i - 1] for i in x) for x in g[1:])))
+        lines.append("GROUPHOLD %s %s" % (a, GROUPHOLD[a] if GROUPHOLD[a] else "off"))
+        lines.append("WITNESS %s %s" % (a, WITNESS_GH[a]))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# run readers -- the RAW .out files are PRIMARY
+# =============================================================================
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    eps = {}
+    for a, b, c in EPTR_RE.findall(txt):
+        eps[int(a)] = (float(b), float(c))
+    lines = txt.splitlines()
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "vw": [ln for ln in lines if ln.startswith("VOTE_W")],
+           "bh": [ln for ln in lines if ln.startswith("BETA_HOLD")],
+           "gh": [ln for ln in lines if ln.startswith("GROUP_HOLD")],
+           "rh": [ln for ln in lines if ln.startswith("REST_HOLD")],
+           "ch": [ln for ln in lines if ln.startswith("COMP_HOLD")],
+           "wh": [ln for ln in lines if ln.startswith("WINDOW_HOLD")],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["plateau5"] is not None)
+    return rec
+
+
+def read_runs(runsdir):
+    """(arm, seed) -> the run.  The highest job id among COMPLETE runs wins."""
+    cand, notes = {}, []
+    if not runsdir or not os.path.isdir(runsdir):
+        return {}, notes
+    for fn in sorted(os.listdir(runsdir)):
+        m = OUT_RE.match(fn)
+        if not m:
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        rec = parse_run(os.path.join(runsdir, fn))
+        rec.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(rec)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d files (%d complete); using %s" % (k[0], k[1], len(lst), len(comp), pick["file"]))
+        got[k] = pick
+    return got, notes
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# corpus readers -- --selftest and a NON-GATING row-count disclosure ONLY, always through filter_rows
+# =============================================================================
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0"
+            and r.get("complete") == "1" and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r):
+    return (r.get("epochs_requested") == str(EPOCHS) and r.get("augment") == AUG and r.get("beta_clip") == CLIP
+            and r.get("meta_stepsize") == MST and r.get("alpha0") == A0 and r.get("batch_size") == str(BATCH))
+
+
+def pooled_sigma(rows, extra):
+    cells = {}
+    for r in rows:
+        if usable(r) and std_cell(r) and extra(r):
+            cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = mean(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+def net_is(net):
+    return lambda r: r.get("network") == net and r.get("dataset") == DSET
+
+
+# =============================================================================
+# probe records and G-BITE
+# =============================================================================
+def load_probe(runsdir, arm, seed, prefix=PREFIX, max_step=None):
+    """-> list of records, or None if absent.  Unparseable lines are None entries.  max_step (selftest only) keeps
+    records with step < max_step."""
+    for base in (os.path.join(runsdir, prefix), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (prefix, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            if max_step is not None:
+                recs = [r for r in recs if isinstance(r, dict) and isinstance(r.get("step"), int) and r["step"] < max_step]
+            return recs
+    return None
+
+
+GH_KEYS = ("gh_n", "gh_active", "gh_nat", "gh_held")
+FOREIGN_KEYS = ("bh_n", "bh_active", "bh_nat", "bh_held", "ch_n", "ch_active", "ch_nat", "ch_held",
+                "rh_n", "rh_active", "rh_nat", "rh_held", "wh_n", "wh_active", "wh_on")
+
+
+def _groupvec(r, key, ng):
+    v = r.get(key)
+    if not (isinstance(v, list) and len(v) == 1 and isinstance(v[0], list) and len(v[0]) == ng):
+        return None
+    return [float(x) for x in v[0]]
+
+
+def bite_check(arm, recs, every=PROBE, n_records=N_RECORDS):
+    """G-BITE for ONE run.  -> (ok, detail).  Pure function of the records.  Every held arm holds GROUP 1."""
+    ng = len(arm_groups(arm))
+    held = arm in HELD
+    d = {"n": 0, "nonfinite": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0, "bad_sched": 0,
+         "bad_sched_pre": 0, "bad_gh": 0, "keys_wrong": 0, "active_records": 0, "gh_active_last": None,
+         "worst_lion": 0.0, "worst_sched": 0.0, "ng": ng}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    prev = -1
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre = _groupvec(r, "beta_pre", ng)
+            mom = _groupvec(r, "mom_pre", ng)
+            z = _groupvec(r, "z_agg", ng)
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        s = r["step"]
+        if s != every * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        n = s + 2
+        for g in range(ng):
+            if held and g == 1:
+                continue
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst_lion"] = max(d["worst_lion"], e)
+            d["bad_lion"] += e > BH_TOL
+        d["keys_wrong"] += any(key in r for key in FOREIGN_KEYS)
+        has_gh = any(key in r for key in GH_KEYS)
+        if not held:
+            d["keys_wrong"] += has_gh
+            continue
+        es, ep = abs(beta[1] - hold_value(arm, n)), abs(bpre[1] - hold_value(arm, n - 1))
+        d["worst_sched"] = max(d["worst_sched"], es, ep)
+        d["bad_sched"] += es > BH_TOL
+        d["bad_sched_pre"] += ep > BH_TOL
+        try:
+            cn, ca, cnat, cheld = (int(r["gh_n"]), int(r["gh_active"]), float(r["gh_nat"]), float(r["gh_held"]))
+        except (KeyError, TypeError, ValueError):
+            d["bad_gh"] += 1
+            continue
+        nat1, tie1 = lion_natural(bpre[1], mom[1], z[1])
+        ok = (cn == n and abs(cheld - beta[1]) <= BH_TOL and 0 <= ca <= cn and ca >= prev
+              and (tie1 or abs(cnat - nat1) <= BH_TOL))
+        d["bad_gh"] += not ok
+        d["active_records"] += abs(cnat - cheld) > BH_TOL
+        prev = max(prev, ca)
+        d["gh_active_last"] = ca
+    ok = (len(recs) == n_records and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == n_records
+          and d["bad_step"] == 0 and d["bad_lion"] == 0 and d["keys_wrong"] == 0)
+    if held:
+        ok = (ok and d["bad_sched"] == 0 and d["bad_sched_pre"] == 0 and d["bad_gh"] == 0
+              and (d["gh_active_last"] is None or d["gh_active_last"] >= d["active_records"]))
+    return ok, d
+
+
+# =============================================================================
+# DESCRIPTIVE, NON-GATING probe readouts.  Nothing here reaches decide(), a gate or the FINAL line.
+# =============================================================================
+def beta_summary(recs, coord):
+    vals = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("beta"), list) and len(r["beta"]) > coord and isinstance(r.get("step"), int):
+            try:
+                v = float(r["beta"][coord])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                vals.append((r["step"], v))
+    if not vals:
+        return None
+    pin = None
+    kpk = max(range(len(vals)), key=lambda i: vals[i][1])
+    for k in range(kpk, len(vals)):
+        if all(math.exp(v + 15.0) <= 2.0 for _s, v in vals[k:]):
+            pin = vals[k][0] / float(STEPS_PER_EPOCH)
+            break
+    win = [math.exp(v + 15.0) for s, v in vals if 15 <= s / float(STEPS_PER_EPOCH) < 30]
+    win2 = [math.exp(v + 15.0) for s, v in vals if 30 <= s / float(STEPS_PER_EPOCH) < 60]
+    return {"last": vals[-1][1], "peak": vals[kpk][1], "peak_epoch": vals[kpk][0] / float(STEPS_PER_EPOCH),
+            "pin_epoch": pin, "r1530": mean(win), "r3060": mean(win2)}
+
+
+def descriptive_probe_readout(runsdir, runs):
+    print("\nDESCRIPTIVE, NON-GATING -- beta from the runs' own probe.jsonl; r = exp(beta + 15) over epochs 15-30 / 30-60;"
+          " pin = first r <= 2 for good; g0 = the complement (the shared step size of every tensor not isolated)")
+    for a in ARMS:
+        for s in SEEDS:
+            recs = load_probe(runsdir, a, s)
+            if not recs:
+                continue
+            parts = []
+            for coord in range(len(arm_groups(a))):
+                bs = beta_summary(recs, coord)
+                if bs:
+                    parts.append("g%d peak %.3f @%.1f pin %s r %.0f/%.0f" % (
+                        coord, bs["peak"], bs["peak_epoch"], "never" if bs["pin_epoch"] is None else "%.1f" % bs["pin_epoch"],
+                        bs["r1530"] or 0.0, bs["r3060"] or 0.0))
+            lg = [r for r in recs if isinstance(r, dict) and "gh_active" in r]
+            print("  %-9s s%d  %s  gh_active %s" % (a, s, " | ".join(parts), lg[-1]["gh_active"] if lg else "-"))
+    ep_list = (9, 14, 16, 17, 18, 19, 24, 29, 39, 49, 99)
+    print("\nDESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) at epoch lines %s" % " / ".join(str(e) for e in ep_list))
+    for a in ARMS:
+        cells = []
+        for e in ep_list:
+            te = [runs[(a, s)]["eps"][e][1] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            tr = [runs[(a, s)]["eps"][e][0] for s in SEEDS if e in runs[(a, s)]["eps"]]
+            cells.append("%.1f (%.1f)" % (mean(te), mean(tr)) if te else "n/a")
+        print("  %-9s %s" % (a, " / ".join(cells)))
+
+    def am(arm, e):
+        v = [runs[(arm, s)]["eps"][e][1] for s in SEEDS if e in runs[(arm, s)]["eps"]]
+        return mean(v) if len(v) == len(SEEDS) else None
+    for x, y in (("ISO", "HOLDBIG3"), ("ONE50", "ONE50BIG"), ("ONE59", "ONE59BIG"), ("ONE53", "ONE53BIG"),
+                 ("ISO", "ISOSPLIT"), ("ISOSPLIT", "ONE50BIG")):
+        first = None
+        for e in range(EPOCHS):
+            if all(am(x, f) is not None and am(y, f) is not None and abs(am(x, f) - am(y, f)) > 2.0 for f in range(e, EPOCHS)):
+                first = e
+                break
+        print("  first epoch line from which |arm-mean TEST %s - %s| stays > 2 pp: %s" % (x, y, "never" if first is None else first))
+
+
+# =============================================================================
+# THE BRANCH MAP -- a pure function of the in-batch means and one flag
+# =============================================================================
+def state(L, M):
+    if L >= M["ISO"] - MATCH_BAR:
+        return "AT-ISO"
+    if L <= M["k01"] + NULL_BAR:
+        return "AT-K01"
+    return "BETWEEN"
+
+
+def single_word(M, s):
+    free, big = "ONE%d" % s, "ONE%dBIG" % s
+    pfx = "ONE%d" % s
+    if M[free] < M["k01"] + READ_MARGIN:
+        return pfx + "-UNREADABLE"
+    if M[big] <= M["k01"] + NULL_BAR:
+        return pfx + "-STALLS"
+    if M[big] >= M[free] - MATCH_BAR:
+        return pfx + "-NO-EFFECT"
+    return pfx + "-PARTIAL"
+
+
+def split_word(M):
+    if M["ISOSPLIT"] <= M["k01"] + NULL_BAR:
+        return "SPLIT-STALLS"
+    if M["ISOSPLIT"] >= M["ISO"] - MATCH_BAR:
+        return "SPLIT-NO-EFFECT"
+    return "SPLIT-PARTIAL"
+
+
+def summary_word(w50, w59, w53):
+    if any(w.endswith("-STALLS") for w in (w50, w59, w53)):
+        return "ONE-SUFFICES"
+    if not w50.endswith("-UNREADABLE") and not w59.endswith("-UNREADABLE"):
+        return "NO-ONE-SUFFICES"
+    return "ONE-UNRESOLVED"
+
+
+def decide(M, diverged=False):
+    """M: arm -> mean plateau5."""
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M["ISO"] - M["k01"] < GAP_MIN:
+        return "POSITIVE-CONTROL-FAILED"
+    if M["HOLDBIG3"] > M["k01"] + NULL_BAR:
+        return "REPLICATE-FAILED"
+    w50, w59, w53 = single_word(M, 50), single_word(M, 59), single_word(M, 53)
+    return "%s+%s+%s+%s+%s" % (summary_word(w50, w59, w53), w50, w59, w53, split_word(M))
+
+
+READING = ("252.8(1)'s remaining confound (the ResNet stall at PlainNet's dose held THREE carriers together, PlainNet's held "
+           "idx 50 alone)")
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement about the" % (FLOOR_MIN, CEIL_MAX),
+                        "harness, not about held set.  " + READING + " stays as registered at 252."],
+    "PATCH-NOT-VERIFIED": [
+        "G-BITE failed: on at least one run the probe records do not show the registered hold -- group 1 on tri:9428 in beta",
+        "and beta_pre at every record -- (or show Lion's own value there, a hold key on a free arm, a touched unheld group,",
+        "the wrong schedule, a hold that acted only at probe steps, a gh_* record that does not audit, a foreign key, or",
+        "missing / short / unreadable records).  This is the BROKEN-SINGLETON-HOLD null or an unreadable witness: NO level",
+        "is read -- a one-tensor hold that never bit predicts EXACTLY NO-ONE-SUFFICES with every word NO-EFFECT.",
+        READING + " stays as at 252."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch; " + READING + " stays as at 252."],
+    "SCALAR-NOT-COLLAPSED": ["k01 did not sit at its collapsed level in batch (> %.0f pp).  Nothing to explain." % K01_MAX],
+    "POSITIVE-CONTROL-FAILED": [
+        "ISO (byte-identical to ciso1's / cdep1's / cvt8's) did not lift the scalar arm by %.0f pp in this batch." % GAP_MIN,
+        "No held-set statement is licensed.  Report and stop."],
+    "REPLICATE-FAILED": [
+        "HOLDBIG3 (cvt8's HOLDBIG, the same spec and GROUP_HOLD string) did not sit at the k01 location (<= k01 + %.0f pp) at" % NULL_BAR,
+        "new seeds.  Every single-carrier hold is read against the three-carrier stall, so none is read (words stamped as",
+        "UNBRANCHED-*).  EFFECT ON " + READING + ": cvt8's DOSE-FULL is PUT IN QUESTION by a failed replication (not rescinded)."],
+}
+LICENSE_SUMMARY = {
+    "ONE-SUFFICES": [
+        "ONE-SUFFICES: at least one carrier, isolated ALONE in its own step-size group and held on PlainNet's dose (tri:9428,",
+        "bitwise the schedule that stalled PlainNet and cvt8's HOLDBIG), with every other tensor -- the other two carriers",
+        "included -- sharing one free Lion step size, puts the run at the k01 location.  EFFECT ON " + READING + ": for that",
+        "carrier the held set is NOT needed at this dose; the PlainNet sentence (240 / 246: one tensor on this dose stalls)",
+        "TRANSFERS to ResNet18_c100 at this cell for that single tensor.  Sufficiency, at this cell only."],
+    "NO-ONE-SUFFICES": [
+        "NO-ONE-SUFFICES: neither last-in-branch carrier (50, 59), each isolated alone and held on PlainNet's dose with the",
+        "rest free, stalls the run (and the shortcut carrier 53 does not either, where readable), while the three held",
+        "together (HOLDBIG3) do.  EFFECT ON " + READING + ": the held set DIFFERS BY NETWORK at matched absolute dose -- on",
+        "ResNet18_c100 no single carrier on PlainNet's dose is sufficient in its own group; three together are.  Not",
+        "licensed: why (network, residual path, which pair would do); that no larger single-tensor dose would stall."],
+    "ONE-UNRESOLVED": [
+        "ONE-UNRESOLVED: no single carrier stalls, but at least one last-in-branch singleton (50 or 59) could not be read",
+        "because its own free isolation did not rescue by %.0f pp.  EFFECT ON %s: unresolved; report." % (READ_MARGIN, READING)],
+}
+LICENSE_WORD = {
+    "STALLS": "sits at the k01 location (<= k01 + %.0f pp) while its free twin rescues: this ONE tensor on PlainNet's dose is SUFFICIENT to stall." % NULL_BAR,
+    "PARTIAL": "sits more than %.0f pp below its free twin but above the k01 location: this ONE tensor on PlainNet's dose costs part of its own rescue." % MATCH_BAR,
+    "NO-EFFECT": "sits within %.0f pp of (or above) its free twin: holding this ONE tensor on PlainNet's dose does not measurably cost its rescue." % MATCH_BAR,
+    "UNREADABLE": "not read: the free singleton isolation sits < %.0f pp above k01, so a stall could not be told from no rescue." % READ_MARGIN,
+}
+SINGLE_ROLE = {50: "layer4.0.bn2.weight (last BN of the downsampling block's residual branch; Kim et al.'s gamma_last)",
+               59: "layer4.1.bn2.weight (last BN of the final block's residual branch; gamma_last)",
+               53: "layer4.0.shortcut.1.weight (the projection-shortcut BN; Kim et al.'s gamma_down)"}
+LICENSE_SPLIT = {
+    "SPLIT-STALLS": [
+        "SPLIT-STALLS: carrier 50 held on PlainNet's dose while 53 and 59 sit OUT of the complement's vote in their own free",
+        "group puts the run at the k01 location: the one-tensor hold does not need the other carriers voting in the shared",
+        "step size.  (NO-FREE-SPLIT-CONTROL: the [59,1,2] partition was not run free; a stall is still read, as a location.)"],
+    "SPLIT-PARTIAL": [
+        "SPLIT-PARTIAL: carrier 50 held on PlainNet's dose with 53 and 59 isolated free sits between k01 and ISO.  Because the",
+        "free [59,1,2] partition was NOT run (NO-FREE-SPLIT-CONTROL), part of the gap may be the partition itself; read as a",
+        "location only, no sentence about the hold's own cost."],
+    "SPLIT-NO-EFFECT": [
+        "SPLIT-NO-EFFECT: carrier 50 held on PlainNet's dose, with 53 and 59 isolated free, stays within %.0f pp of ISO: with" % MATCH_BAR,
+        "the other carriers out of the complement's vote the one-tensor hold does not stall."],
+}
+
+
+def licence_lines(branch):
+    if branch in LICENSE:
+        return LICENSE[branch]
+    parts = branch.split("+")
+    if len(parts) != 5 or parts[0] not in LICENSE_SUMMARY or parts[4] not in LICENSE_SPLIT:
+        return None
+    ws = parts[1:4]
+    for w, (s, _f, _b) in zip(ws, SINGLES):
+        if not w.startswith("ONE%d-" % s) or w[len("ONE%d-" % s):] not in LICENSE_WORD:
+            return None
+    if summary_word(*ws) != parts[0]:
+        return None
+    out = list(LICENSE_SUMMARY[parts[0]])
+    for w, (s, _f, _b) in zip(ws, SINGLES):
+        out.append("%s -- ONE%dBIG, %s, %s" % (w, s, SINGLE_ROLE[s], LICENSE_WORD[w[len("ONE%d-" % s):]]))
+    out += LICENSE_SPLIT[parts[4]]
+    words = dict((w.split("-", 1)[0], w.split("-", 1)[1]) for w in ws)
+    if parts[0] == "ONE-SUFFICES" and parts[4] == "SPLIT-NO-EFFECT" and words.get("ONE50") == "STALLS":
+        out += ["TOGETHER (ONE50-STALLS with SPLIT-NO-EFFECT): 50's hold stalls while 53 and 59 vote in the shared complement and",
+                "does not once they sit in their own free group -- the one-tensor stall needs the remaining carriers' vote in the",
+                "shared step size (the ctd1 vote route), at this dose.  Sufficiency both ways; no free [59,1,2] control."]
+    if parts[0] == "NO-ONE-SUFFICES" and parts[4] == "SPLIT-STALLS":
+        out += ["TOGETHER (NO-ONE-SUFFICES with SPLIT-STALLS): no singleton hold stalls with the other carriers voting in the",
+                "complement, yet 50's hold stalls with them isolated free -- the other carriers' presence in the complement's vote",
+                "PROTECTS the run against a single held carrier.  Sufficiency; no free [59,1,2] control."]
+    if (words.get("ONE50") == words.get("ONE59") and words.get("ONE53") != words.get("ONE50")
+            and "UNREADABLE" not in (words.get("ONE50"), words.get("ONE53"))):
+        out += ["CATEGORY (Kim et al., arXiv:2205.07260, positions of gamma in a residual block): the two gamma_last carriers read",
+                "alike (%s) and the gamma_down shortcut carrier reads differently (%s): the held-set answer follows the"
+                % (words.get("ONE50"), words.get("ONE53")),
+                "position category at this cell.  One tensor per category; not a category law."]
+    out += ["EFFECT ON " + READING + ": as the words say, at this cell only (ResNet18_c100, ciso1's cell, 100 epochs, the dose",
+            "fixed at tri:9428, every hold from init).  Readings at k01 are LOCATIONS (164.6)."]
+    return out
+
+
+def all_branches():
+    out = set(LICENSE)
+    W = ("STALLS", "PARTIAL", "NO-EFFECT", "UNREADABLE")
+    for a in W:
+        for b in W:
+            for c in W:
+                ws = ("ONE50-" + a, "ONE59-" + b, "ONE53-" + c)
+                for sp in LICENSE_SPLIT:
+                    out.add("%s+%s+%s+%s+%s" % ((summary_word(*ws),) + ws + (sp,)))
+    return out
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    print("=" * 78)
+    print(" cvt10 -- ResNet18_c100: ONE carrier vs THREE at PlainNet's dose  (PATCH_GROUPHOLD, cvt8's tree unchanged)")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-9s %-7s sizes %-10s GROUP_HOLD %s" % (a, PT_TYPE[a], ",".join(str(x) for x in SIZES[a]),
+                                                         GROUPHOLD[a] or "(unset)"))
+    print(" CO-PRIMARY: P_ONE50 = ONE50 - ONE50BIG; P_ONE59 = ONE59 - ONE59BIG; P_ONE53 = ONE53 - ONE53BIG.")
+    print(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)." % (EPOCHS - 5, EPOCHS - 1))
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+    runs, rnotes = read_runs(runsdir)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET, "NN-name": NET,
+                    "batch-size": str(BATCH), "num-epochs": str(EPOCHS), "meta-stepsize": MST, "alpha0": A0,
+                    "stepsize-groups": SPEC[a], "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                    "momentum-param-base": "0.99", "weight-decay-base": "0.1", "momentum-param-meta": "0.99",
+                    "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad]) if (dup or bad) else "")
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(re.sub(r" PROBE_DIR=\S*", "", ln) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()), "G-ENV one distinct ENV line, one per run",
+         "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is ciso1's / cdep1's / cvt8's, byte for byte (PROBE_DIR stripped)")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not PT_RE.match(r["pt"][0]) or PT_RE.match(r["pt"][0]).group(1) != PT_TYPE[a]]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`" % (PROBE, NTENS),
+         "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    print("\nG-VOTEW / G-BHOLD / G-RHOLD / G-CHOLD / G-WHOLD / G-GHOLD   ONE `VOTE_W: off`, ONE `BETA_HOLD: off`, ONE")
+    print("          `REST_HOLD: off`, NO COMP_HOLD or WINDOW_HOLD line, ONE GROUP_HOLD line == the arm's registered witness")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            hchk(r["vw"] == [WITNESS_VW], "G-VOTEW %s-s%d" % (a, s), "" if r["vw"] == [WITNESS_VW] else "got %r" % (r["vw"][:2],))
+            hchk(r["bh"] == [WITNESS_BH], "G-BHOLD %s-s%d" % (a, s), "" if r["bh"] == [WITNESS_BH] else "got %r" % (r["bh"][:2],))
+            hchk(r["rh"] == [WITNESS_RH], "G-RHOLD %s-s%d" % (a, s), "" if r["rh"] == [WITNESS_RH] else "got %r" % (r["rh"][:2],))
+            hchk(r["ch"] == [] and r["wh"] == [], "G-CHOLD/G-WHOLD %s-s%d" % (a, s),
+                 "" if r["ch"] == [] and r["wh"] == [] else "got %r %r" % (r["ch"][:1], r["wh"][:1]))
+            hchk(r["gh"] == [WITNESS_GH[a]], "G-GHOLD %s-s%d" % (a, s),
+                 "" if r["gh"] == [WITNESS_GH[a]] else "got %r" % ([x[:200] for x in r["gh"][:2]],))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == synthetic_manifest_text(), "G-STRUCT byte-identical to synthetic_manifest_text() (62 tensors, five partitions, the hold table)",
+             "%d vs %d bytes" % (len(txt), len(synthetic_manifest_text())))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        hchk(prov.get("MODE") == "submit", "G-PROV MODE submit", str(prov.get("MODE")))
+        hchk(prov.get("BUILD_NETWORK_SHA256") == LIVE_BN_SHA, "G-PROV build_network.py == the LIVE one %s..." % LIVE_BN_SHA[:12],
+             str(prov.get("BUILD_NETWORK_SHA256"))[:16])
+        hchk(prov.get("HF_SHA256") == HF_POST_SHA, "G-PROV HF.py == HF_POST_SHA %s... (cvt8's tree, unchanged)" % HF_POST_SHA[:12],
+             str(prov.get("HF_SHA256"))[:16])
+        hchk(prov.get("RUNNER_SHA256") == RUNNER_SHA, "G-PROV RUNNER_SHA256 == cvt8's runner %s..." % RUNNER_SHA[:12],
+             str(prov.get("RUNNER_SHA256"))[:16])
+        me = file_sha(os.path.abspath(__file__))
+        hchk(prov.get("SCORER_SHA256") == me, "G-PROV SCORER_SHA256 == this scorer's sha256 %s..." % me[:12],
+             str(prov.get("SCORER_SHA256"))[:16])
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-9s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        print("            seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    the registered hold reached beta at every record, and touched nothing else")
+    print("  (a) 500 records; (b) every UNHELD group == Lion recomputed from its own beta_pre/mom_pre/z_agg (tol %.0e);" % BH_TOL)
+    print("  (c) group 1 of every held arm: beta == tri:9428(step+2), beta_pre == tri:9428(step+1); (d) gh_* records audit;")
+    print("  (e) no gh_* key on a free arm, no bh_* / ch_* / rh_* / wh_* key anywhere.  Non-finite records are counted, not failed.")
+    bite_fail = []
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = load_probe(runsdir, a, s)
+            ok, d = bite_check(a, recs)
+            nonfin[(a, s)] = d["nonfinite"]
+            print("  %-4s G-BITE %-9s s%-3d groups %d records %s  bad %d  nonfinite %d  lion %d (ties %d, worst %.1e)  sched %d/%d"
+                  " (worst %.1e)  gh-audit %d  keys-wrong %d  gh_active %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, d["ng"], "absent" if recs is None else len(recs), d["bad_rec"], d["nonfinite"],
+                     d["bad_lion"], d["ties"], d["worst_lion"], d["bad_sched"], d["bad_sched_pre"], d["worst_sched"],
+                     d["bad_gh"], d["keys_wrong"], d["gh_active_last"], ("  (%s)" % d["why"]) if "why" in d else ""))
+            if not ok:
+                bite_fail.append("%s-s%d" % (a, s))
+    if bite_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | G-BITE failed on %s" % ",".join(bite_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / 3.0)
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/3)  (df_inbatch %d)" % (se, df))
+
+    C = {"P_ONE50": ("ONE50", "ONE50BIG"), "P_ONE59": ("ONE59", "ONE59BIG"), "P_ONE53": ("ONE53", "ONE53BIG")}
+    K = {"D_ISO": ("ISO", "k01"), "R_HB3": ("ISO", "HOLDBIG3"), "P_SPLIT": ("ISO", "ISOSPLIT"), "Q_SPLIT": ("ISOSPLIT", "ONE50BIG"),
+         "E_50": ("ONE50BIG", "HOLDBIG3"), "E_59": ("ONE59BIG", "HOLDBIG3"), "E_53": ("ONE53BIG", "HOLDBIG3")}
+    print("\nCONTRASTS (every one WITHIN batch)")
+    for nm, (x, y) in C.items():
+        v = M[x] - M[y]
+        print("  PRIMARY  %-8s = %-9s - %-9s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, T[x] - T[y]))
+    for nm, (x, y) in K.items():
+        v = M[x] - M[y]
+        print("  KEY      %-8s = %-9s - %-9s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)" % (nm, x, y, v, v / se, T[x] - T[y]))
+    for a in ARMS[2:]:
+        print("  KEY      D_%-9s = %-9s - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+              % (a, a, M[a] - M["k01"], (M[a] - M["k01"]) / se, T[a] - T["k01"]))
+    lld = ((M["ONE50"] - M["ONE50BIG"]) + (M["ONE59"] - M["ONE59BIG"])) / 2.0 - (M["ONE53"] - M["ONE53BIG"])
+    print("  DESCRIPTIVE L_LAST_DOWN = mean(P_ONE50, P_ONE59) - P_ONE53 = %+.4f pp" % lld)
+    print("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | READ_MARGIN %.1f pp (%.2f SE) | RESCUE %.1f pp"
+          % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, NULL_BAR, NULL_BAR / se, READ_MARGIN, READ_MARGIN / se, RESCUE_BAR))
+
+    print("\nG-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR, "" if not div else "  diverged: %s" % div))
+
+    branch = decide(M, bool(div))
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "HOLD-FROM-INIT", "BIG-IS-PLAINNET-DOSE", "SINGLETON-GROUPS", "NO-FREE-SPLIT-CONTROL",
+              "ONE-DOSE-ONLY", "ONE-NETWORK-RESNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    D_ISO = M["ISO"] - M["k01"]
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if D_ISO >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if D_ISO >= GAP_MIN:
+        for a in ARMS[2:]:
+            stamps.append("%s-%s" % (a, state(M[a], M)))
+        if branch == "REPLICATE-FAILED":
+            w = (single_word(M, 50), single_word(M, 59), single_word(M, 53))
+            stamps.append("UNBRANCHED-%s" % "+".join((summary_word(*w),) + w + (split_word(M),)))
+    for a in ARMS[2:]:
+        if M[a] - M["ISO"] > MATCH_BAR:
+            stamps.append("%s-ABOVE-ISO" % a)
+        if M[a] - M["k01"] < -NULL_BAR:
+            stamps.append("%s-BELOW-K01" % a)
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % a)
+    for _s, f, b in SINGLES:
+        if M[b] > M[f] + MATCH_BAR:
+            stamps.append("%s-ABOVE-%s" % (b, f))
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in HELD):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    if not branch.startswith(("UNRESOLVED", "SCALAR", "POSITIVE", "REPLICATE")):
+        ws = dict((w.split("-", 1)[0], w.split("-", 1)[1]) for w in branch.split("+")[1:4])
+        if ws["ONE50"] == ws["ONE59"] and ws["ONE53"] != ws["ONE50"] and "UNREADABLE" not in (ws["ONE50"], ws["ONE53"]):
+            stamps.append("KIM-CATEGORY-SPLIT")
+    qual = [(M[x] - M[y], T[x] - T[y]) for x, y in C.values()]
+    agree = all((t > 0) == (p > 0) for p, t in qual if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cvt10 bar or contrast):")
+    for b, dct in R_BETWEEN.items():
+        print("  %s: %s" % (b, "  ".join("%s %.4f" % kv for kv in dct.items())))
+    print("  cvt10 {120,121,122}: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+
+    try:
+        descriptive_probe_readout(runsdir, runs)
+    except Exception as ex:
+        print("  (descriptive probe readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in licence_lines(branch):
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Any other network, cell, dose or horizon; GroupNorm, VGG, PlainNet (RULE 11).")
+    print("  * Necessity: every reading is what a hold is SUFFICIENT to do.")
+    print("  * Why ResNet and PlainNet differ, a dose curve (one dose, tri:9428), or when the step size acts (holds from init).")
+    print("  * Any pair of carriers held together (not run), or a category law from one tensor per category.")
+    print("  * ISOSPLIT's cost relative to its own free partition (not run).")
+    print("  * Point agreement for an arm at the k01 level: such readings are LOCATIONS (164.6).")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_ENV = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+          "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+          "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 PROBE_DIR=/x/probe EB_RHO=na EB_LOG=0")
+_E_BASE = {"k01": 23.0, "ISO": 70.0, "HOLDBIG3": 19.5, "ONE50": 65.0, "ONE50BIG": 20.0, "ONE59": 64.0, "ONE59BIG": 21.0,
+           "ONE53": 65.5, "ONE53BIG": 66.0, "ISOSPLIT": 22.0}
+_E_BRANCH0 = "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-NO-EFFECT+SPLIT-STALLS"
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, gh=None, rh=None, vw=None,
+             bh=None, ch=None):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cvt10 --run-name %s" % (NET, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env, "NVIDIA L4, 23034 MiB",
+             WITNESS_VW if vw is None else vw, WITNESS_BH if bh is None else bh,
+             WITNESS_GH[arm] if gh is None else gh, WITNESS_RH if rh is None else rh, ch or "",
+             "Files already downloaded and verified", "Files already downloaded and verified",
+             "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 dir=/x"
+             % (PT_TYPE[arm], NTENS)]
+    lines = [ln for ln in lines if ln != ""]
+    for e in range(n_ep):
+        te = level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0))
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.9, te + 15.0), te))
+    if run_done:
+        lines += ["43  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_probe_records(arm, seed=0, n=N_RECORDS, as_P=None, unheld=False, touch_other=False, pre_natural=False,
+                     gh_forge=False, gh_off_by_one=False, strip_gh=False, add_gh=False, add_foreign=None, as_arm_groups=None):
+    """synthetic PROBE_TENSOR records consistent with the harness's Lion step and the arm's hold on group 1.
+    as_P: group 1 follows tri:<as_P> (wrong dose).  unheld: group 1 follows Lion (the null).  touch_other: the last unheld
+    group is moved off Lion.  pre_natural: beta_pre[1] is Lion's (hold only at probe steps).  add_foreign: a key prefix."""
+    import random
+    rnd = random.Random(10000 + seed + 7 * ARMS.index(arm))
+    ng = len(arm_groups(as_arm_groups or arm))
+    out = []
+    active = 0
+    P = as_P or P_BIG
+    for k in range(n):
+        s = 100 * k
+        mom = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        z = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        bpre = [f32(max(LO, min(HI, -13.8 + 0.3 * math.sin(k / 30.0 + g) - 0.004 * k))) for g in range(ng)]
+        beta = [f32(lion_natural(bpre[g], mom[g], z[g])[0]) for g in range(ng)]
+        rec = {"step": s, "pt_b2": 0.9, "pt_mp": 0.99}
+        if arm in HELD and not unheld and ng >= 2:
+            bpre[1] = v_of(s + 1, P) if not pre_natural else f32(bpre[1] + 0.25)
+            beta[1] = v_of(s + 2, P)
+            nat1 = f32(lion_natural(bpre[1], mom[1], z[1])[0])
+            if abs(nat1 - beta[1]) > BH_TOL:
+                active += 1
+            rec.update({"gh_n": s + 2 + (1 if gh_off_by_one else 0), "gh_active": active,
+                        "gh_nat": (nat1 + 0.01) if gh_forge else nat1, "gh_held": beta[1]})
+            if strip_gh:
+                for key in GH_KEYS:
+                    rec.pop(key)
+        if touch_other:
+            g = ng - 1 if not (arm in HELD and ng - 1 == 1) else 0
+            beta[g] = f32(beta[g] + 0.002)
+        if add_gh:
+            rec.update({"gh_n": s + 2, "gh_active": 0, "gh_nat": beta[-1], "gh_held": beta[-1]})
+        if add_foreign:
+            rec.update({add_foreign + "_n": s + 2, add_foreign + "_active": 0})
+        rec.update({"beta": beta, "beta_pre": [bpre], "mom_pre": [mom], "z_agg": [z],
+                    "z_tensor": [0.0] * NTENS, "m_tensor": [0.0] * NTENS})
+        out.append(rec)
+    return out
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            p = os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for r in _e_probe_records(a, seed=s):
+                    f.write(json.dumps(r) + "\n")
+
+
+def _e_prov(d, mode="submit", bn=LIVE_BN_SHA, hf=HF_POST_SHA, runner=None, scorer=None):
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write(
+        "MODE %s\nBUILD_NETWORK_SHA256 %s\nHF_SHA256 %s\nRUNNER_SHA256 %s\nSCORER_SHA256 %s\n"
+        % (mode, bn, hf, runner or RUNNER_SHA, scorer or file_sha(os.path.abspath(__file__))))
+
+
+def _e_build(d, template, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None, env_break=None,
+             spec_break=None, gh_break=None, rh_break=None, vw_break=None, bh_break=None, ch_break=None, manifest=None,
+             prov=None, probe_break=None, probe_drop=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(manifest if manifest is not None else synthetic_manifest_text())
+    _e_prov(d, **(prov or {}))
+    jid = 9900000
+    pb = probe_break or {}
+
+    def pick(br, a, s):
+        return br[1] if br and br[0] == (a, s) else None
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                p = os.path.join(d, PREFIX, pname)
+                os.makedirs(p)
+                with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                    for r in pb[(a, s)]:
+                        f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = pick(spec_break, a, s)
+            _e_write(d, a, s, jid, L, env=env, spec=spec, gh=pick(gh_break, a, s), rh=pick(rh_break, a, s),
+                     vw=pick(vw_break, a, s), bh=pick(bh_break, a, s), ch=pick(ch_break, a, s))
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0, "gamma": "1",
+            "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH), "epochs_requested": str(EPOCHS), "hier": "none",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (net, gran, v) in enumerate([(NET, "scalar", 1.0), (NET, "scalar", 80.0), (NET, "scalar", 40.0),
+                                        (NET, ONE50SPEC, 2.0), (NET, ONE50SPEC, 95.0), (NET, ONE59SPEC, 45.0),
+                                        (NET, ONE59SPEC, 3.0), (NET, SPLITSPEC, 3.0), (NET, SPLITSPEC, 95.0),
+                                        (NET, ISOSPEC, 2.0), (NET, ISOSPEC, 90.0)]):
+        inv.append(dict(base, network=net, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _bar_lines(out):
+    return [ln for ln in out.splitlines() if ln.startswith("  SIGMA_USED") or ln.startswith("  SE_ARM_DIFF")
+            or ln.startswith("  bars:") or ln.startswith("  PRIMARY")]
+
+
+def _spec_from_scorer(fname, key):
+    p = os.path.join(HERE, fname)
+    if not os.path.exists(p):
+        return None
+    import ast
+    txt = open(p).read()
+    m = re.search(r"^SPEC = (\{.*?^\})", txt, re.S | re.M)
+    if not m:
+        return None
+    return ast.literal_eval(m.group(1)).get(key)
+
+
+def _load_module(name, fname):
+    import importlib.util
+    p = os.path.join(HERE, fname)
+    if not os.path.exists(p):
+        return None
+    spec = importlib.util.spec_from_file_location(name, p)
+    m = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, HERE)
+    try:
+        spec.loader.exec_module(m)
+    finally:
+        sys.path.pop(0)
+    return m
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cVT10 --selftest: design, byte identities with ciso1 / cdep1 / cvt8, the G-BITE nulls on REAL records, the frozen")
+    print("manifest, frozen bars (O2), the noise floor through corpus_exclusions.filter_rows, the floor table, the REAL score()")
+    print("on synthetic runs, the corpus-invariance proof and the documented one-argument invocation.\n")
+
+    print("A. ARITHMETIC, REGEX AND DESIGN")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3) - SE_PRIOR) < 1e-6, "SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)")
+    chk(SIGMA_PRIOR == SIGMA_R18ALL, "SIGMA_PRIOR = SIGMA_R18ALL (ResNet18_c100 only)")
+    chk(list(inspect.signature(compose_sigma).parameters) == ["sigma_in"], "compose_sigma() takes ONE argument -- NO corpus")
+    chk(all(compose_sigma(s)[1] == max(SIGMA_PRIOR, s) for s in (0.0, 0.2, SIGMA_PRIOR, 0.8, 1.5, 4.0)),
+        "SIGMA_USED == max(frozen floor, in-batch) over 6 in-batch values")
+    src = inspect.getsource(score)
+    chk("pooled_sigma" not in src and src.count("read_corpus") == 1,
+        "score() calls no corpus statistic; its single read_corpus() feeds a row-count print only")
+    chk(list(inspect.signature(decide).parameters) == ["M", "diverged"], "decide() is a function of the in-batch means and one flag")
+    dsrc = (inspect.getsource(decide) + inspect.getsource(single_word) + inspect.getsource(split_word)
+            + inspect.getsource(summary_word) + inspect.getsource(state))
+    chk("load_probe" not in dsrc and "recs" not in dsrc, "decide() and its word functions read NO probe record")
+    chk(src.index("final = \"FINAL: %s | %s\"") < src.index("descriptive_probe_readout(runsdir, runs)"),
+        "the descriptive probe readout runs AFTER the FINAL line is composed")
+    chk(src.index("G-BITE failed on") < src.index("CONTRASTS (every one") < src.index("branch = decide(M"),
+        "order: G-BITE, then contrasts, then the branch")
+    chk(GAP_MIN >= 2 * RESCUE_BAR and RESCUE_BAR > MATCH_BAR > NULL_BAR > 0 and READ_MARGIN == 2 * MATCH_BAR,
+        "bar ordering GAP_MIN >= 2 RESCUE > MATCH > NULL; READ_MARGIN = 2 MATCH")
+    chk(GAP_MIN > MATCH_BAR + NULL_BAR, "SPLIT-STALLS (<= k01+2) and SPLIT-NO-EFFECT (>= ISO-5) are disjoint once D_ISO >= GAP_MIN")
+    chk(READ_MARGIN > MATCH_BAR + NULL_BAR,
+        "once ONE<s> >= k01 + READ_MARGIN: STALLS (<= k01+2) and NO-EFFECT (>= ONE<s>-5) are disjoint, PARTIAL non-empty")
+    chk(MATCH_BAR >= 5 * SE_PRIOR and NULL_BAR >= 3 * SE_PRIOR, "MATCH >= 5 SE and NULL >= 3 SE at the prior",
+        "%.2f / %.2f SE" % (MATCH_BAR / SE_PRIOR, NULL_BAR / SE_PRIOR))
+    chk(all(K01_MAX > R_BETWEEN[b]["k01"] + 5 and K01_MAX < R_BETWEEN[b]["ISO"] - 30 for b in R_BETWEEN),
+        "K01_MAX sits between every anchor's k01 (+5) and ISO (-30)")
+    chk(R_BETWEEN["cvt8"]["HOLDBIG"] <= R_BETWEEN["cvt8"]["k01"] + NULL_BAR - 5.0,
+        "cvt8's HOLDBIG (19.38) sits >= 5 pp inside the replicate gate at cvt8's k01 (23.06)")
+    chk(all(R_BETWEEN[b]["ONE"] >= R_BETWEEN[b]["k01"] + READ_MARGIN + 20 for b in ("ciso1", "cdep1")),
+        "ciso1 / cdep1's ONE (64.75 / 64.83) sit >= 20 pp inside the ONE50 read margin")
+    chk(BH_TOL <= MS / 50.0, "BH_TOL is <= 1/50 of one Lion step")
+    chk(EPTR_RE.search("Epoch 99, Train Accuracy: 94.61 %, Test Accuracy: 70.44 %") is not None, "epoch-line regex matches")
+    om = [OUT_RE.match("cvt10-%s-s120-1234567.out" % a) for a in ARMS]
+    chk(all(om) and [m.group(1) for m in om] == list(ARMS) and OUT_RE.match("cvt1-k01-s1-1.out") is None
+        and OUT_RE.match("cvt8-HOLDBIG-s102-1.out") is None and OUT_RE.match("cvt10-ONE-s120-1.out") is None
+        and OUT_RE.match("cvt10-HOLDBIG-s120-1.out") is None and OUT_RE.match("cvt100-k01-s120-1.out") is None,
+        "run-file regex matches cvt10's ten arms ONLY (not cvt1-, cvt8-, cvt100-, ONE, HOLDBIG)")
+    chk(PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=62 x") is not None
+        and PT_RE.match("PROBE_TENSOR: on every=100 type=blockwise tensors=53 x") is None, "PROBE_TENSOR regex: 62, not 53")
+    chk(set(SPEC) == set(ARMS) == set(GROUPHOLD) == set(WITNESS_GH) == set(SIZES) and set(HOLD_IDX) == set(HELD) and len(ARMS) == 10,
+        "ten arms; tables cover exactly them")
+    chk(all(re.match(r"^[A-Za-z0-9_.:+]*$", v) and "," not in v for v in GROUPHOLD.values()),
+        "every GROUP_HOLD value is ONE token of [A-Za-z0-9_.:+], no comma")
+    chk(GROUPHOLD["HOLDBIG3"] == "layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight:tri:9428"
+        and GROUPHOLD["ONE50BIG"] == GROUPHOLD["ISOSPLIT"] == "layer4.0.bn2.weight:tri:9428"
+        and GROUPHOLD["ONE59BIG"] == "layer4.1.bn2.weight:tri:9428" and GROUPHOLD["ONE53BIG"] == "layer4.0.shortcut.1.weight:tri:9428"
+        and all(GROUPHOLD[a] == "" for a in ARMS if a not in HELD), "the GROUP_HOLD strings, literal")
+    chk(WITNESS_GH["ONE53BIG"] == "GROUP_HOLD: on type=blockwise group=1 groupsize=1 names=layer4.0.shortcut.1.weight mode=tri "
+        "P=9428 b0=-13.815510749816895 ms=0.001 lo=-15.0 hi=-2.3026 peak=%r" % (B0 + MS * 9428), "ONE53BIG's witness, literal")
+    chk(WITNESS_GH["ISOSPLIT"] == WITNESS_GH["ONE50BIG"], "ISOSPLIT's witness == ONE50BIG's (group 1 = {50} in both partitions)")
+    for a in ARMS:
+        g = arm_groups(a)
+        ok = [len(x) for x in g] == SIZES[a] and sorted(sum(g, [])) == list(range(1, 63))
+        if a in HELD:
+            ok = ok and g[1] == sorted(HOLD_IDX[a])
+        chk(ok, "%-9s partition %s is total, disjoint; group 1 == the held set" % (a, SIZES[a]))
+    chk(arm_groups("ISOSPLIT")[2] == [53, 59] and arm_groups("ONE59")[1] == [59] and arm_groups("ONE53")[1] == [53],
+        "ISOSPLIT group 2 = {53,59}; ONE59 / ONE53 isolate exactly 59 / 53")
+    chk(all(SPEC[f] == SPEC[b] for _s, f, b in SINGLES) and SPEC["HOLDBIG3"] == SPEC["ISO"] == ISOSPEC,
+        "every held arm's spec == its free twin's (only GROUP_HOLD differs); ISOSPLIT has no free twin (disclosed)")
+    prefixes = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD")
+    chk(not any(p != q and p.startswith(q) for p in prefixes for q in prefixes),
+        "no witness prefix is a prefix of another (CORRECTIONS 245 / 251)")
+    chk(B0 == -13.815510749816895, "b0 = float32(log 1e-6) = -13.815510749816895")
+    nclamp = min(n for n in range(P_BIG, 60000) if v_of(n, P_BIG) == LO)
+    chk(all(v_of(n) == LO for n in range(nclamp, 50002, 97)) and abs(nclamp / 500.0 - 40.08) < 0.01
+        and v_of(P_BIG + 1) == f32(B0 + MS * P_BIG) and v_of(1) == B0 and v_of(2) == f32(B0 + MS),
+        "tri(9428): b0 at updates 0-1, peak after update P+1, clamp after update %d (epoch %.2f) and stays" % (nclamp, nclamp / 500.0))
+    nat, tie = lion_natural(-10.0, 1e-3, 1e-3)
+    chk(abs(nat - (-10.001)) < 1e-12 and not tie and lion_natural(-15.0, 1e-3, 0.0)[0] == -15.0 and lion_natural(-3.0, 0.0, 0.0)[1],
+        "lion_natural: DOWN on L > 0, clamps at -15, flags L == 0 as a tie")
+    chk(SEEDS == (120, 121, 122) and set(SEEDS) < set(SEED_BLOCK) and N_RECORDS == 500,
+        "seeds {120,121,122} from the pre-assigned block {120..123}; 500 records per run")
+    chk(re.match(r"^[0-9a-f]{64}$", RUNNER_SHA) is not None, "RUNNER_SHA is a pinned sha256")
+    chk(all(licence_lines(b) is not None for b in all_branches()) and len(all_branches()) == len(LICENSE) + 4 * 4 * 4 * 3,
+        "every one of the %d registered branches has a licence text" % len(all_branches()))
+    note("expected cost %.1f GPU-h at 100 ep (cvt8 sacct 0.82 / run); hard bound = launcher WALL x %d" % (R18_PER_RUN_GPUH * 30, 30))
+
+    print("\nB. BYTE IDENTITIES, THE FROZEN MANIFEST, AND THE G-BITE NULLS ON LANDED RECORDS")
+    t = r18_tensors()
+    numel = [q for _n, q, _o in t]
+    chk(len(t) == NTENS and sum(numel) == TOTPAR, "ResNet18_c100: %d tensors, %d parameters" % (NTENS, TOTPAR))
+    chk(tuple(NAMES[i - 1] for i in CARRIER_IDX) == CARRIERS and all(numel[i - 1] == 512 for i in CARRIER_IDX),
+        "carriers 50 / 53 / 59 by NAME, 512 each")
+    for key, mine, fname in (("ISO", "ISO", "cIS1_ciso1_isolate_score.py"), ("k01", "k01", "cIS1_ciso1_isolate_score.py"),
+                             ("ONE", "ONE50", "cIS1_ciso1_isolate_score.py"), ("ONE", "ONE50", "cDP1_cdep1_depth_score.py"),
+                             ("ISO", "ISO", "cDP1_cdep1_depth_score.py")):
+        theirs = _spec_from_scorer(fname, key)
+        if theirs is None:
+            skip("%s not reachable -- byte-identity of %s not checked" % (fname, key))
+        else:
+            chk(theirs == SPEC[mine], "%s's spec is BYTE-IDENTICAL to %s's %s (%s)" % (mine, fname.split("_")[0], key, fname))
+    S8 = _load_module("cvt8_scorer_for_cvt10", "cVT8_doseroute_score.py")
+    if S8 is None:
+        chk(False, "cVT8_doseroute_score.py importable")
+    else:
+        chk(S8.SPEC["ISO"] == SPEC["ISO"] == S8.SPEC["HOLDBIG"] == SPEC["HOLDBIG3"] and S8.SPEC["k01"] == SPEC["k01"],
+            "B cvt8's registered scorer: ISO's and HOLDBIG's specs == ISO's and HOLDBIG3's, byte for byte")
+        chk(S8.GROUPHOLD["HOLDBIG"] == GROUPHOLD["HOLDBIG3"] and S8.WITNESS_GH["HOLDBIG"] == WITNESS_GH["HOLDBIG3"]
+            and S8.WITNESS_RH["HOLDBIG"] == WITNESS_RH and S8.P_BIG == P_BIG,
+            "B cvt8's registered scorer: HOLDBIG's GROUP_HOLD string, GROUP_HOLD witness and REST_HOLD witness == HOLDBIG3's")
+        chk(S8.HF_POST_SHA == HF_POST_SHA and S8.RUNNER_SHA == RUNNER_SHA and S8.LIVE_BN_SHA == LIVE_BN_SHA
+            and S8.HF_PRE_SHA == HF_CVT7_SHA and S8.NAMES == NAMES and S8.ENV_EXPECTED == ENV_EXPECTED,
+            "B cvt8's tree (HF, runner, build_network), its names and its ENV line are this batch's")
+        chk(all(S8.v_of(n, P_BIG) == v_of(n) for n in range(0, 50002, 13)) and S8.B0 == B0 and S8.LO == LO and S8.HI == HI,
+            "B cvt8's tri:9428 schedule == this one at every 13th update")
+    S7 = _load_module("cvt7_scorer_for_cvt10", "cVT7_grouphold_score.py")
+    if S7 is not None:
+        chk(S7.witness_gh_of("tri", P_BIG) == WITNESS_GH["HOLDBIG3"],
+            "B cvt7's registered witness form (PATCH_GROUPHOLD's author) gives HOLDBIG3's witness")
+    have = runsdir and all(os.path.isdir(os.path.join(runsdir, b)) for b in ("ciso1", "cdep1", "cvt8"))
+    if have:
+        n_one = n_one_null = n_one_null59 = 0
+        for b, seeds in (("ciso1", (21, 22, 23)), ("cdep1", (24, 25, 26))):
+            for s0 in seeds:
+                recs = load_probe(runsdir, "ONE", s0, prefix=b, max_step=50000)
+                n_one += bite_check("ONE50", recs)[0]
+                okn, dn = bite_check("ONE50BIG", recs)
+                n_one_null += (not okn) and dn["bad_sched"] + dn["bad_sched_pre"] > 0 and dn["bad_lion"] == 0
+                okn, dn = bite_check("ONE59BIG", recs)
+                n_one_null59 += (not okn) and dn["bad_sched"] + dn["bad_sched_pre"] > 0
+        chk(n_one == 6, "B G-BITE PASSES on the 6 landed ONE runs (ciso1 s21-23, cdep1 s24-26) read as ONE50 (free)", "%d/6" % n_one)
+        chk(n_one_null == 6 and n_one_null59 == 6,
+            "B THE BROKEN-SINGLETON-HOLD NULL ON REAL RECORDS: every landed free ONE run read as ONE50BIG (and as ONE59BIG) FAILS "
+            "the tri:9428 schedule with its unheld group still Lion (6/6, 6/6)", "%d / %d" % (n_one_null, n_one_null59))
+        n_ctl = 0
+        for s0 in (102, 103, 104):
+            n_ctl += bite_check("k01", load_probe(runsdir, "k01", s0, prefix="cvt8"))[0]
+            n_ctl += bite_check("ISO", load_probe(runsdir, "ISO", s0, prefix="cvt8"))[0]
+        chk(n_ctl == 6, "B G-BITE PASSES on cvt8's 6 landed k01 / ISO runs read as controls", "%d/6" % n_ctl)
+        hb = hh = iso_split = 0
+        for s0 in (102, 103, 104):
+            hb += bite_check("HOLDBIG3", load_probe(runsdir, "HOLDBIG", s0, prefix="cvt8"))[0]
+            okh, dh = bite_check("HOLDBIG3", load_probe(runsdir, "HOLDHIGH", s0, prefix="cvt8"))
+            hh += (not okh) and dh["bad_sched"] > 0
+            oks, ds = bite_check("ISOSPLIT", load_probe(runsdir, "ISO", s0, prefix="cvt8"))
+            iso_split += (not oks) and ds["bad_rec"] == N_RECORDS
+        chk(hb == 3, "B cvt8's 3 landed HOLDBIG runs PASS G-BITE as HOLDBIG3 (the same spec and string)", "%d/3" % hb)
+        chk(hh == 3, "B cvt8's HOLDHIGH (tri:8609) read as HOLDBIG3 FAILS the schedule (3/3): the dose is checked", "%d/3" % hh)
+        chk(iso_split == 3, "B a landed 2-group ISO record read as the 3-group ISOSPLIT FAILS on every record (3/3)", "%d/3" % iso_split)
+        note("G-BITE cannot tell a [61,1] hold from a [59,3] hold by records alone (both 2 groups, group 1 on tri:9428): the "
+             "partition is carried by G-ARGS (the spec) and G-GHOLD (groupsize and names in the witness)")
+    else:
+        note("landed ciso1 / cdep1 / cvt8 records not under %s -- the real-record nulls are recorded at 258" % runsdir)
+    live_man = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt") if runsdir else ""
+    if live_man and os.path.exists(live_man):
+        chk(open(live_man).read() == synthetic_manifest_text(), "B the LIVE manifest guard 4 wrote is BYTE-IDENTICAL to synthetic_manifest_text()")
+    else:
+        note("no live manifest under %s/%s -- the launcher's guard 4d makes the byte comparison" % (runsdir, PREFIX))
+
+    print("\nC. CORPUS PREMISES AND THE NOISE FLOOR, read through corpus_exclusions.filter_rows (OPERATIONS 36)")
+    try:
+        CE = _exclusions()
+        chk(hasattr(CE, "filter_rows"), "analysis/corpus_exclusions.py imports and provides filter_rows")
+    except Exception as ex:
+        CE = None
+        chk(False, "analysis/corpus_exclusions.py imports", "%s: %s" % (type(ex).__name__, ex))
+    chk("filter_rows" in inspect.getsource(read_corpus), "read_corpus() calls filter_rows by default")
+    rows = read_corpus(csvpath) if CE else None
+    if rows is None:
+        skip("corpus premises -- %s not readable" % csvpath)
+    else:
+        sha = file_sha(csvpath)
+        reg = sha == REG_CORPUS_SHA256
+        naive = read_corpus(csvpath, filtered=False)
+        note("corpus %d rows (cvt10 excluded), %d after filter_rows, sha %s... -- %s" % (
+            len(naive), len(rows), sha[:12], "THE REGISTRATION CORPUS" if reg else "not the registration corpus: drift NOTED"))
+        s_f = pooled_sigma(rows, net_is(NET))
+        s_n = pooled_sigma(naive, net_is(NET))
+        print("       SIGMA_R18ALL  FILTERED %s (df %s, cells %s)   NAIVE %s (df %s)" % (fmt(s_f[0], 14), s_f[1], s_f[2], fmt(s_n[0], 14), s_n[1]))
+        if reg:
+            chk(s_f[0] is not None and abs(s_f[0] - SIGMA_R18ALL) < 1e-12 and s_f[1] == SIGMA_R18ALL_DF,
+                "SIGMA_R18ALL: the FROZEN literal %.17g IS the FILTERED value (df %d) on the registration corpus" % (SIGMA_R18ALL, SIGMA_R18ALL_DF))
+            chk(s_n[0] is not None and abs(s_n[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and s_n[0] > 3 * s_f[0],
+                "the NAIVE ResNet floor %.4f is > 3 x the filtered one: the held rows would inflate it (the trap, disclosed)" % SIGMA_R18ALL_NAIVE)
+            chk(file_sha(os.path.join(REPO, "results", "CORPUS-EXCLUSIONS.tsv")) == REG_EXCLUSIONS_SHA256,
+                "the exclusion TSV is the registration one (ff953334...)")
+        else:
+            note("SIGMA_R18ALL filtered %s vs frozen %.17g -- feeds no bar (O2)" % (fmt(s_f[0], 12), SIGMA_R18ALL))
+        chk(not any(r.get("seed") in tuple(str(x) for x in SEED_BLOCK) for r in naive), "ZERO corpus rows carry a seed of the block 120-123")
+        note("THE CSV HAS NO GROUP_HOLD COLUMN: at ingest the 15 held rows (HOLDBIG3, ONE50BIG, ONE59BIG, ONE53BIG, ISOSPLIT x3) "
+             "go into results/CORPUS-EXCLUSIONS.tsv in the SAME commit, one GROUP_HOLD witness each (single kind; OPERATIONS 36)")
+
+    print("\nD. THE FLOOR TABLE (164.6).  Chance %.2f pp, ceiling 100.  Levels UNSURE." % CHANCE)
+    lo_all = 100.0
+    for acc, pred in ACCOUNTS.items():
+        print("  %-60s %s" % (acc, "  ".join("%s %.0f-%.0f" % (a, pred[a][0], pred[a][1]) for a in ARMS)))
+        lo_all = min(lo_all, min(pred[a][0] for a in ARMS))
+        for nm, (x, y) in (("P_ONE50", ("ONE50", "ONE50BIG")), ("P_ONE59", ("ONE59", "ONE59BIG")), ("P_ONE53", ("ONE53", "ONE53BIG"))):
+            dlo, dhi = pred[x][0] - pred[y][1], pred[x][1] - pred[y][0]
+            chk(dhi <= (100 - CHANCE) - 25 and dlo >= -(100 - CHANCE) + 25,
+                "%-44s %s predicted %+.0f..%+.0f is >= 25 pp inside both hard bounds" % (acc[:44], nm, dlo, dhi))
+        chk(pred["ISO"][0] - pred["k01"][1] >= 3 * RESCUE_BAR, "%-44s ISO predicted >= 30 pp off k01" % acc[:44])
+        mid = dict((a, (pred[a][0] + pred[a][1]) / 2.0) for a in ARMS)
+        chk(decide(mid) == EXPECTED_BRANCH[acc], "%-44s midpoint lands in %s" % (acc[:44], EXPECTED_BRANCH[acc]), decide(mid))
+    chk(lo_all - CHANCE >= 7.0, "the LOWEST level ANY account predicts for ANY arm is >= 7 pp above chance", "%.1f" % (lo_all - CHANCE))
+    null = ACCOUNTS["BROKEN-SINGLETON-HOLD (null)"]
+    chk(null == ACCOUNTS["HELD SET NEEDED, NO SINGLE BITES"]
+        and all(null[b] == null[f] for _s, f, b in SINGLES) and null["ISOSPLIT"] == null["ISO"],
+        "DECLARED: a one-tensor hold that never bit (held arm = its free twin; ISOSPLIT at ISO) predicts EXACTLY the "
+        "'NO SINGLE BITES' account -- G-BITE separates them")
+    mids = [decide(dict((a, (p[a][0] + p[a][1]) / 2.0) for a in ARMS)) for k_, p in ACCOUNTS.items() if "null" not in k_]
+    chk(len(set(mids)) == len(mids), "the %d non-null accounts' midpoints land in %d different branches" % (len(mids), len(mids)),
+        str(len(set(mids))))
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS (invented numbers; evidence of nothing)")
+    tmp = tempfile.mkdtemp(prefix="cvt10_selftest_")
+    template = os.path.join(tmp, "_probe_template")
+    _e_probe_template(template)
+    plman = synthetic_manifest_text().replace("NETWORK ResNet18_c100", "NETWORK PlainNet18_c100")
+    B0R = _E_BRANCH0
+    cases = [
+        ("base: gamma_last stall, shortcut no effect, split stalls", {}, {}, B0R),
+        ("every single stalls", {"ONE53BIG": 21.5}, {}, "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-STALLS+SPLIT-STALLS"),
+        ("held set needed, partial", {"ONE50BIG": 40.0, "ONE59BIG": 42.0, "ONE53BIG": 45.0, "ISOSPLIT": 45.0}, {},
+         "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-PARTIAL+ONE53-PARTIAL+SPLIT-PARTIAL"),
+        ("held set needed, no effect", {"ONE50BIG": 64.0, "ONE59BIG": 63.5, "ONE53BIG": 62.5, "ISOSPLIT": 69.0}, {},
+         "NO-ONE-SUFFICES+ONE50-NO-EFFECT+ONE59-NO-EFFECT+ONE53-NO-EFFECT+SPLIT-NO-EFFECT"),
+        ("vote route: singles stall, split no effect", {"ONE53BIG": 22.0, "ISOSPLIT": 68.0}, {},
+         "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-STALLS+SPLIT-NO-EFFECT"),
+        ("only split stalls", {"ONE50BIG": 40.0, "ONE59BIG": 40.0}, {}, "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-PARTIAL+ONE53-NO-EFFECT+SPLIT-STALLS"),
+        ("shortcut isolation does not rescue", {"ONE53": 25.0, "ONE53BIG": 23.0}, {},
+         "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-UNREADABLE+SPLIT-STALLS"),
+        ("ONE59 unreadable, no stall", {"ONE59": 30.0, "ONE59BIG": 28.0, "ONE50BIG": 40.0}, {},
+         "ONE-UNRESOLVED+ONE50-PARTIAL+ONE59-UNREADABLE+ONE53-NO-EFFECT+SPLIT-STALLS"),
+        ("single big above its free twin is NO-EFFECT, stamped", {"ONE53BIG": 72.0}, {}, B0R),
+        ("REPLICATE-FAILED", {"HOLDBIG3": 40.0}, {}, "REPLICATE-FAILED"),
+        ("positive control fails", {"ISO": 35.0}, {}, "POSITIVE-CONTROL-FAILED"),
+        ("scalar not collapsed", {"k01": 40.0, "HOLDBIG3": 41.0}, {}, "SCALAR-NOT-COLLAPSED"),
+        ("near-bar REPLICATE just inside", {"HOLDBIG3": 23.0 + NULL_BAR - 0.05}, {}, B0R),
+        ("near-bar REPLICATE just outside", {"HOLDBIG3": 23.0 + NULL_BAR + 0.05}, {}, "REPLICATE-FAILED"),
+        ("near-bar STALL just outside", {"ONE50BIG": 23.0 + NULL_BAR + 0.05}, {},
+         "ONE-SUFFICES+ONE50-PARTIAL+ONE59-STALLS+ONE53-NO-EFFECT+SPLIT-STALLS"),
+        ("near-bar NO-EFFECT just inside", {"ONE59BIG": 64.0 - MATCH_BAR + 0.05, "ONE50BIG": 40.0}, {},
+         "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-NO-EFFECT+ONE53-NO-EFFECT+SPLIT-STALLS"),
+        ("near-bar NO-EFFECT just outside", {"ONE59BIG": 64.0 - MATCH_BAR - 0.05, "ONE50BIG": 40.0}, {},
+         "NO-ONE-SUFFICES+ONE50-PARTIAL+ONE59-PARTIAL+ONE53-NO-EFFECT+SPLIT-STALLS"),
+        ("near-bar READ_MARGIN just inside", {"ONE53": 23.0 + READ_MARGIN + 0.05, "ONE53BIG": 26.5}, {},
+         "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-PARTIAL+SPLIT-STALLS"),
+        ("near-bar READ_MARGIN just outside", {"ONE53": 23.0 + READ_MARGIN - 0.05, "ONE53BIG": 26.5}, {},
+         "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-UNREADABLE+SPLIT-STALLS"),
+        ("near-bar SPLIT NO-EFFECT just inside", {"ISOSPLIT": 70.0 - MATCH_BAR + 0.05}, {},
+         "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-NO-EFFECT+SPLIT-NO-EFFECT"),
+        ("diverged", {}, {"over": {("ONE59BIG", 121): 40.0}}, "UNRESOLVED-DIVERGED"),
+        ("harness: every arm tiny", dict((a, 3.0) for a in ARMS), {}, "HARNESS-UNSOUND"),
+        ("harness: AUGMENT=0 on one run", {}, {"env_break": ("ONE53BIG", 122)}, "HARNESS-UNSOUND"),
+        ("harness: ONE59 ran ONE50's spec", {}, {"spec_break": (("ONE59", 121), ONE50SPEC)}, "HARNESS-UNSOUND"),
+        ("harness: ISOSPLIT ran ISO's spec", {}, {"spec_break": (("ISOSPLIT", 120), ISOSPEC)}, "HARNESS-UNSOUND"),
+        ("harness: ONE50BIG printed HOLDBIG3's witness", {}, {"gh_break": (("ONE50BIG", 120), WITNESS_GH["HOLDBIG3"])}, "HARNESS-UNSOUND"),
+        ("harness: ONE59BIG printed ONE53BIG's witness", {}, {"gh_break": (("ONE59BIG", 122), WITNESS_GH["ONE53BIG"])}, "HARNESS-UNSOUND"),
+        ("harness: ISOSPLIT printed group=2", {}, {"gh_break": (("ISOSPLIT", 121), WITNESS_GH["ISOSPLIT"].replace("group=1", "group=2"))}, "HARNESS-UNSOUND"),
+        ("harness: a tri:8609 witness", {}, {"gh_break": (("ONE50BIG", 121), witness_gh_of((50,), P=8609))}, "HARNESS-UNSOUND"),
+        ("harness: a free arm printed an on-line", {}, {"gh_break": (("ONE53", 120), WITNESS_GH["ONE53BIG"])}, "HARNESS-UNSOUND"),
+        ("harness: no GROUP_HOLD line (the LIVE tree)", {}, {"gh_break": (("ONE50", 122), "")}, "HARNESS-UNSOUND"),
+        ("harness: no REST_HOLD line (cvt7's tree)", {}, {"rh_break": (("k01", 120), "")}, "HARNESS-UNSOUND"),
+        ("harness: a REST_HOLD on-line", {}, {"rh_break": (("ISO", 121), "REST_HOLD: on type=blockwise group=0 x")}, "HARNESS-UNSOUND"),
+        ("harness: a COMP_HOLD line", {}, {"ch_break": (("HOLDBIG3", 122), "COMP_HOLD: off")}, "HARNESS-UNSOUND"),
+        ("harness: a WINDOW_HOLD line (cvt9's tree)", {}, {"ch_break": (("ONE59", 120), "WINDOW_HOLD: off")}, "HARNESS-UNSOUND"),
+        ("harness: a VOTE_W on-line", {}, {"vw_break": (("ONE50BIG", 121), "VOTE_W: on type=blockwise items=50:x")}, "HARNESS-UNSOUND"),
+        ("harness: a BETA_HOLD on-line", {}, {"bh_break": (("ONE53BIG", 121), "BETA_HOLD: on type=blockwise group=1 x")}, "HARNESS-UNSOUND"),
+        ("harness: manifest names another net", {}, {"manifest": plman}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt7's HF", {}, {"prov": {"hf": HF_CVT7_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the LIVE HF", {}, {"prov": {"hf": HF_LIVE_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is cvt7's runner", {}, {"prov": {"runner": CVT7_RUNNER_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance is the LIVE runner", {}, {"prov": {"runner": LIVE_RUNNER_SHA}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names PlainNet's build_network", {},
+         {"prov": {"bn": "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance dry-run", {}, {"prov": {"mode": "dry-run"}}, "HARNESS-UNSOUND"),
+        ("harness: provenance names another scorer", {}, {"prov": {"scorer": "0" * 64}}, "HARNESS-UNSOUND"),
+        ("BROKEN SINGLETON HOLD: every one-tensor arm unheld at NO-EFFECT's levels",
+         {"ONE50BIG": 64.5, "ONE59BIG": 63.5, "ONE53BIG": 62.5, "ISOSPLIT": 69.5},
+         {"probe_break": dict(((a, 121), _e_probe_records(a, seed=121, unheld=True, strip_gh=True))
+                              for a in ("ONE50BIG", "ONE59BIG", "ONE53BIG", "ISOSPLIT"))}, "PATCH-NOT-VERIFIED"),
+        ("BROKEN HOLD: unheld but carrying gh keys", {},
+         {"probe_break": {("ONE59BIG", 120): _e_probe_records("ONE59BIG", seed=120, unheld=True, add_gh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: ONE50BIG on tri:8609", {},
+         {"probe_break": {("ONE50BIG", 122): _e_probe_records("ONE50BIG", seed=122, as_P=8609)}}, "PATCH-NOT-VERIFIED"),
+        ("WRONG DOSE: HOLDBIG3 on tri:8609 (cvt8's HOLDHIGH)", {},
+         {"probe_break": {("HOLDBIG3", 121): _e_probe_records("HOLDBIG3", seed=121, as_P=8609)}}, "PATCH-NOT-VERIFIED"),
+        ("HOLD ONLY AT PROBE STEPS: ONE53BIG beta_pre is Lion's", {},
+         {"probe_break": {("ONE53BIG", 120): _e_probe_records("ONE53BIG", seed=120, pre_natural=True)}}, "PATCH-NOT-VERIFIED"),
+        ("UNHELD GROUP TOUCHED: ISOSPLIT's free {53,59} group", {},
+         {"probe_break": {("ISOSPLIT", 122): _e_probe_records("ISOSPLIT", seed=122, touch_other=True)}}, "PATCH-NOT-VERIFIED"),
+        ("UNHELD GROUP TOUCHED: ONE59BIG's complement", {},
+         {"probe_break": {("ONE59BIG", 121): _e_probe_records("ONE59BIG", seed=121, touch_other=True)}}, "PATCH-NOT-VERIFIED"),
+        ("ISOSPLIT records with 2 groups (ISO's partition)", {},
+         {"probe_break": {("ISOSPLIT", 120): _e_probe_records("HOLDBIG3", seed=120)}}, "PATCH-NOT-VERIFIED"),
+        ("gh_nat FORGED", {}, {"probe_break": {("ONE50BIG", 120): _e_probe_records("ONE50BIG", seed=120, gh_forge=True)}}, "PATCH-NOT-VERIFIED"),
+        ("gh_n OFF BY ONE", {}, {"probe_break": {("ISOSPLIT", 121): _e_probe_records("ISOSPLIT", seed=121, gh_off_by_one=True)}}, "PATCH-NOT-VERIFIED"),
+        ("a FREE singleton carries gh keys", {}, {"probe_break": {("ONE53", 122): _e_probe_records("ONE53", seed=122, add_gh=True)}}, "PATCH-NOT-VERIFIED"),
+        ("a held arm carries rh keys", {}, {"probe_break": {("HOLDBIG3", 120): _e_probe_records("HOLDBIG3", seed=120, add_foreign="rh")}}, "PATCH-NOT-VERIFIED"),
+        ("a free arm carries bh keys", {}, {"probe_break": {("ONE59", 122): _e_probe_records("ONE59", seed=122, add_foreign="bh")}}, "PATCH-NOT-VERIFIED"),
+        ("k01's Lion broken", {}, {"probe_break": {("k01", 122): _e_probe_records("k01", seed=122, touch_other=True)}}, "PATCH-NOT-VERIFIED"),
+        ("probe: a ONE59BIG file garbled", {},
+         {"probe_break": {("ONE59BIG", 120): _e_probe_records("ONE59BIG", seed=120)[:499] + ["{not json"]}}, "PATCH-NOT-VERIFIED"),
+        ("probe: an ISOSPLIT probe dir missing", {}, {"probe_drop": ("ISOSPLIT", 121)}, "PATCH-NOT-VERIFIED"),
+        ("probe: an ONE50 file short (400 records)", {}, {"probe_break": {("ONE50", 122): _e_probe_records("ONE50", n=400, seed=122)}}, "PATCH-NOT-VERIFIED"),
+        ("a DROPPED run", {}, {"drop": ("ONE53BIG", 121)}, "INCOMPLETE"),
+        ("a TRUNCATED higher-jid resubmission", {}, {"shadow": ("ISOSPLIT", 120)}, B0R),
+    ]
+    results = {}
+    for lab, lv, kw, want in cases:
+        dd = os.path.join(tmp, re.sub(r"\W+", "_", lab))
+        os.makedirs(dd)
+        _e_build(dd, template, levels=lv, **kw)
+        rc, fin, out = _e_score(dd, csvpath)
+        results[lab] = (rc, fin, out, dd)
+        chk(fin.startswith("FINAL: %s |" % want), "E %-64s -> %s" % (lab[:64], want), fin[:110])
+    rc, fin, out, dpath = results["base: gamma_last stall, shortcut no effect, split stalls"]
+    chk(rc == 0 and all(x in fin for x in ("HARNESS-CLEAN", "PATCH-BITES", "HOLDBIG3-AT-K01", "ONE50BIG-AT-K01", "ONE53BIG-AT-ISO",
+                                          "FLOOR-READINGS-ARE-BOUNDS", "ONE-NETWORK-RESNET", "BIG-IS-PLAINNET-DOSE",
+                                          "NO-FREE-SPLIT-CONTROL", "SINGLETON-GROUPS", "KIM-CATEGORY-SPLIT", "TRAIN-AGREES",
+                                          "HOLDBIG3-BELOW-K01")),
+        "E the base case exits 0 with the state stamps, KIM-CATEGORY-SPLIT and the unconditional stamps", fin[:200])
+    chk("KIM-CATEGORY-SPLIT" not in results["every single stalls"][1], "E KIM-CATEGORY-SPLIT does not fire when all three read alike")
+    chk("ONE53BIG-ABOVE-ONE53" in results["single big above its free twin is NO-EFFECT, stamped"][1],
+        "E a held singleton more than 5 pp above its free twin is stamped")
+    chk("UNBRANCHED-" in results["REPLICATE-FAILED"][1], "E an unbranched batch stamps its would-be words")
+    chk(results["BROKEN SINGLETON HOLD: every one-tensor arm unheld at NO-EFFECT's levels"][0] == 1,
+        "E the BROKEN-SINGLETON-HOLD null at its predicted levels exits 1, reaching NO branch")
+    chk(results["a DROPPED run"][0] == 2, "E a DROPPED run exits 2 (INCOMPLETE)")
+    chk(results["harness: AUGMENT=0 on one run"][0] == 1, "E a harness failure exits 1")
+    chk(results["a TRUNCATED higher-jid resubmission"][1] == results["base: gamma_last stall, shortcut no effect, split stalls"][1],
+        "E a truncated higher-jid resubmission does not shadow a complete run")
+    chk("G-BITE ISOSPLIT  s120 groups 3 records 500  bad 0  nonfinite 0  lion 0" in out and "keys-wrong 0" in out,
+        "E G-BITE reads 500 records per run, 3 groups on ISOSPLIT, and audits every group")
+    chk("arm-mean TEST (TRAIN) at epoch lines" in out and "CATEGORY (Kim et al." in out,
+        "E the descriptive readout and the composed licence print (after FINAL)")
+
+    print("\n   O2 INVARIANCE: the SAME synthetic runs against four corpora")
+    variants = _e_csv_variants(csvpath if csvpath and os.path.exists(csvpath) else None, tmp)
+    for case in ("base: gamma_last stall, shortcut no effect, split stalls", "held set needed, partial", "REPLICATE-FAILED"):
+        ref_fin, ref_bars = None, None
+        dd = results[case][3]
+        for lab in ("real", "real+invented", "minimal-invented", "no-corpus"):
+            if lab not in variants:
+                skip("O2 %s corpus not available on this host" % lab)
+                continue
+            rc, fin, out = _e_score(dd, variants[lab])
+            bars = _bar_lines(out)
+            if ref_fin is None:
+                ref_fin, ref_bars = fin, bars
+            chk(fin == ref_fin and bars == ref_bars and len(bars) == 6,
+                "O2 %-36s %-17s FINAL and SIGMA/SE/bars/PRIMARY lines are IDENTICAL" % (case[:36], lab), fin[:44])
+    if "real+invented" in variants:
+        a_ = pooled_sigma(read_corpus(variants["real"]), net_is(NET))[0]
+        b_ = pooled_sigma(read_corpus(variants["real+invented"]), net_is(NET))[0]
+        chk(a_ is not None and b_ is not None and b_ > 5 * a_,
+            "O2 non-vacuity: invented rows at cvt10's own cells MOVE the FILTERED ResNet sigma (%.4f -> %.4f); FINAL did not move"
+            % (a_ or 0, b_ or 0))
+
+    print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION, as a subprocess")
+    me = os.path.abspath(__file__)
+    try:
+        p = subprocess.run([sys.executable, me, dpath], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 0 and fl and fl[-1] == results["base: gamma_last stall, shortcut no effect, split stalls"][1],
+            "`python3 %s <runsdir>` exits 0 with the in-process FINAL line" % os.path.basename(me), "rc %d" % p.returncode)
+        p = subprocess.run([sys.executable, me, results["a DROPPED run"][3]], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=900)
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL:")]
+        chk(p.returncode == 2 and fl and fl[-1].startswith("FINAL: INCOMPLETE"), "... and on a dropped run exits 2 with FINAL: INCOMPLETE",
+            "rc %d" % p.returncode)
+    except Exception as e:
+        chk(False, "subprocess invocation", "%s: %s" % (type(e).__name__, e))
+
+    print("\nF. THE BRANCH MAP IS TOTAL -- 40,000 random in-batch means, every branch registered")
+    import random
+    rnd = random.Random(20260917)
+    seen = set()
+    for _ in range(40000):
+        m = dict((a, rnd.uniform(1.0, 80.0)) for a in ARMS)
+        if rnd.random() < 0.8:
+            m["k01"], m["ISO"] = rnd.uniform(15, 28), rnd.uniform(62, 78)
+            m["HOLDBIG3"] = m["k01"] + rnd.uniform(-5, 2)
+            for _s, f, b in SINGLES:
+                m[f] = rnd.choice((rnd.uniform(m["k01"], m["k01"] + 12), rnd.uniform(40, 75)))
+                m[b] = rnd.choice((m["k01"] + rnd.uniform(-4, 3), rnd.uniform(m["k01"], m[f] + 6)))
+            m["ISOSPLIT"] = rnd.choice((m["k01"] + rnd.uniform(-4, 3), rnd.uniform(m["k01"], m["ISO"] + 3)))
+        seen.add(decide(m, rnd.random() < 0.02))
+    chk(seen <= all_branches() and all(licence_lines(b) for b in seen), "every branch decide() returns has a registered licence text",
+        "%d distinct" % len(seen))
+    reached = set(r[1].split(" |")[0][len("FINAL: "):] for r in results.values())
+    note("branches reached by section E or the sweep: %d of %d registered" % (len(reached | seen), len(all_branches())))
+    words = set(w for b in (reached | seen) for w in b.split("+"))
+    want_words = (set(LICENSE_SUMMARY) | set(LICENSE_SPLIT)
+                  | set("ONE%d-%s" % (s, w) for s, _f, _b in SINGLES for w in LICENSE_WORD))
+    chk(want_words <= words and set(LICENSE) - {"INCOMPLETE", "HARNESS-UNSOUND", "PATCH-NOT-VERIFIED"} <= reached | seen,
+        "every registered word and every single-word branch is reached", "missing %s" % sorted(want_words - words))
+    chk(all("252" in " ".join(licence_lines(b)) for b in all_branches() if b not in ("INCOMPLETE", "SCALAR-NOT-COLLAPSED", "POSITIVE-CONTROL-FAILED")),
+        "every substantive licence states its effect on 252.8(1)'s confound")
+    chk(all(summary_word(*b.split("+")[1:4]) == b.split("+")[0] for b in all_branches() if b.count("+") == 4),
+        "every five-word branch's SUMMARY is the function of its three singleton words")
+
+    print("\nG. RULE 21 PREMISE: no cvt10 run may exist yet")
+    runs, _n = read_runs(runsdir) if runsdir else ({}, [])
+    chk(not runs, "no cvt10-*.out under %s" % runsdir, "%d found" % len(runs))
+    if csvpath and os.path.exists(csvpath):
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in csv.DictReader(open(csvpath))), "no cvt10- row in the CSV")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n%s" % ("ALL PASS" if not GATE_FAIL else "FAILURES: %d" % len(GATE_FAIL)))
+    for f in GATE_FAIL:
+        print("   FAIL", f)
+    return 1 if GATE_FAIL else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="cvt10 registered scorer.  Documented invocation: "
+                                             "python3 analysis/cVT10_onevsthree_score.py <runsdir>")
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--runsdir", dest="runsdir_kw", default="")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    ap.add_argument("--manifest", default="", help="defaults to <runsdir>/cvt10/PARTITION-MANIFEST.txt")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+    runsdir = a.runsdir or a.runsdir_kw
+    if a.selftest:
+        return selftest(a.csv, runsdir or ".")
+    if not runsdir:
+        ap.error("a runsdir is required: python3 %s <runsdir>" % os.path.basename(__file__))
+    rc, _fin = score(runsdir, a.csv, a.manifest)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

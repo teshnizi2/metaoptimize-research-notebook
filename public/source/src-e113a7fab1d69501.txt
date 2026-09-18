@@ -1,0 +1,518 @@
+#!/bin/bash
+# =============================================================================
+# cVT10_onevsthree.sh -- `cvt10`: ResNet18_c100 -- ONE CARRIER vs THREE AT PlainNet's DOSE.  ONE SUBMISSION, 30 JOBS
+#   (10 arms x 3 seeds), 100 EPOCHS, SEEDS {120,121,122}, ResNet18_c100 / CIFAR-100, ciso1's cell, PROBE=100,
+#   PROBE_TENSOR=1 ON EVERY ARM.  CORRECTIONS 258 (LIMITS-PREP 5.1 R1, refined).
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here touches the other account; every guard
+# and scancel line is filtered on `cvt10-`.
+#
+# REGISTERED SCORER: analysis/cVT10_onevsthree_score.py, committed BEFORE this batch is submitted (RULE 21).
+#     DOCUMENTED INVOCATION:  python3 analysis/cVT10_onevsthree_score.py <runsdir>
+#
+# NO NEW HARNESS CODE.  The batch runs from cvt8's EXISTING isolated tree $WS/harness_cvt8/cifar10 (HF.py 5197dc2e...,
+# UNCHANGED; verified by cvt8's registered stage script, unedited) with cvt8's runner $WS/jobs/run_cifar_cvt8.sh
+# (UNCHANGED).  REST_HOLD is never set (the tree prints `REST_HOLD: off`).  Guard 4f requires the real-run bite log
+# (tests/test_cvt10_hold_realrun.py, bin/cVT10_realrun_bite.sbatch) on THIS HF.py and scorer.
+#
+# THE ARMS (group 1 is the held group of every held arm; every hold is tri:9428 = PlainNet's dose)
+#   k01        scalar                                        ISO        [59,3] free
+#   HOLDBIG3   [59,3]  GROUP_HOLD=<50+53+59>:tri:9428        ONE50      [61,1] {50} free (ciso1 / cdep1 ONE)
+#   ONE50BIG   [61,1]  GROUP_HOLD=layer4.0.bn2.weight:tri:9428
+#   ONE59      [61,1] {59} free                              ONE59BIG   [61,1]  GROUP_HOLD=layer4.1.bn2.weight:tri:9428
+#   ONE53      [61,1] {53} free                              ONE53BIG   [61,1]  GROUP_HOLD=layer4.0.shortcut.1.weight:tri:9428
+#   ISOSPLIT   [59,1,2] {50} held / {53,59} free             GROUP_HOLD=layer4.0.bn2.weight:tri:9428
+#
+# RULE 20.  Every ARGS value is ONE shell token.  GROUP_HOLD rides sbatch's --export list and CANNOT ride the runner's ENV
+# line: PATCH_GROUPHOLD prints its witness line at construction on EVERY run, and that line is what the separate ENV audit
+# and the scorer's G-GHOLD read.  analysis/argsline_guard.py IS NOT EDITED.
+#
+# COST.  cvt8 by sacct: 17.30 GPU-h / 21 = 0.82 GPU-h per 100-epoch ResNet18_c100 run.  30 jobs ~= 24.6 GPU-h expected;
+# HARD BOUND = WALL x 30 = 90 GPU-h (WALL 03:00:00).
+#
+# USAGE   bash bin/cVT10_onevsthree.sh               # dry run: every guard, every composed line printed; submits nothing
+#         bash bin/cVT10_onevsthree.sh --submit      # the ONLY submitting form
+# ENV     CVT10_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD WINDOW_HOLD
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+H7=$WS/harness_cvt7/cifar10
+HARN=$WS/harness_cvt8/cifar10
+RUNNER=$WS/jobs/run_cifar_cvt8.sh
+SAVE=$WS/runs/cvt10
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="120 121 122"
+SEEDRE='(120|121|122|123)'
+MST=1e-3
+A0=1e-6
+NTENS=62
+TOTPAR=11220132
+G_K01='scalar'
+G_ISO='sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight'
+G_ONE50='sets:1-49,51-62/layer4.0.bn2.weight'
+G_ONE59='sets:1-58,60-62/layer4.1.bn2.weight'
+G_ONE53='sets:1-52,54-62/layer4.0.shortcut.1.weight'
+G_SPLIT='sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight/layer4.0.shortcut.1.weight,layer4.1.bn2.weight'
+GH_3='layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight:tri:9428'
+GH_50='layer4.0.bn2.weight:tri:9428'
+GH_59='layer4.1.bn2.weight:tri:9428'
+GH_53='layer4.0.shortcut.1.weight:tri:9428'
+ARMS="k01 ISO HOLDBIG3 ONE50 ONE50BIG ONE59 ONE59BIG ONE53 ONE53BIG ISOSPLIT"
+NJOBS=30
+WALL=03:00:00
+LIVE_BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_CVT7_SHA=2396f2be8102724c120ea5271d2d84acf3835ffb9a5c7947fc282121cf2a588f
+HF_POST_SHA=5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9
+RUNNER_SHA=1dbe4ff52eccbbb1c9936f4a687ed88172dd41c48b14ae60eb353b45f766f5e0
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cVT10_onevsthree_score.py"
+SELF="$REPO/bin/cVT10_onevsthree.sh"
+BSB="$REPO/bin/cVT10_realrun_bite.sbatch"
+TESTB="$REPO/tests/test_cvt10_hold_realrun.py"
+TESTGR="$REPO/tests/test_grouphold_realrun.py"
+STAGE8="$REPO/bin/cVT8_stage_harness.sh"
+STAGE7="$REPO/bin/cVT7_stage_harness.sh"
+SC8="$REPO/analysis/cVT8_doseroute_score.py"
+SC7="$REPO/analysis/cVT7_grouphold_score.py"
+SC1="$REPO/analysis/cIS1_ciso1_isolate_score.py"
+SCD="$REPO/analysis/cDP1_cdep1_depth_score.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+ARCH8="$REPO/jobs/run_cifar_cvt8.sh"
+HFH="$HARN/Optimizers/HF.py"
+HFRH="$HARN/Optimizers/HF.py.pre_resthold"
+BNH="$HARN/build_network.py"
+BLOG="$SAVE/bite_grouphold.log"
+
+echo "=============================================================="
+echo " cvt10 -- ResNet18_c100: ONE carrier vs THREE at PlainNet's dose  (PATCH_GROUPHOLD; cvt8's tree, unchanged)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C  ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   k01       $G_K01"
+echo "   ISO       $G_ISO"
+echo "   HOLDBIG3  ISO's    GROUP_HOLD=$GH_3"
+echo "   ONE50     $G_ONE50"
+echo "   ONE50BIG  ONE50's  GROUP_HOLD=$GH_50"
+echo "   ONE59     $G_ONE59"
+echo "   ONE59BIG  ONE59's  GROUP_HOLD=$GH_59"
+echo "   ONE53     $G_ONE53"
+echo "   ONE53BIG  ONE53's  GROUP_HOLD=$GH_53"
+echo "   ISOSPLIT  $G_SPLIT  GROUP_HOLD=$GH_50"
+echo " 10 arms x 3 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " CO-PRIMARY: P_ONE50 = ONE50 - ONE50BIG; P_ONE59 = ONE59 - ONE59BIG; P_ONE53 = ONE53 - ONE53BIG"
+echo " DOCUMENTED INVOCATION: python3 analysis/cVT10_onevsthree_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${COMP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] \
+  && [ -z "${WINDOW_HOLD+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD, REST_HOLD and WINDOW_HOLD are UNSET in the launcher's environment" \
+  || guard_fail "guard 0b: an intervention switch is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$SELF" "$BSB" "$TESTB" "$TESTGR" "$STAGE8" "$STAGE7" "$SC8" "$SC7" "$SC1" "$SCD" "$EXCL" "$EXCLT" "$LIBF" "$AGF" \
+         "$CSVP" "$ARCH8" "$RUNNER" "$HFH" "$HFRH" "$BNH"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cVT10_onevsthree_score.py bin/cVT10_onevsthree.sh bin/cVT10_realrun_bite.sbatch tests/test_cvt10_hold_realrun.py"
+REUSEF="tests/test_grouphold_realrun.py bin/cVT8_stage_harness.sh bin/cVT7_stage_harness.sh analysis/cVT8_doseroute_score.py analysis/cVT7_grouphold_score.py analysis/cIS1_ciso1_isolate_score.py analysis/cDP1_cdep1_depth_score.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/_lib_guards.sh analysis/argsline_guard.py jobs/run_cifar_cvt8.sh"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the four registration files and twelve reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CVT10_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CVT10_REGISTERED_COMMIT"
+    echo "          (RULE 21 is re-verified by wall clock: that commit's %ct vs the earliest sacct Submit)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CVT10_REGISTERED_COMMIT is unset -- declare the commit whose tree was staged"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CVT10_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+cmp -s "$RUNNER" "$ARCH8" && echo "guard 1b2: the archived jobs/run_cifar_cvt8.sh is BYTE-IDENTICAL to the runner the batch uses (cvt8's, reused)" \
+  || guard_fail "guard 1b2: jobs/run_cifar_cvt8.sh in the repo differs from $RUNNER"
+
+# ---- guard 1c: the scorer selftest, INCLUDING O2, the real-record nulls and the invocation ----
+SELFT=/tmp/cvt10_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION\|Traceback' "$SELFT" | head -20; tail -5 "$SELFT"; }
+[ "$(grep -c '^  SKIP' "$SELFT")" = 0 ] && echo "guard 1c1: no SKIP line (every byte identity and corpus premise was checked on this host)" \
+  || guard_fail "guard 1c1: the selftest skipped a check on this host"
+grep -qE "^  PASS O2 base: gamma_last stall, shortcut no +real\+invented " "$SELFT" && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows at cvt10's cells, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cVT10_onevsthree_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows carry a seed of the block 120-123" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed check ran and passed" || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS ONE50's spec is BYTE-IDENTICAL to cIS1's ONE" "$SELFT" && grep -q "^  PASS ONE50's spec is BYTE-IDENTICAL to cDP1's ONE" "$SELFT" \
+  && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cIS1's ISO" "$SELFT" \
+  && grep -q "^  PASS B cvt8's registered scorer: HOLDBIG's GROUP_HOLD string, GROUP_HOLD witness and REST_HOLD witness == HOLDBIG3's" "$SELFT" \
+  && grep -q "^  PASS B cvt8's tree (HF, runner, build_network), its names and its ENV line are this batch's" "$SELFT" \
+  && echo "guard 1c5: ONE50 byte-identical to ciso1's / cdep1's ONE; ISO to ciso1's; HOLDBIG3 is cvt8's HOLDBIG; cvt8's tree" \
+  || guard_fail "guard 1c5: the byte-identity checks did not pass"
+grep -q "^  PASS B G-BITE PASSES on the 6 landed ONE runs" "$SELFT" && grep -q "^  PASS B THE BROKEN-SINGLETON-HOLD NULL ON REAL RECORDS" "$SELFT" \
+  && grep -q "^  PASS B cvt8's 3 landed HOLDBIG runs PASS G-BITE as HOLDBIG3" "$SELFT" && grep -q "^  PASS B cvt8's HOLDHIGH (tri:8609) read as HOLDBIG3 FAILS" "$SELFT" \
+  && grep -q "^  PASS B G-BITE PASSES on cvt8's 6 landed k01 / ISO runs" "$SELFT" \
+  && echo "guard 1c7: G-BITE passes 6 landed ONE, 6 cvt8 controls, 3 cvt8 HOLDBIG; FAILS 12 real-record singleton nulls and 3 wrong-dose reads" \
+  || guard_fail "guard 1c7: the real-record G-BITE checks did not pass"
+grep -q "^  PASS SIGMA_R18ALL: the FROZEN literal 0.68119834093519049 IS the FILTERED value (df 221)" "$SELFT" \
+  && echo "guard 1c8: OPERATIONS 36 -- the frozen floor IS the corpus_exclusions.filter_rows value on the registration corpus" \
+  || guard_fail "guard 1c8: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS E BROKEN SINGLETON HOLD: every one-tensor arm unheld" "$SELFT" && grep -q "^  PASS E HOLD ONLY AT PROBE STEPS" "$SELFT" \
+  && grep -q "^  PASS E WRONG DOSE: ONE50BIG on tri:8609" "$SELFT" && grep -q "^  PASS E UNHELD GROUP TOUCHED: ISOSPLIT" "$SELFT" \
+  && echo "guard 1c9: the broken-singleton null, a probe-step-only hold, a wrong dose and a touched unheld group reach PATCH-NOT-VERIFIED" \
+  || guard_fail "guard 1c9: G-BITE break cases did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+# ---- guard 2: RULE 21 premise -- nothing of this batch exists yet ----------------
+grep -q '^cvt10-' "$CSVP" && guard_fail "guard 2: cvt10-* already in the CSV" || echo "guard 2: no cvt10-* row in the corpus"
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2c: corpus premise failed"
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+hit = [r["run"] for r in rows if r.get("seed") in ("120", "121", "122", "123")]
+print("guard 2c: rows carrying seed 120/121/122/123: %d" % len(hit))
+raise SystemExit(1 if hit else 0)
+PYEOF
+NOUT=$(ls "$WS/runs"/cvt10-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cvt10-*.out on disk" || guard_fail "guard 2b: $NOUT cvt10-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- "--seed $SEEDRE( |\$)")
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 120/121/122/123" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 120-123"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cvt10-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cvt10-* jobs" || guard_fail "guard 2e: sacct shows $NS cvt10-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cvt10-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cvt10-* in squeue" || guard_fail "guard 2f: $NQ cvt10-* already queued"
+fi
+
+# ---- guard 3/4a: cvt8's tree unchanged (cvt7's tree too) --------------------------------
+bash "$STAGE8" >/tmp/cvt10_stage8.$$ 2>&1 \
+  && { echo "guard 4a: bin/cVT8_stage_harness.sh (registered, UNEDITED, verify mode) VERIFIES cvt8's tree unchanged:"; grep -E 'V-|VERIFIED' /tmp/cvt10_stage8.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4a: cvt8's tree is NOT consistent"; tail -20 /tmp/cvt10_stage8.$$; }
+rm -f /tmp/cvt10_stage8.$$
+bash "$STAGE7" >/tmp/cvt10_stage7.$$ 2>&1 \
+  && echo "guard 4a1: bin/cVT7_stage_harness.sh (registered, unedited, verify mode) VERIFIES cvt7's tree unchanged" \
+  || { guard_fail "guard 4a1: cvt7's tree is NOT consistent"; tail -10 /tmp/cvt10_stage7.$$; }
+rm -f /tmp/cvt10_stage7.$$
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$BNH")" = "$LIVE_BN_SHA" ] && [ "$(sha "$LIVE/build_network.py")" = "$LIVE_BN_SHA" ] \
+  && echo "guard 3b: build_network.py == the LIVE one c7998883..." || guard_fail "guard 3b: build_network.py is not the LIVE one"
+[ "$(sha "$HFH")" = "$HF_POST_SHA" ] && [ "$(sha "$HFRH")" = "$HF_CVT7_SHA" ] && [ "$(sha "$H7/Optimizers/HF.py")" = "$HF_CVT7_SHA" ] \
+  && [ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] \
+  && echo "guard 3c: HF.py == cvt8's 5197dc2e...; .pre_resthold == cvt7's 2396f2be...; the LIVE HF.py is 4732b74a..." \
+  || guard_fail "guard 3c: the tree's HF files are not the pinned ones"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == 1dbe4ff5... (cvt8's runner, reused unchanged)" \
+  || guard_fail "guard 3e: $RUNNER is not the pinned cvt8 runner"
+grep -q PATCH_GROUPHOLD "$LIVE/Optimizers/HF.py" && guard_fail "guard 3d: the LIVE HF.py carries PATCH_GROUPHOLD" \
+  || echo "guard 3d: the LIVE HF.py carries no PATCH_GROUPHOLD"
+
+# ---- guard 4f: the real-run bite log on THIS HF and THIS scorer ----
+HFSHA=$(sha "$HFH"); BNSHA=$(sha "$BNH"); SCSHA=$(sha "$SC")
+if [ -f "$BLOG" ] && grep -q "^BITE_RC 0$" "$BLOG" && [ "$(grep -c '^ALL PASS$' "$BLOG")" = 1 ] && [ "$(grep -c '^  FAIL' "$BLOG")" = 0 ] \
+   && grep -q "^TREE $HARN HF $HFSHA build_network $BNSHA$" "$BLOG" && grep -q "^SCORER_SHA256 $SCSHA$" "$BLOG" \
+   && grep -q "^DRIVER_SHA256 $(sha "$TESTB")$" "$BLOG" && grep -q "^REGISTERED_TEST_SHA256 $(sha "$TESTGR")$" "$BLOG" \
+   && [ "$(grep -c "PASS RB1 .* the scorer's OWN bite_check PASSES on the 30 real records" "$BLOG")" = 5 ] \
+   && [ "$(grep -c "PASS RB1 .* printed exactly ONE GROUP_HOLD line == the scorer's witness" "$BLOG")" = 5 ] \
+   && [ "$(grep -c "PASS RB2 .* the scorer's bite_check PASSES as a control" "$BLOG")" = 3 ] \
+   && grep -q "PASS RB2 SPLITFREE \[59,1,2\]: 3 groups at every record" "$BLOG" \
+   && [ "$(grep -c "PASS RB3 .* the held group sits at -15 after every step" "$BLOG")" = 2 ] \
+   && grep -q "PASS RB0 ONE50 free vs itself: every parameter and buffer after the last step BITWISE-IDENTICAL" "$BLOG" \
+   && [ "$(grep -c "PASS RB4 .* raises ValueError at construction" "$BLOG")" = 3 ]; then
+  echo "guard 4f: the real-run bite log (tests/test_cvt10_hold_realrun.py) ALL PASS on THIS HF, THIS scorer: $(grep -c '^  PASS' "$BLOG") PASS / $(grep -c '^  FAIL' "$BLOG") FAIL (sha $(sha "$BLOG" | cut -c1-8))"
+else
+  guard_fail "guard 4f: no ALL PASS bite log for HF $HFSHA and scorer $SCSHA at $BLOG -- sbatch $BSB, then copy its .out there"
+fi
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, built from cvt8's tree, per arm with NAMES and GROUP_HOLD ----
+mkdir -p "$SAVE"
+MTMP=/tmp/cvt10_manifest.$$
+python3 - "$HARN" "$MTMP" "$NTENS" "$TOTPAR" "$NET" "$SC" "$G_K01" "$G_ISO" "$G_ONE50" "$G_ONE59" "$G_ONE53" "$G_SPLIT" \
+          "$GH_3" "$GH_50" "$GH_59" "$GH_53" "$ARMS" "$SEEDS" <<'PYEOF' || guard_fail "guard 4: live partition / hold / literal check FAILED"
+import sys, os, io, inspect, re, contextlib, importlib.util
+harn, out, ntens, totpar, net_name, scp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+gk, gi, g50, g59, g53, gsp, h3, h50, h59, h53, arms_s, seeds_s = sys.argv[7:19]
+spm = importlib.util.spec_from_file_location("cvt10sc", scp); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+bad = 0
+# guard 4c': the launcher's literals == the scorer's
+want_spec = {"k01": gk, "ISO": gi, "HOLDBIG3": gi, "ONE50": g50, "ONE50BIG": g50, "ONE59": g59, "ONE59BIG": g59, "ONE53": g53,
+             "ONE53BIG": g53, "ISOSPLIT": gsp}
+want_gh = {"HOLDBIG3": h3, "ONE50BIG": h50, "ONE59BIG": h59, "ONE53BIG": h53, "ISOSPLIT": h50}
+lit = (tuple(arms_s.split()) == S.ARMS and want_spec == S.SPEC and all(S.GROUPHOLD[a] == want_gh.get(a, "") for a in S.ARMS)
+       and tuple(int(x) for x in seeds_s.split()) == S.SEEDS and net_name == S.NET and ntens == S.NTENS and totpar == S.TOTPAR)
+print("guard 4c': ARMS, the ten spec strings, the five GROUP_HOLD values, SEEDS, NET, NTENS, TOTPAR agree in launcher and scorer: %s" % lit)
+bad += not lit
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+T, tot = len(nps), sum(numel)
+print("guard 4: live %s from cvt8's tree -- %d tensors, %d parameters" % (net_name, T, tot))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar)); raise SystemExit(1)
+nbn = sum(isinstance(m, nn.BatchNorm2d) for m in net.modules()); ngn = sum(isinstance(m, nn.GroupNorm) for m in net.modules())
+if (nbn, ngn) != (S.N_BATCHNORM, 0): bad += 1
+if names != S.NAMES:
+    print("!!! guard 4: the LIVE parameter names are not the scorer's NAMES"); bad += 1
+for i, nm in zip(S.CARRIER_IDX, S.CARRIERS):
+    print("guard 4: idx %d on the live model = %s (%s, numel %d)" % (i, names[i - 1], own[names[i - 1]], numel[i - 1]))
+    if names[i - 1] != nm or own[names[i - 1]] != "BatchNorm2d" or numel[i - 1] != 512: bad += 1
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "NORM BatchNorm2d %d GroupNorm %d" % (nbn, ngn),
+         "CLIP_C %s" % S.CLIP, "EPOCHS %d" % S.EPOCHS, "META_STEPS %d" % (S.EPOCHS * (50000 // S.BATCH))]
+lines += ["TENSOR %d %s %d %s" % (i + 1, names[i], numel[i], own[names[i]]) for i in range(T)]
+lines.append("CARRIERS %s" % ",".join("%d:%s" % (i, names[i - 1]) for i in S.CARRIER_IDX))
+lines.append("HOLD B0 %r MS %r P_BIG %d" % (float(torch.log(torch.tensor(1e-6))), S.MS, S.P_BIG))
+for arm in S.ARMS:
+    spec = S.SPEC[arm]
+    for k in ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD"):
+        os.environ.pop(k, None)
+    if S.GROUPHOLD[arm]:
+        os.environ["GROUP_HOLD"] = S.GROUPHOLD[arm]
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, spec, nps, 1e-6)
+    os.environ.pop("GROUP_HOLD", None)
+    L = buf.getvalue().splitlines()
+    gl = [ln for ln in L if ln.startswith("GROUP_HOLD")]; rl = [ln for ln in L if ln.startswith("REST_HOLD")]
+    bl = [ln for ln in L if ln.startswith("BETA_HOLD")]; vl = [ln for ln in L if ln.startswith("VOTE_W")]
+    cl = [ln for ln in L if ln.startswith("COMP_HOLD") or ln.startswith("WINDOW_HOLD")]
+    shp = [tuple(b.shape) for b in o.beta]
+    b0 = [float(x) for x in o.beta[0].reshape(-1)]
+    print("guard 4: %-9s type=%s beta %s init %s  _gh_on %s g %s mode %s P %s  _rh_on %s"
+          % (arm, o.stepsize_type, shp, b0, getattr(o, "_gh_on", None), getattr(o, "_gh_g", None), getattr(o, "_gh_mode", None),
+             getattr(o, "_gh_P", None), getattr(o, "_rh_on", None)))
+    print("         GROUP_HOLD == registered: %s ; REST_HOLD %s ; BETA_HOLD %s ; VOTE_W %s ; COMP/WINDOW lines %d"
+          % (gl == [S.WITNESS_GH[arm]], rl, bl, vl, len(cl)))
+    if gl != [S.WITNESS_GH[arm]] or rl != ["REST_HOLD: off"] or vl != ["VOTE_W: off"] or bl != ["BETA_HOLD: off"] or cl \
+       or o.stepsize_type != S.PT_TYPE[arm] or bool(getattr(o, "_gh_on", False)) != bool(S.GROUPHOLD[arm]) \
+       or getattr(o, "_rh_on", False) or getattr(o, "_rednorm", False) or getattr(o, "_bh_on", False) or getattr(o, "_vw_on", False):
+        print("!!! guard 4: %s does not construct as registered" % arm); bad += 1
+    if arm in S.HELD:
+        want0 = [S.B0] * len(S.SIZES[arm])
+        want0[1] = S.B0
+        if o._gh_mode != "tri" or o._gh_P != S.P_BIG or o._gh_g != 1 or b0 != want0 \
+           or any(float(torch.tensor([o._gh_value(n)], dtype=torch.float32)[0]) != S.v_of(n) for n in (0, 1, 2, 3, 101, 9428, 9429, 9430, 20000, 50001)):
+            print("!!! guard 4: %s hold state is not the registered one" % arm); bad += 1
+    if spec == "scalar":
+        if shp != [()]: bad += 1
+        lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % arm)
+    else:
+        g = HF.polish_the_stepsize_groups(None, spec, nps)
+        sizes = [len(x) for x in g]; pc = [sum(numel[names.index(n)] for n in x) for x in g]
+        gidx = [sorted(names.index(n) + 1 for n in x) for x in g]
+        if sizes != S.SIZES[arm] or gidx != S.arm_groups(arm) or shp != [(len(sizes),)] or [len(x) for x in o.param_groups_indices] != sizes:
+            print("!!! guard 4: %s is not the registered %s partition" % (arm, S.SIZES[arm])); bad += 1
+        if arm in S.HELD and sorted(o.param_groups_indices[1]) != [i - 1 for i in sorted(S.HOLD_IDX[arm])]:
+            print("!!! guard 4: %s group 1 is not the held set" % arm); bad += 1
+        lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUPS1+ %s"
+                     % (arm, spec, len(g), ",".join(str(s) for s in sizes), ",".join(str(s) for s in pc),
+                        " / ".join(" ".join(x) for x in g[1:])))
+    lines.append("GROUPHOLD %s %s" % (arm, S.GROUPHOLD[arm] if S.GROUPHOLD[arm] else "off"))
+    lines.append("WITNESS %s %s" % (arm, gl[0] if gl else "(none)"))
+src = inspect.getsource(HF.Lion_meta_update)
+m = re.search(r"torch\.sign\(self\.args_meta\['Lion_beta2'\]\*self\.momentum_meta\[i\]\s*\+\s*\(1-self\.args_meta\['Lion_beta2'\]\)\*HtT_gradft\[i\]\)", src)
+print("guard 4f': Lion_meta_update subtracts ms*sign(b2*momentum_meta + (1-b2)*z), elementwise: %s" % bool(m))
+if not m: bad += 1
+st = inspect.getsource(HF.step)
+i_mu, i_cl = st.find("self.meta_update(HtT_gradft)"), st.find(".clamp(self._beta_lo, self._beta_hi)")
+i_gh, i_rh, i_pr = st.find("self._gh_apply()"), st.find("self._rh_apply()"), st.find("self._probe(HtT_gradft)")
+ok_st = 0 <= i_mu < i_cl < i_gh < i_rh < i_pr
+print("guard 4f': step() order meta_update < clamp < _gh_apply < _rh_apply < _probe: %s" % ok_st)
+if not ok_st: bad += 1
+txt = "\n".join(lines) + "\n"
+if txt != S.synthetic_manifest_text():
+    print("!!! guard 4d: the live manifest differs from the scorer's synthetic_manifest_text()")
+    a_, b_ = txt.splitlines(), S.synthetic_manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("    first difference at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "(none)")[:200], (b_[k] if k < len(b_) else "(none)")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cvt10-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+rm -f "$MTMP"
+
+# ---- guard 4g: provenance (the scored file ONLY on --submit) ---------------------
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $BNSHA"
+  echo "HF_SHA256 $HFSHA"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "SCORER_SHA256 $SCSHA"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "REGISTERED_COMMIT ${CVT10_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "HF_PRE_RESTHOLD_SHA256 $(sha "$HFRH")"
+  echo "CVT7_HF_SHA256 $(sha "$H7/Optimizers/HF.py")"
+  echo "LIVE_HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "LIVE_BUILD_NETWORK_SHA256 $(sha "$LIVE/build_network.py")"
+  echo "BITE_LOG_SHA256 $(sha "$BLOG" 2>/dev/null)"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cvt8/STAGE-MANIFEST.txt")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "GROUP_HOLD HOLDBIG3=$GH_3"; echo "GROUP_HOLD ONE50BIG=ISOSPLIT=$GH_50"; echo "GROUP_HOLD ONE59BIG=$GH_59"; echo "GROUP_HOLD ONE53BIG=$GH_53"
+  echo "GROUP_HOLD k01=ISO=ONE50=ONE59=ONE53=unset; REST_HOLD, BETA_HOLD, COMP_HOLD, VOTE_W, WINDOW_HOLD unset on every arm"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cvt10-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions ----------------------------------
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 60 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest -----------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cvt10", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+# ---- guard 9: the harness the guards tested IS the harness the runner runs ---------
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+# ---- compose, guard each line under RULE 20, then (only with --submit) submit ----
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      k01)       G=$G_K01;   WG="" ;;
+      ISO)       G=$G_ISO;   WG="" ;;
+      HOLDBIG3)  G=$G_ISO;   WG=$GH_3 ;;
+      ONE50)     G=$G_ONE50; WG="" ;;
+      ONE50BIG)  G=$G_ONE50; WG=$GH_50 ;;
+      ONE59)     G=$G_ONE59; WG="" ;;
+      ONE59BIG)  G=$G_ONE59; WG=$GH_59 ;;
+      ONE53)     G=$G_ONE53; WG="" ;;
+      ONE53BIG)  G=$G_ONE53; WG=$GH_53 ;;
+      ISOSPLIT)  G=$G_SPLIT; WG=$GH_50 ;;
+    esac
+    HX=""; [ -n "$WG" ] && HX=",GROUP_HOLD=$WG"
+    RN="cvt10-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR$HX \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    GOTG=$(printf '%s\n' "$CMD" | grep -o 'GROUP_HOLD=[^ ,]*'); NGH=$(printf '%s\n' "$CMD" | grep -o 'GROUP_HOLD=' | wc -l | tr -d ' ')
+    NOTHER=$(printf '%s\n' "$CMD" | grep -o 'BETA_HOLD=\|VOTE_W=\|COMP_HOLD=\|REST_HOLD=\|WINDOW_HOLD=\|:floor' | wc -l | tr -d ' ')
+    [ "$NOTHER" = 0 ] || { echo "!!! $RN carries a BETA_HOLD / VOTE_W / COMP_HOLD / REST_HOLD / WINDOW_HOLD or a test-only floor string"; BAD=$((BAD+1)); }
+    if [ -z "$WG" ]; then [ "$NGH" = 0 ] || { echo "!!! $RN carries a GROUP_HOLD"; BAD=$((BAD+1)); }
+    else [ "$NGH" = 1 ] && [ "$GOTG" = "GROUP_HOLD=$WG" ] || { echo "!!! $RN: $NGH GROUP_HOLD or not its own"; BAD=$((BAD+1)); }; fi
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / GROUP_HOLD pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cvt10-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cvt10-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cvt10- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cvt10-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cvt10 job started inside the window.  Re-check with:"
+       echo "         python3 $AGF $WS/runs --name cvt10- --batch-consistency --vary stepsize-groups --vary seed --vary run-name" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cvt10-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 30/30 RUN_DONE, after RULE 20 at full coverage):"
+  echo "    python3 $REPO/analysis/cVT10_onevsthree_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cVT10_onevsthree.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

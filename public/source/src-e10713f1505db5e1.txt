@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""csv1 REGISTRATION-TIME DERIVATIONS (CORRECTIONS 262).  Reads ONLY landed records (probe.jsonl of cvt1 / cvt4 / cvt6 /
+cvt9, all LANDED) and the corpus through analysis/corpus_exclusions.filter_rows.  Nothing here reads a csv1 run.  What it
+prints is copied into analysis/cSV1_shadowvote_score.py as LITERALS; that scorer's selftest re-derives the share prior on
+the host's records and requires equality with LANDED_SHARE_MIN below.
+
+THE QUESTION (LIMITS-PREP 5.1 N1).  cvt4 / cvt6 / cvt9 show that a LARGE held step size on idx 50 (layer4.1.bn2.weight)
+is SUFFICIENT to stall PlainNet18_c100 at cvt1's cell; cvt1 showed that removing 50's vote (MUTE) does not rescue.  Is a
+large APPLIED step on 50 NECESSARY for the stall when its vote -- at shared-step-size magnitude -- stays in the shared
+sum?  csv1 holds 50's applied step at the clamp floor in the scalar grouping with (SHADOWLOW) its shadow term, built at
+the shared step size from its real momentum and weights, or (NAIVELOW) its natural, floor-sized term in the sum.
+
+Sections:
+  S1  the carrier's vote share on landed k01: per run, the median over records in epochs [16, 36) of
+      |z_tensor[50]| / sum_i |z_tensor[i]|, with the shared beta's peak and pin epoch; MUTE's raw share beside it.
+      The minimum per-run median is the literal LANDED_SHARE_MIN; DOM_K01_MIN (0.30) and DOM_FRAC (0.50) are set well
+      under it.  Why [16, 36): 50's share is ~0.01-0.05 before epoch 16 (the shared step is still ~1e-6 .. 1e-4) and rises
+      to ~0.5 exactly as the shared beta peaks (epoch ~17) and falls; the shared beta pins at the floor at 36.2-36.6.
+  S2  FLOOR_ALPHA = float32(exp(float32(-15))), the value HOLDLOW's group applied (np.exp of the float32 clamp floor).
+  S3  G-BITE non-vacuity on landed records: every landed k01 run read as INERT / SHADOWLOW / NAIVELOW must FAIL (no sv_
+      keys: the BROKEN-PATCH null); landed MUTE read as k01 must FAIL (z_agg drops 50); landed k01 / MUTE / HEAD read as
+      themselves must PASS.  (Uses the registered scorer's bite_check; printed, not asserted here.)
+  S4  the noise floor on the current corpus, 227.6's definitions, through corpus_exclusions.filter_rows.
+  S5  freshness: corpus rows and .out ARGS lines carrying seeds 136-139; csv1- rows.
+
+  python3 analysis/csv1_registration_derivations.py <runs dir holding cvt1/ cvt4/ cvt6/ cvt9/> [<all_runs.csv>]
+"""
+import csv
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import cvt4_registration_derivations as DV4      # registered at 237, imported UNEDITED (pooled_sigma)
+sys.path.pop(0)
+
+LANDED_K01 = (("cvt1", (78, 79, 80)), ("cvt4", (90, 91, 92)), ("cvt6", (96, 97, 98)), ("cvt9", (105, 106, 107)))
+LANDED_MUTE = (("cvt1", (78, 79, 80)),)
+LANDED_HEAD = (("cvt1", (78, 79, 80)), ("cvt4", (90, 91, 92)))
+WIN = (16.0, 36.0)
+UPE = 500
+LANDED_SHARE_MIN = 0.5115   # S1 output, 4 d.p. (the scorer's selftest compares within 5e-4)
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def load(runs, b, a, s):
+    p = os.path.join(runs, b, "probe_%s-%s-s%d" % (b, a, s), "probe.jsonl")
+    if not os.path.exists(p):
+        return None
+    return [json.loads(ln) for ln in open(p) if ln.strip()]
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2]))
+
+
+def share(recs, win=WIN):
+    v = []
+    for r in recs:
+        ep = r["step"] / float(UPE)
+        if win[0] <= ep < win[1]:
+            zt = [abs(float(x)) for x in r["z_tensor"]]
+            if sum(zt) > 0:
+                v.append(zt[49] / sum(zt))
+    return median(v)
+
+
+def beta_track(recs):
+    b = [(r["step"] / float(UPE), float(r["beta"][0])) for r in recs]
+    pk = max(b, key=lambda x: x[1])
+    pin = None
+    for i in range(len(b)):
+        if all(v <= -15.0 + 0.01 for _e, v in b[i:]):
+            pin = b[i][0]
+            break
+    return pk, pin
+
+
+def main():
+    runs = sys.argv[1] if len(sys.argv) > 1 else "/cluster/account_b/metaopt/runs"
+    csvpath = sys.argv[2] if len(sys.argv) > 2 else os.path.join(REPO, "results", "all_runs.csv")
+    print("csv1 registration derivations (CORRECTIONS 262)")
+    print("  runs %s" % runs)
+
+    print("\nS1  THE CARRIER's VOTE SHARE on landed k01 (median over records in epochs [%.0f, %.0f) of |z50| / sum |z|)" % WIN)
+    mins = []
+    for b, ss in LANDED_K01:
+        for s in ss:
+            R = load(runs, b, "k01", s)
+            if R is None:
+                print("  %s k01 s%d: no probe records on this host" % (b, s))
+                continue
+            sh = share(R)
+            pre = share(R, (0.0, 16.0))
+            post = share(R, (36.0, 100.0))
+            pk, pin = beta_track(R)
+            mins.append(sh)
+            print("  %s k01  s%d  records %d  share [0,16) %.4f  [16,36) %.4f  [36,100) %.4f  shared beta peak %.3f @ epoch %.1f, pin %s"
+                  % (b, s, len(R), pre, sh, post, pk[1], pk[0], pin))
+    for b, ss in LANDED_MUTE:
+        for s in ss:
+            R = load(runs, b, "MUTE", s)
+            if R:
+                pk, pin = beta_track(R)
+                print("  %s MUTE s%d  raw share [16,36) %.4f (its term is weighted 0 in the sum)  shared beta peak %.3f @ %.1f, pin %s"
+                      % (b, s, share(R), pk[1], pk[0], pin))
+    if mins:
+        print("  LANDED k01 per-run [16,36) medians: min %.4f  max %.4f  over %d runs  (literal LANDED_SHARE_MIN %.4f: %s)"
+              % (min(mins), max(mins), len(mins), LANDED_SHARE_MIN, abs(min(mins) - LANDED_SHARE_MIN) < 5e-4))
+        print("  registered bars: DOM_K01_MIN 0.30 (%.2f under the landed minimum); DOM_FRAC 0.50 -> SHADOWLOW must reach >= %.3f at the landed minimum"
+              % (min(mins) - 0.30, 0.5 * min(mins)))
+
+    print("\nS2  THE FLOOR STEP SIZE")
+    fa = f32(math.exp(f32(-15.0)))
+    print("  FLOOR_ALPHA = float32(exp(float32(-15.0))) = %r  (HOLDLOW's group applied np.exp(float32 beta) at beta = -15.0)" % fa)
+    try:
+        import numpy as np
+        print("  numpy: np.exp(np.asarray(-15.0, dtype=np.float32)) = %r (dtype %s); x 1.0 (PATCH_SCHED under SCHED=none) = %r (%s)"
+              % (float(np.exp(np.asarray(-15.0, dtype=np.float32))), np.exp(np.asarray(-15.0, dtype=np.float32)).dtype,
+                 float(np.exp(np.asarray(-15.0, dtype=np.float32)) * 1.0), type(np.exp(np.asarray(-15.0, dtype=np.float32)) * 1.0).__name__))
+    except ImportError:
+        print("  numpy not importable here (the scorer's literal is the pure-python value)")
+
+    print("\nS3  G-BITE NON-VACUITY ON LANDED RECORDS (the registered scorer's bite_check, printed)")
+    sys.path.insert(0, HERE)
+    import cSV1_shadowvote_score as SC
+    sys.path.pop(0)
+    for b, ss in LANDED_K01:
+        for s in ss:
+            R = load(runs, b, "k01", s)
+            if R is None:
+                continue
+            own = SC.bite_check("k01", R)
+            nulls = [SC.bite_check(a, R)[0] for a in SC.SV_ARMS]
+            print("  %s k01  s%d as k01: %s (lion %d, zagg %d, worst zagg %.2e)   as INERT/SHADOWLOW/NAIVELOW: %s"
+                  % (b, s, own[0], own[1]["bad_lion"], own[1]["bad_zagg"], own[1]["worst_zagg"], nulls))
+    for b, ss in LANDED_MUTE:
+        for s in ss:
+            R = load(runs, b, "MUTE", s)
+            if R:
+                print("  %s MUTE s%d as MUTE: %s   as k01: %s" % (b, s, SC.bite_check("MUTE", R)[0], SC.bite_check("k01", R)[0]))
+    for b, ss in LANDED_HEAD:
+        for s in ss:
+            R = load(runs, b, "HEAD", s)
+            if R:
+                ok, d = SC.bite_check("HEAD", R)
+                print("  %s HEAD s%d as HEAD: %s (lion %d, zagg %d, worst zagg %.2e)" % (b, s, ok, d["bad_lion"], d["bad_zagg"], d["worst_zagg"]))
+
+    print("\nS4  THE NOISE FLOOR through corpus_exclusions.filter_rows (OPERATIONS 36), 227.6's definitions")
+    if os.path.exists(csvpath):
+        sys.path.insert(0, HERE)
+        import corpus_exclusions as CE
+        sys.path.pop(0)
+        naive = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith("csv1-")]
+        filt = CE.filter_rows(naive)
+        tsv = os.path.join(REPO, "results", "CORPUS-EXCLUSIONS.tsv")
+        print("  corpus %s  sha %s  %d rows, %d after filter_rows; exclusion list sha %s"
+              % (csvpath, hashlib.sha256(open(csvpath, "rb").read()).hexdigest(), len(naive), len(filt),
+                 hashlib.sha256(open(tsv, "rb").read()).hexdigest()))
+        out = {}
+        for k, net in (("R18ALL", "ResNet18_c100"), ("PLAIN", "PlainNet18_c100")):
+            sf, sn = DV4.pooled_sigma(filt, net), DV4.pooled_sigma(naive, net)
+            out[k] = sf[0]
+            print("  SIGMA_%-7s FILTERED %r (df %d, %d cells)   NAIVE %r (df %d, %d cells)" % (k, sf[0], sf[1], sf[2], sn[0], sn[1], sn[2]))
+        sp = max(out["R18ALL"], out["PLAIN"])
+        print("  SIGMA_PRIOR = max(filtered pair) = %r ; SE_PRIOR (3 vs 3) = %.6f" % (sp, sp * math.sqrt(2 / 3.0)))
+
+        print("\nS5  FRESHNESS")
+        print("  corpus rows carrying seed 136 / 137 / 138 / 139: %d ; csv1- rows: %d"
+              % (sum(r.get("seed") in ("136", "137", "138", "139") for r in naive),
+                 sum(r.get("run", "").startswith("csv1-") for r in csv.DictReader(open(csvpath)))))
+    else:
+        print("  corpus not readable at %s" % csvpath)
+    nargs = 0
+    for fn in glob.glob(os.path.join(runs, "*.out")):
+        with open(fn, errors="replace") as fh:
+            for ln in fh:
+                if ln.startswith("ARGS:"):
+                    nargs += bool(re.search(r"--seed (136|137|138|139)( |$)", ln))
+                    break
+    print("  .out ARGS lines under %s carrying --seed 136-139: %d ; csv1-*.out: %d"
+          % (runs, nargs, len(glob.glob(os.path.join(runs, "csv1-*.out")))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

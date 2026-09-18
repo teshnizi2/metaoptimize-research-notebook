@@ -23,7 +23,7 @@ const CVT5_FINAL = ['K-DEPENDENT-EQUILIBRIUM', 'RESCUE-SURVIVES', 'K33-HOLDS-PIN
 
 test('MT222 and MT223 are the cvt4 and cvt5 rows, both Goal met under the documented rules, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(158, 160).map(e => e.id), ['MT222', 'MT223'], 'appended after every record that existed before them, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [164, 146, 18, 3127]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [168, 150, 18, 3181]);
   assert.equal(CVT4_FINAL.length, 16);
   assert.equal(CVT5_FINAL.length, 32);
   const cases: [string, string, string[], number, string][] = [
@@ -76,7 +76,7 @@ test('the intervention warnings name every intervened arm and the exclusion list
 });
 
 test('the 30 runs link to MT222 / MT223 with sanitized logs, and exactly the 18 intervened runs are marked', () => {
-  assert.equal(runs.length, 3127);
+  assert.equal(runs.length, 3181);
   const batches: [string, string, string[], number, number, Record<string, [number, string, string]>][] = [
     ['cvt4', 'MT222', ['90', '91', '92'], 18, 100, {
       HOLDLOW: [3, 'BETA_HOLD', 'step-size hold'], HOLDSHARED: [3, 'BETA_HOLD', 'step-size hold'],

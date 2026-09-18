@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""RULE 20 audit for cmg1 (CORRECTIONS 259, owed at 259.11/259.12).
+
+Reads ONLY the ARGS / ENV / PROBE_TENSOR / foreign-switch lines of each run's OWN .out file.  No `Epoch` line is
+opened, parsed or printed, so running this reads NO accuracy number.  The registered scorer
+(`analysis/cMG1_mergecarrier_score.py`, sha bdd212d4...) is imported UNEDITED from the stage for its
+`expected_args()`, `ENV_EXPECTED`, `PT_RE`, `FOREIGN_PREFIXES`, `ARMS`, `SEEDS`; `analysis/argsline_guard.py` is run
+UNEDITED from the stage.
+
+usage: python3 l259_rule20.py [STAGE] [RUNSDIR]
+"""
+import glob, importlib.util, os, re, subprocess, sys, time
+
+STAGE = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/stage_cmg1")
+RUNS = os.path.expanduser(sys.argv[2] if len(sys.argv) > 2 else "/cluster/account_b/metaopt/runs")
+
+
+def load(p):
+    s = importlib.util.spec_from_file_location(os.path.basename(p)[:-3], p)
+    m = importlib.util.module_from_spec(s)
+    s.loader.exec_module(m)
+    return m
+
+
+def sha(p):
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        for b in iter(lambda: fh.read(1 << 16), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def head_lines(path):
+    """Every line of the file that is one of the four audited kinds.  Epoch lines are never yielded."""
+    keep = []
+    with open(path, errors="replace") as fh:
+        for ln in fh:
+            if ln.startswith(("ARGS:", "ENV:", "PROBE_TENSOR:")) or ln.startswith(FOREIGN):
+                keep.append(ln.rstrip("\n"))
+    return keep
+
+
+scorer_path = os.path.join(STAGE, "analysis", "cMG1_mergecarrier_score.py")
+guard_path = os.path.join(STAGE, "analysis", "argsline_guard.py")
+sc = load(scorer_path)
+FOREIGN = tuple(p + ":" for p in sc.FOREIGN_PREFIXES) + sc.FOREIGN_PREFIXES
+
+print("RULE20 cmg1 utc=%s host=%s" % (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), os.uname()[1]))
+print("  stage=%s  runs=%s" % (STAGE, RUNS))
+print("  scorer   %s  %s" % (os.path.basename(scorer_path), sha(scorer_path)))
+print("  guard    %s  %s" % (os.path.basename(guard_path), sha(guard_path)))
+print("  this     %s  %s" % (os.path.basename(os.path.abspath(__file__)), sha(os.path.abspath(__file__))))
+
+bad = 0
+want = sorted((a, s) for a in sc.ARMS for s in sc.SEEDS)
+started, envs, pts, saves = [], {}, {}, set()
+print("\n===================== per-run ARGS / ENV / PROBE_TENSOR / foreign  (12 expected)")
+for a, s in want:
+    fs = sorted(glob.glob(os.path.join(RUNS, "%s-%s-s%d-*.out" % (sc.PREFIX, a, s))))
+    if not fs:
+        print("  MISS %s-%s-s%d  no .out" % (sc.PREFIX, a, s))
+        bad += 1
+        continue
+    if len(fs) > 1:
+        print("  NOTE %s-%s-s%d  %d .out files (resubmission): %s" % (sc.PREFIX, a, s, len(fs),
+                                                                      ",".join(os.path.basename(f) for f in fs)))
+    for f in fs:
+        L = head_lines(f)
+        args = [x for x in L if x.startswith("ARGS:")]
+        env = [x for x in L if x.startswith("ENV:")]
+        pt = [x for x in L if x.startswith("PROBE_TENSOR:")]
+        frn = [x for x in L if x.startswith(FOREIGN)]
+        if not args:
+            print("  WAIT %s  no ARGS line yet (not started)" % os.path.basename(f))
+            bad += 1
+            continue
+        started.append((a, s))
+        sv = ""
+        ok_args = len(args) == 1
+        if ok_args:
+            m = re.search(r"--save-directory (\S+) ", args[0])
+            sv = m.group(1) if m else ""
+            saves.add(sv)
+            ok_args = sv.endswith("/" + sc.PREFIX) and args[0] == sc.expected_args(a, s, sv)
+        pdir = ""
+        ok_env = len(env) == 1
+        if ok_env:
+            m = re.search(r" PROBE_DIR=(\S*)", env[0])
+            pdir = m.group(1) if m else ""
+            stripped = re.sub(r" PROBE_DIR=\S*", "", env[0])
+            envs[stripped] = envs.get(stripped, 0) + 1
+            ok_env = (stripped == sc.ENV_EXPECTED
+                      and pdir == "%s/probe_%s-%s-s%d" % (sv, sc.PREFIX, a, s))
+        mp = sc.PT_RE.match(pt[0]) if len(pt) == 1 else None
+        if mp:
+            k = re.sub(r" dir=\S*", "", pt[0]); pts[k] = pts.get(k, 0) + 1
+        ok_pt = mp is not None and mp.group(1) == "blockwise" and mp.group(2) == pdir
+        ok_frn = not frn
+        ok = ok_args and ok_env and ok_pt and ok_frn
+        print("  %-4s %-28s ARGS %s  ENV %s  PT %s(%s)  FOREIGN-none %s"
+              % ("PASS" if ok else "FAIL", os.path.basename(f)[:-4], ok_args, ok_env, ok_pt,
+                 mp.group(1) if mp else "-", ok_frn))
+        if not ok:
+            bad += 1
+            for lab, v in (("ARGS", args[:1]), ("ENV", env[:1]), ("PT", pt[:1]), ("FOREIGN", frn[:2])):
+                print("         %s: %r" % (lab, v))
+
+print("\n===================== batch summary")
+print("  coverage %d / %d started; all expected started: %s" % (len(started), len(want), sorted(started) == want))
+print("  one save-directory: %s  %s" % (len(saves) == 1, sorted(saves)))
+print("  distinct ENV lines (PROBE_DIR stripped): %d" % len(envs))
+for e in sorted(envs):
+    print("      x%d  %s" % (envs[e], e))
+print("  distinct PROBE_TENSOR lines (dir stripped): %d" % len(pts))
+for k in sorted(pts):
+    print("      x%d  %s" % (pts[k], k))
+if sorted(started) != want:
+    print("  NOT AT FULL COVERAGE")
+    bad += 1
+
+print("\n===================== argsline_guard.py UNEDITED  --batch-consistency --strict")
+cmd = [sys.executable, guard_path, RUNS, "--name", sc.PREFIX + "-", "--batch-consistency", "--strict",
+       "--vary", "stepsize-groups", "--vary", "seed", "--vary", "run-name"]
+r = subprocess.run(cmd, capture_output=True, text=True)
+print("  $ " + " ".join(cmd[1:]))
+for ln in r.stdout.strip().splitlines():
+    print("  " + ln)
+if r.stderr.strip():
+    print("  STDERR " + r.stderr.strip()[:400])
+print("  rc=%d" % r.returncode)
+bad += r.returncode != 0
+
+print("\n===================== argsline_guard.py UNEDITED  per-run --expect of every non-axis flag")
+AXES = ("stepsize-groups", "seed", "run-name", "save-directory")
+ref = sc.expected_args(sc.ARMS[0], sc.SEEDS[0]).split(" ")[1:]
+expects, i = [], 0
+while i < len(ref):
+    if ref[i].startswith("--"):
+        flag = ref[i][2:]
+        val = ref[i + 1] if i + 1 < len(ref) and not ref[i + 1].startswith("--") else ""
+        if flag not in AXES:
+            expects.append("%s=%s" % (flag, val))
+        i += 2
+    else:
+        i += 1
+cmd = [sys.executable, guard_path, RUNS, "--name", sc.PREFIX + "-"]
+for e in expects:
+    cmd += ["--expect", e]
+r2 = subprocess.run(cmd, capture_output=True, text=True)
+print("  %d flags asserted: %s" % (len(expects), " ".join(expects)))
+for ln in r2.stdout.strip().splitlines()[-6:]:
+    print("  " + ln)
+print("  rc=%d" % r2.returncode)
+bad += r2.returncode != 0
+
+print("\nRULE20 cmg1 %s" % ("PASS" if bad == 0 else "FAIL (%d)" % bad))
+print("RULE20 end utc=%s" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+sys.exit(0 if bad == 0 else 1)

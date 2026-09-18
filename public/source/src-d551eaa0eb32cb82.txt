@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cCV0_carrier_vote_core.py -- THE SHARED, FROZEN CORE OF TWO REGISTERED SCORERS
+#     analysis/cST1_carrier_contrast_score.py   (`cst1`, CORRECTIONS 256, LIMITS-PREP S2)
+#     analysis/cCT1_c10_dominance_score.py      (`cct1`, CORRECTIONS 257, LIMITS-PREP S3)
+# Each scorer pins this file's sha256 as a literal and refuses to score (UNRESOLVED-PROVENANCE)
+# if the file it imported is not that file.  RULE 16: never edited after registration; a broken
+# core is FROZEN and a successor core + successor scorers are registered.
+#
+# Stdlib only.  No torch.  Reads raw `.out` files, `probe_tensor.json` / `probe.jsonl` records
+# (patches/patch_probe_tensor.py, PATCH_PROBE_TENSOR) and, for disclosure and the selftest only,
+# results/all_runs.csv THROUGH analysis/corpus_exclusions.filter_rows (OPERATIONS 36).
+#
+# THE CARRIER-VOTE STATISTICS (defined here ONCE, used by both batches, calibrated at registration
+# on 18 landed probe runs at the mechanism cell -- analysis/cst1_cct1_registration_derivations.py):
+#
+#   Per record r of a run (every one of the 500 records, steps 0..49,900):
+#     L_i   = b2 * m_i + (1 - b2) * z_i  for the 62 tensors, from the record's own m_tensor / z_tensor
+#             and pt_b2 (= Lion_beta2 = 0.9).  This is the per-tensor term of the quantity whose sign
+#             Lion_meta_update applies (cTD2 184.1(1)).
+#     s     = the sign of the SHARED aggregate.  scalar runs: the HARNESS's own
+#             sign(b2 * mom_pre + (1 - b2) * z_agg); every other type: sign(sum_i L_i), the
+#             counterfactual shared vote (what one shared step size would have received from this
+#             run's own per-tensor terms).  s == 0 -> the record is INDETERMINATE and skipped.
+#     C     = the carrier set {50 layer4.0.bn2.weight, 53 layer4.0.shortcut.1.weight,
+#             59 layer4.1.bn2.weight} (1-based; `ctd1`, 184; the names are checked on every run's
+#             manifest and header).
+#     DOM_C(r)   := sign(sum_{i in C} L_i) == s  AND  |sum_{i in C} L_i| > sum_{i not in C} |L_i|
+#                   -- C ALONE FIXES THE SIGN OF THE SHARED VOTE, whatever the other 59 terms do.
+#     TOP3_C(r)  := the three largest |L_i| are exactly C (as a set).
+#     DOM_TOP3(r):= the three largest |L_i| (whichever they are) alone fix the sign, by the same rule.
+#     SHARE_C(r) := sum_{i in C} |L_i| / sum_i |L_i|.
+#   Per run / pooled over runs (records pooled, not run means):
+#     DOM_C, TOP3_C, DOM_TOP3 = shares of determinate records; SHARE_C = median over records;
+#     R_T, DOWN, CAR_EQ as cTD2 (DISAGREE = s != sign(#{L_i>0} - #{L_i<0}), both non-zero; the
+#     carrying set = the shortest |L|-ranked prefix whose partial sum has sign s and out-weighs the
+#     remainder; CAR_EQ = share of DISAGREE records whose carrying set == C); PINNED = n_at_lo >= 1 on a
+#     1-coordinate record (scalar only); MODAL_TOP3 = the most frequent top-3 set; class shares of
+#     sum_i |L_i| (BN scale / BN bias / conv / linear), median over records.
+#
+# DECOMPOSITION (the capture's integrity, per record, per group g of the run's own partition):
+#     |sum_{i in g} z_i - z_agg[g]| / sum_i |z_i| <= TOL_Z and the same for m vs mom_pre (TOL_M);
+#     on every UNCLAMPED coordinate, -(beta - beta_pre)/ms == sign(b2 * mom_pre[g] + (1-b2) * z_agg[g]).
+#     The number of coordinates a record carries IS the partition that ran: a `sets:` arm whose records
+#     carry one coordinate ran scalar (the BROKEN-SPEC null) and fails the partition gate.
+# =============================================================================
+from __future__ import annotations
+
+import collections
+import csv
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+CORE_VERSION = "cCV0-1"
+
+# ---- the live model (re-derived on cluster_b at registration from build_network c7998883...) ------------
+TENSOR_NAMES = (
+    "conv1.weight", "bn1.weight", "bn1.bias", "layer1.0.conv1.weight",
+    "layer1.0.bn1.weight", "layer1.0.bn1.bias", "layer1.0.conv2.weight",
+    "layer1.0.bn2.weight", "layer1.0.bn2.bias", "layer1.1.conv1.weight",
+    "layer1.1.bn1.weight", "layer1.1.bn1.bias", "layer1.1.conv2.weight",
+    "layer1.1.bn2.weight", "layer1.1.bn2.bias", "layer2.0.conv1.weight",
+    "layer2.0.bn1.weight", "layer2.0.bn1.bias", "layer2.0.conv2.weight",
+    "layer2.0.bn2.weight", "layer2.0.bn2.bias",
+    "layer2.0.shortcut.0.weight", "layer2.0.shortcut.1.weight",
+    "layer2.0.shortcut.1.bias", "layer2.1.conv1.weight",
+    "layer2.1.bn1.weight", "layer2.1.bn1.bias", "layer2.1.conv2.weight",
+    "layer2.1.bn2.weight", "layer2.1.bn2.bias", "layer3.0.conv1.weight",
+    "layer3.0.bn1.weight", "layer3.0.bn1.bias", "layer3.0.conv2.weight",
+    "layer3.0.bn2.weight", "layer3.0.bn2.bias",
+    "layer3.0.shortcut.0.weight", "layer3.0.shortcut.1.weight",
+    "layer3.0.shortcut.1.bias", "layer3.1.conv1.weight",
+    "layer3.1.bn1.weight", "layer3.1.bn1.bias", "layer3.1.conv2.weight",
+    "layer3.1.bn2.weight", "layer3.1.bn2.bias", "layer4.0.conv1.weight",
+    "layer4.0.bn1.weight", "layer4.0.bn1.bias", "layer4.0.conv2.weight",
+    "layer4.0.bn2.weight", "layer4.0.bn2.bias",
+    "layer4.0.shortcut.0.weight", "layer4.0.shortcut.1.weight",
+    "layer4.0.shortcut.1.bias", "layer4.1.conv1.weight",
+    "layer4.1.bn1.weight", "layer4.1.bn1.bias", "layer4.1.conv2.weight",
+    "layer4.1.bn2.weight", "layer4.1.bn2.bias", "linear.weight",
+    "linear.bias")
+_TRUNK_NUMEL = (
+    1728, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64, 36864, 64, 64,
+    73728, 128, 128, 147456, 128, 128, 8192, 128, 128, 147456, 128, 128,
+    147456, 128, 128, 294912, 256, 256, 589824, 256, 256, 32768, 256, 256,
+    589824, 256, 256, 589824, 256, 256, 1179648, 512, 512, 2359296, 512, 512,
+    131072, 512, 512, 2359296, 512, 512, 2359296, 512, 512)
+NUMEL = {"ResNet18_c100": _TRUNK_NUMEL + (51200, 100),     # 11,220,132
+         "ResNet18": _TRUNK_NUMEL + (5120, 10)}            # 11,173,962
+TOTAL = {k: sum(v) for k, v in NUMEL.items()}
+N_TENSORS = 62
+
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+C_IDX1 = (50, 53, 59)
+C_IDX0 = tuple(i - 1 for i in C_IDX1)
+
+BETA_LO, BETA_HI = -15.0, -2.3026
+B2_REG = 0.9
+PROBE_EVERY = 100
+EPOCHS = 100
+META_STEPS = 50000
+N_RECORDS = META_STEPS // PROBE_EVERY          # 500
+TOL_Z = 1e-5
+TOL_M = 1e-4
+DECOMP_FAIL_MAX = 0.01
+SIGN_FAIL_MAX = 0.01
+
+# the live harness pins (read on cluster_b at registration, 2026-09-17; unchanged since cdep1 / 188)
+HF_LIVE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+BUILD_NETWORK_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+TRAIN_PY_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+LOAD_DATA_SHA = "b52b58a35dcecd80ce6d8f8033b09c20dad9f4827b808f4ea2a828ce88138c46"
+RUNNER_LIVE_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"   # $WS/jobs/run_cifar.sh
+
+ENV_FIXED = ("AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+             "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+             "PROBE=100 EB_RHO=na EB_LOG=0")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=100 type=(scalar|layerwise|blockwise) tensors=62 meta_alg=Lion "
+                   r"momentum_param=0\.99 Lion_beta2=0\.9 dir=(\S+)$")
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+# every intervention kind any isolated tree of this campaign prints, plus the two reserved for Tracks E / F.
+# The LIVE tree prints none of them; a line starting with one proves a run did not use the live tree.
+FOREIGN_PREFIXES = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD",
+                    "DECAY_MASK", "SHADOW_VOTE", "WD_SCALE")
+
+
+# =============================================================================
+# small helpers
+# =============================================================================
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def mean(v):
+    v = list(v)
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    v = list(v)
+    return statistics.stdev(v) if len(v) > 1 else None
+
+
+def file_sha(path):
+    if not path or not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def core_sha():
+    return file_sha(os.path.abspath(__file__.replace(".pyc", ".py")))
+
+
+class Ledger:
+    """PASS / FAIL / SKIP lines; a FAIL is recorded under the gate that was open when it happened."""
+
+    def __init__(self, quiet=False):
+        self.rows = []
+        self.quiet = quiet
+
+    def chk(self, cond, label, extra="", gate=None):
+        ok = bool(cond)
+        if not self.quiet:
+            print("  %-4s %s%s" % ("PASS" if ok else "FAIL", label, ("   " + extra) if extra else ""))
+        self.rows.append((ok, label, gate))
+        return ok
+
+    def note(self, label):
+        if not self.quiet:
+            print("  NOTE %s" % label)
+
+    def fails(self, gate=None):
+        return [l for ok, l, g in self.rows if not ok and (gate is None or g == gate)]
+
+
+def tail5(te, budget=EPOCHS):
+    v = [te[e] for e in range(budget - 5, budget) if e in te]
+    if len(v) != 5 or not all(isinstance(x, float) and math.isfinite(x) for x in v):
+        return None
+    return sum(v) / 5.0
+
+
+def parse_sets(spec, names=TENSOR_NAMES):
+    """PATCH_NAMESETS grammar (`sets:<g0>/<g1>/...`, each a comma list of 1-based indices, ranges a-b, or names)
+    -> list of sorted 1-based index lists."""
+    if spec == "scalar":
+        return [list(range(1, len(names) + 1))]
+    if spec == "layerwise":
+        return [[i] for i in range(1, len(names) + 1)]
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def tensor_class(name):
+    if name.startswith("linear."):
+        return "linear"
+    if name.endswith(".bias"):
+        return "bn_bias"
+    if ".bn" in name or ".shortcut.1." in name or name.startswith("bn1."):
+        return "bn_scale"
+    return "conv"
+
+
+CLASSES = ("bn_scale", "bn_bias", "conv", "linear")
+CLASS_OF = tuple(tensor_class(n) for n in TENSOR_NAMES)
+
+
+# =============================================================================
+# readers
+# =============================================================================
+def parse_out(path):
+    txt = open(path, errors="replace").read()
+    lines = txt.splitlines()
+    te, tr = {}, {}
+    for a, b, c in EPTR_RE.findall(txt):
+        tr[int(a)] = float(b)
+        te[int(a)] = float(c)
+    rec = {"file": path, "test": te, "train": tr, "n_ep": len(te),
+           "args": [l for l in lines if l.startswith("ARGS:")],
+           "env": [l for l in lines if l.startswith("ENV:")],
+           "pt": [l for l in lines if l.startswith("PROBE_TENSOR:")],
+           "foreign": [l for l in lines if l.startswith(FOREIGN_PREFIXES)],
+           "done": any(l.strip() == "RUN_DONE" for l in lines),
+           "traceback": "Traceback (most recent call last)" in txt}
+    rec["p5"] = tail5(te)
+    rec["t5"] = tail5(tr)
+    rec["complete"] = (sorted(te) == list(range(EPOCHS)) and rec["done"] and not rec["traceback"]
+                       and rec["p5"] is not None)
+    return rec
+
+
+def read_outs(runsdir, batch, arms):
+    """(arm, seed) -> the run.  Among several .out files for one (arm, seed) the highest job id among COMPLETE
+    ones wins (a truncated resubmission never shadows a complete run); notes list every duplicate."""
+    pat = re.compile(r"^%s-(%s)-s(\d+)-(\d+)\.out$" % (re.escape(batch), "|".join(re.escape(a) for a in
+                                                                                   sorted(arms, key=len, reverse=True))))
+    cand, notes = {}, []
+    for d in (runsdir, os.path.join(runsdir, batch)):
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            m = pat.match(fn)
+            if not m:
+                continue
+            r = parse_out(os.path.join(d, fn))
+            r.update({"arm": m.group(1), "seed": int(m.group(2)), "job": int(m.group(3)), "name": fn})
+            cand.setdefault((r["arm"], r["seed"]), {})[r["job"]] = r
+    got = {}
+    for k, byjob in cand.items():
+        lst = list(byjob.values())
+        comp = [r for r in lst if r["complete"]]
+        pick = max(comp or lst, key=lambda r: r["job"])
+        if len(lst) > 1:
+            notes.append("%s-s%d has %d .out files (%d complete); using %s" % (k[0], k[1], len(lst), len(comp),
+                                                                              pick["name"]))
+        got[k] = pick
+    return got, notes
+
+
+def read_probe(runsdir, batch, arm, seed):
+    d = os.path.join(runsdir, batch, "probe_%s-%s-s%d" % (batch, arm, seed))
+    pj = os.path.join(d, "probe.jsonl")
+    if not os.path.isfile(pj):
+        return None
+    recs, bad = [], 0
+    for ln in open(pj, errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(r, dict):
+            recs.append(r)
+        else:
+            bad += 1
+    hdr = None
+    hp = os.path.join(d, "probe_tensor.json")
+    if os.path.isfile(hp):
+        try:
+            hdr = json.load(open(hp))
+        except ValueError:
+            hdr = None
+    return {"dir": d, "recs": recs, "bad": bad, "hdr": hdr}
+
+
+def read_manifest(path):
+    man = {"tensors": [], "arms": {}, "kv": {}}
+    if not path or not os.path.isfile(path):
+        return None
+    for ln in open(path):
+        p = ln.split()
+        if not p:
+            continue
+        if p[0] == "TENSOR" and len(p) >= 4:
+            man["tensors"].append((int(p[1]), p[2], int(p[3])))
+        elif p[0] == "ARMSPEC" and len(p) >= 4:
+            d = {"spec": p[3]}
+            if "GROUPS" in p:
+                d["groups"] = [[int(x) for x in g.split(",")] for g in p[p.index("GROUPS") + 1].split("/")]
+            man["arms"][p[1]] = d
+        else:
+            man["kv"][p[0]] = " ".join(p[1:])
+    return man
+
+
+def read_kv(path):
+    if not path or not os.path.isfile(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+# =============================================================================
+# the per-record statistics
+# =============================================================================
+def record_L(r):
+    b2 = float(r.get("pt_b2", B2_REG))
+    z, m = r["z_tensor"], r["m_tensor"]
+    return [b2 * mi + (1.0 - b2) * zi for mi, zi in zip(m, z)], b2
+
+
+def shared_sign(r, L, b2):
+    za, ma = r["z_agg"][0], r["mom_pre"][0]
+    if len(za) == 1 and len(ma) == 1:
+        return sgn(b2 * ma[0] + (1.0 - b2) * za[0])
+    return sgn(sum(L))
+
+
+def carrying_set(X, s):
+    order = sorted(range(len(X)), key=lambda i: -abs(X[i]))
+    rem = sum(abs(x) for x in X)
+    part = 0.0
+    for k, i in enumerate(order, 1):
+        part += X[i]
+        rem -= abs(X[i])
+        if sgn(part) == s and abs(part) > rem:
+            return order[:k]
+    return order
+
+
+def fixes_sign(L, idx, s):
+    si = sum(L[i] for i in idx)
+    rest = sum(abs(L[j]) for j in range(len(L)) if j not in idx)
+    return sgn(si) == s and abs(si) > rest
+
+
+def vote_stats(recs, c_idx0=C_IDX0):
+    """Pooled carrier-vote statistics over a list of records (any number of runs)."""
+    cs = set(c_idx0)
+    st = {"n": 0, "indet": 0, "dom_c": 0, "top3_c": 0, "dom_top3": 0, "share_c": [], "det": 0, "dis": 0,
+          "car_eq": 0, "down": 0, "pinned": 0, "dom_c_pinned": 0, "modal": collections.Counter(),
+          "argmax": collections.Counter(), "cls": {c: [] for c in CLASSES}, "unparsable": 0,
+          "dom_c_by_decile": [[0, 0] for _ in range(10)]}
+    for r in recs:
+        try:
+            L, b2 = record_L(r)
+            s = shared_sign(r, L, b2)
+        except (KeyError, IndexError, TypeError, ValueError):
+            st["unparsable"] += 1
+            continue
+        if len(L) != N_TENSORS:
+            st["unparsable"] += 1
+            continue
+        if s == 0:
+            st["indet"] += 1
+            continue
+        st["n"] += 1
+        order = sorted(range(len(L)), key=lambda i: -abs(L[i]))
+        top3 = order[:3]
+        dom = fixes_sign(L, c_idx0, s)
+        st["dom_c"] += dom
+        st["top3_c"] += set(top3) == cs
+        st["dom_top3"] += fixes_sign(L, top3, s)
+        st["modal"][tuple(sorted(i + 1 for i in top3))] += 1
+        st["argmax"][order[0] + 1] += 1
+        tot = sum(abs(x) for x in L)
+        st["share_c"].append(sum(abs(L[i]) for i in c_idx0) / tot if tot > 0 else 0.0)
+        if tot > 0:
+            for c in CLASSES:
+                st["cls"][c].append(sum(abs(L[i]) for i in range(len(L)) if CLASS_OF[i] == c) / tot)
+        step = r.get("step")
+        if isinstance(step, int) and 0 <= step < META_STEPS:
+            dd = st["dom_c_by_decile"][step * 10 // META_STEPS]
+            dd[0] += 1
+            dd[1] += dom
+        if len(r.get("beta", [])) == 1 and (r.get("n_at_lo") or 0) >= 1:
+            st["pinned"] += 1
+            st["dom_c_pinned"] += dom
+        maj = sgn(sum(1 for x in L if x > 0) - sum(1 for x in L if x < 0))
+        if maj != 0:
+            st["det"] += 1
+            if maj != s:
+                st["dis"] += 1
+                st["car_eq"] += set(carrying_set(L, s)) == cs
+                st["down"] += s > 0
+    n = st["n"]
+    out = {"n": n, "indet": st["indet"], "unparsable": st["unparsable"],
+           "DOM_C": st["dom_c"] / n if n else None,
+           "TOP3_C": st["top3_c"] / n if n else None,
+           "DOM_TOP3": st["dom_top3"] / n if n else None,
+           "SHARE_C": statistics.median(st["share_c"]) if st["share_c"] else None,
+           "R_T": st["dis"] / st["det"] if st["det"] else None, "n_dis": st["dis"],
+           "CAR_EQ": st["car_eq"] / st["dis"] if st["dis"] else None,
+           "DOWN": st["down"] / st["dis"] if st["dis"] else None,
+           "PINNED_FRAC": st["pinned"] / n if n else None,
+           "DOM_C_PINNED": st["dom_c_pinned"] / st["pinned"] if st["pinned"] else None,
+           "MODAL_TOP3": st["modal"].most_common(3), "ARGMAX": st["argmax"].most_common(5),
+           "CLASS_SHARE": dict((c, statistics.median(v) if v else None) for c, v in st["cls"].items()),
+           "DOM_C_DECILE": [(d[1] / d[0]) if d[0] else None for d in st["dom_c_by_decile"]]}
+    return out
+
+
+def decomposition(recs, groups1, ms):
+    """-> dict of counts.  groups1: the run's registered partition (1-based index lists)."""
+    g0 = [[i - 1 for i in g] for g in groups1]
+    n = bad_shape = bad_z = bad_m = n_sign = bad_sign = clamped = bad_shared = 0
+    worst_z = worst_m = 0.0
+    for r in recs:
+        n += 1
+        try:
+            z, m = r["z_tensor"], r["m_tensor"]
+            za, ma = r["z_agg"][0], r["mom_pre"][0]
+            bpre, bpost = r["beta_pre"][0], r["beta"]
+            b2 = float(r.get("pt_b2", B2_REG))
+        except (KeyError, IndexError, TypeError, ValueError):
+            bad_shape += 1
+            continue
+        if not (len(z) == len(m) == N_TENSORS and len(za) == len(ma) == len(bpre) == len(bpost) == len(g0)):
+            bad_shape += 1
+            continue
+        sz = sum(abs(v) for v in z) + 1e-30
+        sm = sum(abs(v) for v in m) + 1e-30
+        dz = max(abs(sum(z[i] for i in g) - za[k]) for k, g in enumerate(g0)) / sz
+        dm = max(abs(sum(m[i] for i in g) - ma[k]) for k, g in enumerate(g0)) / sm
+        worst_z, worst_m = max(worst_z, dz), max(worst_m, dm)
+        bad_z += dz > TOL_Z
+        bad_m += dm > TOL_M
+        if len(g0) == 1:
+            L = [b2 * mi + (1 - b2) * zi for mi, zi in zip(m, z)]
+            Lh = b2 * ma[0] + (1 - b2) * za[0]
+            if abs(sum(L) - Lh) > 1e-4 * (sum(abs(x) for x in L) + 1e-30) and sgn(sum(L)) != sgn(Lh):
+                bad_shared += 1
+        for k in range(len(g0)):
+            if not (BETA_LO + 1e-9 < bpost[k] < BETA_HI - 1e-9):
+                clamped += 1
+                continue
+            n_sign += 1
+            Lh = b2 * ma[k] + (1 - b2) * za[k]
+            bad_sign += abs(-(bpost[k] - bpre[k]) / ms - sgn(Lh)) > 1e-3
+    return {"n": n, "bad_shape": bad_shape, "bad_z": bad_z, "bad_m": bad_m, "worst_z": worst_z, "worst_m": worst_m,
+            "n_sign": n_sign, "bad_sign": bad_sign, "clamped": clamped, "bad_shared": bad_shared}
+
+
+def decomposition_ok(d):
+    n = max(d["n"], 1)
+    return (d["n"] > 0 and d["bad_shape"] == 0 and d["bad_z"] / n <= DECOMP_FAIL_MAX
+            and d["bad_m"] / n <= DECOMP_FAIL_MAX and d["n_sign"] > 0
+            and d["bad_sign"] / max(d["n_sign"], 1) <= SIGN_FAIL_MAX and d["bad_shared"] / n <= DECOMP_FAIL_MAX)
+
+
+def describe_stats(tag, s, out=print):
+    out("  %-22s n=%d  DOM_C %s  TOP3_C %s  DOM_TOP3 %s  SHARE_C(med) %s  R_T %s (DIS %d)  CAR_EQ %s  DOWN %s  "
+        "PINNED %s  DOM_C|pinned %s" % (tag, s["n"], fmt(s["DOM_C"]), fmt(s["TOP3_C"]), fmt(s["DOM_TOP3"]),
+                                        fmt(s["SHARE_C"]), fmt(s["R_T"]), s["n_dis"], fmt(s["CAR_EQ"]),
+                                        fmt(s["DOWN"]), fmt(s["PINNED_FRAC"]), fmt(s["DOM_C_PINNED"])))
+    out("  %-22s modal top-3 %s; argmax %s" % (
+        "", ", ".join("{%s} x%d" % (",".join(str(i) for i in k), v) for k, v in s["MODAL_TOP3"]),
+        ", ".join("%d(%s) x%d" % (i, TENSOR_NAMES[i - 1], v) for i, v in s["ARGMAX"])))
+    out("  %-22s class share of sum|L| (median): %s; DOM_C by decile %s" % (
+        "", " ".join("%s %s" % (c, fmt(s["CLASS_SHARE"][c], 3)) for c in CLASSES),
+        " ".join(fmt(x, 2) for x in s["DOM_C_DECILE"])))
+
+
+# =============================================================================
+# the corpus (disclosure + selftest only; ALWAYS through filter_rows)
+# =============================================================================
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csv_path, exclude_prefix=None, filtered=True):
+    if not csv_path or not os.path.isfile(csv_path):
+        return None
+    rows = [r for r in csv.DictReader(open(csv_path))
+            if not (exclude_prefix and r.get("run", "").startswith(exclude_prefix + "-"))]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+            and (r.get("plateau5") or "").strip() != "")
+
+
+def pooled_sigma(rows, net, dset, ms="1e-3", a0="1e-6"):
+    """cVT8's SIGMA_R18ALL definition (227.6 / 248.7), parameterised by network and dataset: pooled within-cell SD of
+    plateau5 over every usable standard-cell row (100 ep, aug 1, clip -15:-2.3026, bs 100, the given ms / alpha0), any
+    granularity; cells with n >= 2."""
+    cells = {}
+    for r in rows:
+        if not (usable(r) and r.get("network") == net and r.get("dataset") == dset
+                and r.get("epochs_requested") == "100" and r.get("augment") == "1"
+                and r.get("beta_clip") == "-15:-2.3026" and r.get("meta_stepsize") == ms
+                and r.get("alpha0") == a0 and r.get("batch_size") == "100"):
+            continue
+        cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = sum(v) / len(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+def cell_rows(rows, net, dset, ms, a0, gran):
+    return [r for r in rows if usable(r) and r.get("network") == net and r.get("dataset") == dset
+            and r.get("meta_stepsize") == ms and r.get("alpha0") == a0 and r.get("granularity") == gran
+            and r.get("hier", "") == "" and r.get("epochs_requested") == "100" and r.get("augment") == "1"
+            and r.get("beta_clip") == "-15:-2.3026" and r.get("batch_size") == "100"
+            and r.get("base") == "SGDm" and r.get("meta") == "Lion" and r.get("gamma") == "1"]
+
+
+# =============================================================================
+# synthetic runs for the selftests (the REAL score() reads them)
+# =============================================================================
+def synth_L(kind, rng, k):
+    """62 per-tensor terms for a record.  kind: 'dom' (C alone fixes a positive sign, C are the top-3),
+    'nodom' (C tiny; 'others' carry, majority agrees), 'other3' (tensors 47, 48, 61 dominate, C tiny)."""
+    L = [rng.uniform(-1e-3, 1e-3) for _ in range(N_TENSORS)]
+    if kind == "dom":
+        for i in C_IDX0:
+            L[i] = 0.3 + 0.05 * rng.random()
+        for j in range(N_TENSORS):
+            if j not in C_IDX0:
+                L[j] = -abs(L[j])
+    elif kind == "nodom":
+        for i in C_IDX0:
+            L[i] = 1e-6 * rng.uniform(-1, 1)
+        for j in (45, 48, 57, 60):
+            L[j] = 0.05 + 0.01 * rng.random()
+    elif kind == "other3":
+        for i in C_IDX0:
+            L[i] = 1e-6 * rng.uniform(-1, 1)
+        for j in (46, 47, 60):
+            L[j] = 0.4 + 0.05 * rng.random()
+        for j in range(N_TENSORS):
+            if j not in (46, 47, 60):
+                L[j] = -abs(L[j])
+    else:
+        raise ValueError(kind)
+    return L
+
+
+def synth_records(groups1, dom_share, rng, ms, kind_else="nodom", break_decomp=False, n_coords=None,
+                  n_records=N_RECORDS, pinned_from=None):
+    """Records whose m_tensor == z_tensor == L (so L_i = b2*m_i + (1-b2)*z_i == L_i exactly).  The first
+    round(dom_share * n) records are 'dom', the rest `kind_else`.  n_coords overrides the coordinate count (the
+    BROKEN-SPEC null writes 1)."""
+    g0 = [[i - 1 for i in g] for g in groups1]
+    if n_coords == 1:
+        g0 = [list(range(N_TENSORS))]
+    ndom = int(round(dom_share * n_records))
+    recs = []
+    for k in range(n_records):
+        L = synth_L("dom" if k < ndom else kind_else, rng, k)
+        za = [sum(L[i] for i in g) for g in g0]
+        bpre = [-10.0] * len(g0)
+        bpost = [bpre[c] - ms * sgn(za[c]) for c in range(len(g0))]
+        if break_decomp:
+            za = [x + 1.0 + abs(x) for x in za]
+        pinned = 1 if (pinned_from is not None and k >= pinned_from and len(g0) == 1) else 0
+        recs.append({"step": k * PROBE_EVERY, "beta": bpost, "beta_pre": [bpre], "z_agg": [za], "mom_pre": [za],
+                     "z_tensor": L, "m_tensor": L, "pt_b2": B2_REG, "pt_mp": 0.99, "n_at_lo": pinned})
+    return recs
+
+
+def write_synth_run(root, batch, arm, seed, job, args_line, pt_type, test_level, train_level=None, recs=None,
+                    net="ResNet18_c100", drop_run_done=False, n_epochs=EPOCHS, extra_lines=(), env=None,
+                    hdr_override=None, pt_line=True, rng=None):
+    run = "%s-%s-s%d" % (batch, arm, seed)
+    pdir = os.path.join(root, batch, "probe_" + run)
+    os.makedirs(pdir, exist_ok=True)
+    lines = ["NODE=synthetic | JOB=%s %d | AUGMENT=1" % (run, job), args_line,
+             "ENV: " + (env if env is not None else ENV_FIXED.replace("PROBE=100", "PROBE=100 PROBE_DIR=" + pdir))]
+    if pt_line:
+        lines.append("PROBE_TENSOR: on every=100 type=%s tensors=62 meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 "
+                     "dir=%s" % (pt_type, pdir))
+    lines += list(extra_lines)
+    tl = train_level if train_level is not None else test_level + 5.0
+    for e in range(n_epochs):
+        jit = 0.0 if rng is None else rng.uniform(-0.05, 0.05)
+        lines.append("Epoch %d, Train Accuracy: %.3f %%, Test Accuracy: %.3f %%" % (e, tl + jit, test_level + jit))
+    if not drop_run_done:
+        lines.append("RUN_DONE")
+    with open(os.path.join(root, "%s-%d.out" % (run, job)), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    hdr = {"PROBE_TENSOR": 1, "every": PROBE_EVERY, "stepsize_type": pt_type, "n_tensors": N_TENSORS,
+           "param_numels": list(NUMEL[net]), "len_beta_list": 1, "meta_alg": "Lion", "momentum_param": 0.99,
+           "Lion_beta2": 0.9}
+    if hdr_override:
+        hdr.update(hdr_override)
+    json.dump(hdr, open(os.path.join(pdir, "probe_tensor.json"), "w"))
+    if recs is not None:
+        with open(os.path.join(pdir, "probe.jsonl"), "w") as f:
+            for r in recs:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    return run

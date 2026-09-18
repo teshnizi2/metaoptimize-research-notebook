@@ -28,6 +28,12 @@ From the command line:
            MULTI_KIND registers for its (batch, arm) -- so its other ON line is verified, not skipped;
            CORRECTIONS 251: any number of kinds, e.g. cvt8's forced arms (GROUP_HOLD + REST_HOLD), cvt9's held arms
            (BETA_HOLD + COMP_HOLD) and its EARLY / LATE (+ WINDOW_HOLD, three kinds);
+           ARGS-VALUE KINDS (CORRECTIONS 263): a run may deviate from the standard cell in a CLI FLAG alone
+           (cmo1's `--momentum-param-base 0.9`, `--weight-decay-base 0`), which no CSV column carries and no patch
+           line announces.  Such a row is listed with an ARGS witness `<KIND>: <flag>=<value>` (ARGS_KINDS);
+           `--check --runs` verifies it against the run's OWN `ARGS:` line read with argparse semantics, requires
+           every INGESTED standard-cell run whose ARGS deviates to be listed, holds the unlisted runs of a listed
+           batch to the standard values, and FAILs if one 15-key cell pools unlisted rows with different values;
            then prints the noise-floor demonstration: the registered cvt1 sigmas (227.6) re-derived on
            the current corpus three ways -- as 227 did (every `cvt1-` row dropped), as a future
            registration should (only the listed rows dropped), and naively (nothing dropped).
@@ -36,6 +42,8 @@ Exit 0 all checks pass, 1 any check fails.
 import csv
 import math
 import os
+import re
+import shlex
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -167,6 +175,136 @@ MULTI_KIND.update({
 })
 
 
+# ---- --check only: ARGS-VALUE witness kinds (CORRECTIONS 263) ---------------------------------------------------
+# `cmo1` (CORRECTIONS 255) changes the BASE optimiser through CLI FLAGS, not a patched tree: its M9* arms run
+# `--momentum-param-base 0.9` and its W0* arms `--weight-decay-base 0`, everything else at the standard cell.
+# Neither flag is a column of results/all_runs.csv, so aggregate.py writes those rows with the PLAIN arm's cell key
+# (255.7) and they would pool into the 0.99 / 0.1 cells.  There is no `<KIND>: on` line to read here -- the witness
+# is the run's OWN `ARGS:` line, the one prefix every run prints, read with argparse semantics (the LAST occurrence
+# of a repeated flag wins), exactly as analysis/argsline_guard.py reads it under STANDING RULE 20.
+#
+# argsline_guard is a REGISTERED file and is NOT imported (this module stays stdlib-only and standalone, as it
+# re-types 227.6's sigmas and the scorers' MULTI_KIND lines instead of importing them): its tokenizer and last-wins
+# rule are re-typed below, and tests/test_corpus_exclusions_check.py C24 pins them to it on real and synthetic
+# ARGS lines (equal effective dicts, repeated flags and `--flag=value` included).
+#
+# One entry per flag: (kind, flag, standard value).  A run DEVIATES on a kind when its own ARGS line carries that
+# flag with a value that is not NUMERICALLY the standard; an absent flag is the standard (argparse's default), so
+# older logs written before the flag existed do not deviate.  A future factor flag is one line here.
+# load / keys / is_excluded / filter_rows ignore all of this, as they ignore KINDS.
+ARGS_KINDS = [
+    ("ARGS_MOMENTUM_BASE", "momentum-param-base", "0.99"),  # cmo1's M9 arms (255.2); SGDm base momentum
+    ("ARGS_WD_BASE", "weight-decay-base", "0.1"),           # cmo1's W0 arms (255.2); base weight decay
+]
+ARGS_LINE_PREFIX = "ARGS:"   # jobs/run_cifar.sh echoes it on EVERY run, before train.py is called
+# PREFIX GUARANTEE (CORRECTIONS 245's, extended).  A witness is read as ONE kind because no name of KINDS +
+# ARGS_KINDS is a prefix of another (V / B / G / C / R / W / ARGS_M / ARGS_W).  The two readers cannot cross
+# either: no KINDS prefix is a prefix of `ARGS:` and none starts with `ARGS`, so witness_lines never collects an
+# `ARGS:` line; and an ARGS-kind name is followed by `_`, not `:`, so no `<KIND>: ...` line is read as an ARGS
+# line.  check() computes both and FAILs if an entry ever breaks them.
+#
+# SCOPE of the completeness check.  The standard values above are the MECHANISM LINE's cell (255.2: ResNet18_c100 /
+# PlainNet18_c100, CIFAR-100, 100 epochs, aug 1, clip -15:-2.3026, ms 1e-3, alpha0 1e-6, batch 100 -- `_pooled`'s
+# filter, re-typed as STD_CELL / STD_NETWORKS).  Older corpus batches outside that cell ran momentum 0.9 as THEIR
+# standard (128 ingested rows in 12 batches on 2026-09-18), so "deviates" is required-to-be-listed only INSIDE the
+# standard cell; outside it the check counts the rows (DESCRIPTIVE) and the cell-mixing rule below still FAILs if
+# any one 15-key cell would pool unlisted rows carrying different values.
+STD_CELL = [("dataset", "CIFAR100"), ("epochs_requested", "100"), ("augment", "1"), ("beta_clip", "-15:-2.3026"),
+            ("meta_stepsize", "1e-3"), ("alpha0", "1e-6"), ("batch_size", "100")]
+STD_NETWORKS = ("PlainNet18_c100", "ResNet18_c100")
+_ARGS_RE = re.compile(r"^\s*ARGS:\s*(.*)$")
+
+
+def args_kind_names():
+    return [k for k, _f, _s in ARGS_KINDS]
+
+
+def args_witness(kind, value):
+    """-> the TSV `witness` string for an ARGS kind: `<KIND>: <flag>=<value>`, the value verbatim from the run."""
+    flag = dict((k, f) for k, f, _s in ARGS_KINDS)[kind]
+    return "%s: %s=%s" % (kind, flag, value)
+
+
+def _args_tokens(payload):
+    """argsline_guard.tokenize, re-typed: shlex so quoted values survive, plain split if the line is not lexable."""
+    try:
+        return shlex.split(payload)
+    except ValueError:
+        return payload.split()
+
+
+def _args_effective(payload_or_tokens):
+    """argsline_guard.parse_flags + effective, re-typed: flag -> value, the LAST occurrence winning (argparse)."""
+    tokens = _args_tokens(payload_or_tokens) if not isinstance(payload_or_tokens, list) else payload_or_tokens
+    eff, i, n = {}, 0, len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if tok.startswith("--") and len(tok) > 2:
+            if "=" in tok:
+                flag, val = tok.split("=", 1)
+                eff[flag.lstrip("-")] = val
+                i += 1
+                continue
+            vals, j = [], i + 1
+            while j < n and not (tokens[j].startswith("--") and len(tokens[j]) > 2):
+                vals.append(tokens[j])
+                j += 1
+            eff[tok.lstrip("-")] = " ".join(vals)
+            i = j
+            continue
+        i += 1
+    return eff
+
+
+def args_line_of(path):
+    """-> the first `ARGS:` payload of a raw .out (head only: it is line 2 of every run_cifar.sh job), or None."""
+    try:
+        with open(path, errors="replace") as fh:
+            for k, ln in enumerate(fh):
+                if k > 200:
+                    break
+                m = _ARGS_RE.match(ln)
+                if m:
+                    return m.group(1).strip()
+    except IOError:
+        return None
+    return None
+
+
+def args_factors(path):
+    """-> {flag: effective value} for the registered ARGS flags of one raw .out, or None if it prints no ARGS line."""
+    payload = args_line_of(path)
+    if payload is None:
+        return None
+    eff = _args_effective(payload)
+    return dict((f, eff[f]) for _k, f, _s in ARGS_KINDS if f in eff)
+
+
+def _num_equal(a, b):
+    """argsline_guard.values_equal, re-typed: string equality with a numeric fallback (0 == 0.0, 1e-4 == 0.0001)."""
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return False
+
+
+def args_deviations(factors):
+    """-> {kind: witness} for every registered flag the run carries at a non-standard value (absent = standard)."""
+    out = {}
+    for k, f, std in ARGS_KINDS:
+        if f in factors and not _num_equal(factors[f], std):
+            out[k] = args_witness(k, factors[f])
+    return out
+
+
+def in_standard_cell(row):
+    """-> True if this CSV row sits in the mechanism line's standard cell, where ARGS_KINDS' standards are defined."""
+    return (row.get("network") in STD_NETWORKS
+            and all(row.get(c) == v for c, v in STD_CELL))
+
+
 def multi_kind_of(fn):
     """-> the registered {kind: line} of a `<batch>-<arm>-...` run name or .out file name, or None."""
     return MULTI_KIND.get(tuple(fn.split("-")[:2]))
@@ -174,6 +312,9 @@ def multi_kind_of(fn):
 
 def kind_of(witness):
     for k, _off in KINDS:
+        if witness.startswith(k + ":"):
+            return k
+    for k in args_kind_names():  # CORRECTIONS 263: the ARGS-value kinds, read the same way (`<KIND>: ...`)
         if witness.startswith(k + ":"):
             return k
     return None
@@ -201,6 +342,16 @@ def check(runs_dirs):
     collide = [(ka, kb) for ka, _o in KINDS for kb, _p in KINDS if ka != kb and ka.startswith(kb)]
     for ka, kb in collide:
         bad.append("KINDS prefix %r starts with %r: a %s line would also be read as %s" % (ka, kb, ka, kb))
+    # CORRECTIONS 263: the same proof over KINDS + ARGS_KINDS, and across the two readers (see ARGS_KINDS)
+    allnames = [k for k, _o in KINDS] + args_kind_names()
+    acollide = [(ka, kb) for ka in allnames for kb in allnames if ka != kb and ka.startswith(kb)]
+    for ka, kb in acollide:
+        bad.append("kind name %r starts with %r: a %s witness would also be read as %s" % (ka, kb, ka, kb))
+    across = ([k for k, _o in KINDS if ARGS_LINE_PREFIX.startswith(k) or k.startswith("ARGS")]
+              + [k for k in args_kind_names() if _ARGS_RE.match(args_witness(k, "0"))])
+    for k in across:
+        bad.append("kind %r collides with the `%s` line prefix: one line would be read by both readers"
+                   % (k, ARGS_LINE_PREFIX))
     cnt = {}
     for r in rows:
         cnt[(r["run"], r["job_id"])] = cnt.get((r["run"], r["job_id"]), 0) + 1
@@ -235,7 +386,9 @@ def check(runs_dirs):
             wl[fn] = witness_lines(p)
             if fn in listed:
                 kd = kind_of(listed[fn]["witness"])
-                if kd is not None and wl[fn][kd] != [listed[fn]["witness"]]:
+                # CORRECTIONS 263: an ARGS-value witness names no printed line; it is verified against the run's
+                # own ARGS line in the block below, not in witness_lines.
+                if kd is not None and kd not in args_kind_names() and wl[fn][kd] != [listed[fn]["witness"]]:
                     bad.append("%s witness %r != listed" % (fn, wl[fn][kd]))
                 n_w += 1
             else:
@@ -299,6 +452,79 @@ def check(runs_dirs):
               " exactly its registered ON line of each kind: %s" % (n_two, len(bad) == nb))
         print("  multi-kind runs (CORRECTIONS 251): those runs by the number of kinds MULTI_KIND registers for them: %s"
               % ", ".join("%d kinds %d" % (n, n_by.get(n, 0)) for n in sorted(set(len(d) for d in MULTI_KIND.values()))))
+        # ---- ARGS-VALUE WITNESSES (CORRECTIONS 263) ----------------------------------------------------------------
+        # A listed ARGS row carries its run's own value; every INGESTED standard-cell run whose ARGS deviates is
+        # listed; a batch with ARGS listings holds its other runs to the standard values; and no 15-key cell pools
+        # unlisted rows with different values.  Nothing here reads a `<KIND>:` line, and nothing above reads an
+        # `ARGS:` line (the prefix proof).
+        nb = len(bad)
+        rowby = dict(((r["run"], r["job_id"]), r) for r in rows)
+        abatches = set(e["batch"] for e in ents if kind_of(e["witness"]) in args_kind_names())
+        n_args = n_noargs = n_dev = n_dev_std = n_dev_out = n_dev_new = n_listed_args = 0
+        cellvals = {}
+        for fn, p in sorted(outs.items()):
+            fac = args_factors(p)
+            if fac is None:
+                n_noargs += 1
+                continue
+            n_args += 1
+            dev = args_deviations(fac)
+            run, _sep, jid = fn[:-len(".out")].rpartition("-")
+            ent = listed.get(fn)
+            ekd = kind_of(ent["witness"]) if ent else None
+            if ekd in args_kind_names():
+                n_listed_args += 1
+                if ekd not in dev:
+                    bad.append("%s is listed with an %s witness but its own ARGS line does not deviate (%s)"
+                               % (fn, ekd, ", ".join("%s=%s" % kv for kv in sorted(fac.items())) or "flag absent"))
+                elif dev[ekd] != ent["witness"]:
+                    bad.append("%s ARGS witness %r != listed %r" % (fn, dev[ekd], ent["witness"]))
+            if dev:
+                n_dev += 1
+                row = rowby.get((run, jid))
+                for kd in sorted(dev):
+                    if kd == ekd:
+                        continue
+                    if ent is not None:
+                        bad.append("%s deviates on %s but is listed with a %s witness" % (fn, kd, ekd))
+                    elif row is not None and in_standard_cell(row):
+                        bad.append("%s is a CSV row in the standard cell whose ARGS deviates (%s) but is NOT listed"
+                                   % (fn, dev[kd]))
+                    elif fn.split("-")[0] in abatches:
+                        bad.append("%s is an unlisted run of a listed batch whose ARGS deviates (%s)" % (fn, dev[kd]))
+                if ent is None:
+                    if row is None:
+                        n_dev_new += 1
+                    elif in_standard_cell(row):
+                        n_dev_std += 1
+                    else:
+                        n_dev_out += 1
+                elif ekd in args_kind_names() and row is not None and in_standard_cell(row):
+                    n_dev_std += 1
+            if ent is None and (run, jid) in rowby:  # the cell-mixing rule reads UNLISTED ingested rows only
+                ck = tuple(rowby[(run, jid)].get(c, "") for c in CELLKEYS)
+                cellvals.setdefault(ck, {}).setdefault(
+                    tuple((f, fac.get(f, "(absent)")) for _k, f, _s in ARGS_KINDS), []).append(fn)
+        args_complete = len(bad) == nb  # before the cell-mixing rule, which prints its own verdict
+        mixed = [(ck, v) for ck, v in cellvals.items() if len(v) > 1]
+        for ck, v in sorted(mixed):
+            bad.append("cell %s pools unlisted rows with different base-optimiser values: %s"
+                       % ("/".join(x for x in ck if x),
+                          "; ".join("%s -> %s" % (", ".join("%s=%s" % kv for kv in vals), ", ".join(sorted(f)[:3]))
+                                    for vals, f in sorted(v.items()))))
+        print("  ARGS-value kinds (CORRECTIONS 263): %s; the witness is the run's own `%s` line (a distinct prefix"
+              " present on every run, read with argparse last-wins semantics); no kind name is a prefix of another"
+              " and neither reader can take the other's line: %s"
+              % (" / ".join("%s (--%s, standard %s)" % (k, f, s) for k, f, s in ARGS_KINDS),
+                 ARGS_LINE_PREFIX, not (acollide or across)))
+        print("  ARGS witness (CORRECTIONS 263): %d listed runs carry their listed ARGS value; %d .out files carry an"
+              " ARGS line (%d without one); %d deviate from the standard, %d are CSV rows in the standard cell, every"
+              " one listed: %s; %d deviating CSV rows outside the standard cell (DESCRIPTIVE, not listed); %d not in"
+              " the CSV (not ingested, not required)"
+              % (n_listed_args, n_args, n_noargs, n_dev, n_dev_std, args_complete, n_dev_out, n_dev_new))
+        print("  ARGS cell mixing (CORRECTIONS 263): %d cells hold an unlisted ingested run; none pools two different"
+              " (%s) value sets: %s"
+              % (len(cellvals), ", ".join(f for _k, f, _s in ARGS_KINDS), not mixed))
     print("\nnoise-floor demonstration (227.6's definitions; cell = 15 CELLKEYS; complete, unsuperseded, std cell)")
     k = set(ks)
     variants = [("as 227 registered it: every cvt1- row dropped", [r for r in rows if not r["run"].startswith("cvt1-")]),

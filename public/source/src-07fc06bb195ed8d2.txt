@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cCT1_c10_dominance_score.py -- THE REGISTERED SCORER OF `cct1` (CORRECTIONS 257; docs/LIMITS-PREP.md 5.1 S3).
+#
+#   DO THE CARRIERS DOMINATE THE SHARED VOTE WHERE SCALAR DOES NOT COLLAPSE?  ResNet18 / CIFAR-10 at the mechanism
+#   hyper-parameters (SGDm 0.99 / wd 0.1 + Lion 0.99 / 0.9 / wd 0, ms 1e-3, alpha0 1e-6, gamma 1, clip -15:-2.3026,
+#   AUGMENT=1, batch 100, 100 epochs) -- the corpus cell that does NOT collapse (scalar 87.913 n15 vs layerwise
+#   90.919 n26, ratio 0.967; docs/LIMITS-PREP 2.2).  ZERO-GPU CHECK FIRST (LIMITS-PREP Z2): no CIFAR-10 run anywhere
+#   carries PROBE_TENSOR (all 303 probe-on `.out` files in the mirror are CIFAR-100; the 9 cluster_b `.out` files not in
+#   the mirror include one probe-on VGG CIFAR-100 smoke) -- so the existing records cannot answer this and S3 is NOT
+#   cancelled.
+#
+#   2 ARMS x SEEDS {116, 117, 118} = 6 JOBS, ONE submission, PROBE=100, PROBE_TENSOR=1 on both:
+#     k01  `scalar`     the arm the question is about (its records give DOM_C)
+#     kL   `layerwise`  the IN-BATCH non-collapse reference (batch is the unit of replication) and the layerwise
+#                       companion of the vote (as `ctd1`'s lay arm, 184.4)
+#   Seed 119 (pre-assigned) is NOT used (budget; it stays fresh).
+#
+# THE DOCUMENTED INVOCATION:
+#     python3 analysis/cCT1_c10_dominance_score.py <runsdir>
+#     python3 analysis/cCT1_c10_dominance_score.py --selftest [--runsdir <dir holding ctd1/ ciso1/ cdep1/>]
+# exit 0 scored; 1 gate failed; 2 INCOMPLETE.  RULE 21 / RULE 16 as cST1.  Statistics: analysis/cCV0_carrier_vote_core.py
+# (sha pinned, G-CORE) -- the SAME definitions and code as `cst1`'s nomination check.
+#
+# =============================================================================
+# THE QUANTITIES AND BARS -- FROZEN LITERALS (O2)
+# =============================================================================
+#   DOM_C, TOP3_C from k01's 1,500 records pooled (core definitions; C = {50, 53, 59} -- the same names on this model:
+#   the 62 tensors of ResNet18 and ResNet18_c100 differ only in linear.weight / linear.bias numels, 5120 / 10).
+#     CARRIERS-DOMINATE            DOM_C >= 0.50 AND TOP3_C >= 0.50
+#     CARRIERS-DO-NOT-DOMINATE     DOM_C <= 0.10
+#     CARRIER-DOMINANCE-PARTIAL    otherwise
+#   CALIBRATION (registration, the same code, CIFAR-100 ms 1e-3): collapsing scalar x9 DOM_C 0.784-0.820 (pooled
+#   0.8069) -> CARRIERS-DOMINATE; layerwise x9 0.0000 -> CARRIERS-DO-NOT-DOMINATE.
+#   RATIO = k01 / kL (arm means of plateau5 = mean test accuracy, epochs 95..99):
+#     SCALAR-COLLAPSED-HERE   RATIO <= 0.50 (R50)      SCALAR-PARTIAL-HERE   0.50 < RATIO < 0.90
+#     NOT-COLLAPSED           RATIO >= 0.90 (the corpus cell reads 0.967; 0.90 is 6.4 pp under kL's 90.9 = 43 SE)
+#   DIVERGED_BAR 5.0 pp (any arm's seed range); LEVEL_MIN 5.0, LEVEL_MAX 99.0 (any run).
+#   SIGMA_PRIOR 0.17974628843213575 = the S3 pair's cells (hier '' scalar + layerwise, ms 1e-3, alpha0 1e-6) through
+#   filter_rows on the 3,127-row corpus (df 39, 2 cells); disclosure only (no level bar here is in pp).  The
+#   all-granularity CIFAR-10 definition gives 3.2448 (df 324, 91 cells: hier / shrink variants) and is NOT used.
+#
+# =============================================================================
+# THE BRANCH MAP (decide(), first match wins; decide() reads no record)
+# =============================================================================
+#   score() gates: INCOMPLETE (2) -> HARNESS-UNSOUND (1: G-CORE, G-PROV, G-STRUCT, G-ARGS, G-ENV, G-PT, G-FOREIGN,
+#   G-HEADER, G-RECORDS) -> SPEC-NOT-APPLIED (1: G-SPEC, k01 1 coordinate, kL 62) -> UNRESOLVED-DECOMPOSITION (1)
+#   decide(): UNRESOLVED-DIVERGED -> <COLLAPSE>+<DOM>  (9 branches; 10 in all)
+#   STAMPS: KL-DOM_C=<x> and KL-<its DOM word> (the layerwise companion; predicted ~0 by the 1e-3 calibration),
+#   DOM_TOP3, R_T, DOWN, PINNED-FRAC, MODAL-TOP3={...}, ARGMAX=<idx>, RATIO=<x>, DATASET-AND-HEAD-CO-VARY,
+#   ONE-CELL-CIFAR10-MS1E-3, HORIZON-100-ONLY, ONE-NETWORK-RESNET18, FLOOR-NOT-APPLICABLE, SIGMA-PRIOR-FROZEN.
+#
+# =============================================================================
+# ACCOUNTS (UNSURE; midpoints asserted in selftest D)
+# =============================================================================
+#   account                     DOM_C      k01     kL       branch
+#   DOMINANCE-GENERIC           0.50-0.90  86-90   89.5-92  NOT-COLLAPSED+CARRIERS-DOMINATE
+#   DOMINANCE-TRACKS-COLLAPSE   0.00-0.10  86-90   89.5-92  NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE
+#   DOMINANCE-PARTIAL           0.20-0.40  86-90   89.5-92  NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL
+#   COLLAPSES-IN-BATCH          0.50-0.90  15-40   89.5-92  SCALAR-COLLAPSED-HERE+CARRIERS-DOMINATE
+#   BROKEN-CAPTURE (null)       any        86-90   89.5-92  reaches no branch: UNRESOLVED-DECOMPOSITION (G-DECOMP)
+#   LAYERWISE-RAN-SCALAR (null) as GENERIC 86-90   = k01    reaches no branch: SPEC-NOT-APPLIED (G-SPEC)
+#   A prior-art note bearing on the modal account: Gray et al. (arXiv:2411.00999) find the normalisation layers'
+#   per-example gradients predict the TOTAL gradient noise scale of healthy transformers, and 184.4 found BN scales
+#   the largest class per element under BOTH dynamics; neither says a SHARED hypergradient vote is fixed by three
+#   named tensors.  UNSURE which account holds.
+#
+# LICENCE LANGUAGE: association between two cells (CIFAR-100 collapse / CIFAR-10 no collapse) that differ in dataset
+# AND head width; never causation; never another network, cell or horizon.
+# =============================================================================
+from __future__ import annotations
+
+import argparse
+import csv
+import inspect
+import itertools
+import math
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import cCV0_carrier_vote_core as core  # noqa: E402
+
+CORE_SHA = "0754ca84e44258fbe628d7985cb5268f69272f004e25af531950304ec148c5e6"
+
+BATCH = "cct1"
+NET = "ResNet18"
+DSET = "CIFAR10"
+MST = "1e-3"
+MS = 1e-3
+A0 = "1e-6"
+SEEDS = (116, 117, 118)
+UNUSED_SEEDS = (119,)
+ARMS = ("k01", "kL")
+SPEC = {"k01": "scalar", "kL": "layerwise"}
+PT_TYPE = {"k01": "scalar", "kL": "layerwise"}
+N_COORDS = {"k01": 1, "kL": 62}
+N_RUNS = len(ARMS) * len(SEEDS)
+
+DOM_HI = 0.50
+DOM_LO = 0.10
+TOP3_BAR = 0.50
+RATIO_COLLAPSE = 0.50
+RATIO_OK = 0.90
+DIVERGED_BAR = 5.0
+LEVEL_MIN = 5.0
+LEVEL_MAX = 99.0
+SIGMA_PRIOR = 0.17974628843213575
+SE_PRIOR = SIGMA_PRIOR * math.sqrt(2.0 / 3.0)
+REG_CORPUS_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+CALIB_SCALAR_POOLED = 0.8069
+ANCHOR = {"k01 C10 (n15)": 87.9128, "kL C10 (n26)": 90.919, "k01 C100 1e-3 (n44)": 22.9562,
+          "layerwise C100 1e-3 (n32)": 69.4166}
+
+COLLAPSE_WORDS = ("NOT-COLLAPSED", "SCALAR-PARTIAL-HERE", "SCALAR-COLLAPSED-HERE")
+DOM_WORDS = ("CARRIERS-DOMINATE", "CARRIER-DOMINANCE-PARTIAL", "CARRIERS-DO-NOT-DOMINATE")
+
+ACCOUNTS = {
+    "DOMINANCE-GENERIC": {"dom": (0.50, 0.90), "k01": (86, 90), "kL": (89.5, 92)},
+    "DOMINANCE-TRACKS-COLLAPSE": {"dom": (0.00, 0.10), "k01": (86, 90), "kL": (89.5, 92)},
+    "DOMINANCE-PARTIAL": {"dom": (0.20, 0.40), "k01": (86, 90), "kL": (89.5, 92)},
+    "COLLAPSES-IN-BATCH": {"dom": (0.50, 0.90), "k01": (15, 40), "kL": (89.5, 92)},
+}
+EXPECTED_BRANCH = {
+    "DOMINANCE-GENERIC": "NOT-COLLAPSED+CARRIERS-DOMINATE",
+    "DOMINANCE-TRACKS-COLLAPSE": "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE",
+    "DOMINANCE-PARTIAL": "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL",
+    "COLLAPSES-IN-BATCH": "SCALAR-COLLAPSED-HERE+CARRIERS-DOMINATE",
+}
+
+HEADLINE = {
+    "NOT-COLLAPSED+CARRIERS-DOMINATE":
+        "On CIFAR-10 / ResNet18 at the mechanism hyper-parameters, where scalar does not collapse in batch "
+        "(k01 / kL >= 0.90), the same three last-block BN scales alone fix the shared vote on >= 50 % of k01's records "
+        "and are its three largest terms on >= 50 %: CARRIER VOTE DOMINANCE IS NOT SUFFICIENT FOR COLLAPSE (across "
+        "these two cells; dataset and head width co-vary)",
+    "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE":
+        "On CIFAR-10 / ResNet18 at the mechanism hyper-parameters, where scalar does not collapse in batch, the three "
+        "carriers fix the shared vote on <= 10 % of k01's records, against 0.81 at the collapsing CIFAR-100 cell: "
+        "CARRIER DOMINANCE CO-OCCURS WITH COLLAPSE across these two cells (association only; dataset and head width "
+        "co-vary; not causation)",
+    "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL":
+        "Scalar does not collapse in batch and the carriers fix the shared vote on between 10 % and 50 % of k01's "
+        "records (or are not its top three on half): neither the 'not sufficient' nor the 'co-occurs' sentence",
+}
+NOT_LICENSED = ("causation (dataset and head width co-vary); other networks, datasets, meta steps, alpha0 or "
+                "horizons; that dominance on CIFAR-10 has the CIFAR-100 time course; anything about the ISO rescue")
+
+
+def licence(branch):
+    if branch == "UNRESOLVED-DIVERGED":
+        return "NONE: a seed range > 5 pp or a run outside [5, 99]"
+    col, dom = branch.split("+")
+    if col in ("SCALAR-COLLAPSED-HERE", "SCALAR-PARTIAL-HERE"):
+        return ("NO dominance-without-collapse sentence: the corpus premise (ratio 0.967) failed in this batch (%s); "
+                "the dominance word %s is DESCRIPTIVE" % (col, dom))
+    return HEADLINE[branch]
+
+
+def all_branches():
+    return ["UNRESOLVED-DIVERGED"] + ["%s+%s" % t for t in itertools.product(COLLAPSE_WORDS, DOM_WORDS)]
+
+
+ARGS_FMT = ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion "
+            "--momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset %s --NN-name %s "
+            "--batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize %s --alpha0 %s --num-epochs 100 "
+            "--stepsize-groups %s --seed %d --save-directory %s --run-name %s")
+
+
+def args_line(arm, seed, ws="/cluster/account_b/metaopt"):
+    return ARGS_FMT % (DSET, NET, MST, A0, SPEC[arm], seed, ws + "/runs/" + BATCH, "%s-%s-s%d" % (BATCH, arm, seed))
+
+
+def args_ok(line, arm, seed):
+    m = re.match(r"^(.*--save-directory )(\S+)( --run-name \S+)$", line or "")
+    if not m or not m.group(2).endswith("/runs/" + BATCH):
+        return False
+    return line == args_line(arm, seed, m.group(2)[:-len("/runs/" + BATCH)])
+
+
+def manifest_text():
+    names, numel = core.TENSOR_NAMES, core.NUMEL[NET]
+    lines = ["BATCH %s" % BATCH, "NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(names),
+             "TOTAL_PARAMS %d" % sum(numel)]
+    for i, (n, q) in enumerate(zip(names, numel), 1):
+        lines.append("TENSOR %d %s %d" % (i, n, q))
+    lines.append("CARRIERS %s" % ",".join("%d:%s" % x for x in zip(core.C_IDX1, core.CARRIERS)))
+    for a in ARMS:
+        g = core.parse_sets(SPEC[a])
+        lines.append("ARMSPEC %s SPEC %s GROUPS %s" % (a, SPEC[a], "/".join(",".join(str(i) for i in x) for x in g)))
+    return "\n".join(lines) + "\n"
+
+
+def dom_word(dom, top3):
+    if dom is None or top3 is None:
+        return None
+    if dom >= DOM_HI and top3 >= TOP3_BAR:
+        return "CARRIERS-DOMINATE"
+    if dom <= DOM_LO:
+        return "CARRIERS-DO-NOT-DOMINATE"
+    return "CARRIER-DOMINANCE-PARTIAL"
+
+
+def collapse_word(ratio):
+    if ratio <= RATIO_COLLAPSE:
+        return "SCALAR-COLLAPSED-HERE"
+    if ratio >= RATIO_OK:
+        return "NOT-COLLAPSED"
+    return "SCALAR-PARTIAL-HERE"
+
+
+def decide(M):
+    """M: {'lev': {arm: mean}, 'rng': {arm: range}, 'runs': [...], 'dom', 'top3'} -> (branch, stamps)."""
+    if any(M["rng"][a] > DIVERGED_BAR for a in ARMS) or any(not (LEVEL_MIN <= x <= LEVEL_MAX) for x in M["runs"]):
+        return "UNRESOLVED-DIVERGED", []
+    ratio = M["lev"]["k01"] / M["lev"]["kL"]
+    return "%s+%s" % (collapse_word(ratio), dom_word(M["dom"], M["top3"])), ["RATIO=%.4f" % ratio]
+
+
+def score(runsdir, csv_path=core.DEFAULT_CSV, quiet=False):
+    led = core.Ledger(quiet=quiet)
+    P = (lambda *a: None) if quiet else print
+    P("=" * 100)
+    P("cCT1 -- `cct1`: carrier vote dominance on CIFAR-10 (no collapse).  runsdir %s" % runsdir)
+    P("=" * 100)
+    runs, notes = core.read_outs(runsdir, BATCH, ARMS)
+    for n in notes:
+        led.note(n)
+
+    P("\n[G-COMPLETE]")
+    probes, complete = {}, True
+    for a in ARMS:
+        for s in SEEDS:
+            r = runs.get((a, s))
+            ok = led.chk(r is not None and r["complete"], "%s-s%d: complete .out" % (a, s), gate="COMPLETE")
+            pr = core.read_probe(runsdir, BATCH, a, s)
+            probes[(a, s)] = pr
+            ok2 = led.chk(pr is not None and len(pr["recs"]) >= core.N_RECORDS, "%s-s%d: >= 500 probe records" % (a, s),
+                          "%d" % (len(pr["recs"]) if pr else 0), gate="COMPLETE")
+            complete &= ok and ok2
+    if not complete:
+        final = "FINAL: INCOMPLETE | %d/%d complete" % (sum(1 for v in runs.values() if v["complete"]), N_RUNS)
+        P("\n" + final)
+        return final, 2
+
+    P("\n[G-CORE / G-PROV / G-STRUCT]")
+    led.chk(core.core_sha() == CORE_SHA, "G-CORE: core sha256 == registered", core.core_sha(), gate="HARNESS")
+    prov = core.read_kv(os.path.join(runsdir, BATCH, "PROVENANCE.txt"))
+    led.chk(prov is not None, "G-PROV: PROVENANCE.txt present", gate="HARNESS")
+    prov = prov or {}
+    for key, want in (("MODE", "submit"), ("HF_SHA256", core.HF_LIVE_SHA), ("BUILD_NETWORK_SHA256",
+                                                                            core.BUILD_NETWORK_SHA),
+                      ("TRAIN_PY_SHA256", core.TRAIN_PY_SHA), ("RUNNER_SHA256", core.RUNNER_LIVE_SHA),
+                      ("CORE_SHA256", CORE_SHA), ("SCORER_SHA256", core.file_sha(os.path.abspath(__file__)))):
+        led.chk(prov.get(key) == want, "G-PROV: %s == %s" % (key, want), "got %s" % prov.get(key), gate="HARNESS")
+    mp = os.path.join(runsdir, BATCH, "PARTITION-MANIFEST.txt")
+    man = open(mp).read() if os.path.isfile(mp) else None
+    led.chk(man == manifest_text(), "G-STRUCT: PARTITION-MANIFEST.txt byte-identical (%d bytes)" % len(manifest_text()),
+            gate="HARNESS")
+
+    P("\n[G-ARGS / G-ENV / G-PT / G-FOREIGN / G-HEADER / G-RECORDS]")
+    for a in ARMS:
+        for s in SEEDS:
+            r, pr, tag = runs[(a, s)], probes[(a, s)], "%s-s%d" % (a, s)
+            led.chk(len(r["args"]) == 1 and args_ok(r["args"][0], a, s), "G-ARGS %s" % tag, gate="HARNESS")
+            pdir, env_ok = None, len(r["env"]) == 1
+            if env_ok:
+                m = re.search(r" PROBE_DIR=(\S+)", r["env"][0])
+                pdir = m.group(1) if m else None
+                env_ok = (re.sub(r" PROBE_DIR=\S+", "", r["env"][0]) == "ENV: " + core.ENV_FIXED and pdir is not None
+                          and pdir.endswith("/runs/%s/probe_%s-%s" % (BATCH, BATCH, tag)))
+            led.chk(env_ok, "G-ENV %s" % tag, gate="HARNESS")
+            m = core.PT_RE.match(r["pt"][0]) if len(r["pt"]) == 1 else None
+            led.chk(m is not None and m.group(1) == PT_TYPE[a] and m.group(2) == pdir,
+                    "G-PT %s: type=%s, dir == PROBE_DIR" % (tag, PT_TYPE[a]), gate="HARNESS")
+            led.chk(not r["foreign"], "G-FOREIGN %s" % tag, "; ".join(r["foreign"])[:120], gate="HARNESS")
+            h = pr["hdr"] or {}
+            led.chk(h.get("PROBE_TENSOR") == 1 and h.get("every") == core.PROBE_EVERY and h.get("stepsize_type") ==
+                    PT_TYPE[a] and h.get("n_tensors") == core.N_TENSORS and tuple(h.get("param_numels", ())) ==
+                    core.NUMEL[NET] and h.get("meta_alg") == "Lion" and h.get("Lion_beta2") == 0.9,
+                    "G-HEADER %s (%s numels)" % (tag, NET), gate="HARNESS")
+            led.chk(pr["bad"] == 0 and [x.get("step") for x in pr["recs"]] == list(range(0, core.META_STEPS,
+                                                                                          core.PROBE_EVERY)),
+                    "G-RECORDS %s" % tag, gate="HARNESS")
+    if led.fails("HARNESS"):
+        final = "FINAL: HARNESS-UNSOUND | %d harness check(s) failed: %s" % (len(led.fails("HARNESS")),
+                                                                            led.fails("HARNESS")[0])
+        P("\n" + final)
+        return final, 1
+
+    P("\n[G-SPEC]")
+    for a in ARMS:
+        for s in SEEDS:
+            recs = probes[(a, s)]["recs"]
+            nc = set(len(x.get("beta", [])) for x in recs)
+            nz = set(len((x.get("z_agg") or [[]])[0]) for x in recs)
+            led.chk(nc == {N_COORDS[a]} and nz == {N_COORDS[a]}, "G-SPEC %s-s%d: %d coordinate(s)" % (a, s, N_COORDS[a]),
+                    "beta %s z_agg %s" % (sorted(nc), sorted(nz)), gate="SPEC")
+    if led.fails("SPEC"):
+        final = "FINAL: SPEC-NOT-APPLIED | %s" % led.fails("SPEC")[0]
+        P("\n" + final)
+        return final, 1
+
+    P("\n[G-DECOMP]")
+    for a in ARMS:
+        for s in SEEDS:
+            d = core.decomposition(probes[(a, s)]["recs"], core.parse_sets(SPEC[a]), MS)
+            led.chk(core.decomposition_ok(d), "G-DECOMP %s-s%d" % (a, s),
+                    "shape %d z %d m %d (worst %.1e / %.1e) sign %d/%d clamped %d shared %d" % (
+                        d["bad_shape"], d["bad_z"], d["bad_m"], d["worst_z"], d["worst_m"], d["bad_sign"],
+                        d["n_sign"], d["clamped"], d["bad_shared"]), gate="DECOMP")
+    if led.fails("DECOMP"):
+        final = "FINAL: UNRESOLVED-DECOMPOSITION | %s" % led.fails("DECOMP")[0]
+        P("\n" + final)
+        return final, 1
+
+    P("\n[DOMINANCE] k01's records (the registered statistic), and kL's (the companion)")
+    for a in ARMS:
+        for s in SEEDS:
+            core.describe_stats("%s-s%d" % (a, s), core.vote_stats(probes[(a, s)]["recs"]), out=P)
+    st = {a: core.vote_stats([x for s in SEEDS for x in probes[(a, s)]["recs"]]) for a in ARMS}
+    for a in ARMS:
+        core.describe_stats("%s POOLED" % a, st[a], out=P)
+    P("  calibration (CIFAR-100 ms 1e-3, registration): collapsing scalar DOM_C pooled %.4f; layerwise 0.0000"
+      % CALIB_SCALAR_POOLED)
+
+    P("\n[LEVELS]")
+    lev, rng, allruns = {}, {}, []
+    for a in ARMS:
+        v = [runs[(a, s)]["p5"] for s in SEEDS]
+        t = [runs[(a, s)]["t5"] for s in SEEDS]
+        lev[a], rng[a] = core.mean(v), max(v) - min(v)
+        allruns += v
+        P("  %-3s %s mean %.4f range %.3f | train %s" % (a, " ".join("%.3f" % x for x in v), lev[a], rng[a],
+                                                         " ".join("%.3f" % x for x in t)))
+    gap = lev["kL"] - lev["k01"]
+    P("  kL - k01 = %+.4f pp = %+.2f SE (SE_PRIOR %.6f); ratio %.4f" % (gap, gap / SE_PRIOR, SE_PRIOR,
+                                                                        lev["k01"] / lev["kL"]))
+    M = {"lev": lev, "rng": rng, "runs": allruns, "dom": st["k01"]["DOM_C"], "top3": st["k01"]["TOP3_C"]}
+    branch, stamps = decide(M)
+    k = st["kL"]
+    stamps += ["DOM_C=%.4f" % st["k01"]["DOM_C"], "TOP3_C=%.4f" % st["k01"]["TOP3_C"],
+               "KL-DOM_C=%.4f" % k["DOM_C"], "KL-%s" % dom_word(k["DOM_C"], k["TOP3_C"]),
+               "DOM_TOP3=%s" % core.fmt(st["k01"]["DOM_TOP3"]), "R_T=%s" % core.fmt(st["k01"]["R_T"]),
+               "DOWN=%s" % core.fmt(st["k01"]["DOWN"]), "PINNED-FRAC=%s" % core.fmt(st["k01"]["PINNED_FRAC"]),
+               "MODAL-TOP3={%s}" % ",".join(str(i) for i in st["k01"]["MODAL_TOP3"][0][0]),
+               "ARGMAX=%d" % st["k01"]["ARGMAX"][0][0], "GAP-IN-BATCH=%.4f" % gap, "HARNESS-CLEAN", "SPEC-APPLIED",
+               "DECOMPOSITION-OK", "DATASET-AND-HEAD-CO-VARY", "ONE-CELL-CIFAR10-MS1E-3", "HORIZON-100-ONLY",
+               "ONE-NETWORK-RESNET18", "FLOOR-NOT-APPLICABLE", "SIGMA-PRIOR-FROZEN"]
+
+    P("\n[DESCRIPTIVE, gating nothing] beta trajectories")
+    for s in SEEDS:
+        b = [x["beta"][0] for x in probes[("k01", s)]["recs"]]
+        pk = max(range(len(b)), key=lambda i: b[i])
+        P("  k01-s%d: peak %.3f at step %d; terminal %.3f; share at floor %.3f" % (
+            s, b[pk], pk * core.PROBE_EVERY, b[-1], sum(1 for x in b if x <= core.BETA_LO + 1e-6) / len(b)))
+    for s in SEEDS:
+        recs = probes[("kL", s)]["recs"]
+        P("  kL-s%d carriers' own beta terminal %s; linear.weight %.3f" % (
+            s, " ".join("%.3f" % recs[-1]["beta"][i] for i in core.C_IDX0), recs[-1]["beta"][60]))
+    if core.read_corpus(csv_path, exclude_prefix=BATCH) is not None:
+        P("  corpus anchors (non-gating, filtered): %s" % "; ".join("%s %.4f" % kv for kv in ANCHOR.items()))
+
+    P("\nBRANCH   %s" % branch)
+    P("LICENCE  %s" % licence(branch))
+    P("NOT LICENSED  %s" % NOT_LICENSED)
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    P("\n" + final)
+    return final, 0
+
+
+def _synth_batch(root, levels, dom, rng, kl_dom=0.0, spec_break=None, decomp_break=None, drop=None, no_done=None,
+                 args_mut=None, env_mut=None, pt_mut=None, foreign=None, hdr_mut=None, short=None, prov_mut=None,
+                 man_mut=None, seed_jitter=None, kind_else="nodom", cache=None, ws="/cluster/account_b/metaopt"):
+    os.makedirs(os.path.join(root, BATCH), exist_ok=True)
+    job = 7100000
+    for a in ARMS:
+        for s in SEEDS:
+            job += 1
+            if drop == (a, s):
+                continue
+            groups = core.parse_sets(SPEC[a])
+            share = dom if a == "k01" else kl_dom
+            key = (a, share, kind_else, spec_break == (a, s), decomp_break == (a, s), short == (a, s))
+            recs = cache.get(key) if cache is not None else None
+            if recs is None:
+                recs = core.synth_records(groups, share, rng, MS, kind_else=kind_else,
+                                          break_decomp=decomp_break == (a, s),
+                                          n_coords=1 if spec_break == (a, s) else None)
+                if short == (a, s):
+                    recs = recs[:-1]
+                if cache is not None:
+                    cache[key] = recs
+            lvl = levels[a] + (seed_jitter.get((a, s), 0.0) if seed_jitter else 0.0)
+            pdir = os.path.join(ws, "runs", BATCH, "probe_%s-%s-s%d" % (BATCH, a, s))
+            env = core.ENV_FIXED.replace("PROBE=100", "PROBE=100 PROBE_DIR=" + pdir)
+            if env_mut == (a, s):
+                env = env.replace("BETA_CLIP=-15:-2.3026", "BETA_CLIP=none")
+            al = args_line(a, s, ws)
+            if args_mut == (a, s):
+                al = al.replace("--dataset CIFAR10 --NN-name ResNet18 ", "--dataset CIFAR100 --NN-name ResNet18_c100 ")
+            run = core.write_synth_run(root, BATCH, a, s, job, al, PT_TYPE[a] if pt_mut != (a, s) else "blockwise",
+                                       lvl, train_level=min(lvl + 5.0, 99.9), recs=recs, net=NET,
+                                       drop_run_done=no_done == (a, s), env=env,
+                                       hdr_override={"param_numels": list(core.NUMEL["ResNet18_c100"])}
+                                       if hdr_mut == (a, s) else None)
+            outp = os.path.join(root, "%s-%d.out" % (run, job))
+            txt = open(outp).read()
+            txt = re.sub(r"(PROBE_TENSOR: on .* dir=)\S+", lambda m: m.group(1) + pdir, txt)
+            if foreign and foreign[0] == (a, s):
+                txt = txt.replace("\nEpoch 0,", "\n%s\nEpoch 0," % foreign[1], 1)
+            open(outp, "w").write(txt)
+    prov = {"MODE": "submit", "HF_SHA256": core.HF_LIVE_SHA, "BUILD_NETWORK_SHA256": core.BUILD_NETWORK_SHA,
+            "TRAIN_PY_SHA256": core.TRAIN_PY_SHA, "RUNNER_SHA256": core.RUNNER_LIVE_SHA, "CORE_SHA256": CORE_SHA,
+            "SCORER_SHA256": core.file_sha(os.path.abspath(__file__))}
+    if prov_mut:
+        prov.update(prov_mut)
+    with open(os.path.join(root, BATCH, "PROVENANCE.txt"), "w") as f:
+        for k, v in prov.items():
+            f.write("%s %s\n" % (k, v))
+    mt = manifest_text()
+    if man_mut:
+        mt = mt.replace("linear.weight 5120", "linear.weight 51200")
+    open(os.path.join(root, BATCH, "PARTITION-MANIFEST.txt"), "w").write(mt)
+
+
+def selftest(csv_path, runsdir=None):
+    led = core.Ledger()
+    print("=" * 100)
+    print("cCT1 SELFTEST")
+    print("=" * 100)
+
+    print("\n[A] design, literals, bars, branches")
+    led.chk(core.core_sha() == CORE_SHA, "the imported core is the registered core", core.core_sha())
+    led.chk(N_RUNS == 6 and set(SEEDS) | set(UNUSED_SEEDS) == {116, 117, 118, 119}, "6 runs; 116-118 used, 119 unused")
+    led.chk(core.NUMEL[NET][:60] == core.NUMEL["ResNet18_c100"][:60] and core.NUMEL[NET][60:] == (5120, 10)
+            and core.TOTAL[NET] == 11173962, "ResNet18 == ResNet18_c100 except the head (5120 / 10); 11,173,962 params")
+    led.chk([core.TENSOR_NAMES[i - 1] for i in core.C_IDX1] == list(core.CARRIERS), "C = 50, 53, 59 by name")
+    led.chk(0 < DOM_LO < DOM_HI < 1 and RATIO_COLLAPSE < RATIO_OK < ANCHOR["k01 C10 (n15)"] / ANCHOR["kL C10 (n26)"],
+            "bar ordering; RATIO_OK below the corpus ratio 0.967")
+    try:
+        import cST1_carrier_contrast_score as st1
+        led.chk((st1.DOM_HI, st1.DOM_LO, st1.TOP3_BAR, st1.CORE_SHA) == (DOM_HI, DOM_LO, TOP3_BAR, CORE_SHA),
+                "the dominance bars and the core are cst1's nomination bars and core, byte for byte")
+    except Exception as e:  # noqa: BLE001
+        led.chk(False, "cST1 importable", str(e))
+    br = all_branches()
+    led.chk(len(br) == 10 and all(licence(b) for b in br), "10 branches, every one has a licence")
+    src = inspect.getsource(decide)
+    led.chk("probe" not in src and "recs" not in src and "read_" not in src, "decide() reads no record")
+    led.chk(abs(SE_PRIOR - SIGMA_PRIOR * math.sqrt(2 / 3)) < 1e-15, "SE_PRIOR = SIGMA_PRIOR * sqrt(2/3)")
+    led.chk(args_line("kL", 116).count("--") == 20, "20 flags in the registered ARGS line")
+    mc = decide({"lev": {"k01": ANCHOR["k01 C100 1e-3 (n44)"], "kL": ANCHOR["layerwise C100 1e-3 (n32)"]},
+                 "rng": {"k01": 1, "kL": 1}, "runs": [22.96, 69.42], "dom": CALIB_SCALAR_POOLED, "top3": 0.8238})[0]
+    led.chk(mc == "SCALAR-COLLAPSED-HERE+CARRIERS-DOMINATE", "the CIFAR-100 calibration cell, read by decide(), is "
+                                                             "SCALAR-COLLAPSED-HERE+CARRIERS-DOMINATE", mc)
+
+    print("\n[B] the dominance words on LANDED records (CIFAR-100, ms 1e-3)")
+    calib = [("ctd1", "sc", (18, 19, 20)), ("ciso1", "k01", (21, 22, 23)), ("cdep1", "k01", (24, 25, 26))]
+    lay = [("ctd1", "lay", (18, 19, 20)), ("ciso1", "k62", (21, 22, 23)), ("cdep1", "k62", (24, 25, 26))]
+    if runsdir and all(core.read_probe(runsdir, b, a, s[0]) for b, a, s in calib + lay):
+        for grp, want in ((calib, "CARRIERS-DOMINATE"), (lay, "CARRIERS-DO-NOT-DOMINATE")):
+            recs = sum((core.read_probe(runsdir, b, a, s)["recs"] for b, a, ss in grp for s in ss), [])
+            s_ = core.vote_stats(recs)
+            led.chk(dom_word(s_["DOM_C"], s_["TOP3_C"]) == want and len(recs) == 4500,
+                    "PREMISE %s x9 reads %s" % (grp[0][1], want), "DOM_C %.4f" % s_["DOM_C"])
+    else:
+        print("  SKIP the landed probe records are not under --runsdir")
+
+    print("\n[C] noise floor through filter_rows; freshness")
+    rows, raw = core.read_corpus(csv_path), core.read_corpus(csv_path, filtered=False)
+    if rows is None:
+        print("  SKIP no corpus")
+    else:
+        pair = core.cell_rows(rows, NET, DSET, MST, A0, "scalar") + core.cell_rows(rows, NET, DSET, MST, A0, "layerwise")
+        sig, df, nc = core.pooled_sigma(pair, NET, DSET)
+        if core.file_sha(csv_path) == REG_CORPUS_SHA:
+            led.chk(abs(sig - SIGMA_PRIOR) < 1e-12 and df == 39 and nc == 2, "the pair sigma == SIGMA_PRIOR", repr(sig))
+        else:
+            print("  NOTE corpus moved since registration; pair sigma now %r (df %d); SIGMA_PRIOR frozen" % (sig, df))
+        led.chk(not any(r["run"].startswith(BATCH + "-") for r in raw), "no cct1- row")
+        led.chk(not any(r.get("seed") in ("116", "117", "118", "119") for r in raw), "no row with seed 116-119")
+
+    print("\n[D] accounts")
+    for name, acc in ACCOUNTS.items():
+        mid = lambda k: (acc[k][0] + acc[k][1]) / 2.0  # noqa: E731
+        M = {"lev": {a: mid(a) for a in ARMS}, "rng": {a: 0.5 for a in ARMS}, "runs": [mid(a) for a in ARMS],
+             "dom": mid("dom"), "top3": 0.8 if mid("dom") >= DOM_HI else 0.0}
+        led.chk(decide(M)[0] == EXPECTED_BRANCH[name], "account %s -> %s" % (name, EXPECTED_BRANCH[name]), decide(M)[0])
+    led.chk(len(set(EXPECTED_BRANCH.values())) == len(EXPECTED_BRANCH), "4 accounts, 4 branches")
+
+    print("\n[E] the REAL score() on synthetic batches")
+    tmp = tempfile.mkdtemp(prefix="cct1_selftest_")
+    rng = random.Random(20260917)
+    cache = {}
+    base = {"k01": 88.0, "kL": 90.9}
+
+    def run_case(label, want_prefix, want_rc, levels=None, dom=0.8, **kw):
+        root = os.path.join(tmp, re.sub(r"[^A-Za-z0-9]+", "_", label))
+        _synth_batch(root, levels or base, dom, rng, cache=cache, **kw)
+        final, rc = score(root, csv_path, quiet=True)
+        led.chk(final.startswith("FINAL: " + want_prefix) and rc == want_rc,
+                "E %-54s -> %s (rc %d)" % (label, want_prefix, want_rc), "got %s rc %d" % (final[:90], rc))
+        shutil.rmtree(root, ignore_errors=True)
+        return final
+
+    f = run_case("DOMINANCE-GENERIC", "NOT-COLLAPSED+CARRIERS-DOMINATE |", 0)
+    led.chk("KL-DOM_C=0.0000" in f and "KL-CARRIERS-DO-NOT-DOMINATE" in f, "the kL companion stamps read kL's records")
+    run_case("DOMINANCE-TRACKS-COLLAPSE", "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE", 0, dom=0.0)
+    run_case("other trio dominates", "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE", 0, dom=0.0, kind_else="other3")
+    run_case("DOMINANCE-PARTIAL", "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL", 0, dom=0.3)
+    run_case("COLLAPSES-IN-BATCH", "SCALAR-COLLAPSED-HERE+CARRIERS-DOMINATE", 0, {"k01": 27.0, "kL": 90.9})
+    run_case("partial collapse", "SCALAR-PARTIAL-HERE+CARRIERS-DOMINATE", 0, {"k01": 70.0, "kL": 90.9})
+    run_case("kL dominated too (unexpected)", "NOT-COLLAPSED+CARRIERS-DOMINATE", 0, kl_dom=0.9)
+    run_case("near bar: ratio 0.901", "NOT-COLLAPSED+", 0, {"k01": 81.9, "kL": 90.9})
+    run_case("near bar: ratio 0.899", "SCALAR-PARTIAL-HERE+", 0, {"k01": 81.72, "kL": 90.9})
+    run_case("near bar: ratio 0.500", "SCALAR-COLLAPSED-HERE+", 0, {"k01": 45.45, "kL": 90.9})
+    run_case("near bar: DOM_C 0.502", "NOT-COLLAPSED+CARRIERS-DOMINATE", 0, dom=0.502)
+    run_case("near bar: DOM_C 0.498", "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL", 0, dom=0.498)
+    run_case("near bar: DOM_C 0.100", "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE", 0, dom=0.100)
+    run_case("near bar: DOM_C 0.104", "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL", 0, dom=0.104)
+    run_case("diverged (k01 s117 -6)", "UNRESOLVED-DIVERGED", 0, seed_jitter={("k01", 117): -6.0})
+    run_case("dropped run", "INCOMPLETE", 2, drop=("kL", 118))
+    run_case("no RUN_DONE", "INCOMPLETE", 2, no_done=("k01", 116))
+    run_case("499 records", "INCOMPLETE", 2, short=("kL", 117))
+    run_case("ARGS: CIFAR-100 net/dataset", "HARNESS-UNSOUND", 1, args_mut=("k01", 116))
+    run_case("ENV: BETA_CLIP=none", "HARNESS-UNSOUND", 1, env_mut=("kL", 116))
+    run_case("PT type blockwise on k01", "HARNESS-UNSOUND", 1, pt_mut=("k01", 117))
+    run_case("foreign DECAY_MASK line", "HARNESS-UNSOUND", 1, foreign=(("kL", 117), "DECAY_MASK: off"))
+    run_case("header numels of ResNet18_c100", "HARNESS-UNSOUND", 1, hdr_mut=("kL", 118))
+    run_case("provenance HF wrong", "HARNESS-UNSOUND", 1, prov_mut={"HF_SHA256": "816e3357" + "0" * 56})
+    run_case("provenance core wrong", "HARNESS-UNSOUND", 1, prov_mut={"CORE_SHA256": "0" * 64})
+    run_case("provenance MODE dryrun", "HARNESS-UNSOUND", 1, prov_mut={"MODE": "dryrun"})
+    run_case("manifest of the CIFAR-100 head", "HARNESS-UNSOUND", 1, man_mut=True)
+    run_case("LAYERWISE-RAN-SCALAR null: kL-s116", "SPEC-NOT-APPLIED", 1, spec_break=("kL", 116),
+             levels={"k01": 88.0, "kL": 88.0})
+    run_case("BROKEN-CAPTURE null: k01-s118", "UNRESOLVED-DECOMPOSITION", 1, decomp_break=("k01", 118))
+
+    print("\n[E2] O2 invariance")
+    root = os.path.join(tmp, "o2")
+    _synth_batch(root, base, 0.8, rng, cache=cache)
+    f0, _ = score(root, csv_path, quiet=True)
+    if csv_path and os.path.isfile(csv_path):
+        rr = list(csv.DictReader(open(csv_path)))
+        inj = os.path.join(tmp, "inject.csv")
+        with open(inj, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(rr[0].keys()))
+            w.writeheader()
+            for r in rr:
+                w.writerow(r)
+            for k in range(11):
+                r = dict(rr[0])
+                r.update({"run": "zzinject-%d" % k, "job_id": str(9910000 + k), "network": NET, "dataset": DSET,
+                          "meta_stepsize": MST, "alpha0": A0, "granularity": "scalar", "plateau5": str(10 + 8 * k),
+                          "superseded": "0", "collapsed": "0", "complete": "1", "epochs_requested": "100",
+                          "augment": "1", "beta_clip": "-15:-2.3026", "batch_size": "100", "hier": "", "base": "SGDm",
+                          "meta": "Lion", "gamma": "1"})
+                w.writerow(r)
+        pr = core.read_corpus(inj)
+        pair = core.cell_rows(pr, NET, DSET, MST, A0, "scalar") + core.cell_rows(pr, NET, DSET, MST, A0, "layerwise")
+        s_inj = core.pooled_sigma(pair, NET, DSET)[0]
+        f1, _ = score(root, inj, quiet=True)
+        f2, _ = score(root, None, quiet=True)
+        led.chk(f0 == f1 == f2 and s_inj > 1.0, "FINAL identical on corpus / injected corpus (pair sigma %.2f) / none"
+                % s_inj)
+    shutil.rmtree(root, ignore_errors=True)
+
+    print("\n[E3] the one-argument subprocess invocation")
+    root = os.path.join(tmp, "sub")
+    _synth_batch(root, base, 0.8, rng, cache=cache)
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), root], capture_output=True, text=True)
+    led.chk(p.returncode == 0 and "FINAL: NOT-COLLAPSED+CARRIERS-DOMINATE" in p.stdout, "`<runsdir>` exit 0")
+    for fn in os.listdir(root):
+        if fn.startswith("cct1-kL-s117"):
+            os.remove(os.path.join(root, fn))
+    p = subprocess.run([sys.executable, os.path.abspath(__file__), root], capture_output=True, text=True)
+    led.chk(p.returncode == 2 and "FINAL: INCOMPLETE" in p.stdout, "a dropped run: exit 2")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    fails = led.fails()
+    print("\nSELFTEST %s: %d PASS / %d FAIL" % ("PASSES" if not fails else "FAILS",
+                                                sum(1 for ok, _l, _g in led.rows if ok), len(fails)))
+    for x in fails:
+        print("  FAILED: %s" % x)
+    return 0 if not fails else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt")
+    ap.add_argument("--csv", default=core.DEFAULT_CSV)
+    a = ap.parse_args()
+    if a.selftest:
+        sys.exit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    sys.exit(score(a.runsdir, a.csv)[1])
+
+
+if __name__ == "__main__":
+    main()

@@ -77,12 +77,23 @@ mapping is reviewable in one place and never applied ad hoc:
     227's one in-place wording correction (checked by ``check_in_place_correction``), CORRECTIONS only by the inserted 253.15
     section and its note. ``CVT89_AMENDMENTS`` carries the corrected cell into MT227's scope without moving an outcome.
 
+12. The four MUST-tier landings (MASTER-TABLE lines 228-231 at campaign commit 40d29cf, CORRECTIONS 264-266) are imported
+    by ``MUST_ROWS``. The pinned file may differ from the cvt8/cvt9 final-audit pin on header line 3 alone -- line 5, the
+    bottom-line paragraph, was deliberately not amended this cycle -- and no line may move; no existing row was amended,
+    so no earlier record changes (``MUST_BEARS_ON`` records the relationship). ``docs/CORRECTIONS.md`` is append-only from
+    that pin: the ingest commit 77c6de9 added entries 254-263 and the landing replaced its closing "Next free number"
+    trailer with entries 264-266. Only ``cmo1`` owes exclusion rows, and they are of a NEW kind: its M9 and W0 arms deviate
+    from the standard cell in a base-optimiser CLI FLAG alone, which no patch announces and no CSV column carries, so the
+    campaign lists them under the ARGS-value witness kinds of CORRECTIONS 263 (``ARGS_KINDS``). ``MUST_ARGS_DEVIATIONS``
+    names those 18 runs; ``args_deviation()`` reads such a row and ``args_witness_line()`` checks it against the run's own
+    ``ARGS:`` line under argparse last-wins semantics. ``cst1``, ``cct1`` and ``cmg1`` own no exclusion row at all.
+
 Record text is plain text: ``clean()`` removes Markdown bold, emphasis and code marks from every MASTER-TABLE cell and
 from the text fields of the campaign's register export (``BASE_TEXT_FIELDS``), which copies the cells with their marks.
 
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
 ``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221,
-then MT222-MT223, then MT224-MT225, then MT226-MT227);
+then MT222-MT223, then MT224-MT225, then MT226-MT227, then MT228-MT231);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -94,6 +105,7 @@ import csv
 import hashlib
 import json
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -230,6 +242,20 @@ ADDED_PHASES = [{
     # 252 / 253; 2026-09-17 08:50 +0200, 17 Sep 06:50 UTC). The phase still ends on 17 Sep.
     "experimentIds": [f"MT{line}" for line in range(APPENDED_FIRST_ROW, 227 + 1)],
     "source": "docs/CORRECTIONS.md 216-226 at 64e4f47",
+}, {
+    # The MUST-have tier of docs/LIMITS-PREP.md section 5.1, approved by the operator and registered as a block on
+    # 17 Sep (CORRECTIONS 255 cmo1, 256 cst1, 257 cct1, 259 cmg1), launched the same day and landed on 18 Sep: the
+    # batches were scored at campaign commits 6d09d1f and 8e341e4, ingested once at 77c6de9 (corpus 3,127 -> 3,181)
+    # and written up at 40d29cf (CORRECTIONS 264-266). A separate phase from phase-09: these four ask what the carrier
+    # account NEEDS -- another base-optimiser configuration, another meta step size, a non-collapsing dataset, the
+    # merge direction -- rather than which network or horizon it survives.
+    "id": "phase-10", "date": "2026-09-17", "period": "17-18 Sep", "title": "What the carrier account needs",
+    "test": "One-factor-at-a-time base-optimiser legs; a second meta step size; the one non-collapsing cell; merging the carriers instead of isolating them",
+    "observed_result": "The collapse survives momentum 0.9 but not weight decay 0; CIFAR-10 does not collapse and its carriers never dominate; the carrier merge costs ~4 pp, inside the 5 pp bar; the second meta step size is blocked by a scorer tolerance defect",
+    "next_question": "Which weight-decay route acts, and is carrier separation ever necessary",
+    # MUST_FIRST_ROW / MUST_LAST_ROW are 228 and 231; they are defined further down the file, so the four IDs are written out.
+    "experimentIds": ["MT228", "MT229", "MT230", "MT231"],
+    "source": "docs/CORRECTIONS.md 264-266 at 40d29cf",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -360,7 +386,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     raw, previous = b"", None
     # Each pin must be a byte prefix of the next: the list may only grow by appended rows.
     for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256),
-                             (CVT67_COMMIT, CVT67_INTERVENTIONS_TSV_SHA256), (CVT89_COMMIT, CVT89_INTERVENTIONS_TSV_SHA256)]:
+                             (CVT67_COMMIT, CVT67_INTERVENTIONS_TSV_SHA256), (CVT89_COMMIT, CVT89_INTERVENTIONS_TSV_SHA256),
+                             (MUST_COMMIT, MUST_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -371,16 +398,31 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
     for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS}.items():
-        mine = [row for row in rows if row["batch"] == spec["batch"]]
-        arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
-        if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
-            raise ValueError(f"{INTERVENTIONS_TSV} does not list the registered intervened arms of {eid}: {arms}")
-        for row in mine:
+        for row in listed_rows(rows, eid, spec):
+            if is_args_deviation(row["witness"]):
+                raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as a patch intervention with an ARGS-value witness")
             intervention_kinds(row["intervention"])  # every listed hold must be a known kind
-            runs[row["job_id"]] = {**row, "experimentId": eid}
+            runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": False}
+    # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
+    # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
+    for eid, spec in MUST_ARGS_DEVIATIONS.items():
+        for row in listed_rows(rows, eid, spec):
+            if not is_args_deviation(row["witness"]):
+                raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
+            args_deviation(row["intervention"], row["witness"])  # the flag, its value and the witness must agree
+            runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": True}
     if len(runs) != len(rows):
         raise ValueError(f"{INTERVENTIONS_TSV} lists runs with no registered intervention record")
     return runs
+
+
+def listed_rows(rows: list[dict], eid: str, spec: dict) -> list[dict]:
+    """The exclusion rows of one record's batch, with the registered arm counts checked."""
+    mine = [row for row in rows if row["batch"] == spec["batch"]]
+    arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
+    if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
+        raise ValueError(f"{INTERVENTIONS_TSV} does not list the registered intervened arms of {eid}: {arms}")
+    return mine
 
 
 # The exclusion list's intervention column is free text: one PATCH=value per hold, separated by spaces (CORRECTIONS 245:
@@ -436,6 +478,96 @@ def additional_witness(lines: list[str], patch: str, value: str) -> str:
     if expected not in found[0] + " ":
         raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
     return found[0]
+
+
+# The exclusion list's witness column normally quotes the run's own "<PATCH>: on ..." line. CORRECTIONS 263 added a SECOND
+# kind of row, because cmo1 (CORRECTIONS 255) changes the BASE optimiser through CLI FLAGS rather than a patched tree: its
+# M9* arms run `--momentum-param-base 0.9` and its W0* arms `--weight-decay-base 0`, everything else at the standard cell.
+# No patch announces such a deviation and no column of results/all_runs.csv carries it, so there is no "<KIND>: on" line to
+# read. The row's intervention cell is the flag as it was written on the command line ("--momentum-param-base 0.9"), its
+# witness cell is "<KIND>: <flag>=<value>", and the evidence is the run's OWN `ARGS:` line -- the one prefix every run
+# prints -- read with argparse last-wins semantics, exactly as analysis/argsline_guard.py reads it under STANDING RULE 20.
+# An unknown kind, a witness that does not match its own intervention cell, or a listed value that is the standard value
+# stops the export rather than being guessed. kind -> (flag, standard value, plain-English name of the factor).
+ARGS_KINDS = {"ARGS_MOMENTUM_BASE": ("momentum-param-base", "0.99", "base momentum"),
+              "ARGS_WD_BASE": ("weight-decay-base", "0.1", "base weight decay")}
+ARGS_LINE_PREFIX = "ARGS:"
+
+
+def args_equal(left: str, right: str) -> bool:
+    """Numeric comparison where both sides parse as numbers, so 0.9 and 0.90 are one value; otherwise exact."""
+    try:
+        return float(left) == float(right)
+    except ValueError:
+        return left == right
+
+
+def is_args_deviation(witness: str) -> bool:
+    """True for an exclusion row whose witness names an ARGS-value kind rather than a patch's ON line."""
+    return witness.split(":", 1)[0] in ARGS_KINDS
+
+
+def args_deviation(intervention: str, witness: str) -> tuple[str, str, str, str]:
+    """(kind, flag, value, standard value) for an ARGS-value exclusion row, or a ValueError."""
+    kind, sep, rest = witness.partition(": ")
+    if not sep or kind not in ARGS_KINDS:
+        raise ValueError(f"Unknown ARGS-value witness in {INTERVENTIONS_TSV}: {witness!r}")
+    flag, equals, value = rest.partition("=")
+    expected, standard, _name = ARGS_KINDS[kind]
+    if not equals or not value or flag != expected or " " in rest:
+        raise ValueError(f"Unreadable ARGS-value witness in {INTERVENTIONS_TSV}: {witness!r}")
+    if intervention != f"--{flag} {value}":
+        raise ValueError(f"The {kind} intervention cell must be the flag as written on the command line: {intervention!r}")
+    if args_equal(value, standard):
+        raise ValueError(f"{kind} lists the standard value {standard} as a deviation")
+    return kind, flag, value, standard
+
+
+def args_phrase(kind: str) -> str:
+    """'base momentum flag --momentum-param-base', for the run note and the record's warning."""
+    flag, _standard, name = ARGS_KINDS[kind]
+    return f"{name} flag --{flag}"
+
+
+def args_effective(payload: str) -> dict[str, str]:
+    """flag -> value for an ARGS payload, the LAST occurrence winning, as argparse and analysis/argsline_guard.py read it.
+
+    argsline_guard is a REGISTERED campaign file and is not imported (RULE 16); its tokenizer and last-wins rule are
+    re-typed here, as analysis/corpus_exclusions.py re-types them on the campaign side (CORRECTIONS 263)."""
+    try:
+        tokens = shlex.split(payload)
+    except ValueError:
+        tokens = payload.split()
+    effective, index = {}, 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        flag, equals, inline = token.partition("=")
+        if equals:
+            effective[flag], index = inline, index + 1
+        elif index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+            effective[flag], index = tokens[index + 1], index + 2
+        else:
+            effective[flag], index = "", index + 1
+    return effective
+
+
+def args_witness_line(lines: list[str], flag: str, value: str, standard: str) -> str:
+    """The run's own ARGS line, checked to carry <flag> at the listed value; the returned witness quotes that flag only.
+
+    The raw ARGS line also carries the run's private save directory, so the witness published beside the run is the
+    checked flag alone. The sanitized raw log is published in full, so a reader can read the whole line there."""
+    found = [line for line in lines if line.startswith(ARGS_LINE_PREFIX)]
+    if len(found) != 1:
+        raise ValueError(f"A run log must print exactly one '{ARGS_LINE_PREFIX}' line; found {len(found)}")
+    listed = args_effective(found[0][len(ARGS_LINE_PREFIX):]).get(f"--{flag}")
+    if listed is None or not args_equal(listed, value):
+        raise ValueError(f"The run log's ARGS line carries --{flag} {listed!r}, not the listed {value!r}")
+    if args_equal(listed, standard):
+        raise ValueError(f"The run log's ARGS line carries the standard --{flag} {standard}, so the run does not deviate")
+    return f"{ARGS_LINE_PREFIX} --{flag} {listed}"
 
 
 # ---------------------------------------------------------------------------
@@ -1310,6 +1442,135 @@ def apply_cvt89_amendments(rows: list[dict], repo: Path) -> list[dict]:
     return amended
 
 
+# ---------------------------------------------------------------------------
+# 12. The four MUST-tier landings (CORRECTIONS 264-266): four appended rows, no row amended.
+# ---------------------------------------------------------------------------
+# Campaign commit 40d29cf (cycle 154, CORRECTIONS 264 + 265 + 266) appended the cmo1, cst1, cct1 and cmg1 landings as
+# MASTER-TABLE lines 228-231 and recounted header line 3. Nothing else may differ from the cvt8/cvt9 final-audit pin and
+# no line may move. Line 5, the bottom-line paragraph, was DELIBERATELY left unamended this cycle (CORRECTIONS 266.12:
+# cmo1's W0k01 71.5600 is still 6.03 pp below that cell's tuned SGD+momentum+cosine peak 77.5927, so GAP_in stands), so
+# unlike every landing since cvt3 the pin edits header line 3 alone. No existing row was amended, so no earlier record
+# changes; MUST_BEARS_ON records which earlier records these four bear on.
+MUST_COMMIT = "40d29cf908c788dffc868d926ca069d89fdea1a6"
+MUST_MASTER_TABLE_SHA256 = "3bae7bd5bcdaad6c3bc9213944971f4171f29cdf3e34cf90463b1e24319696b1"
+MUST_FIRST_ROW, MUST_LAST_ROW = 228, 231
+MUST_EDITED_LINES = {3}
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# MT228 (cmo1) is Mixed, as MT218, MT221, MT224, MT226 and MT227: the momentum leg answers both halves of the question in
+# its registered direction, but the weight-decay leg defies a registered expectation -- at base weight decay 0 the scalar
+# arm is the BEST arm in the batch, so there is no gap for the isolation to close and the registered ISO reading is
+# stamped W0-ISO-AT-REF and NOT read (264.3). Half the question is therefore unanswerable at that cell, and the batch
+# additionally ran on two GPU models that were neither registered nor gated (264.4(4)).
+# MT229 (cst1) is Open: the registered scorer STOPPED at G-DECOMP on all nine runs and exited 1, so the batch reaches no
+# branch and owns no licence sentence -- VERDICT_RULES["open"], "the primary is void, undecided, blocked". Its levels and
+# contrasts are labelled DESCRIPTIVE ONLY by the row itself and are not a result. The blocking gate is a scorer tolerance
+# DEFECT, reported under RULE 16 and deliberately NOT fixed (265.3); a frozen successor must be registered before its
+# output is read.
+# MT230 (cct1) is Goal met, as MT219, MT222, MT223 and MT225: both registered words are returned (RATIO 0.9641 and
+# DOM_C 0.0000), the scorer exits 0 with every gate passing, no registered band is missed and neither bar is near
+# (DOM_C 0 of 1,500 against a 150-record bar; k01 could fall 5.817 pp and still read NOT-COLLAPSED). Its bounds --
+# association not causation, the co-varying dataset and head width, three seeds, one cell -- are scope, not a missed band.
+# MT231 (cmg1) is Mixed: the merge question is answered and the single licensed sentence is granted, but no registered
+# account's LEVELS are reproduced (A3 predicts MCAR 68.4166 against the observed 65.4335; A1 and A2 predict 59.998), so
+# ACCOUNT-A3-MERGE-HARMLESS is a BRANCH match only, and the verdict turns on a near bar with 0.8850 pp (1.84 SE) of margin.
+# None of the four corrects an earlier published claim, so none carries the Corrected badge: the two refuted sentences
+# (264.6 W1's epoch-duplicate claim, 266.6's N-pin clause) were claims of the landing reports themselves, corrected inside
+# the same entries before any of this reached the register.
+MUST_ROWS = {
+    228: ("mixed", 9, ["cmo1"], ["page-19"], None, "M9:COLLAPSE-PERSISTS/ISO-RESCUES+W0:COLLAPSE-IS-CONFIG/ISO-UNREADABLE: the momentum leg answers both halves of the question in its registered direction -- at SGDm base momentum 0.9 the scalar collapse PERSISTS (M9k01 24.5833 against its own layerwise M9kL 69.3913, gap 44.8080 pp = +80.56 SE, ratio 0.3543 against the anchor's 0.3300) and isolating ciso1's three carriers STILL RESCUES (M9ISO 70.9047, clearing the one-sided M9ISO >= M9kL - 5 bar by 6.5133 pp and in fact +1.5133 pp above M9kL) -- and the anchor reproduces at fresh seeds (G_A +46.2620, R_A +47.6340). But the weight-decay leg defies a registered expectation: at base weight decay 0 the scalar arm is the BEST arm in the batch (W0k01 71.5600, +48.7713 pp above the anchor k01 and +3.3900 pp above its own layerwise W0kL), so there is no gap for the isolation to close and the registered ISO reading is stamped W0-ISO-AT-REF and NOT read, leaving the rescue half of the question unanswerable at that cell. One value per factor and one factor at a time, with no CTL arm at either new configuration and the interaction not run; the batch also ran on two GPU models that were neither registered nor gated (10 RTX 2080 Ti, 17 NVIDIA L4), which leaves both half-words untouched because every deciding contrast is hardware-matched seed for seed, but makes DI_M9 a fully confounded comparison."),
+    229: ("open", 9, ["cst1"], ["page-19"], None, "UNRESOLVED-DECOMPOSITION: the registered scorer STOPPED at G-DECOMP on all nine runs and exited 1, so the batch reaches NO branch, owns NO licence sentence and NO number in its row is a result; its levels and contrasts are labelled DESCRIPTIVE ONLY. The blocking gate is a scorer TOLERANCE DEFECT, reported under RULE 16 and deliberately NOT fixed: an ABSOLUTE 1e-3 bar is applied to a quotient whose float32 quantisation residual is bounded by 0.5*ulp(beta)/ms = 1.589e-03 at ms 3e-4, and the posted beta equals the registered update BIT FOR BIT on 6,876 of 6,876 unclamped cst1 coordinates (92,788 of 92,788 once the verifier widens it across cst1 and cct1), worst residual 1.358e-03, so the harness applied exactly the registered update and the bar simply cannot be met at this meta step (the corrected forward bound: safe for ms >= 4.77e-04, crossover 4.7684e-04). Every other gate PASSES and G-SPEC excludes the BROKEN-SPEC null, but a FROZEN SUCCESSOR must be REGISTERED BEFORE its output is read, and the blocked reading is bar-sensitive -- DOM_C misses its frozen 0.50 bar by 41 records of 1,500 and TOP3_C by SIX."),
+    230: ("met", 9, ["cct1"], ["page-19"], None, "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE: both registered words are returned on CIFAR-10 -- the scalar arm does not collapse in batch (RATIO = k01 / kL = 0.9641 >= 0.90, GAP-IN-BATCH +3.2607 pp = +22.22 SE) and the three carriers fix the shared sign on 0 of k01's 1,500 records (DOM_C 0.0000 <= 0.10) against 0.8069 at the collapsing CIFAR-100 cell -- the scorer exits 0 with every gate passing, no registered band is missed and neither bar is near (DOM_C 0 of 1,500 against a 150-record bar, and k01 could fall 5.817 pp and still read NOT-COLLAPSED). The carriers ARE still the largest single terms (modal top-3 {50,53,59} on 1,041 of 1,500, tensor 59 the argmax on 1,243, BN scales a median 0.545 of the summed abs(L)) but never OUT-WEIGH the other 59, SHARE_C median 0.4228 < 0.5. Its limits -- two cells only, dataset and head width co-varying, the CIFAR-100 side a registration calibration on earlier runs, three seeds -- are scope that the licence states as ASSOCIATION, not registered bands the result missed."),
+    231: ("mixed", 9, ["cmg1"], ["page-19"], None, "NO-MERGE-HARMS: the merge question is answered and the single licensed sentence is granted -- DELTA_ID = MCTL - MCAR = +3.0225 pp = +6.27 SE with all four same-seed pairs positive, D_CAR = KLS - MCAR = +4.1150 pp stays INSIDE the frozen 5.0 pp margin, KLS lands in the corpus layerwise band, and G-PARTITION's non-vacuity is re-proved on the real records by 24 cross-reads with 0 pass, which excludes the BROKEN-PARTITION null. But a registered expectation was defied: NO account's LEVELS are reproduced (A3 predicts MCAR 68.4166 against the observed 65.4335, and A1 / A2 predict 59.998), so ACCOUNT-A3-MERGE-HARMLESS is a BRANCH match only and is descriptive. The verdict also turns on a NEAR BAR -- D_CAR is 0.8850 pp (1.84 SE) short of the margin while being +8.54 SE from zero and below the bar in all four seeds, so the carrier merge measurably costs ~4 pp -- DELTA_ID is sub-margin, so the harm may be called neither carrier-specific nor absent, TRAIN-AGREES is disclosed as VACUOUS, and the control triple is not role-matched."),
+}
+# Earlier records these rows bear on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MUST_BEARS_ON = {
+    228: ["MT162", "MT155"],  # ciso1's collapse and rescue, re-run at two base-optimiser settings; W0k01 71.5600 lands level with cdn1's method arm but 6.03 pp under that cell's tuned baseline, so MT155 does not move
+    229: ["MT162", "MT163"],  # ciso1's isolation and cdep1's count-matched control, re-asked at a second meta step size; the gate blocks the reading
+    230: ["MT162"],           # ciso1's carrier dominance, asked at the one non-collapsing cell the campaign can reach
+    231: ["MT163", "MT162"],  # cdep1's matched triple and ciso1's carriers, merged instead of isolated: the necessity direction
+}
+# The 18 deviating arms. results/all_runs.csv has no column for a base-optimiser CLI flag, so cmo1's M9* and W0* rows
+# carry the plain 0.99 / 0.1 cell key; the campaign lists them in the same hash-pinned exclusion file under the ARGS-value
+# witness kinds added at CORRECTIONS 263. cst1, cct1 and cmg1 own no exclusion row: none of their runs prints an
+# intervention line and their arms are separated by columns the corpus already carries (266.1, 265.1).
+MUST_INTERVENTIONS_TSV_SHA256 = "76c910b8f598a4a72a4158391720220a46f1bc70273fa5ecca903cfc58b4edfd"
+MUST_ARGS_DEVIATIONS = {
+    "MT228": {
+        "batch": "cmo1", "arms": {"M9k01": 3, "M9kL": 3, "M9ISO": 3, "W0k01": 3, "W0kL": 3, "W0ISO": 3},
+        "title": "cmo1's M9 and W0 arms differ from the standard cell in a base-optimiser CLI flag, not in any CSV column",
+        "source": f"{INTERVENTIONS_TSV} at {MUST_COMMIT[:7]}; CORRECTIONS 255, 263 and 264",
+        "note": ("All nine cmo1 arms ran the LIVE harness with NO patch: the six deviating arms change the BASE optimiser through "
+                 "command-line flags alone. M9k01, M9kL and M9ISO ran --momentum-param-base 0.9 with weight decay held at the "
+                 "standard 0.1; W0k01, W0kL and W0ISO ran --weight-decay-base 0 with momentum held at the standard 0.99; the "
+                 "anchor arms k01, kL and ISO ran both flags at the standard 0.99 / 0.1. ONE value per factor and ONE factor at a "
+                 "time: the interaction (0.9 AND 0) was not run. Neither flag is a column of results/all_runs.csv, so the run "
+                 "inventory writes all 18 rows with the plain 0.99 / 0.1 cell key: seed for seed they differ from their anchor arm "
+                 "only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT measurements of the standard "
+                 "cell. There is no PATCH ON line to read here, because no patch ran: the witness is the run's OWN ARGS: line, the "
+                 "one prefix every run prints, read with argparse last-wins semantics, and each row is listed in "
+                 "results/CORPUS-EXCLUSIONS.tsv under the ARGS-value witness kind ARGS_MOMENTUM_BASE or ARGS_WD_BASE added at "
+                 "CORRECTIONS 263. Drop them before pooling runs by cell. The batch's own anchor arms are ordinary measurements of "
+                 "their cells, and cst1, cct1 and cmg1 own no exclusion row at all."),
+    },
+}
+# docs/CORRECTIONS.md is append-only from the cvt8/cvt9 final audit to this landing: the ingest commit 77c6de9 (corpus
+# 3,127 -> 3,181, the 18 ARGS-value exclusion rows) added entries 254-263, and the landing replaced that file's closing
+# "Next free number" trailer with entries 264, 265 and 266 and a new trailer. No earlier line moved or changed, so no
+# registration text was corrected in place this cycle and no record gains a registration warning.
+MUST_INGEST_COMMIT = "77c6de90ff6dcc5444f1c864bafc6dbdfd6b2476"
+MUST_INGEST_CORRECTIONS_SHA256 = "0219271152528978d4eccba038b40e9b9987828934dd2629b8a8742bb70c8778"
+MUST_CORRECTIONS_SHA256 = "bb2702e1ddc5d7b7c8ccd3c6f12a21645ca2b9a59743f68e99d61e4c4f8f8454"
+MUST_ENTRIES = (264, 265, 266)
+MUST_TRAILER = "Next free number: "
+
+
+def must_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the four MUST-tier landings; only header line 3 and four appended rows may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MUST_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MUST_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MUST_COMMIT[:12]} does not match the pinned MUST-tier-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = cvt89_audit_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MUST_LAST_ROW or len(before) != MUST_FIRST_ROW - 1 or changed != MUST_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MUST_COMMIT[:7]} moved a line or edited lines other than {sorted(MUST_EDITED_LINES)}: {sorted(changed)}")
+    return lines
+
+
+def must_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the landing and at the ingest; the ingest's closing trailer is the only line that may go."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MUST_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MUST_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_COMMIT[:12]} does not match the pinned bytes")
+    previous = subprocess.check_output(["git", "-C", str(repo), "show", f"{MUST_INGEST_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(previous).hexdigest() != MUST_INGEST_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_INGEST_COMMIT[:12]} does not match the pinned bytes")
+    lines, before = raw.decode("utf-8").splitlines(), previous.decode("utf-8").splitlines()
+    if len(lines) <= len(before) or not before[-1].startswith(MUST_TRAILER) or not lines[-1].startswith(MUST_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_COMMIT[:7]} does not append entries below the ingest's closing trailer")
+    if lines[:len(before) - 1] != before[:-1]:
+        changed = [n for n in range(1, len(before)) if lines[n - 1] != before[n - 1]]
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_COMMIT[:7]} changed an earlier line: {changed[:8]}")
+    appended = [line for line in lines[len(before) - 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MUST_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_COMMIT[:7]} does not append exactly entries {MUST_ENTRIES}: {appended[:4]}")
+    earlier, _ = cvt89_audit_corrections(repo)
+    if lines[:len(earlier)] != earlier:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MUST_COMMIT[:7]} changed an entry of the cvt8/cvt9 audit pin {CVT89_AUDIT_COMMIT[:7]}")
+    return lines, before
+
+
+def must_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 228-231 (cmo1, cst1, cct1, cmg1) and attach cmo1's ARGS-value deviation note."""
+    rows = appended_rows(lines, MUST_ROWS, MUST_FIRST_ROW, MUST_LAST_ROW, MUST_COMMIT)
+    for row in rows:
+        spec = MUST_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def amended_master_table(repo: Path) -> list[str]:
     """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
     raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
@@ -1516,7 +1777,10 @@ def appended_rows(lines: list[str], mapping: dict | None = None, first: int = AP
             raise ValueError(f"MASTER-TABLE line {line}: the mapping reason must start with the row's first verdict token {tokens[0]}")
         outcome = RULE_OUTCOME[rule]
         references = [{"path": MASTER_TABLE, "line": line, "rowText": lines[line - 1]}]
-        references += [part for part in split_references(ref) if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
+        # Record text is plain text, and a citation is record text: MASTER-TABLE line 229 writes a scorer gate in backticks
+        # inside its ref cell. clean() is applied to each citation, not to the cell, so the bracket-aware split is unchanged.
+        # Only the appended rows are cleaned here; the section-10 rows keep the citations they were published with.
+        references += [clean(part) for part in split_references(ref) if re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
         rows.append({
             "id": partition_id(line), "section": str(section), "area": AREAS[section],
             "goal": question, "comparison": clean(varied), "why": label[1] + ".",
@@ -1565,7 +1829,8 @@ def load_register(workspace: Path, repo: Path) -> list[dict]:
 
     The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place.
     The cvt6 / cvt7 landing (CORRECTIONS 246-247) amended no row either (only line 5, which feeds no record), nor did the
-    cvt8 / cvt9 landing (CORRECTIONS 252-253); its final audit (CORRECTIONS 253.15) then corrected row 227 in place."""
+    cvt8 / cvt9 landing (CORRECTIONS 252-253); its final audit (CORRECTIONS 253.15) then corrected row 227 in place.
+    The four MUST-tier landings (CORRECTIONS 264-266) amended no row and did not touch line 5 either."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
     return apply_cvt89_amendments(apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo)), Path(repo))
 
@@ -1581,7 +1846,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
     added = (partition_rows(master_table_at_commit(Path(repo))) + appended_rows(appended_master_table(Path(repo)))
              + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo)))
              + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo)))
-             + cvt67_rows(cvt67_master_table(Path(repo))) + cvt89_rows(cvt89_master_table(Path(repo))))
+             + cvt67_rows(cvt67_master_table(Path(repo))) + cvt89_rows(cvt89_master_table(Path(repo)))
+             + must_rows(must_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

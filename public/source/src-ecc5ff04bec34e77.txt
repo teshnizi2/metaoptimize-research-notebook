@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cct1_attack_indep.py -- THE INDEPENDENT ATTACK PARSER OF `cct1` (CORRECTIONS 257; landed at 258*).
+#
+# WHAT IT IS.  A second, independent implementation of every line the REGISTERED scorer
+# analysis/cCT1_c10_dominance_score.py prints on the landed batch.  It imports NO repo module
+# (no cCV0_carrier_vote_core, no corpus_exclusions, no scorer): stdlib only.  It re-derives the
+# model (names and numels built from the ResNet18 architecture, not copied from the core), the
+# partition manifest, every gate, every carrier-vote statistic, the levels from the RAW `.out`
+# files, the corpus sigma and the corpus anchors through the exclusions TSV, and the branch,
+# licence and FINAL line.
+#
+# HOW IT IS USED.  It prints a REPLICA block whose lines are byte-identical to the registered
+# scorer's stdout (minus the scorer's one `runsdir` line, which is a host path), so the two can be
+# diffed mechanically, and a CHECK block of its own -- claims the scorer does NOT make, including
+# the exact float32 reconstruction of every applied beta step and the sha256 of every input file.
+# It never reads the scorer or the scorer's output.
+#
+#     python3 analysis/cct1_attack_indep.py <runsdir> [--csv <all_runs.csv>] [--tsv <CORPUS-EXCLUSIONS.tsv>]
+#
+# Exit 0 iff VIOLATIONS 0.  Every host path is printed on a HOSTPATH line at the end and nowhere
+# else, so the output is byte-identical on cluster_b and on the Mac apart from those lines.
+#
+# THE CORPUS IT USES: results/all_runs.csv and results/CORPUS-EXCLUSIONS.tsv at repo commit
+# 1cb52f7 ("ingest cvt8 + cvt9"), sha256 1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a
+# (3,127 rows) and ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191 -- the corpus
+# `cct1` was registered against (REG_CORPUS_SHA in the scorer).  Both shas are re-computed below
+# and a mismatch is a VIOLATION.
+#
+# DEFINITIONS RE-TYPED FROM CORRECTIONS 256.3 / 257.3 (not imported):
+#   L_i  = b2*m_i + (1-b2)*z_i over the 62 tensors, from each record's own m_tensor / z_tensor / pt_b2
+#   s    = sign(b2*mom_pre + (1-b2)*z_agg) on a 1-coordinate run; sign(sum_i L_i) otherwise; s == 0 skipped
+#   C    = {50, 53, 59} 1-based = layer4.0.bn2.weight, layer4.0.shortcut.1.weight, layer4.1.bn2.weight
+#   DOM_C   sign(sum_C L) == s AND |sum_C L| > sum_{i not in C} |L_i|
+#   TOP3_C  the three largest |L_i| are exactly C;  DOM_TOP3  whichever three are largest fix the sign
+#   SHARE_C sum_C |L| / sum |L| (median over records);  R_T / CAR_EQ / DOWN as cTD2 (see below)
+#   plateau5 = mean TEST accuracy of epochs 95..99 read from the RAW `.out` (never from a CSV column)
+# =============================================================================
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import sys
+from collections import Counter
+
+BATCH = "cct1"
+NET = "ResNet18"
+DSET = "CIFAR10"
+N_CLASSES = 10
+MST = "1e-3"
+MS = 1e-3
+A0 = "1e-6"
+ARMS = ("k01", "kL")
+SEEDS = (116, 117, 118)
+SPEC = {"k01": "scalar", "kL": "layerwise"}
+PT_TYPE = {"k01": "scalar", "kL": "layerwise"}
+N_COORDS = {"k01": 1, "kL": 62}
+C_IDX1 = (50, 53, 59)
+CARRIER_NAMES = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+B2 = 0.9
+BETA_LO, BETA_HI = -15.0, -2.3026
+PROBE_EVERY = 100
+META_STEPS = 50000
+N_RECORDS = 500
+EPOCHS = 100
+TOL_Z, TOL_M = 1e-5, 1e-4
+DECOMP_FAIL_MAX = 0.01
+SIGN_FAIL_MAX = 0.01
+
+DOM_HI, DOM_LO, TOP3_BAR = 0.50, 0.10, 0.50
+RATIO_COLLAPSE, RATIO_OK = 0.50, 0.90
+DIVERGED_BAR, LEVEL_MIN, LEVEL_MAX = 5.0, 5.0, 99.0
+SIGMA_PRIOR = 0.17974628843213575
+SE_PRIOR = SIGMA_PRIOR * math.sqrt(2.0 / 3.0)
+CALIB_SCALAR_POOLED = 0.8069
+
+REG_CSV_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+REG_TSV_SHA = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+CORPUS_COMMIT = "1cb52f7"
+
+# the provenance literals CORRECTIONS 256.10 / 257.8 record (re-typed, not imported)
+HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+BUILD_NETWORK_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+TRAIN_PY_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+CORE_SHA = "0754ca84e44258fbe628d7985cb5268f69272f004e25af531950304ec148c5e6"
+SCORER_SHA = "9bedffa80f9940571931c7ab2967e6a3b1329e2e66439764ce4a23d009557bd7"
+
+ENV_FIXED = ("AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+             "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+             "PROBE=100 EB_RHO=na EB_LOG=0")
+FOREIGN_PREFIXES = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD",
+                    "DECAY_MASK", "SHADOW_VOTE", "WD_SCALE")
+ARGS_FMT = ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion "
+            "--momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset %s --NN-name %s "
+            "--batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize %s --alpha0 %s --num-epochs 100 "
+            "--stepsize-groups %s --seed %d --save-directory %s --run-name %s")
+EP_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=100 type=(scalar|layerwise|blockwise) tensors=62 meta_alg=Lion "
+                   r"momentum_param=0\.99 Lion_beta2=0\.9 dir=(\S+)$")
+
+# the headline sentences CORRECTIONS 257.3 registered (re-typed so a changed licence is caught)
+HEADLINE = {
+    "NOT-COLLAPSED+CARRIERS-DOMINATE":
+        "On CIFAR-10 / ResNet18 at the mechanism hyper-parameters, where scalar does not collapse in batch "
+        "(k01 / kL >= 0.90), the same three last-block BN scales alone fix the shared vote on >= 50 % of k01's records "
+        "and are its three largest terms on >= 50 %: CARRIER VOTE DOMINANCE IS NOT SUFFICIENT FOR COLLAPSE (across "
+        "these two cells; dataset and head width co-vary)",
+    "NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE":
+        "On CIFAR-10 / ResNet18 at the mechanism hyper-parameters, where scalar does not collapse in batch, the three "
+        "carriers fix the shared vote on <= 10 % of k01's records, against 0.81 at the collapsing CIFAR-100 cell: "
+        "CARRIER DOMINANCE CO-OCCURS WITH COLLAPSE across these two cells (association only; dataset and head width "
+        "co-vary; not causation)",
+    "NOT-COLLAPSED+CARRIER-DOMINANCE-PARTIAL":
+        "Scalar does not collapse in batch and the carriers fix the shared vote on between 10 % and 50 % of k01's "
+        "records (or are not its top three on half): neither the 'not sufficient' nor the 'co-occurs' sentence",
+}
+NOT_LICENSED = ("causation (dataset and head width co-vary); other networks, datasets, meta steps, alpha0 or "
+                "horizons; that dominance on CIFAR-10 has the CIFAR-100 time course; anything about the ISO rescue")
+
+# what the registered scorer PRINTED on this batch (transcribed from its stdout; this parser never reads that
+# file).  Every one of these is re-derived below and a difference is a VIOLATION.
+EXPECT_FINAL = ("FINAL: NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE | RATIO=0.9641 | DOM_C=0.0000 | TOP3_C=0.6940 | "
+                "KL-DOM_C=0.0000 | KL-CARRIERS-DO-NOT-DOMINATE | DOM_TOP3=0.0793 | R_T=0.4770 | DOWN=1.0000 | "
+                "PINNED-FRAC=0.0000 | MODAL-TOP3={50,53,59} | ARGMAX=59 | GAP-IN-BATCH=3.2607 | HARNESS-CLEAN | "
+                "SPEC-APPLIED | DECOMPOSITION-OK | DATASET-AND-HEAD-CO-VARY | ONE-CELL-CIFAR10-MS1E-3 | "
+                "HORIZON-100-ONLY | ONE-NETWORK-RESNET18 | FLOOR-NOT-APPLICABLE | SIGMA-PRIOR-FROZEN")
+EXPECT_LEVELS = {"k01": (87.662, 87.188, 87.694), "kL": (90.792, 90.786, 90.748)}
+EXPECT_TRAIN = {"k01": (93.792, 93.550, 93.528), "kL": (99.654, 99.636, 99.680)}
+EXPECT_MANIFEST_BYTES = 2733
+EXPECT_ANCHOR = {"k01 C10 (n15)": (87.9128, 15), "kL C10 (n26)": (90.919, 26),
+                 "k01 C100 1e-3 (n44)": (22.9562, 44), "layerwise C100 1e-3 (n32)": (69.4166, 32)}
+
+VIOL = []
+OUT = []
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def V(msg):
+    VIOL.append(msg)
+    P("  VIOLATION %s" % msg)
+
+
+def chk(cond, label, extra=""):
+    P("  %-4s %s%s" % ("OK" if cond else "BAD", label, ("   " + extra) if extra else ""))
+    if not cond:
+        VIOL.append(label + (("   " + extra) if extra else ""))
+    return bool(cond)
+
+
+# =============================================================================
+# the model, built from the architecture (NOT copied from the core's tables)
+# =============================================================================
+def build_model(n_classes):
+    """ResNet18 for 32x32 inputs: conv1 3->64 3x3, four stages of two BasicBlocks (64,128,256,512),
+    a 1x1 shortcut conv + BN wherever the stage changes width, then a linear head.  Returns the
+    (name, numel) list in the order the harness enumerates parameters."""
+    out = [("conv1.weight", 64 * 3 * 3 * 3), ("bn1.weight", 64), ("bn1.bias", 64)]
+    inp = 64
+    for stage, planes in enumerate((64, 128, 256, 512), start=1):
+        for blk in range(2):
+            pre = "layer%d.%d." % (stage, blk)
+            out.append((pre + "conv1.weight", planes * inp * 3 * 3))
+            out.append((pre + "bn1.weight", planes))
+            out.append((pre + "bn1.bias", planes))
+            out.append((pre + "conv2.weight", planes * planes * 3 * 3))
+            out.append((pre + "bn2.weight", planes))
+            out.append((pre + "bn2.bias", planes))
+            if inp != planes:
+                out.append((pre + "shortcut.0.weight", planes * inp))
+                out.append((pre + "shortcut.1.weight", planes))
+                out.append((pre + "shortcut.1.bias", planes))
+            inp = planes
+    out.append(("linear.weight", 512 * n_classes))
+    out.append(("linear.bias", n_classes))
+    return out
+
+
+MODEL = build_model(N_CLASSES)
+NAMES = tuple(n for n, _ in MODEL)
+NUMELS = tuple(q for _, q in MODEL)
+C_IDX0 = tuple(i - 1 for i in C_IDX1)
+
+
+def tclass(name):
+    if name.startswith("linear."):
+        return "linear"
+    if name.endswith(".bias"):
+        return "bn_bias"
+    if ".bn" in name or ".shortcut.1." in name or name.startswith("bn1."):
+        return "bn_scale"
+    return "conv"
+
+
+CLASSES = ("bn_scale", "bn_bias", "conv", "linear")
+CLASS_OF = tuple(tclass(n) for n in NAMES)
+
+
+def manifest_text():
+    L = ["BATCH %s" % BATCH, "NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(NAMES),
+         "TOTAL_PARAMS %d" % sum(NUMELS)]
+    for i, (n, q) in enumerate(MODEL, 1):
+        L.append("TENSOR %d %s %d" % (i, n, q))
+    L.append("CARRIERS %s" % ",".join("%d:%s" % x for x in zip(C_IDX1, CARRIER_NAMES)))
+    for a in ARMS:
+        g = ([list(range(1, 63))] if SPEC[a] == "scalar" else [[i] for i in range(1, 63)])
+        L.append("ARMSPEC %s SPEC %s GROUPS %s" % (a, SPEC[a], "/".join(",".join(str(i) for i in x) for x in g)))
+    return "\n".join(L) + "\n"
+
+
+# =============================================================================
+# tiny helpers (own implementations)
+# =============================================================================
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def med(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def avg(v):
+    v = list(v)
+    return sum(v) / len(v) if v else None
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def args_line(arm, seed, ws):
+    return ARGS_FMT % (DSET, NET, MST, A0, SPEC[arm], seed, ws + "/runs/" + BATCH,
+                       "%s-%s-s%d" % (BATCH, arm, seed))
+
+
+# =============================================================================
+# readers
+# =============================================================================
+def find_out(runsdir, arm, seed):
+    pat = re.compile(r"^%s-%s-s%d-(\d+)\.out$" % (BATCH, arm, seed))
+    hits = []
+    for d in (runsdir, os.path.join(runsdir, BATCH)):
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                m = pat.match(fn)
+                if m:
+                    hits.append((int(m.group(1)), os.path.join(d, fn)))
+    return sorted(hits)
+
+
+def read_out(path):
+    txt = open(path, errors="replace").read()
+    lines = txt.splitlines()
+    te, tr = {}, {}
+    for e, a, b in EP_RE.findall(txt):
+        tr[int(e)] = float(a)
+        te[int(e)] = float(b)
+    r = {"path": path, "test": te, "train": tr,
+         "args": [l for l in lines if l.startswith("ARGS:")],
+         "env": [l for l in lines if l.startswith("ENV:")],
+         "pt": [l for l in lines if l.startswith("PROBE_TENSOR:")],
+         "foreign": [l for l in lines if l.startswith(FOREIGN_PREFIXES)],
+         "done": any(l.strip() == "RUN_DONE" for l in lines),
+         "tb": "Traceback (most recent call last)" in txt}
+    tail = [te.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    trl = [tr.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    ok5 = all(isinstance(x, float) and math.isfinite(x) for x in tail)
+    r["p5"] = sum(tail) / 5.0 if ok5 else None
+    r["t5"] = sum(trl) / 5.0 if all(isinstance(x, float) and math.isfinite(x) for x in trl) else None
+    r["complete"] = sorted(te) == list(range(EPOCHS)) and r["done"] and not r["tb"] and r["p5"] is not None
+    return r
+
+
+def read_probe(runsdir, arm, seed):
+    d = os.path.join(runsdir, BATCH, "probe_%s-%s-s%d" % (BATCH, arm, seed))
+    recs, bad = [], 0
+    for ln in open(os.path.join(d, "probe.jsonl"), errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            bad += 1
+            continue
+        recs.append(r) if isinstance(r, dict) else None
+    hdr = json.load(open(os.path.join(d, "probe_tensor.json")))
+    return {"dir": d, "recs": recs, "bad": bad, "hdr": hdr}
+
+
+# =============================================================================
+# the statistics (own implementation of 256.3)
+# =============================================================================
+def rec_L(r):
+    b2 = float(r.get("pt_b2", B2))
+    return [b2 * m + (1.0 - b2) * z for m, z in zip(r["m_tensor"], r["z_tensor"])], b2
+
+
+def shared_s(r, L, b2):
+    za, ma = r["z_agg"][0], r["mom_pre"][0]
+    if len(za) == 1 and len(ma) == 1:
+        return sgn(b2 * ma[0] + (1.0 - b2) * za[0])
+    return sgn(sum(L))
+
+
+def fixes(L, idx, s):
+    tot = sum(L[i] for i in idx)
+    rest = sum(abs(L[j]) for j in range(len(L)) if j not in idx)
+    return sgn(tot) == s and abs(tot) > rest
+
+
+def carrying(L, s):
+    order = sorted(range(len(L)), key=lambda i: -abs(L[i]))
+    rem = sum(abs(x) for x in L)
+    part = 0.0
+    for k, i in enumerate(order, 1):
+        part += L[i]
+        rem -= abs(L[i])
+        if sgn(part) == s and abs(part) > rem:
+            return order[:k]
+    return order
+
+
+def vote_stats(recs):
+    cs = set(C_IDX0)
+    n = indet = dom = t3 = dt3 = det = dis = careq = down = pinned = dompin = 0
+    shares, cls = [], {c: [] for c in CLASSES}
+    modal, argmax = Counter(), Counter()
+    dec = [[0, 0] for _ in range(10)]
+    for r in recs:
+        L, b2 = rec_L(r)
+        s = shared_s(r, L, b2)
+        if s == 0:
+            indet += 1
+            continue
+        n += 1
+        order = sorted(range(len(L)), key=lambda i: -abs(L[i]))
+        top3 = order[:3]
+        d = fixes(L, C_IDX0, s)
+        dom += d
+        t3 += set(top3) == cs
+        dt3 += fixes(L, top3, s)
+        modal[tuple(sorted(i + 1 for i in top3))] += 1
+        argmax[order[0] + 1] += 1
+        tot = sum(abs(x) for x in L)
+        shares.append(sum(abs(L[i]) for i in C_IDX0) / tot if tot > 0 else 0.0)
+        if tot > 0:
+            for c in CLASSES:
+                cls[c].append(sum(abs(L[i]) for i in range(len(L)) if CLASS_OF[i] == c) / tot)
+        st = r.get("step")
+        if isinstance(st, int) and 0 <= st < META_STEPS:
+            dd = dec[st * 10 // META_STEPS]
+            dd[0] += 1
+            dd[1] += d
+        if len(r.get("beta", [])) == 1 and (r.get("n_at_lo") or 0) >= 1:
+            pinned += 1
+            dompin += d
+        maj = sgn(sum(1 for x in L if x > 0) - sum(1 for x in L if x < 0))
+        if maj:
+            det += 1
+            if maj != s:
+                dis += 1
+                careq += set(carrying(L, s)) == cs
+                down += s > 0
+    return {"n": n, "indet": indet, "DOM_C": dom / n if n else None, "TOP3_C": t3 / n if n else None,
+            "DOM_TOP3": dt3 / n if n else None, "SHARE_C": med(shares) if shares else None,
+            "R_T": dis / det if det else None, "n_dis": dis, "CAR_EQ": careq / dis if dis else None,
+            "DOWN": down / dis if dis else None, "PINNED_FRAC": pinned / n if n else None,
+            "DOM_C_PINNED": dompin / pinned if pinned else None,
+            "MODAL_TOP3": modal.most_common(3), "ARGMAX": argmax.most_common(5),
+            "CLASS_SHARE": dict((c, med(v) if v else None) for c, v in cls.items()),
+            "DECILE": [(d[1] / d[0]) if d[0] else None for d in dec]}
+
+
+def describe(tag, s):
+    P("  %-22s n=%d  DOM_C %s  TOP3_C %s  DOM_TOP3 %s  SHARE_C(med) %s  R_T %s (DIS %d)  CAR_EQ %s  DOWN %s  "
+      "PINNED %s  DOM_C|pinned %s" % (tag, s["n"], fmt(s["DOM_C"]), fmt(s["TOP3_C"]), fmt(s["DOM_TOP3"]),
+                                      fmt(s["SHARE_C"]), fmt(s["R_T"]), s["n_dis"], fmt(s["CAR_EQ"]),
+                                      fmt(s["DOWN"]), fmt(s["PINNED_FRAC"]), fmt(s["DOM_C_PINNED"])))
+    P("  %-22s modal top-3 %s; argmax %s" % (
+        "", ", ".join("{%s} x%d" % (",".join(str(i) for i in k), v) for k, v in s["MODAL_TOP3"]),
+        ", ".join("%d(%s) x%d" % (i, NAMES[i - 1], v) for i, v in s["ARGMAX"])))
+    P("  %-22s class share of sum|L| (median): %s; DOM_C by decile %s" % (
+        "", " ".join("%s %s" % (c, fmt(s["CLASS_SHARE"][c], 3)) for c in CLASSES),
+        " ".join(fmt(x, 2) for x in s["DECILE"])))
+
+
+def decomposition(recs, groups1, ms):
+    g0 = [[i - 1 for i in g] for g in groups1]
+    n = bshape = bz = bm = nsign = bsign = clamped = bshared = 0
+    wz = wm = 0.0
+    exact32 = 0
+    for r in recs:
+        n += 1
+        z, m = r["z_tensor"], r["m_tensor"]
+        za, ma = r["z_agg"][0], r["mom_pre"][0]
+        bpre, bpost = r["beta_pre"][0], r["beta"]
+        b2 = float(r.get("pt_b2", B2))
+        if not (len(z) == len(m) == 62 and len(za) == len(ma) == len(bpre) == len(bpost) == len(g0)):
+            bshape += 1
+            continue
+        sz = sum(abs(v) for v in z) + 1e-30
+        sm = sum(abs(v) for v in m) + 1e-30
+        dz = max(abs(sum(z[i] for i in g) - za[k]) for k, g in enumerate(g0)) / sz
+        dm = max(abs(sum(m[i] for i in g) - ma[k]) for k, g in enumerate(g0)) / sm
+        wz, wm = max(wz, dz), max(wm, dm)
+        bz += dz > TOL_Z
+        bm += dm > TOL_M
+        if len(g0) == 1:
+            L = [b2 * mi + (1 - b2) * zi for mi, zi in zip(m, z)]
+            Lh = b2 * ma[0] + (1 - b2) * za[0]
+            if abs(sum(L) - Lh) > 1e-4 * (sum(abs(x) for x in L) + 1e-30) and sgn(sum(L)) != sgn(Lh):
+                bshared += 1
+        for k in range(len(g0)):
+            if not (BETA_LO + 1e-9 < bpost[k] < BETA_HI - 1e-9):
+                clamped += 1
+                continue
+            nsign += 1
+            Lh = b2 * ma[k] + (1 - b2) * za[k]
+            bsign += abs(-(bpost[k] - bpre[k]) / ms - sgn(Lh)) > 1e-3
+            exact32 += (f32(f32(bpre[k]) - f32(f32(ms) * sgn(Lh))) == bpost[k])
+    return {"n": n, "bad_shape": bshape, "bad_z": bz, "bad_m": bm, "worst_z": wz, "worst_m": wm,
+            "n_sign": nsign, "bad_sign": bsign, "clamped": clamped, "bad_shared": bshared, "exact32": exact32}
+
+
+def decomp_ok(d):
+    n = max(d["n"], 1)
+    return (d["n"] > 0 and d["bad_shape"] == 0 and d["bad_z"] / n <= DECOMP_FAIL_MAX
+            and d["bad_m"] / n <= DECOMP_FAIL_MAX and d["n_sign"] > 0
+            and d["bad_sign"] / max(d["n_sign"], 1) <= SIGN_FAIL_MAX and d["bad_shared"] / n <= DECOMP_FAIL_MAX)
+
+
+# =============================================================================
+# the corpus (own reader; the exclusions TSV applied by (run, job_id))
+# =============================================================================
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+
+def load_corpus(csv_path, tsv_path):
+    rows = list(csv.DictReader(open(csv_path)))
+    excl = set()
+    lines = [l.rstrip("\n") for l in open(tsv_path) if l.strip() and not l.startswith("#")]
+    head = lines[0].split("\t")
+    for ln in lines[1:]:
+        f = dict(zip(head, ln.split("\t")))
+        excl.add((f["run"], f["job_id"]))
+    kept = [r for r in rows if (r.get("run"), r.get("job_id")) not in excl]
+    return rows, kept, excl
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+            and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r, net, dset, ms, a0):
+    return (usable(r) and r.get("network") == net and r.get("dataset") == dset
+            and r.get("epochs_requested") == "100" and r.get("augment") == "1"
+            and r.get("beta_clip") == "-15:-2.3026" and r.get("meta_stepsize") == ms
+            and r.get("alpha0") == a0 and r.get("batch_size") == "100")
+
+
+def cell_rows(rows, net, dset, ms, a0, gran):
+    return [r for r in rows if std_cell(r, net, dset, ms, a0) and r.get("granularity") == gran
+            and r.get("hier", "") == "" and r.get("base") == "SGDm" and r.get("meta") == "Lion"
+            and r.get("gamma") == "1"]
+
+
+def pooled_sigma(rows, net, dset, ms="1e-3", a0="1e-6"):
+    cells = {}
+    for r in rows:
+        if not std_cell(r, net, dset, ms, a0):
+            continue
+        cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss = df = nc = 0
+    ss = 0.0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = sum(v) / len(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+# =============================================================================
+# main
+# =============================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument("--csv", default=os.path.join(os.path.dirname(here), "results", "all_runs.csv"))
+    ap.add_argument("--tsv", default=os.path.join(os.path.dirname(here), "results", "CORPUS-EXCLUSIONS.tsv"))
+    a = ap.parse_args()
+    rd = a.runsdir
+
+    P("=" * 100)
+    P("cct1_attack_indep -- INDEPENDENT re-derivation of CORRECTIONS 257's scorer output (no repo import)")
+    P("=" * 100)
+
+    # ---- the inputs, by content -------------------------------------------------------------------
+    P("\n[FILES] sha256 of every file read (host-independent; the same list must appear on both hosts)")
+    outs, probes = {}, {}
+    for arm in ARMS:
+        for s in SEEDS:
+            hits = find_out(rd, arm, s)
+            chk(len(hits) == 1, "one .out for %s-s%d" % (arm, s), "%d" % len(hits))
+            job, path = hits[-1]
+            outs[(arm, s)] = read_out(path)
+            outs[(arm, s)]["job"] = job
+            probes[(arm, s)] = read_probe(rd, arm, s)
+            P("  %-14s job %d  out %s" % ("%s-s%d" % (arm, s), job, sha256(path)))
+            P("  %-14s %11s probe.jsonl %s" % ("", "", sha256(os.path.join(probes[(arm, s)]["dir"], "probe.jsonl"))))
+    for f in ("PROVENANCE.txt", "PARTITION-MANIFEST.txt"):
+        P("  %-14s %s %s" % ("batch", f, sha256(os.path.join(rd, BATCH, f))))
+    csv_sha, tsv_sha = sha256(a.csv), sha256(a.tsv)
+    P("  %-14s all_runs.csv %s" % ("corpus", csv_sha))
+    P("  %-14s CORPUS-EXCLUSIONS.tsv %s" % ("corpus", tsv_sha))
+    P("  corpus commit %s (the commit that last wrote both files; the corpus cct1 was registered against)"
+      % CORPUS_COMMIT)
+    chk(csv_sha == REG_CSV_SHA, "all_runs.csv sha == the scorer's REG_CORPUS_SHA")
+    chk(tsv_sha == REG_TSV_SHA, "CORPUS-EXCLUSIONS.tsv sha == the registered one")
+
+    # ---- the model and the manifest ---------------------------------------------------------------
+    P("\n[MODEL] names and numels built from the ResNet18 architecture, then compared to the run's own header")
+    chk(len(MODEL) == 62 and sum(NUMELS) == 11173962, "62 tensors, %d parameters" % sum(NUMELS))
+    chk(tuple(NAMES[i - 1] for i in C_IDX1) == CARRIER_NAMES, "C = {50, 53, 59} are the three carriers by name")
+    man_path = os.path.join(rd, BATCH, "PARTITION-MANIFEST.txt")
+    man = open(man_path).read()
+    mt = manifest_text()
+    chk(man == mt, "PARTITION-MANIFEST.txt rebuilt byte for byte (%d bytes)" % len(mt), "%d bytes on disk" % len(man))
+    chk(len(mt) == EXPECT_MANIFEST_BYTES, "manifest length == the registered %d" % EXPECT_MANIFEST_BYTES)
+    for arm in ARMS:
+        for s in SEEDS:
+            h = probes[(arm, s)]["hdr"]
+            chk(tuple(h.get("param_numels", ())) == NUMELS, "header numels %s-s%d == the built model" % (arm, s))
+
+    # ---- provenance ------------------------------------------------------------------------------
+    P("\n[PROVENANCE] runs/%s/PROVENANCE.txt against the literals CORRECTIONS 257.8 records" % BATCH)
+    prov = {}
+    for ln in open(os.path.join(rd, BATCH, "PROVENANCE.txt")):
+        p = ln.split()
+        if len(p) >= 2:
+            prov.setdefault(p[0], " ".join(p[1:]))
+    for k, want in (("MODE", "submit"), ("HF_SHA256", HF_SHA), ("BUILD_NETWORK_SHA256", BUILD_NETWORK_SHA),
+                    ("TRAIN_PY_SHA256", TRAIN_PY_SHA), ("RUNNER_SHA256", RUNNER_SHA), ("CORE_SHA256", CORE_SHA),
+                    ("SCORER_SHA256", SCORER_SHA)):
+        chk(prov.get(k) == want, "PROVENANCE %s" % k, "got %s" % prov.get(k))
+    sc = os.path.join(here, "cCT1_c10_dominance_score.py")
+    if os.path.isfile(sc):
+        chk(sha256(sc) == SCORER_SHA, "the scorer file on disk is the registered one (sha)")
+
+    # ---- the per-run lines -----------------------------------------------------------------------
+    P("\n[RUN LINES] ARGS / ENV / PROBE_TENSOR / foreign / records, re-derived from each run's own .out")
+    for arm in ARMS:
+        for s in SEEDS:
+            r, pr, tag = outs[(arm, s)], probes[(arm, s)], "%s-s%d" % (arm, s)
+            chk(r["complete"], "%s: RUN_DONE, epochs 0..99, no traceback" % tag)
+            chk(len(r["args"]) == 1, "%s: exactly one ARGS line" % tag)
+            m = re.match(r"^(.*--save-directory )(\S+)( --run-name \S+)$", r["args"][0])
+            ws = m.group(2)[:-len("/runs/" + BATCH)] if m and m.group(2).endswith("/runs/" + BATCH) else None
+            chk(ws is not None and r["args"][0] == args_line(arm, s, ws), "%s: ARGS == the registered line" % tag)
+            pdir = None
+            if len(r["env"]) == 1:
+                mm = re.search(r" PROBE_DIR=(\S+)", r["env"][0])
+                pdir = mm.group(1) if mm else None
+            chk(len(r["env"]) == 1 and re.sub(r" PROBE_DIR=\S+", "", r["env"][0]) == "ENV: " + ENV_FIXED
+                and pdir is not None and pdir.endswith("/runs/%s/probe_%s-%s" % (BATCH, BATCH, tag)),
+                "%s: ENV == the registered line, PROBE_DIR is the run's own" % tag)
+            mp = PT_RE.match(r["pt"][0]) if len(r["pt"]) == 1 else None
+            chk(mp is not None and mp.group(1) == PT_TYPE[arm] and mp.group(2) == pdir,
+                "%s: one PROBE_TENSOR line, type=%s, dir == PROBE_DIR" % (tag, PT_TYPE[arm]))
+            chk(not r["foreign"], "%s: no intervention line (the live tree ran)" % tag)
+            chk(pr["bad"] == 0 and [x.get("step") for x in pr["recs"]] == list(range(0, META_STEPS, PROBE_EVERY)),
+                "%s: 500 records at steps 0..49,900" % tag)
+            nc = set(len(x.get("beta", [])) for x in pr["recs"])
+            nz = set(len((x.get("z_agg") or [[]])[0]) for x in pr["recs"])
+            chk(nc == {N_COORDS[arm]} and nz == {N_COORDS[arm]},
+                "%s: every record carries %d coordinate(s) -- the partition that RAN" % (tag, N_COORDS[arm]))
+
+    # ---- decomposition, plus the float32 reconstruction the scorer does not do ---------------------
+    P("\n[DECOMPOSITION] group sums vs the harness, and the EXACT float32 step reconstruction")
+    dec = {}
+    for arm in ARMS:
+        for s in SEEDS:
+            g = [list(range(1, 63))] if SPEC[arm] == "scalar" else [[i] for i in range(1, 63)]
+            d = decomposition(probes[(arm, s)]["recs"], g, MS)
+            dec[(arm, s)] = d
+            P("  %-10s shape %d z %d m %d (worst %.1e / %.1e) sign %d/%d clamped %d shared %d  exact-float32 %d/%d"
+              % ("%s-s%d" % (arm, s), d["bad_shape"], d["bad_z"], d["bad_m"], d["worst_z"], d["worst_m"],
+                 d["bad_sign"], d["n_sign"], d["clamped"], d["bad_shared"], d["exact32"], d["n_sign"]))
+            chk(decomp_ok(d), "G-DECOMP %s-s%d re-derived" % (arm, s))
+            chk(d["exact32"] == d["n_sign"], "%s-s%d: every applied beta step == float32(beta_pre - ms*sign(L))"
+                % (arm, s))
+
+    # ---- the statistics --------------------------------------------------------------------------
+    stats = {}
+    for arm in ARMS:
+        for s in SEEDS:
+            stats[(arm, s)] = vote_stats(probes[(arm, s)]["recs"])
+    pooled = {arm: vote_stats([x for s in SEEDS for x in probes[(arm, s)]["recs"]]) for arm in ARMS}
+
+    # ---- the levels, from the RAW .out -----------------------------------------------------------
+    P("\n[LEVELS] plateau5 = mean TEST of epochs 95..99 from the RAW .out (the CSV `plateau` column is never read)")
+    lev, rngs, trn = {}, {}, {}
+    for arm in ARMS:
+        v = [outs[(arm, s)]["p5"] for s in SEEDS]
+        t = [outs[(arm, s)]["t5"] for s in SEEDS]
+        lev[arm], rngs[arm], trn[arm] = avg(v), max(v) - min(v), avg(t)
+        P("  %-3s test %s mean %.4f range %.3f | train %s mean %.4f"
+          % (arm, " ".join("%.3f" % x for x in v), lev[arm], rngs[arm], " ".join("%.3f" % x for x in t), trn[arm]))
+        chk(tuple(round(x, 3) for x in v) == EXPECT_LEVELS[arm], "%s test levels == the scorer's" % arm)
+        chk(tuple(round(x, 3) for x in t) == EXPECT_TRAIN[arm], "%s train levels == the scorer's" % arm)
+    gap = lev["kL"] - lev["k01"]
+    ratio = lev["k01"] / lev["kL"]
+    P("  kL - k01 = %+.4f pp = %+.2f SE (SE_PRIOR %.6f); ratio %.4f" % (gap, gap / SE_PRIOR, SE_PRIOR, ratio))
+    ins = [outs[(arm, s)]["p5"] - lev[arm] for arm in ARMS for s in SEEDS]
+    sig_in = math.sqrt(sum(x * x for x in ins) / (len(ins) - len(ARMS)))
+    P("  in-batch sigma %.4f (df %d) -- disclosure; SIGMA_PRIOR %.6f is frozen" % (sig_in, len(ins) - len(ARMS),
+                                                                                   SIGMA_PRIOR))
+
+    # ---- the corpus ------------------------------------------------------------------------------
+    P("\n[CORPUS] sigma and the anchors, re-derived through the exclusions TSV")
+    raw, kept, excl = load_corpus(a.csv, a.tsv)
+    P("  rows %d -> %d after %d exclusion keys" % (len(raw), len(kept), len(excl)))
+    pair = cell_rows(kept, NET, DSET, MST, A0, "scalar") + cell_rows(kept, NET, DSET, MST, A0, "layerwise")
+    sig, df, ncell = pooled_sigma(pair, NET, DSET)
+    P("  pair sigma %r (df %d, %d cells)" % (sig, df, ncell))
+    chk(abs(sig - SIGMA_PRIOR) < 1e-12 and df == 39 and ncell == 2, "pair sigma == SIGMA_PRIOR (df 39, 2 cells)")
+    anch = {"k01 C10 (n15)": cell_rows(kept, "ResNet18", "CIFAR10", "1e-3", "1e-6", "scalar"),
+            "kL C10 (n26)": cell_rows(kept, "ResNet18", "CIFAR10", "1e-3", "1e-6", "layerwise"),
+            "k01 C100 1e-3 (n44)": cell_rows(kept, "ResNet18_c100", "CIFAR100", "1e-3", "1e-6", "scalar"),
+            "layerwise C100 1e-3 (n32)": cell_rows(kept, "ResNet18_c100", "CIFAR100", "1e-3", "1e-6", "layerwise")}
+    for k, rows in anch.items():
+        m = avg([float(r["plateau5"]) for r in rows])
+        want, wn = EXPECT_ANCHOR[k]
+        P("  anchor %-27s n=%d mean %.4f" % (k, len(rows), m))
+        chk(len(rows) == wn and abs(round(m, 4) - want) < 5e-5, "anchor %s == the registered literal" % k)
+    chk(not any(r["run"].startswith(BATCH + "-") for r in raw), "no cct1- row in the corpus (freshness)")
+
+    # ---- the branch ------------------------------------------------------------------------------
+    dom, top3 = pooled["k01"]["DOM_C"], pooled["k01"]["TOP3_C"]
+    if dom >= DOM_HI and top3 >= TOP3_BAR:
+        dw = "CARRIERS-DOMINATE"
+    elif dom <= DOM_LO:
+        dw = "CARRIERS-DO-NOT-DOMINATE"
+    else:
+        dw = "CARRIER-DOMINANCE-PARTIAL"
+    kdom, ktop3 = pooled["kL"]["DOM_C"], pooled["kL"]["TOP3_C"]
+    kw = ("CARRIERS-DOMINATE" if kdom >= DOM_HI and ktop3 >= TOP3_BAR else
+          "CARRIERS-DO-NOT-DOMINATE" if kdom <= DOM_LO else "CARRIER-DOMINANCE-PARTIAL")
+    cw = ("SCALAR-COLLAPSED-HERE" if ratio <= RATIO_COLLAPSE else
+          "NOT-COLLAPSED" if ratio >= RATIO_OK else "SCALAR-PARTIAL-HERE")
+    diverged = (any(rngs[x] > DIVERGED_BAR for x in ARMS)
+                or any(not (LEVEL_MIN <= outs[(x, s)]["p5"] <= LEVEL_MAX) for x in ARMS for s in SEEDS))
+    branch = "UNRESOLVED-DIVERGED" if diverged else "%s+%s" % (cw, dw)
+    stamps = (["RATIO=%.4f" % ratio, "DOM_C=%.4f" % dom, "TOP3_C=%.4f" % top3, "KL-DOM_C=%.4f" % kdom, "KL-%s" % kw,
+               "DOM_TOP3=%s" % fmt(pooled["k01"]["DOM_TOP3"]), "R_T=%s" % fmt(pooled["k01"]["R_T"]),
+               "DOWN=%s" % fmt(pooled["k01"]["DOWN"]), "PINNED-FRAC=%s" % fmt(pooled["k01"]["PINNED_FRAC"]),
+               "MODAL-TOP3={%s}" % ",".join(str(i) for i in pooled["k01"]["MODAL_TOP3"][0][0]),
+               "ARGMAX=%d" % pooled["k01"]["ARGMAX"][0][0], "GAP-IN-BATCH=%.4f" % gap, "HARNESS-CLEAN",
+               "SPEC-APPLIED", "DECOMPOSITION-OK", "DATASET-AND-HEAD-CO-VARY", "ONE-CELL-CIFAR10-MS1E-3",
+               "HORIZON-100-ONLY", "ONE-NETWORK-RESNET18", "FLOOR-NOT-APPLICABLE", "SIGMA-PRIOR-FROZEN"])
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+
+    # =========================================================================
+    # THE REPLICA BLOCK -- these lines are byte-identical to the registered scorer's stdout
+    # =========================================================================
+    P("\n" + "=" * 100)
+    P("REPLICA of the registered scorer's own lines (diff these against results/cct1_c10dominance_score_*.txt)")
+    P("=" * 100)
+    P("\n[DOMINANCE] k01's records (the registered statistic), and kL's (the companion)")
+    for arm in ARMS:
+        for s in SEEDS:
+            describe("%s-s%d" % (arm, s), stats[(arm, s)])
+    for arm in ARMS:
+        describe("%s POOLED" % arm, pooled[arm])
+    P("  calibration (CIFAR-100 ms 1e-3, registration): collapsing scalar DOM_C pooled %.4f; layerwise 0.0000"
+      % CALIB_SCALAR_POOLED)
+    P("\n[LEVELS]")
+    for arm in ARMS:
+        v = [outs[(arm, s)]["p5"] for s in SEEDS]
+        t = [outs[(arm, s)]["t5"] for s in SEEDS]
+        P("  %-3s %s mean %.4f range %.3f | train %s" % (arm, " ".join("%.3f" % x for x in v), lev[arm], rngs[arm],
+                                                         " ".join("%.3f" % x for x in t)))
+    P("  kL - k01 = %+.4f pp = %+.2f SE (SE_PRIOR %.6f); ratio %.4f" % (gap, gap / SE_PRIOR, SE_PRIOR, ratio))
+    P("\n[DESCRIPTIVE, gating nothing] beta trajectories")
+    for s in SEEDS:
+        b = [x["beta"][0] for x in probes[("k01", s)]["recs"]]
+        pk = max(range(len(b)), key=lambda i: b[i])
+        P("  k01-s%d: peak %.3f at step %d; terminal %.3f; share at floor %.3f"
+          % (s, b[pk], pk * PROBE_EVERY, b[-1], sum(1 for x in b if x <= BETA_LO + 1e-6) / len(b)))
+    for s in SEEDS:
+        recs = probes[("kL", s)]["recs"]
+        P("  kL-s%d carriers' own beta terminal %s; linear.weight %.3f"
+          % (s, " ".join("%.3f" % recs[-1]["beta"][i] for i in C_IDX0), recs[-1]["beta"][60]))
+    P("  corpus anchors (non-gating, filtered): %s"
+      % "; ".join("%s %.4f" % (k, EXPECT_ANCHOR[k][0]) for k in EXPECT_ANCHOR))
+    P("\nBRANCH   %s" % branch)
+    P("LICENCE  %s" % HEADLINE[branch])
+    P("NOT LICENSED  %s" % NOT_LICENSED)
+    P("\n" + final)
+
+    P("\n" + "=" * 100)
+    chk(final == EXPECT_FINAL, "FINAL re-derived == the registered scorer's FINAL")
+    P("VIOLATIONS %d" % len(VIOL))
+    for v in VIOL:
+        P("  ! %s" % v)
+    sys.stdout.write("\n".join(OUT) + "\n")
+    print("HOSTPATH runsdir  %s" % os.path.abspath(rd))
+    print("HOSTPATH corpus   %s" % os.path.abspath(a.csv))
+    return 0 if not VIOL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,133 @@
+#!/bin/bash
+# =============================================================================
+# cWD_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `cwd1` / `cwd2` HARNESS TREES.  (CORRECTIONS 260 / 261.)
+#   Touches NO existing file.  Submits nothing.
+#
+# Both batches need PATCH_DECAYMASK (patches/patch_decaymask.py) in HF.py.  The live shared harness and every registered
+# tree (cvt1 ... cvt9) are not edited.  ONE patch, TWO trees:
+#   cwd1:  harness_cwd1/cifar10 = a byte-identical copy of cvt8's tree (ResNet18_c100 lineage) + PATCH_DECAYMASK in HF.py
+#   cwd2:  harness_cwd2/cifar10 = a byte-identical copy of cvt9's tree (PlainNet18_c100 lineage) + PATCH_DECAYMASK in HF.py
+#   <tree>/cifar10/data  ->  SYMLINK to the parent's data target (the live tree's data/)
+#   <tree>/cifar10/Optimizers/HF.py.pre_decaymask   the parent's HF.py bytes
+#   jobs/run_cifar_cwd<k>.sh                           jobs/run_cifar.sh with EXACTLY the cd line changed
+#   <tree>/STAGE-MANIFEST.txt                          sha256 of every staged file
+#
+#   bash bin/cWD_stage_harness.sh cwd1|cwd2            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cWD_stage_harness.sh cwd1|cwd2 --stage    # build it (refuses if it exists)
+# =============================================================================
+set -u
+B=${1:-}; MODE=verify; [ "${2:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+PATCH_DM=$REPO/patches/patch_decaymask.py
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+RUNNER_SRC_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+case "$B" in
+  cwd1) PARENT=cvt8; NET=ResNet18_c100
+        HF_PRE_SHA=5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9
+        HF_POST_SHA=94aedc33046afb12782ffb7f2eb729bafc7fcba5f42227fec373fa67b6f58ebf
+        BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+        RUNNER_SHA=34a8c90ee3a0bee00aa2d0b4a3ad5d16d461fbf5a1f0cda5797e44e44c158371 ;;
+  cwd2) PARENT=cvt9; NET=PlainNet18_c100
+        HF_PRE_SHA=816e335777f7c0bb52747949dff81aa57fe0695bab2d61d984ae6ce9daab3a9d
+        HF_POST_SHA=133c12296b4b9e4428cfe8ba882413c85fc0ec7e5372f3043e6aaa99b623a4b4
+        BN_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+        RUNNER_SHA=f3dfa97fb93e3d749aab156ca2562dd24e9b97e77664cb1537ad1c16a6df73ef ;;
+  *) echo "usage: bash $0 cwd1|cwd2 [--stage]"; exit 2 ;;
+esac
+SRC=$WS/harness_$PARENT/cifar10
+HROOT=$WS/harness_$B
+DEST=$HROOT/cifar10
+RUNNER=$WS/jobs/run_cifar_$B.sh
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+src_files() { (cd "$SRC" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cWD_stage_harness: batch=$B mode=$MODE  WS=$WS"
+echo "  source tree $SRC ($PARENT's, read only)"
+echo "  $B tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  [ -f "$PATCH_DM" ] || { echo "!!! $PATCH_DM is missing"; exit 2; }
+  [ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] || { echo "!!! $PARENT's HF.py sha != pinned $HF_PRE_SHA"; exit 2; }
+  [ "$(sha "$SRC/build_network.py")" = "$BN_SHA" ] || { echo "!!! $PARENT's build_network.py sha != pinned $BN_SHA"; exit 2; }
+  [ "$(sha "$RUNNER_SRC")" = "$RUNNER_SRC_SHA" ] || { echo "!!! run_cifar.sh sha != pinned $RUNNER_SRC_SHA"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(src_files); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f" || exit 2
+  done
+  ln -s "$(readlink "$SRC/data")" "$DEST/data" || exit 2
+  HF_PATH="$DEST/Optimizers/HF.py" python3 "$PATCH_DM" || { echo "!!! patch_decaymask failed"; exit 2; }
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "SRC $SRC"; echo "DEST $DEST"
+    echo "PATCH_DECAYMASK_SHA256 $(sha "$PATCH_DM")"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+[ -d "$DEST" ] || { echo "!!! no $B tree at $DEST -- run with --stage"; exit 2; }
+N=0
+for f in $(src_files); do
+  [ "$f" = ./Optimizers/HF.py ] && continue
+  if [ ! -f "$DEST/$f" ]; then bad "V-a $f missing from the $B tree"; continue; fi
+  [ "$(sha "$SRC/$f")" = "$(sha "$DEST/$f")" ] && N=$((N+1)) || bad "V-a $f differs from $PARENT's tree"
+done
+echo "V-a: $N files byte-identical to $PARENT's tree (Optimizers/HF.py excepted)"
+EXTRA=$(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do
+          [ -f "$SRC/$f" ] || [ "$f" = ./Optimizers/HF.py.pre_decaymask ] || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no file in the $B tree beyond $PARENT's except HF.py.pre_decaymask" || bad "V-a2 extra files: $EXTRA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_decaymask")" = "$HF_PRE_SHA" ] && echo "V-h: HF.py.pre_decaymask == $PARENT's HF.py == pinned $HF_PRE_SHA" \
+  || bad "V-h HF.py.pre_decaymask sha != pinned $HF_PRE_SHA"
+[ "$(sha "$DEST/Optimizers/HF.py")" = "$HF_POST_SHA" ] && echo "V-h2: $B HF.py sha == pinned post $HF_POST_SHA" \
+  || bad "V-h2 $B HF.py sha $(sha "$DEST/Optimizers/HF.py") != pinned post $HF_POST_SHA"
+[ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] && echo "V-h3: $PARENT's HF.py untouched" || bad "V-h3 $PARENT's HF.py has moved"
+HITS=""
+for t in "$LIVE" $WS/harness_cvt1/cifar10 $WS/harness_cvt4/cifar10 $WS/harness_cvt6/cifar10 $WS/harness_cvt7/cifar10 \
+         $WS/harness_cvt8/cifar10 $WS/harness_cvt9/cifar10; do
+  [ -f "$t/Optimizers/HF.py" ] && grep -q -E 'PATCH_DECAYMASK|DECAY_MASK' "$t/Optimizers/HF.py" && HITS="$HITS $t"
+done
+[ -z "$HITS" ] && echo "V-h4: neither the LIVE HF.py nor any cvt1/4/6/7/8/9 tree's HF.py carries a PATCH_DECAYMASK / DECAY_MASK marker" \
+  || bad "V-h4 a registered tree carries PATCH_DECAYMASK:$HITS"
+[ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] && echo "V-h6: the LIVE HF.py is still $HF_LIVE_SHA (untouched)" \
+  || echo "V-h6: NOTE -- the LIVE HF.py has moved; the $B tree does not read it."
+[ "$(sha "$DEST/build_network.py")" = "$BN_SHA" ] && echo "V-b: $B build_network.py == $PARENT's ($BN_SHA)" || bad "V-b build_network.py != $BN_SHA"
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink)" \
+  || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-100-python" ] && echo "V-c2: CIFAR-100 visible through the symlink" || bad "V-c2 cifar-100-python not visible"
+if [ -f "$RUNNER" ]; then
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  D=$(printf '%s\n' "$DL" | grep -c '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST" && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ]; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST (sha $RUNNER_SHA)"
+  else
+    bad "V-d the runner diff is not exactly the cd line (or its sha is not $RUNNER_SHA):"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+else
+  bad "V-d no runner at $RUNNER"
+fi
+TMPF=/tmp/${B}_stage.$$
+if python3 "$REPO/tests/test_decaymask.py" --pre "$DEST/Optimizers/HF.py.pre_decaymask" --post "$DEST/Optimizers/HF.py" \
+     --structural-only >$TMPF.dm 2>&1; then
+  echo "V-f: tests/test_decaymask.py D0 (deleting the three regions == $PARENT's HF.py, byte for byte) passes ($(grep -c '^  PASS' $TMPF.dm) PASS)"
+else
+  bad "V-f tests/test_decaymask.py D0 FAILS"; grep '^  FAIL' $TMPF.dm | head
+fi
+rm -f $TMPF.dm
+[ "$FAIL" = 0 ] && { echo "cWD_stage_harness $B: VERIFIED"; exit 0; } || { echo "cWD_stage_harness $B: NOT CONSISTENT"; exit 2; }

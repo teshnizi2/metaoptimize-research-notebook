@@ -1,0 +1,141 @@
+#!/bin/bash
+# =============================================================================
+# cSV1_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `csv1` HARNESS TREE.  (CORRECTIONS 262.)
+#   Touches NO existing file.  Submits nothing.
+#
+# `csv1` needs PATCH_SHADOWVOTE (patches/patch_shadowvote.py) in HF.py.  The live shared harness and every registered tree
+# (cvt1, cvt4, cvt6, cvt7, cvt8, cvt9) are trees landed batches ran from and are not edited.  So csv1 gets its own tree:
+# a byte-identical copy of cvt9's tree (HF.py + PATCH_WINDOWHOLD, the replay files) with PATCH_SHADOWVOTE applied on top of
+# cvt9's HF.py, and its own runner that differs from jobs/run_cifar.sh in its cd line.
+#
+#   harness_csv1/cifar10/                every file of cvt9's tree (data excepted), byte-identical, except HF.py
+#   harness_csv1/cifar10/data  ->        SYMLINK to the live tree's data/ (cvt9's target)
+#   harness_csv1/cifar10/Optimizers/HF.py.pre_shadowvote   cvt9's HF.py bytes (HF_PRE_SHA 816e3357...)
+#   harness_csv1/cifar10/Optimizers/HF.py                  = cvt9's HF.py + PATCH_SHADOWVOTE (HF_POST_SHA)
+#   jobs/run_cifar_csv1.sh               jobs/run_cifar.sh with EXACTLY the cd line changed
+#   harness_csv1/STAGE-MANIFEST.txt      sha256 of every staged file
+#
+#   bash bin/cSV1_stage_harness.sh            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cSV1_stage_harness.sh --stage    # build it (refuses if it exists)
+# =============================================================================
+set -u
+MODE=verify; [ "${1:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+SRC=$WS/harness_cvt9/cifar10
+SRC6=$WS/harness_cvt6/cifar10
+SRC4=$WS/harness_cvt4/cifar10
+SRC1=$WS/harness_cvt1/cifar10
+HROOT=$WS/harness_csv1
+DEST=$HROOT/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+RUNNER=$WS/jobs/run_cifar_csv1.sh
+PATCH_SV=$REPO/patches/patch_shadowvote.py
+POST_SHA=e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+HF_CVT1_SHA=3f2b98e1a279ceccd0de81019f63d999be1718782f7ce7f479496b7ff3fa4e52
+HF_CVT4_SHA=84b345adf6df8024bbe4c694fcbbaffc6211d1c7b7ae4b9ae933e353298a3d96
+HF_CVT6_SHA=f1b9c8aa87953c2fd3f64145126591608d332812183911a39ce9f525101edd2e
+HF_PRE_SHA=816e335777f7c0bb52747949dff81aa57fe0695bab2d61d984ae6ce9daab3a9d
+HF_POST_SHA=fc9bfb878afe3ded17f8e8475f31bb6811ee5fc25c8e11d189e299f761a61774
+RUNNER_SHA=60ac417bd4811a2a8132a8f74470a14265fd03c31d8c161c9bf7dfb0d1103c5d
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+src_files() { (cd "$SRC" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cSV1_stage_harness: mode=$MODE  WS=$WS"
+echo "  source tree $SRC (cvt9's, read only)"
+echo "  csv1 tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  [ -f "$PATCH_SV" ] || { echo "!!! $PATCH_SV is missing"; exit 2; }
+  [ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] || { echo "!!! cvt9's HF.py sha != pinned $HF_PRE_SHA"; exit 2; }
+  [ "$(sha "$SRC/build_network.py")" = "$POST_SHA" ] || { echo "!!! cvt9's build_network.py sha != pinned $POST_SHA"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(src_files); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$SRC/$f" "$DEST/$f" || exit 2
+  done
+  ln -s "$(readlink "$SRC/data")" "$DEST/data" || exit 2
+  HF_PATH="$DEST/Optimizers/HF.py" python3 "$PATCH_SV" || { echo "!!! patch_shadowvote failed"; exit 2; }
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "SRC $SRC"; echo "DEST $DEST"
+    echo "PATCH_SHADOWVOTE_SHA256 $(sha "$PATCH_SV")"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+[ -d "$DEST" ] || { echo "!!! no csv1 tree at $DEST -- run with --stage"; exit 2; }
+N=0
+for f in $(src_files); do
+  [ "$f" = ./Optimizers/HF.py ] && continue
+  if [ ! -f "$DEST/$f" ]; then bad "V-a $f missing from the csv1 tree"; continue; fi
+  [ "$(sha "$SRC/$f")" = "$(sha "$DEST/$f")" ] && N=$((N+1)) || bad "V-a $f differs from cvt9's tree"
+done
+echo "V-a: $N files byte-identical to cvt9's tree (Optimizers/HF.py excepted)"
+EXTRA=$(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do
+          [ -f "$SRC/$f" ] || [ "$f" = ./Optimizers/HF.py.pre_shadowvote ] || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no file in the csv1 tree beyond cvt9's except HF.py.pre_shadowvote" || bad "V-a2 extra files: $EXTRA"
+[ "$(sha "$DEST/Optimizers/HF.py.pre_shadowvote")" = "$HF_PRE_SHA" ] && echo "V-h: HF.py.pre_shadowvote == cvt9's HF.py == pinned $HF_PRE_SHA" \
+  || bad "V-h HF.py.pre_shadowvote sha != pinned $HF_PRE_SHA"
+[ "$(sha "$DEST/Optimizers/HF.py")" = "$HF_POST_SHA" ] && echo "V-h2: csv1 HF.py sha == pinned post $HF_POST_SHA" \
+  || bad "V-h2 csv1 HF.py sha $(sha "$DEST/Optimizers/HF.py") != pinned post $HF_POST_SHA"
+[ "$(sha "$SRC/Optimizers/HF.py")" = "$HF_PRE_SHA" ] && [ "$(sha "$SRC6/Optimizers/HF.py")" = "$HF_CVT6_SHA" ] \
+  && [ "$(sha "$SRC4/Optimizers/HF.py")" = "$HF_CVT4_SHA" ] && [ "$(sha "$SRC1/Optimizers/HF.py")" = "$HF_CVT1_SHA" ] \
+  && echo "V-h3: cvt9's, cvt6's, cvt4's and cvt1's HF.py untouched" || bad "V-h3 a registered tree's HF.py has moved"
+grep -q -E 'PATCH_SHADOWVOTE|SHADOW_VOTE' "$SRC/Optimizers/HF.py" "$SRC6/Optimizers/HF.py" "$SRC4/Optimizers/HF.py" "$SRC1/Optimizers/HF.py" "$LIVE/Optimizers/HF.py" \
+  && bad "V-h4 the LIVE or a registered tree's HF.py carries PATCH_SHADOWVOTE" \
+  || echo "V-h4: neither the LIVE HF.py nor cvt9's / cvt6's / cvt4's / cvt1's carries a PATCH_SHADOWVOTE / SHADOW_VOTE marker"
+[ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] && echo "V-h6: the LIVE HF.py is still $HF_LIVE_SHA (untouched)" \
+  || echo "V-h6: NOTE -- the LIVE HF.py has moved; the csv1 tree does not read it."
+[ "$(sha "$DEST/build_network.py")" = "$POST_SHA" ] && echo "V-b: csv1 build_network.py == cpl1's POST_SHA" || bad "V-b build_network.py != $POST_SHA"
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink)" \
+  || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-100-python" ] && echo "V-c2: CIFAR-100 visible through the symlink" || bad "V-c2 cifar-100-python not visible"
+if [ -f "$RUNNER" ]; then
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  D=$(printf '%s\n' "$DL" | grep -c '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST" && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ]; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST (sha $RUNNER_SHA)"
+  else
+    bad "V-d the runner diff is not exactly the cd line (or its sha is not $RUNNER_SHA):"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+else
+  bad "V-d no runner at $RUNNER"
+fi
+TMPF=/tmp/csv1_stage.$$
+if python3 "$REPO/tests/test_plainnet.py" --pre "$DEST/build_network.py.pre_plainnet" --post "$DEST/build_network.py" \
+     --hf "$DEST/Optimizers/HF.py" --csv "$REPO/results/all_runs.csv" >$TMPF.tp 2>&1; then
+  echo "V-e: tests/test_plainnet.py passes on the csv1 tree ($(grep -c '^  PASS' $TMPF.tp) PASS)"
+else
+  bad "V-e tests/test_plainnet.py FAILS on the csv1 tree"; grep '^  FAIL' $TMPF.tp | head
+fi
+if python3 "$REPO/tests/test_shadowvote.py" --pre "$DEST/Optimizers/HF.py.pre_shadowvote" --post "$DEST/Optimizers/HF.py" \
+     --structural-only >$TMPF.sv 2>&1; then
+  echo "V-f: tests/test_shadowvote.py S0 (deleting the five regions == cvt9's HF.py, byte for byte) passes ($(grep -c '^  PASS' $TMPF.sv) PASS)"
+else
+  bad "V-f tests/test_shadowvote.py S0 FAILS"; grep '^  FAIL' $TMPF.sv | head
+fi
+if python3 "$REPO/tests/test_windowhold.py" --pre "$DEST/Optimizers/HF.py.pre_windowhold" --post "$DEST/Optimizers/HF.py.pre_shadowvote" \
+     --structural-only >$TMPF.wh 2>&1; then
+  echo "V-g: tests/test_windowhold.py W0 (UNEDITED) passes on the base: HF.py.pre_shadowvote == cvt6's HF.py + PATCH_WINDOWHOLD ($(grep -c '^  PASS' $TMPF.wh) PASS)"
+else
+  bad "V-g tests/test_windowhold.py W0 FAILS on HF.py.pre_shadowvote"; grep '^  FAIL' $TMPF.wh | head
+fi
+rm -f $TMPF.tp $TMPF.sv $TMPF.wh
+[ "$FAIL" = 0 ] && { echo "cSV1_stage_harness: VERIFIED"; exit 0; } || { echo "cSV1_stage_harness: NOT CONSISTENT"; exit 2; }

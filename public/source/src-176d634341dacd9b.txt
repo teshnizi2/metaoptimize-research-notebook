@@ -1,0 +1,440 @@
+#!/bin/bash
+# =============================================================================
+# cMO1_momwd.sh -- `cmo1` (LIMITS-PREP 5.1 S1a): DOES THE SCALAR COLLAPSE AND THE CARRIER RESCUE SURVIVE SGDm MOMENTUM 0.9
+#   (the parent's value) AND BASE WEIGHT DECAY 0?  ONE SUBMISSION, 27 JOBS (9 arms x 3 seeds), 100 EPOCHS,
+#   SEEDS {108,109,110}, ResNet18_c100 / CIFAR-100, ciso1's cell, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.  CORRECTIONS 255.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Nothing here touches the other account; every guard and
+# scancel line is filtered on `cmo1-`.
+#
+# REGISTERED SCORER: analysis/cMO1_momwd_score.py, committed and pushed BEFORE this batch is submitted (RULE 21).
+#     DOCUMENTED INVOCATION:  python3 analysis/cMO1_momwd_score.py <runsdir>
+#
+# NO NEW HARNESS CODE.  The batch runs the LIVE shared harness ($WS/MetaOptimize/.../cifar10, HF.py 4732b74a..., the tree
+# ciso1 / cdep1 ran) through the LIVE runner $WS/jobs/run_cifar.sh (archived byte-identical as jobs/run_cifar_cmo1.sh).
+# The two factors are train.py CLI flags; tests/test_cmo1_flags_bite.py proves on the live files that they reach
+# HF.SGDm_base_update and change it (guard 4h), and the scorer's G-TBARGS reads each run's own parsed-args table.
+#
+# THE ARMS (ISO = ciso1's spec, byte-identical)
+#   k01 / kL / ISO           scalar / layerwise / ISO   --momentum-param-base 0.99  --weight-decay-base 0.1   in-batch ANCHOR
+#   M9k01 / M9kL / M9ISO     scalar / layerwise / ISO   --momentum-param-base 0.9   --weight-decay-base 0.1
+#   W0k01 / W0kL / W0ISO     scalar / layerwise / ISO   --momentum-param-base 0.99  --weight-decay-base 0
+#
+# RULE 20.  Every ARGS value is ONE shell token; the two factor flags are the ONLY ARGS difference between an arm and its
+# anchor twin (besides run name).  No intervention switch rides --export (guard 0b); the ENV line is ciso1's.
+# analysis/argsline_guard.py IS NOT EDITED.  Seed 111 of the pre-assigned block is NOT used (CORRECTIONS 255.2).
+#
+# COST.  cvt7 by sacct: 0.92 GPU-h per 100-epoch ResNet18_c100 run incl. [HOST_3c1b003035] (~0.71 off it).
+# 27 jobs ~= 24.8 GPU-h expected (~19.2 off [HOST_3c1b003035]); HARD BOUND = WALL x 27 = 81 GPU-h (WALL 03:00:00).
+#
+# USAGE   bash bin/cMO1_momwd.sh               # dry run: every guard, every composed line printed; submits nothing
+#         bash bin/cMO1_momwd.sh --submit      # the ONLY submitting form
+# ENV     CMO1_REGISTERED_COMMIT=<sha>   on a host with no git repo, --submit requires it
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD WINDOW_HOLD DECAY_MASK SHADOW_VOTE
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cmo1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="108 109 110"
+MST=1e-3
+A0=1e-6
+NTENS=62
+TOTPAR=11220132
+G_K01='scalar'
+G_KL='layerwise'
+G_ISO='sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight'
+ARMS="k01 kL ISO M9k01 M9kL M9ISO W0k01 W0kL W0ISO"
+NJOBS=27
+WALL=03:00:00
+LIVE_BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+HF_LIVE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+TRAIN_LIVE_SHA=3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7
+BO_LIVE_SHA=25a899b3745e9d66fbf630795a1202c6075e2067daffa077e4a54c28e54c7ec2
+RUNNER_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+
+SC="$REPO/analysis/cMO1_momwd_score.py"
+SELF="$REPO/bin/cMO1_momwd.sh"
+TESTF="$REPO/tests/test_cmo1_flags_bite.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+ARCH="$REPO/jobs/run_cifar_cmo1.sh"
+FLOG="$SAVE/flags_bite.log"
+
+echo "=============================================================="
+echo " cmo1 -- ResNet18_c100: does the scalar collapse / carrier rescue survive momentum 0.9 and weight decay 0?  (LIVE harness)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C  ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   k01 kL ISO           momentum-param-base 0.99  weight-decay-base 0.1   (anchor)"
+echo "   M9k01 M9kL M9ISO     momentum-param-base 0.9   weight-decay-base 0.1"
+echo "   W0k01 W0kL W0ISO     momentum-param-base 0.99  weight-decay-base 0"
+echo "   groupings: k01 $G_K01 | kL $G_KL | ISO $G_ISO"
+echo " 9 arms x 3 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness $LIVE   runner $RUNNER   partitions $PARTS   walltime $WALL"
+echo " CO-PRIMARY (X = M9, W0): G_X = XkL - Xk01; R_X = XISO - Xk01; L_X = Xk01 - k01"
+echo " DOCUMENTED INVOCATION: python3 analysis/cMO1_momwd_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${COMP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] \
+  && [ -z "${WINDOW_HOLD+x}" ] && [ -z "${DECAY_MASK+x}" ] && [ -z "${SHADOW_VOTE+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD, REST_HOLD, WINDOW_HOLD, DECAY_MASK, SHADOW_VOTE are UNSET in the launcher's environment" \
+  || guard_fail "guard 0b: an intervention switch is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$SELF" "$TESTF" "$EXCL" "$EXCLT" "$LIBF" "$AGF" "$CSVP" "$ARCH" "$RUNNER" "$LIVE/Optimizers/HF.py" "$LIVE/train.py" \
+         "$LIVE/build_network.py" "$LIVE/Optimizers/build_optimizer.py"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cMO1_momwd_score.py bin/cMO1_momwd.sh tests/test_cmo1_flags_bite.py jobs/run_cifar_cmo1.sh"
+REUSEF="analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the four registration files and four reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CMO1_REGISTERED_COMMIT:-}" ]; then
+    echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CMO1_REGISTERED_COMMIT"
+    echo "          (RULE 21 is re-verified by wall clock: that commit's push vs the earliest sacct Submit)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CMO1_REGISTERED_COMMIT is unset -- declare the commit whose tree was staged"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CMO1_REGISTERED_COMMIT=<sha>"
+  fi
+fi
+cmp -s "$RUNNER" "$ARCH" && echo "guard 1b2: the archived jobs/run_cifar_cmo1.sh is BYTE-IDENTICAL to the runner the batch uses" \
+  || guard_fail "guard 1b2: jobs/run_cifar_cmo1.sh in the repo differs from $RUNNER"
+
+# ---- guard 1c: the scorer selftest ----------------------------------------------------------------
+SELFT=/tmp/cmo1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION\|Traceback' "$SELFT" | head -20; tail -5 "$SELFT"; }
+grep -q "^  PASS O2 ROBUST (collapse and rescue need nei real+invented " "$SELFT" && grep -q "^  PASS O2 non-vacuity" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows at cmo1's cells, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS .python3 cMO1_momwd_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS ... and on a dropped run exits 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS ZERO corpus rows carry seed 108, 109, 110 or 111" "$SELFT" && grep -q "^  PASS ZERO corpus rows carry the cmo1- prefix" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed / fresh-name checks ran and passed" || guard_fail "guard 1c4: fresh-seed check did not pass"
+grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cIS1's" "$SELFT" && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cVT8's" "$SELFT" \
+  && grep -q "^  PASS ISO's spec is BYTE-IDENTICAL to cDP1's" "$SELFT" \
+  && echo "guard 1c5: ISO byte-identical to ciso1's / cvt8's / cdep1's" || guard_fail "guard 1c5: the byte-identity checks did not pass"
+grep -q "^  PASS SIGMA_R18ALL: the FROZEN literal 0.6811983409351905 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c6: OPERATIONS 36 -- the frozen floor IS the corpus_exclusions.filter_rows value on the registration corpus" \
+  || guard_fail "guard 1c6: the frozen floor was not shown to be the filtered value on this host"
+grep -q "^  PASS E BROKEN-FLAG null: M9k01-s109 witness 0.99 " "$SELFT" && grep -q "^  PASS E BROKEN-FLAG null: W0ISO-s110 witness 0.1 " "$SELFT" \
+  && grep -q "^  PASS decide() on the BROKEN-FLAG null's levels == ROBUST's branch EXACTLY" "$SELFT" \
+  && echo "guard 1c7: the BROKEN-FLAG null predicts ROBUST's levels exactly and G-TBARGS separates it (FLAGS-NOT-VERIFIED)" \
+  || guard_fail "guard 1c7: the BROKEN-FLAG null checks did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+# ---- guard 2: RULE 21 premise -- nothing of this batch exists yet ----------------
+grep -q '^cmo1-' "$CSVP" && guard_fail "guard 2: cmo1-* already in the CSV" || echo "guard 2: no cmo1-* row in the corpus"
+NOUT=$(ls "$WS/runs"/cmo1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cmo1-*.out on disk" || guard_fail "guard 2b: $NOUT cmo1-*.out already exist"
+[ -d "$SAVE/Tensorboard_outputs" ] && [ -n "$(ls "$SAVE/Tensorboard_outputs" 2>/dev/null)" ] \
+  && guard_fail "guard 2g: $SAVE/Tensorboard_outputs is not empty (the G-TBARGS witness must be this batch's alone)" \
+  || echo "guard 2g: no TensorBoard output under $SAVE yet"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (108|109|110|111)( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 108/109/110/111" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran seed 108-111"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cmo1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cmo1-* jobs" || guard_fail "guard 2e: sacct shows $NS cmo1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cmo1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cmo1-* in squeue" || guard_fail "guard 2f: $NQ cmo1-* already queued"
+fi
+
+# ---- guard 3: the LIVE tree is the pinned one ------------------------------------------------------
+[ -d "$LIVE/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $LIVE/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$LIVE/build_network.py")" = "$LIVE_BN_SHA" ] && [ "$(sha "$LIVE/Optimizers/HF.py")" = "$HF_LIVE_SHA" ] \
+  && [ "$(sha "$LIVE/train.py")" = "$TRAIN_LIVE_SHA" ] && [ "$(sha "$LIVE/Optimizers/build_optimizer.py")" = "$BO_LIVE_SHA" ] \
+  && echo "guard 3b: LIVE build_network c7998883..., HF.py 4732b74a... (ciso1's / cdep1's / cvt8's .pre_voteweight), train.py 3fea309e..., build_optimizer 25a899b3..." \
+  || guard_fail "guard 3b: the LIVE tree is not the pinned one"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == a0d0a1b9... (the LIVE run_cifar.sh)" || guard_fail "guard 3e: $RUNNER is not the pinned runner"
+N_SW=$(grep -c -E 'VOTE_W|BETA_HOLD|GROUP_HOLD|COMP_HOLD|REST_HOLD|WINDOW_HOLD|DECAY_MASK|SHADOW_VOTE' "$LIVE/Optimizers/HF.py")
+[ "${N_SW:-1}" = 0 ] && echo "guard 3d: the LIVE HF.py carries NO intervention patch (0 switch names)" \
+  || guard_fail "guard 3d: the LIVE HF.py mentions an intervention switch ($N_SW lines)"
+grep -q "args_base = {name:getattr(args, name+'_base') for name in \['alg', 'normalizer_param', 'momentum_param', 'weight_decay', 'Lion_beta2'\]" "$LIVE/Optimizers/build_optimizer.py" \
+  && echo "guard 3f: build_optimizer.py maps --momentum-param-base / --weight-decay-base into args_base" \
+  || guard_fail "guard 3f: build_optimizer.py's args_base mapping is not the audited line"
+
+# ---- guard 4h: the flags REACH and CHANGE the base update on the LIVE files (CPU, seconds) ------------
+mkdir -p "$SAVE"
+python3 "$TESTF" --live "$LIVE" >/tmp/cmo1_flags.$$ 2>&1; FRC=$?
+if [ "$FRC" = 0 ] && grep -q '^ALL PASS$' /tmp/cmo1_flags.$$ && [ "$(grep -c '^  PASS' /tmp/cmo1_flags.$$)" = 18 ] \
+   && [ "$(grep -c '^  FAIL' /tmp/cmo1_flags.$$)" = 0 ]; then
+  { echo "TEST_SHA256 $(sha "$TESTF")"; echo "HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"; echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)";
+    cat /tmp/cmo1_flags.$$; } > "$FLOG"
+  echo "guard 4h: tests/test_cmo1_flags_bite.py ALL PASS on the LIVE files (18 PASS / 0 FAIL: parse, build_optimizer, SGDm update, BITE) -> $FLOG"
+  grep "F4 BITE" /tmp/cmo1_flags.$$ | sed 's/^/          /'
+else
+  guard_fail "guard 4h: tests/test_cmo1_flags_bite.py did not pass (rc $FRC)"; tail -15 /tmp/cmo1_flags.$$
+fi
+rm -f /tmp/cmo1_flags.$$
+
+# ---- guard 4c': the launcher's literals == the scorer's ------------------------------------------
+python3 - "$SC" "$G_K01" "$G_KL" "$G_ISO" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" "$ARMS" "$LIVE_BN_SHA" "$HF_LIVE_SHA" "$TRAIN_LIVE_SHA" "$RUNNER_SHA" <<'PYEOF' \
+  || guard_fail "guard 4c': launcher / scorer literals disagree"
+import sys, importlib.util
+spm = importlib.util.spec_from_file_location("cmo1sc", sys.argv[1]); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+a = sys.argv
+bad = []
+if tuple(a[9].split()) != S.ARMS: bad.append("ARMS")
+if S.GSPEC != {"k01": a[2], "kL": a[3], "ISO": a[4]}: bad.append("GSPEC")
+if a[5] != S.NET or int(a[6]) != S.NTENS or int(a[7]) != S.TOTPAR: bad.append("NET/NTENS/TOTPAR")
+if tuple(int(x) for x in a[8].split()) != S.SEEDS: bad.append("SEEDS")
+if (a[10], a[11], a[12], a[13]) != (S.LIVE_BN_SHA, S.HF_LIVE_SHA, S.TRAIN_LIVE_SHA, S.LIVE_RUNNER_SHA): bad.append("SHAS")
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': ARMS, the three grouping strings, NET, NTENS, TOTPAR, SEEDS and the four live shas agree in launcher and scorer")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST, per arm ------------------------------------------------------
+MTMP=/tmp/cmo1_manifest.$$
+python3 - "$LIVE" "$MTMP" "$NTENS" "$TOTPAR" "$NET" "$SC" <<'PYEOF' || guard_fail "guard 4: live partition / source check FAILED"
+import sys, os, io, inspect, re, contextlib, importlib.util
+harn, out, ntens, totpar, net_name, scp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+spm = importlib.util.spec_from_file_location("cmo1sc", scp); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+sys.path.insert(0, harn); os.chdir(harn)
+import torch, torch.nn as nn
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(net_name, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+T, tot = len(nps), sum(numel); bad = 0
+print("guard 4: live %s -- %d tensors, %d parameters" % (net_name, T, tot))
+if T != ntens or tot != totpar:
+    print("!!! guard 4: live model is %d / %d, the batch assumes %d / %d" % (T, tot, ntens, totpar)); raise SystemExit(1)
+nbn = sum(isinstance(m, nn.BatchNorm2d) for m in net.modules()); ngn = sum(isinstance(m, nn.GroupNorm) for m in net.modules())
+if (nbn, ngn) != (S.N_BATCHNORM, 0): bad += 1
+if names != S.NAMES:
+    print("!!! guard 4: the LIVE parameter names are not the scorer's NAMES"); bad += 1
+if [own[n] for n in names] != [o for _n, _q, o in S.r18_tensors()] or numel != [q for _n, q, _o in S.r18_tensors()]:
+    print("!!! guard 4: live module types / numels differ from the scorer's table"); bad += 1
+for i, nm in zip(S.CARRIER_IDX, S.CARRIERS):
+    print("guard 4: idx %d on the live model = %s (%s, numel %d)" % (i, names[i - 1], own[names[i - 1]], numel[i - 1]))
+    if names[i - 1] != nm or own[names[i - 1]] != "BatchNorm2d" or numel[i - 1] != 512: bad += 1
+lines = ["NETWORK %s" % net_name, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot, "NORM BatchNorm2d %d GroupNorm %d" % (nbn, ngn),
+         "CLIP_C %s" % S.CLIP, "EPOCHS %d" % S.EPOCHS, "META_STEPS %d" % (S.EPOCHS * (50000 // S.BATCH))]
+lines += ["TENSOR %d %s %d %s" % (i + 1, names[i], numel[i], own[names[i]]) for i in range(T)]
+lines.append("CARRIERS %s" % ",".join("%d:%s" % (i, names[i - 1]) for i in S.CARRIER_IDX))
+for arm in S.ARMS:
+    spec = S.SPEC[arm]
+    o = HF.__new__(HF); o.num_layers = T; o._device = torch.device("cpu")
+    o.args_meta = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+    o._beta_lo, o._beta_hi = -15.0, -2.3026
+    o._hier = "none"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        HF.init_meta(o, spec, nps, 1e-6)
+    shp = [tuple(b.shape) for b in o.beta]
+    print("guard 4: %-6s %-10s type=%s beta %s rednorm %s  base flags %s / %s"
+          % (arm, spec[:10], o.stepsize_type, shp, getattr(o, "_rednorm", None), S.MOMENTUM[arm], S.WDECAY[arm]))
+    if o.stepsize_type != S.PT_TYPE[arm] or getattr(o, "_rednorm", False):
+        print("!!! guard 4: %s does not construct as registered" % arm); bad += 1
+    if spec == "scalar":
+        if shp != [()]: bad += 1
+        lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % arm)
+    elif spec == "layerwise":
+        if shp != [(T,)]: bad += 1
+        lines.append("ARMSPEC %s SPEC layerwise TYPE layerwise M %d" % (arm, shp[0][0] if len(shp) == 1 and len(shp[0]) == 1 else -1))
+    else:
+        g = HF.polish_the_stepsize_groups(None, spec, nps)
+        sizes = [len(x) for x in g]; pc = [sum(numel[names.index(n)] for n in x) for x in g]
+        if sizes != S.ISO_SIZES or pc != S.ISO_PARAMS or list(g[1]) != list(S.CARRIERS) or shp != [(2,)]:
+            print("!!! guard 4: %s is not the registered [59,3] partition" % arm); bad += 1
+        lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                     % (arm, spec, len(g), ",".join(str(s) for s in sizes), ",".join(str(s) for s in pc), " ".join(g[1])))
+    lines.append("BASEFLAGS %s momentum-param-base %s weight-decay-base %s" % (arm, S.MOMENTUM[arm], S.WDECAY[arm]))
+sb = inspect.getsource(HF.SGDm_base_update)
+ok_sb = ("self.args_base['momentum_param']*self.momentum_base[i] + (1 - self.args_base['momentum_param'])*grad" in sb
+         and "delta = a * (self.momentum_base[i] + self.args_base['weight_decay']*w.data)" in sb
+         and "self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta" in sb)
+print("guard 4f: SGDm_base_update is the EMA form reading args_base momentum_param / weight_decay (also in h): %s" % ok_sb)
+if not ok_sb: bad += 1
+txt = "\n".join(lines) + "\n"
+if txt != S.synthetic_manifest_text():
+    print("!!! guard 4d: the live manifest differs from the scorer's synthetic_manifest_text()")
+    a_, b_ = txt.splitlines(), S.synthetic_manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("    first difference at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "(none)")[:200], (b_[k] if k < len(b_) else "(none)")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the live manifest is BYTE-IDENTICAL to the scorer's synthetic_manifest_text() (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/cmo1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+rm -f "$MTMP"
+
+# ---- guard 4g: provenance (the scored file ONLY on --submit) ---------------------
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $(sha "$LIVE/build_network.py")"
+  echo "HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "TRAIN_SHA256 $(sha "$LIVE/train.py")"
+  echo "BUILD_OPTIMIZER_SHA256 $(sha "$LIVE/Optimizers/build_optimizer.py")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "FLAGS_TEST_SHA256 $(sha "$TESTF")"
+  echo "FLAGS_BITE_LOG_SHA256 $(sha "$FLOG" 2>/dev/null)"
+  echo "REGISTERED_COMMIT ${CMO1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $LIVE"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "BASEFLAGS k01=kL=ISO momentum 0.99 wd 0.1; M9* momentum 0.9 wd 0.1; W0* momentum 0.99 wd 0"
+  echo "SWITCHES VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD WINDOW_HOLD DECAY_MASK SHADOW_VOTE unset on every arm; LIVE harness"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/cmo1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+# ---- guard 5: capacity, walltime and partitions ----------------------------------
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+# ---- guard 8: the scorer's DEFAULT resolution finds the manifest -----------------
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("cmo1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+# ---- guard 9: the harness the guards tested IS the harness the runner runs ---------
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$LIVE" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $LIVE but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+# ---- compose, guard each line under RULE 20, then (only with --submit) submit ----
+DESIGN=(alg-base=SGDm alg-meta=Lion num-epochs=$EPOCHS batch-size=$BATCH gamma=$GAMMA dataset=$DSET NN-name=$NET \
+        weight-decay-meta=0 momentum-param-meta=0.99 Lion-beta2-meta=0.9 meta-stepsize=$MST alpha0=$A0)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in
+      *k01) G=$G_K01 ;;
+      *kL)  G=$G_KL ;;
+      *ISO) G=$G_ISO ;;
+    esac
+    case $ARM in
+      M9*) MOMB=0.9;  WDB=0.1 ;;
+      W0*) MOMB=0.99; WDB=0 ;;
+      *)   MOMB=0.99; WDB=0.1 ;;
+    esac
+    RN="cmo1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base $MOMB \
+--weight-decay-base $WDB --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+    guard_presubmit "$CMD" "stepsize-groups=$G" "seed=$S" "run-name=$RN" "momentum-param-base=$MOMB" "weight-decay-base=$WDB" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20: an axis does not round-trip for $RN"; BAD=$((BAD+1)); }
+    python3 - "$SC" "$ARM" "$S" "$CMD" "$SAVE" <<'PYEOF' || { echo "!!! $RN: the composed ARGS payload is not the scorer's expected_args"; BAD=$((BAD+1)); }
+import sys, importlib.util
+spm = importlib.util.spec_from_file_location("cmo1sc", sys.argv[1]); S = importlib.util.module_from_spec(spm); spm.loader.exec_module(S)
+payload = sys.argv[4].split(" /cluster/account_b/metaopt/jobs/run_cifar.sh ", 1)[-1] if " /cluster/account_b/metaopt/jobs/run_cifar.sh " in sys.argv[4] else sys.argv[4].split("run_cifar.sh ", 1)[-1]
+raise SystemExit(0 if " ".join(payload.split()) == S.expected_args(sys.argv[2], int(sys.argv[3]), savedir=sys.argv[5]) else 1)
+PYEOF
+    NOTHER=$(printf '%s\n' "$CMD" | grep -o 'VOTE_W=\|BETA_HOLD=\|GROUP_HOLD=\|COMP_HOLD=\|REST_HOLD=\|WINDOW_HOLD=\|DECAY_MASK=\|SHADOW_VOTE=' | wc -l | tr -d ' ')
+    [ "$NOTHER" = 0 ] || { echo "!!! $RN carries an intervention switch"; BAD=$((BAD+1)); }
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / expected_args / switch pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'cmo1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cmo1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cmo1- present in bin/PROTECTED.txt ----"
+  guard_postlaunch "$WS/runs" "cmo1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cmo1 job started inside the window.  Re-check with:"
+       echo "         python3 $AGF $WS/runs --name cmo1- --batch-consistency --vary stepsize-groups --vary seed --vary run-name --vary momentum-param-base --vary weight-decay-base" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cmo1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo
+  echo "SCORE IT WITH, AND ONLY WITH (at 27/27 RUN_DONE, after RULE 20 at full coverage):"
+  echo "    python3 $REPO/analysis/cMO1_momwd_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cMO1_momwd.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

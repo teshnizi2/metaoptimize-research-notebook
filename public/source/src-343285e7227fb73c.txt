@@ -1,0 +1,292 @@
+#!/bin/bash
+# =============================================================================
+# cST1_carrier_contrast.sh -- `cst1` (CORRECTIONS 256; docs/LIMITS-PREP.md 5.1 S2).
+#   THE CARRIER CONTRAST AT META STEP 3e-4.  ONE SUBMISSION, 9 JOBS (k01 / ISO / CTL x SEEDS {112,113,114}),
+#   ResNet18_c100 / CIFAR-100, 100 EPOCHS, PROBE=100, PROBE_TENSOR=1 ON EVERY ARM.  THE LIVE SHARED HARNESS, UNCHANGED
+#   (no new patch: every arm is a CLI string the live tree already runs -- `scalar`, and the `sets:` strings of
+#   `ciso1` ISO and `cdep1` DEPTH, byte-identical).
+#
+# ACCOUNT account_b (cluster_b) ONLY.  Every squeue / scancel line is filtered on the `cst1-` prefix.
+#
+# REGISTERED SCORER  analysis/cST1_carrier_contrast_score.py (+ its pinned core analysis/cCV0_carrier_vote_core.py),
+# committed and pushed BEFORE this batch is submitted (RULE 21).  THE DOCUMENTED INVOCATION:
+#     python3 analysis/cST1_carrier_contrast_score.py <runsdir>
+#
+# USAGE (from a stage that is a git checkout of the registered commit):
+#     CST1_REGISTERED_COMMIT=<sha> bash bin/cST1_carrier_contrast.sh            # dry run, submits nothing
+#     CST1_REGISTERED_COMMIT=<sha> bash bin/cST1_carrier_contrast.sh --submit
+# =============================================================================
+set -u
+SUBMIT=0; [ "${1:-}" = "--submit" ] && SUBMIT=1
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+
+# nothing from the login shell may reach a run's environment except what this script exports
+unset VOTE_W BETA_HOLD GROUP_HOLD COMP_HOLD REST_HOLD WINDOW_HOLD DECAY_MASK SHADOW_VOTE WD_SCALE \
+      LAM ETA_RATIO COS_TOTAL COS_WARMUP SCHED_TOTAL SCHED_WARMUP SCHED_MIN EB_RHO EB_LOG 2>/dev/null
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+RUNNER=$WS/jobs/run_cifar.sh
+SAVE=$WS/runs/cst1
+CIF=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HFLIVE="$CIF/Optimizers/HF.py"
+PFX=cst1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="112 113 114"
+MST=3e-4
+A0=1e-6
+G_K01='scalar'
+G_ISO='sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight'
+G_CTL='sets:1-46,49-55,57-62/layer4.0.bn1.weight,layer4.0.bn1.bias,layer4.1.bn1.weight'
+ARMS="k01 ISO CTL"
+NJOBS=9
+WALL=03:00:00
+SC="$REPO/analysis/cST1_carrier_contrast_score.py"
+CORE="$REPO/analysis/cCV0_carrier_vote_core.py"
+DER="$REPO/analysis/cst1_cct1_registration_derivations.py"
+ARCH_RUNNER="$REPO/jobs/run_cifar_live_a0d0a1b9.sh"
+SELF="$REPO/bin/cST1_carrier_contrast.sh"
+LOGD=/tmp/cst1_guard.$$; mkdir -p "$LOGD"
+
+echo "=============================================================="
+echo " cst1 -- carrier contrast at meta step $MST, $DSET / $NET"
+echo " AUGMENT=$AUG PROBE=$PROBE PROBE_TENSOR=$PT clamp $CLIP_C alpha0=$A0 $EPOCHS epochs; seeds $SEEDS"
+echo "   k01  $G_K01"
+echo "   ISO  $G_ISO"
+echo "   CTL  $G_CTL"
+echo " 3 arms x 3 seeds = $NJOBS jobs, ONE submission, walltime $WALL"
+echo " scorer: python3 analysis/cST1_carrier_contrast_score.py <runsdir>"
+echo "=============================================================="
+
+# ---- guard 0 / 1: files, git state, RULE 21 -----------------------------------------------------------------------
+CSVP="$REPO/results/all_runs.csv"
+for f in "$CSVP" "$SC" "$CORE" "$DER" "$ARCH_RUNNER" "$SELF" "$REPO/analysis/argsline_guard.py" \
+         "$REPO/analysis/corpus_exclusions.py" "$REPO/bin/_lib_guards.sh" "$REPO/analysis/cDP1_cdep1_depth_score.py" \
+         "$REPO/analysis/cIS1_ciso1_isolate_score.py"; do
+  [ -f "$f" ] || guard_fail "guard 1a: missing $f"
+done
+echo "guard 1a: every file the batch reads is present"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  HEADC=$(git -C "$REPO" rev-parse HEAD)
+  DIRTY=$(git -C "$REPO" status --porcelain -- analysis/cST1_carrier_contrast_score.py analysis/cCV0_carrier_vote_core.py \
+          analysis/cst1_cct1_registration_derivations.py bin/cST1_carrier_contrast.sh jobs/run_cifar_live_a0d0a1b9.sh \
+          analysis/argsline_guard.py analysis/corpus_exclusions.py bin/_lib_guards.sh results/all_runs.csv \
+          results/CORPUS-EXCLUSIONS.tsv 2>/dev/null)
+  [ -z "$DIRTY" ] && echo "guard 1b: scorer, core, derivations, launcher, archived runner, guards and corpus committed at HEAD $HEADC" \
+                  || guard_fail "guard 1b: uncommitted: $DIRTY"
+  if [ -n "${CST1_REGISTERED_COMMIT:-}" ]; then
+    [ "$HEADC" = "$CST1_REGISTERED_COMMIT" ] && echo "guard 1b2: HEAD == CST1_REGISTERED_COMMIT" \
+      || guard_fail "guard 1b2: HEAD $HEADC != CST1_REGISTERED_COMMIT $CST1_REGISTERED_COMMIT"
+  else
+    [ "$SUBMIT" = 1 ] && guard_fail "guard 1b2: --submit requires CST1_REGISTERED_COMMIT" \
+                      || echo "guard 1b2: NOTE dry run without CST1_REGISTERED_COMMIT"
+  fi
+else
+  guard_fail "guard 1b: $REPO is not a git checkout -- stage the registered commit with git"
+fi
+cmp -s "$ARCH_RUNNER" "$RUNNER" && echo "guard 1c: jobs/run_cifar_live_a0d0a1b9.sh is byte-identical to the live $RUNNER" \
+  || guard_fail "guard 1c: the archived runner differs from $RUNNER"
+
+python3 "$SC" --selftest --runsdir "$WS/runs" > "$LOGD/selftest.txt" 2>&1 \
+  && echo "guard 1d: scorer --selftest PASSES: $(grep '^SELFTEST' "$LOGD/selftest.txt")" \
+  || { guard_fail "guard 1d: scorer selftest FAILED"; tail -30 "$LOGD/selftest.txt"; }
+grep -q "^  PASS PREMISE sc: 9 landed runs read NOMINATED" "$LOGD/selftest.txt" \
+  && grep -q "^  PASS PREMISE lay: 9 landed runs read NOT-NOMINATED" "$LOGD/selftest.txt" \
+  && echo "guard 1d2: the nomination PREMISE ran on this host's landed ctd1 / ciso1 / cdep1 probe records (not skipped)" \
+  || guard_fail "guard 1d2: the premise section did not run on this host"
+python3 "$DER" "$WS/runs" > "$LOGD/deriv.txt" 2>&1 || guard_fail "guard 1e: the derivations script failed"
+grep -q "DOM_C 0.8069" "$LOGD/deriv.txt" && grep -q "FILTERED 0.68119834093519" "$LOGD/deriv.txt" \
+  && echo "guard 1e: the derivations reproduce DOM_C 0.8069 (scalar x9) and SIGMA_R18ALL 0.68119834093519 (14 digits) on this host" \
+  || guard_fail "guard 1e: the derivations do not reproduce the registered numbers"
+for f in "$SC" "$CORE" "$DER" "$SELF" "$ARCH_RUNNER"; do
+  echo "guard 1f: sha256 $( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | awk '{print $1}')  ${f#$REPO/}"
+done
+
+# ---- guard 2: freshness -------------------------------------------------------------------------------------------
+grep -q "^$PFX-" "$CSVP" && guard_fail "guard 2: $PFX-* rows already in the CSV" || echo "guard 2: no $PFX- row in the corpus"
+NOUT=$(ls "$WS/runs"/$PFX-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no $PFX-*.out on disk" || guard_fail "guard 2b: $NOUT $PFX-*.out exist"
+NQ=$(squeue -h -u "$USER_NAME" -o %j 2>/dev/null | grep -c "^$PFX-")
+NS=$(sacct -n -u "$USER_NAME" -S 2026-09-01 -o JobName%40 2>/dev/null | grep -c "^ *$PFX-")
+[ "${NQ:-0}" = 0 ] && [ "${NS:-0}" = 0 ] && echo "guard 2c: no $PFX- job in squeue or sacct" \
+  || guard_fail "guard 2c: $NQ queued / $NS accounted $PFX- jobs already exist"
+NDUP=$(python3 - "$CSVP" <<'PYEOF'
+import sys, csv
+print(sum(1 for r in csv.DictReader(open(sys.argv[1])) if r.get("seed") in ("112", "113", "114", "115")))
+PYEOF
+)
+[ "${NDUP:-1}" = 0 ] && echo "guard 2d: 0 corpus rows carry seed 112-115" || guard_fail "guard 2d: $NDUP rows carry seed 112-115"
+NARGS=$(grep -l -E -- "--seed (112|113|114|115)( |$)" "$WS/runs"/*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NARGS:-0}" = 0 ] && echo "guard 2e: 0 .out ARGS lines under \$WS/runs carry seed 112-115" \
+  || guard_fail "guard 2e: $NARGS .out files already carry seed 112-115"
+
+# ---- guard 3: data and the live pins --------------------------------------------------------------------------------
+[ -d "$CIF/data/cifar-100-python" ] && echo "guard 3: cifar-100-python staged" || guard_fail "guard 3: CIFAR-100 not staged"
+python3 - "$CORE" "$HFLIVE" "$CIF/build_network.py" "$CIF/train.py" "$CIF/load_data.py" "$RUNNER" <<'PYEOF' || guard_fail "guard 3b: a live pin moved"
+import sys, hashlib, importlib.util
+spec = importlib.util.spec_from_file_location("core", sys.argv[1]); c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
+want = [c.HF_LIVE_SHA, c.BUILD_NETWORK_SHA, c.TRAIN_PY_SHA, c.LOAD_DATA_SHA, c.RUNNER_LIVE_SHA]
+bad = 0
+for p, w in zip(sys.argv[2:], want):
+    h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    print("guard 3b: %s %s %s" % ("OK " if h == w else "BAD", h, p)); bad += h != w
+raise SystemExit(1 if bad else 0)
+PYEOF
+NPT=$(grep -c 'PATCH_PROBE_TENSOR' "$HFLIVE"); NNS=$(grep -c 'PATCH_NAMESETS' "$HFLIVE")
+[ "$NPT" = 3 ] && [ "$NNS" -ge 1 ] && echo "guard 3c: live HF.py carries PATCH_PROBE_TENSOR (3 markers) and PATCH_NAMESETS" \
+  || guard_fail "guard 3c: PATCH_PROBE_TENSOR markers $NPT, PATCH_NAMESETS $NNS"
+NFOR=$(grep -c -E 'VOTE_W|BETA_HOLD|GROUP_HOLD|COMP_HOLD|REST_HOLD|WINDOW_HOLD|DECAY_MASK|SHADOW_VOTE' "$HFLIVE")
+[ "$NFOR" = 0 ] && echo "guard 3d: no intervention patch in the live HF.py" || guard_fail "guard 3d: $NFOR intervention markers in the live HF.py"
+HFSHA=$( (sha256sum "$HFLIVE" 2>/dev/null || shasum -a 256 "$HFLIVE") | awk '{print $1}')
+ILOG="$WS/runs/ctd1/inertness_test.log"
+grep -q '^ALL PASS$' "$ILOG" 2>/dev/null && grep -q "^POST_SHA256 $HFSHA" "$ILOG" \
+  && echo "guard 3e: PATCH_PROBE_TENSOR CPU inertness (R0-R5, scalar + layerwise) ALL PASS on THIS HF sha ($ILOG)" \
+  || guard_fail "guard 3e: no ALL PASS probe inertness log on sha $HFSHA"
+BLOG="$WS/runs/cdep1/inertness_blockwise.log"
+if grep -q '^ALL PASS$' "$BLOG" 2>/dev/null && grep -q "^POST_SHA256 $HFSHA" "$BLOG" \
+   && grep -qF -- "$G_ISO" "$BLOG" && grep -qF -- "$G_CTL" "$BLOG"; then
+  echo "guard 3f: the BLOCKWISE probe inertness test ALL PASS on THIS HF sha and covers BOTH strings ISO and CTL ($BLOG)"
+else
+  guard_fail "guard 3f: $BLOG does not pass on sha $HFSHA for both specs"
+fi
+
+# ---- guard 4: the LIVE model, the partitions, the manifest --------------------------------------------------------
+mkdir -p "$SAVE"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+CUDA_VISIBLE_DEVICES="" OMP_NUM_THREADS=2 python3 - "$CIF" "$SC" "$MANIFEST" <<'PYEOF' || guard_fail "guard 4: the live model / partition / manifest check FAILED"
+import sys, os, inspect, re, importlib.util
+cif, scp, out = sys.argv[1:4]
+spec = importlib.util.spec_from_file_location("sc", scp); sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc)
+core = sc.core
+sys.path.insert(0, cif); os.chdir(cif)
+import torch
+from build_network import build_network
+from Optimizers.HF import HF
+net = build_network(sc.NET, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _, p in net.named_parameters()]
+bad = 0
+print("guard 4: live %s: %d tensors, %d parameters" % (sc.NET, len(names), sum(numel)))
+if tuple(names) != core.TENSOR_NAMES or tuple(numel) != core.NUMEL[sc.NET]:
+    print("!!! guard 4: the live model is not the registered 62 (names, numels)"); bad += 1
+print("guard 4: carriers %s ; CTL %s" % ([names[i - 1] for i in core.C_IDX1], [names[i - 1] for i in sc.ISOLATED["CTL"]]))
+lines = ["BATCH %s" % sc.BATCH, "NETWORK %s" % sc.NET, "NUM_PARAM_TENSORS %d" % len(names), "TOTAL_PARAMS %d" % sum(numel)]
+lines += ["TENSOR %d %s %d" % (i + 1, names[i], numel[i]) for i in range(len(names))]
+lines.append("CARRIERS %s" % ",".join("%d:%s" % (i, names[i - 1]) for i in core.C_IDX1))
+for arm in sc.ARMS:
+    if sc.SPEC[arm].startswith("sets:"):
+        idx = [[names.index(n) + 1 for n in grp] for grp in HF.polish_the_stepsize_groups(None, sc.SPEC[arm], nps)]
+    elif sc.SPEC[arm] == "layerwise":
+        idx = [[i] for i in range(1, len(names) + 1)]
+    else:
+        idx = [list(range(1, len(names) + 1))]
+    o = HF.__new__(HF); o.num_layers = len(names); o._device = torch.device("cpu")
+    HF.init_meta(o, sc.SPEC[arm], nps, 1e-6)
+    shapes = [tuple(b.shape) for b in o.beta]
+    want_type = {"scalar": "scalar", "layerwise": "layerwise"}.get(sc.SPEC[arm], "blockwise")
+    print("guard 4: %-3s type %s  groups %s  beta shapes %s  rednorm %s" % (arm, o.stepsize_type, [len(x) for x in idx],
+                                                                          shapes, getattr(o, "_rednorm", None)))
+    if o.stepsize_type != want_type or len(idx) != sc.N_COORDS[arm] or [sorted(x) for x in idx] != core.parse_sets(sc.SPEC[arm]) \
+       or getattr(o, "_rednorm", False):
+        print("!!! guard 4: %s does not compose to its registered partition" % arm); bad += 1
+    lines.append("ARMSPEC %s SPEC %s GROUPS %s" % (arm, sc.SPEC[arm], "/".join(",".join(str(i) for i in sorted(x)) for x in idx)))
+text = "\n".join(lines) + "\n"
+if text != sc.manifest_text():
+    print("!!! guard 4: the live manifest is NOT byte-identical to the scorer's manifest_text()"); bad += 1
+else:
+    print("guard 4: the live manifest is byte-identical to the scorer's manifest_text() (%d bytes)" % len(text))
+src = inspect.getsource(HF.step)
+i_bp = src.find("HtT_gradft = self.block_product(self.h_condenced, g)")
+i_pt = src.find("self._pt_capture(self.h_condenced, g, HtT_gradft)")
+i_bu = src.find("self.base_update(net,g)")
+print("guard 4: capture after block_product and before base_update: %s" % (0 <= i_bp < i_pt < i_bu)); bad += not (0 <= i_bp < i_pt < i_bu)
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(text)
+PYEOF
+[ -s "$MANIFEST" ] && cp "$MANIFEST" "$WS/runs/$PFX-PARTITION-MANIFEST.txt" && echo "guard 4b: manifest written to $MANIFEST and $WS/runs/$PFX-PARTITION-MANIFEST.txt"
+
+# ---- guard 4g: provenance -----------------------------------------------------------------------------------------
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+PROV="$SAVE/PROVENANCE.$( [ "$SUBMIT" = 1 ] && echo txt || echo dryrun.txt)"
+{ echo "MODE $( [ "$SUBMIT" = 1 ] && echo submit || echo dryrun)"
+  echo "HF_SHA256 $HFSHA"; echo "BUILD_NETWORK_SHA256 $(sha "$CIF/build_network.py")"
+  echo "TRAIN_PY_SHA256 $(sha "$CIF/train.py")"; echo "LOAD_DATA_SHA256 $(sha "$CIF/load_data.py")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"; echo "CORE_SHA256 $(sha "$CORE")"; echo "SCORER_SHA256 $(sha "$SC")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"; echo "REGISTERED_COMMIT ${CST1_REGISTERED_COMMIT:-none}"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; } > "$PROV"
+echo "guard 4g: provenance -> $PROV"; sed 's/^/          /' "$PROV"
+
+# ---- guard 5: capacity ----------------------------------------------------------------------------------------------
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+RUNN=$(squeue -h -u "$USER_NAME" -t RUNNING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: $PEND pending + $RUNN running on this account; adding $NJOBS"
+[ "${PEND:-0}" -le 40 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+[ "$FAIL" = 1 ] && { echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; }
+
+# ---- compose, RULE 20 pre-check, submit ------------------------------------------------------------------------------
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL")
+echo "guard 5b: partitions $PARTS for walltime $WALL"
+guard_parts_for_wall "$PARTS" "$WALL" || { echo "!!! partitions / walltime disagree"; exit 2; }
+DESIGN=(alg-base=SGDm momentum-param-base=0.99 weight-decay-base=0.1 alg-meta=Lion momentum-param-meta=0.99 \
+        Lion-beta2-meta=0.9 weight-decay-meta=0 dataset=$DSET NN-name=$NET batch-size=$BATCH gamma=$GAMMA \
+        meta-stepsize=$MST alpha0=$A0 num-epochs=$EPOCHS max-time=999:00:00)
+N=0; REJ=0; BAD=0
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    case $ARM in k01) G=$G_K01 ;; ISO) G=$G_ISO ;; CTL) G=$G_CTL ;; esac
+    RN="$PFX-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    CMD="sbatch --job-name=$RN --partition=$PARTS --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base 0.1 --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+    guard_presubmit "$CMD" "${DESIGN[@]}" "stepsize-groups=$G" "seed=$S" "run-name=$RN" "save-directory=$SAVE" >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}" "stepsize-groups=$G" "seed=$S" "run-name=$RN"; BAD=$((BAD+1)); }
+    python3 - "$CMD" "$SC" "$ARM" "$S" "$WS" <<'PYEOF' || { echo "!!! the composed train.py half is not the scorer's registered ARGS line for $RN"; BAD=$((BAD+1)); }
+import sys, importlib.util
+cmd, scp, arm, s, ws = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+spec = importlib.util.spec_from_file_location("sc", scp); sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc)
+half = " ".join(cmd.split("run_cifar.sh", 1)[1].split())
+raise SystemExit(0 if "ARGS: " + half == sc.args_line(arm, s, ws) else 1)
+PYEOF
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >> "$LOGD/sbatch.txt" 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed lines, $BAD failed a pre-check (RULE 20 argsline_guard + the scorer's own ARGS line)"
+[ "$BAD" = 0 ] || { echo "!!! malformed lines"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS; $REJ rejected"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'dry run, nothing submitted' )); $REJ rejected ----"
+if [ "$SUBMIT" = 1 ]; then
+  cat "$LOGD/sbatch.txt"
+  grep -qx "$PFX-" "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "$PFX-" >> "$REPO/bin/PROTECTED.txt"
+  guard_postlaunch "$WS/runs" "$PFX-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED on a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no $PFX job started inside the window; RULE 20 is run by hand at full coverage" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^$PFX-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 9/9 RUN_DONE):  python3 $REPO/analysis/cST1_carrier_contrast_score.py $WS/runs"
+fi
