@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cst2_tol_crosscheck.py -- THE TWO-TOLERANCE CROSS-CHECK behind CORRECTIONS 268.
+#
+# WHAT IT IS.  A stdlib-only, self-contained re-derivation of the G-DECOMP SIGN sub-test under BOTH
+# tolerance rules, run over EVERY landed run of BOTH carrier-vote batches:
+#   OLD (cCV0's frozen rule, which cST1 applied):  |q - sign(L)| <= 1e-3                 (absolute)
+#   NEW (cST2's registered rule):                  |q - sign(L)| <= 1e-3 + 4*ulp32(beta)/ms
+# with q = -(beta - beta_pre)/ms on every UNCLAMPED coordinate of the run's own partition.
+# It imports NO repo module -- not cCV0_carrier_vote_core, not either scorer, not corpus_exclusions --
+# and it reads no accuracy number, no branch word and no scorer output.  It exists to establish two
+# things the CORRECTIONS entry claims:
+#   (1) THE DEFECT AND THE FIX at ms 3e-4 (`cst1`): the OLD rule rejects a bit-exact float32 harness,
+#       the NEW rule accepts it, and the whole residual is float32 quantisation of beta.
+#   (2) NO CHANGE WHERE THE OLD RULE WAS RIGHT at ms 1e-3 (`cct1`, CORRECTIONS 257, where cST1's
+#       sibling cCT1 passed): the two rules AGREE, both with 0 failures.
+# It also verifies, per coordinate, the bitwise reconstruction
+#       beta == float32( beta_pre - float32(ms) * sign(b2*mom_pre + (1-b2)*z_agg) )
+# which is what makes the residual attributable to rounding rather than to a wrong applied step.
+#
+#     python3 analysis/cst2_tol_crosscheck.py <runsdir>
+#
+# Exit 0 iff VIOLATIONS 0.  Host paths appear only on the HOSTPATH line at the end, so the output is
+# byte-identical on cluster_b and on the Mac apart from that line.
+#
+# DEFINITIONS RE-TYPED (not imported) FROM CORRECTIONS 256.3 / 256.5 / 257 and the cCV0 docstring:
+#   L_i = b2*m_i + (1-b2)*z_i;  the harness's per-group vote is b2*mom_pre[g] + (1-b2)*z_agg[g]
+#   a coordinate is CLAMPED iff not (-15 + 1e-9 < beta < -2.3026 - 1e-9)
+#   a run FAILS the sub-test iff more than 1 % of its unclamped coordinates exceed the bar
+# =============================================================================
+import argparse
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import sys
+
+B2 = 0.9
+BETA_LO, BETA_HI = -15.0, -2.3026
+PROBE_EVERY, META_STEPS, N_RECORDS = 100, 50000, 500
+SIGN_FAIL_MAX = 0.01                       # cCV0's rule, re-typed
+
+OLD_BAR = 1e-3                             # cCV0 / cST1: absolute, at every meta step size
+NEW_ABS = 1e-3                             # cST2: the same literal, kept as the floor
+NEW_ULP_K = 4.0                            # cST2: the ulp/ms term's factor (CORRECTIONS 265.3)
+ULP32_MAX_IN_CLIP = 2.0 ** -20             # 9.5367431640625e-07 -- ulp32 on [8, 16)
+
+BATCHES = {
+    "cst1": {"net": "ResNet18_c100", "n_classes": 100, "ms": 3e-4, "seeds": (112, 113, 114),
+             "arms": ("k01", "ISO", "CTL"),
+             "spec": {"k01": "scalar",
+                      "ISO": "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,"
+                             "layer4.1.bn2.weight",
+                      "CTL": "sets:1-46,49-55,57-62/layer4.0.bn1.weight,layer4.0.bn1.bias,layer4.1.bn1.weight"},
+             "ncoord": {"k01": 1, "ISO": 2, "CTL": 2}},
+    "cct1": {"net": "ResNet18", "n_classes": 10, "ms": 1e-3, "seeds": (116, 117, 118),
+             "arms": ("k01", "kL"),
+             "spec": {"k01": "scalar", "kL": "layerwise"},
+             "ncoord": {"k01": 1, "kL": 62}},
+}
+
+VIOL, OUT = [], []
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def chk(cond, label, extra=""):
+    P("  %-4s %s%s" % ("OK" if cond else "BAD", label, ("   " + extra) if extra else ""))
+    if not cond:
+        VIOL.append(label + (("   " + extra) if extra else ""))
+    return bool(cond)
+
+
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def ulp32(x):
+    x = abs(float(x))
+    if x == 0.0 or not math.isfinite(x):
+        return 2.0 ** -149
+    _m, e = math.frexp(x)
+    u = math.ldexp(1.0, e - 24)
+    return u if u > 0.0 else 2.0 ** -149
+
+
+def new_tol(bpre, bpost, ms):
+    return NEW_ABS + NEW_ULP_K * ulp32(max(abs(bpre), abs(bpost))) / ms
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---- the model, built from the ResNet18 architecture itself ---------------------------------------------------------
+def build_model(n_classes):
+    out = [("conv1.weight", 64 * 3 * 3 * 3), ("bn1.weight", 64), ("bn1.bias", 64)]
+    inp = 64
+    for _stage, planes in enumerate((64, 128, 256, 512), start=1):
+        for blk in range(2):
+            pre = "layer%d.%d." % (_stage, blk)
+            out.append((pre + "conv1.weight", planes * inp * 3 * 3))
+            out.append((pre + "bn1.weight", planes))
+            out.append((pre + "bn1.bias", planes))
+            out.append((pre + "conv2.weight", planes * planes * 3 * 3))
+            out.append((pre + "bn2.weight", planes))
+            out.append((pre + "bn2.bias", planes))
+            if inp != planes:
+                out.append((pre + "shortcut.0.weight", planes * inp))
+                out.append((pre + "shortcut.1.weight", planes))
+                out.append((pre + "shortcut.1.bias", planes))
+            inp = planes
+    out.append(("linear.weight", 512 * n_classes))
+    out.append(("linear.bias", n_classes))
+    return out
+
+
+def parse_sets(spec, names):
+    if spec == "scalar":
+        return [list(range(1, len(names) + 1))]
+    if spec == "layerwise":
+        return [[i] for i in range(1, len(names) + 1)]
+    assert spec.startswith("sets:")
+    groups = []
+    for g in spec[5:].split("/"):
+        idx = []
+        for tok in g.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        groups.append(sorted(idx))
+    return groups
+
+
+def read_probe(runsdir, batch, arm, seed):
+    d = os.path.join(runsdir, batch, "probe_%s-%s-s%d" % (batch, arm, seed))
+    recs = []
+    for ln in open(os.path.join(d, "probe.jsonl"), errors="replace"):
+        ln = ln.strip()
+        if ln:
+            recs.append(json.loads(ln))
+    return d, recs
+
+
+def scan(recs, groups1, ms):
+    """Per unclamped coordinate: the quotient q, both bars, and the bitwise float32 reconstruction."""
+    g0 = [[i - 1 for i in g] for g in groups1]
+    n_sign = clamped = old_bad = new_bad = exact32 = 0
+    worst_q = 0.0
+    tol_max = 0.0
+    msf = f32(ms)
+    for r in recs:
+        za, ma = r["z_agg"][0], r["mom_pre"][0]
+        bpre, bpost = r["beta_pre"][0], r["beta"]
+        b2 = float(r.get("pt_b2", B2))
+        for k in range(len(g0)):
+            if not (BETA_LO + 1e-9 < bpost[k] < BETA_HI - 1e-9):
+                clamped += 1
+                continue
+            n_sign += 1
+            s = sgn(b2 * ma[k] + (1 - b2) * za[k])
+            q = -(bpost[k] - bpre[k]) / ms
+            resid = abs(q - s)
+            tol = new_tol(bpre[k], bpost[k], ms)
+            worst_q = max(worst_q, resid)
+            tol_max = max(tol_max, tol)
+            old_bad += resid > OLD_BAR
+            new_bad += resid > tol
+            exact32 += (f32(f32(bpre[k]) - f32(msf * s)) == bpost[k])
+    return {"n_sign": n_sign, "clamped": clamped, "old_bad": old_bad, "new_bad": new_bad,
+            "exact32": exact32, "worst_q": worst_q, "tol_max": tol_max}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir")
+    a = ap.parse_args()
+
+    P("=" * 110)
+    P("cst2_tol_crosscheck -- the OLD (absolute 1e-3) and the NEW (1e-3 + 4*ulp32/ms) G-DECOMP sign bar,")
+    P("applied to every landed run of `cst1` (ms 3e-4) and `cct1` (ms 1e-3).  No repo module imported.")
+    P("=" * 110)
+
+    P("\n[ARITHMETIC] the bound, the crossover, and a worked table of 0.5*ulp32/ms")
+    P("  BETA_CLIP -15:-2.3026 keeps every unclamped |beta| inside [2, 16), so ulp32(beta) <= 2^-20 = %.16e"
+      % ULP32_MAX_IN_CLIP)
+    P("  round-to-nearest bound on |q - sign|:  0.5*ulp32(beta)/ms  +  |float32(ms) - ms|/ms  <=  0.5*ulp32/ms + 2^-24")
+    P("  2^-24 = %.6e (the float32(ms) term), absorbed by the 1e-3 floor both bars keep" % (2.0 ** -24))
+    cross = 0.5 * ULP32_MAX_IN_CLIP / OLD_BAR
+    for ms in (1e-4, 3e-4, 4e-4, 4.7e-4, 4.76837158203125e-4, 4.8e-4, 5e-4, 7e-4, 9e-4, 1e-3, 3e-3, 1e-2):
+        b = 0.5 * ULP32_MAX_IN_CLIP / ms
+        nb = NEW_ABS + NEW_ULP_K * ULP32_MAX_IN_CLIP / ms
+        P("    ms %-12g  0.5*ulp/ms %.4e  vs OLD bar 1.000e-03 -> %-7s   NEW bar %.4e -> %s"
+          % (ms, b, "FAILS" if b > OLD_BAR else "passes", nb, "discriminates" if nb < 1.0 else "TOO LOOSE"))
+    P("  CROSSOVER: the OLD absolute bar is exactly right at ms = 0.5*ulp32/1e-3 = %.14e" % cross)
+    chk(abs(cross - 4.76837158203125e-04) < 1e-18, "the crossover is 4.76837158203125e-04")
+    chk(0.5 * ULP32_MAX_IN_CLIP / 3e-4 > OLD_BAR, "at ms 3e-4 the bound 1.589e-03 EXCEEDS the old 1e-3 bar",
+        "%.6e" % (0.5 * ULP32_MAX_IN_CLIP / 3e-4))
+    chk(0.5 * ULP32_MAX_IN_CLIP / 1e-3 < OLD_BAR, "at ms 1e-3 the bound 4.768e-04 is 52 % UNDER the old 1e-3 bar",
+        "%.6e" % (0.5 * ULP32_MAX_IN_CLIP / 1e-3))
+    chk(NEW_ABS + NEW_ULP_K * ULP32_MAX_IN_CLIP / 3e-4 < 1.0,
+        "the new bar at ms 3e-4 is still far below 1 (a missing step) and 2 (a flipped sign)",
+        "%.6e" % (NEW_ABS + NEW_ULP_K * ULP32_MAX_IN_CLIP / 3e-4))
+
+    tot = {}
+    for batch in ("cst1", "cct1"):
+        B = BATCHES[batch]
+        model = build_model(B["n_classes"])
+        names = [n for n, _ in model]
+        numels = [q for _, q in model]
+        P("\n[%s] %s, %d tensors, %d params, ms %g  (%s)"
+          % (batch, B["net"], len(names), sum(numels), B["ms"],
+             "the batch whose registered scorer stopped at G-DECOMP" if batch == "cst1"
+             else "the batch whose sibling scorer PASSED the same code"))
+        agg = {"n_sign": 0, "clamped": 0, "old_bad": 0, "new_bad": 0, "exact32": 0}
+        worst = 0.0
+        for arm in B["arms"]:
+            groups = parse_sets(B["spec"][arm], names)
+            for s in B["seeds"]:
+                d, recs = read_probe(a.runsdir, batch, arm, s)
+                tag = "%s-s%d" % (arm, s)
+                chk(len(recs) == N_RECORDS and [r.get("step") for r in recs]
+                    == list(range(0, META_STEPS, PROBE_EVERY)),
+                    "%s %s: 500 records at steps 0..49,900" % (batch, tag))
+                chk(len(groups) == B["ncoord"][arm]
+                    and set(len(r["beta"]) for r in recs) == {B["ncoord"][arm]},
+                    "%s %s: %d coordinate(s), the registered partition"
+                    % (batch, tag, B["ncoord"][arm]))
+                r = scan(recs, groups, B["ms"])
+                P("  %-10s probe.jsonl %s" % (tag, sha256(os.path.join(d, "probe.jsonl"))))
+                P("  %-10s unclamped %5d  clamped %4d | OLD bar fails %5d (%6.2f %%)  NEW bar fails %5d (%6.2f %%) "
+                  "| worst|q-s| %.4e  widest NEW bar %.4e | bit-exact float32 %5d/%-5d"
+                  % ("", r["n_sign"], r["clamped"], r["old_bad"], 100.0 * r["old_bad"] / max(r["n_sign"], 1),
+                     r["new_bad"], 100.0 * r["new_bad"] / max(r["n_sign"], 1), r["worst_q"], r["tol_max"],
+                     r["exact32"], r["n_sign"]))
+                chk(r["exact32"] == r["n_sign"],
+                    "%s %s: EVERY unclamped beta == float32(beta_pre - float32(ms)*sign(L))" % (batch, tag))
+                chk(r["new_bad"] == 0, "%s %s: 0 coordinates exceed the NEW ms-aware bar" % (batch, tag))
+                if batch == "cst1":
+                    chk(r["old_bad"] > SIGN_FAIL_MAX * r["n_sign"],
+                        "%s %s: the OLD bar gates this run (> 1 %% of unclamped coordinates)" % (batch, tag),
+                        "%d/%d" % (r["old_bad"], r["n_sign"]))
+                else:
+                    chk(r["old_bad"] == 0, "%s %s: the OLD bar ALSO passes -- the two rules agree at ms 1e-3"
+                        % (batch, tag))
+                for k in agg:
+                    agg[k] += r[k]
+                worst = max(worst, r["worst_q"])
+        tot[batch] = (agg, worst)
+        P("  TOTAL %s: unclamped %d, clamped %d | OLD fails %d, NEW fails %d | bit-exact %d/%d | worst|q-s| %.4e"
+          % (batch, agg["n_sign"], agg["clamped"], agg["old_bad"], agg["new_bad"], agg["exact32"], agg["n_sign"],
+             worst))
+
+    P("\n[VERDICT OF THE CROSS-CHECK]")
+    a1, w1 = tot["cst1"]
+    a2, w2 = tot["cct1"]
+    P("  cst1 (ms 3e-4): the OLD bar rejects %d of %d bit-exact unclamped coordinates; the NEW bar rejects %d."
+      % (a1["old_bad"], a1["n_sign"], a1["new_bad"]))
+    P("  cct1 (ms 1e-3): the OLD bar rejects %d of %d; the NEW bar rejects %d -- THE TWO RULES AGREE."
+      % (a2["old_bad"], a2["n_sign"], a2["new_bad"]))
+    P("  bit-exact float32 reconstructions over BOTH batches: %d of %d unclamped coordinates."
+      % (a1["exact32"] + a2["exact32"], a1["n_sign"] + a2["n_sign"]))
+    P("  worst |q - sign(L)|: cst1 %.4e (bound 0.5*ulp/ms = %.4e), cct1 %.4e (bound %.4e)."
+      % (w1, 0.5 * ULP32_MAX_IN_CLIP / 3e-4, w2, 0.5 * ULP32_MAX_IN_CLIP / 1e-3))
+    chk(w1 <= 0.5 * ULP32_MAX_IN_CLIP / 3e-4 and w2 <= 0.5 * ULP32_MAX_IN_CLIP / 1e-3,
+        "both batches' worst residual is inside the round-to-nearest bound: the whole residual is quantisation")
+    chk(a1["exact32"] + a2["exact32"] == a1["n_sign"] + a2["n_sign"],
+        "the harness applied EXACTLY the registered update on every unclamped coordinate of both batches")
+    chk(a1["new_bad"] == 0 and a2["new_bad"] == 0 and a2["old_bad"] == 0 and a1["old_bad"] > 0,
+        "the successor's bar changes cst1's gate and changes NOTHING at cct1's meta step")
+
+    P("\n" + "=" * 110)
+    P("VIOLATIONS %d" % len(VIOL))
+    for v in VIOL:
+        P("  ! %s" % v)
+    sys.stdout.write("\n".join(OUT) + "\n")
+    print("HOSTPATH runsdir  %s" % os.path.abspath(a.runsdir))
+    return 0 if not VIOL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

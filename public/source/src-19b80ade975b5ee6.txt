@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""cwd1_livemodel_normscale_check.py -- CORRECTIONS 260, landing check, READ-ONLY, CPU ONLY.
+
+Rebuilds the LIVE `cwd1` model from the isolated harness tree's own `build_network.py` and checks, on
+the real torch modules, that PATCH_DECAYMASK's `normscale` rule ("every 1-D `*.weight`") selects
+EXACTLY the BatchNorm2d scales BY MODULE TYPE -- 20 tensors, 4,800 parameters -- and that those are
+the indices and names each masked run's own `DECAY_MASK:` witness line announces.
+
+    python3 analysis/cwd1_livemodel_normscale_check.py <harness_cifar10_dir> [--witness <a cwd1 .out>]
+
+e.g. on cluster_b, after
+    module load Python/3.10.4-GCCcore-11.3.0 && source $METAOPT_WS/envs/mo/bin/activate
+    python3 cwd1_livemodel_normscale_check.py $METAOPT_WS/harness_cwd1/cifar10 \
+            --witness $METAOPT_WS/runs/cwd1-k01NWD-s128-5045343.out
+
+It SUBMITS NOTHING, allocates no GPU and writes nothing.  Exit 0 iff every check passes.
+"""
+import argparse
+import os
+import sys
+
+EXPECT_TENSORS = 62
+EXPECT_PARAMS = 11220132
+EXPECT_MASKED = 20
+EXPECT_NUMEL = 4800
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+
+FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("ok" if cond else "!!", label, ("   " + extra) if extra else ""))
+    if not cond:
+        FAIL.append(label)
+    return bool(cond)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("harness_dir", help="the isolated tree's cifar10/ directory (holds build_network.py)")
+    ap.add_argument("--witness", default="", help="a masked cwd1 .out, to compare its DECAY_MASK line against")
+    a = ap.parse_args()
+
+    import torch
+    sys.path.insert(0, os.path.abspath(a.harness_dir))
+    import build_network as BN
+
+    net = BN.build_network("ResNet18_c100", torch.device("cpu"))
+    named = list(net.named_parameters())
+    print("live model: %d parameter tensors, %d parameters" % (len(named), sum(p.numel() for _, p in named)))
+    chk(len(named) == EXPECT_TENSORS, "62 parameter tensors")
+    chk(sum(p.numel() for _, p in named) == EXPECT_PARAMS, "11,220,132 parameters")
+
+    by_rule = [(i + 1, n, p.numel()) for i, (n, p) in enumerate(named) if n.endswith(".weight") and p.dim() == 1]
+    bn_names = set((mn + ".weight") if mn else "weight"
+                   for mn, m in net.named_modules() if isinstance(m, torch.nn.BatchNorm2d))
+    by_type = [(i + 1, n, p.numel()) for i, (n, p) in enumerate(named) if n in bn_names]
+
+    chk([x[:2] for x in by_rule] == [x[:2] for x in by_type],
+        "the patch's rule (1-D *.weight) selects the SAME tensors as BatchNorm2d BY MODULE TYPE")
+    chk(len(by_rule) == EXPECT_MASKED, "the mask is 20 tensors", str(len(by_rule)))
+    chk(sum(x[2] for x in by_rule) == EXPECT_NUMEL, "the mask is 4,800 parameters", str(sum(x[2] for x in by_rule)))
+    for c in CARRIERS:
+        chk(any(x[1] == c for x in by_rule), "the ctd1 carrier %s is inside the mask" % c)
+    n_other_1d = sum(1 for _, p in named if p.dim() == 1) - len(by_rule)
+    chk(n_other_1d == 21, "the 21 other 1-D tensors (20 BatchNorm2d shifts + the linear bias) keep their weight decay",
+        str(n_other_1d))
+
+    idx = ",".join(str(x[0]) for x in by_rule)
+    names = ",".join(x[1] for x in by_rule)
+    print("  idx   %s" % idx)
+    print("  names %s" % names)
+
+    if a.witness:
+        got = [ln.strip() for ln in open(a.witness, errors="replace") if ln.startswith("DECAY_MASK:")]
+        want = ("DECAY_MASK: on base=SGDm wd=0.1 spec=normscale masked=%d of=%d numel=%d idx=%s names=%s"
+                % (len(by_rule), len(named), sum(x[2] for x in by_rule), idx, names))
+        chk(got == [want], "the run's own DECAY_MASK witness line == the live model's mask", str(got[:1])[:200])
+
+    print("\n%s" % ("LIVE-MODEL CHECK PASS" if not FAIL else "LIVE-MODEL CHECK FAIL: %r" % FAIL))
+    return 0 if not FAIL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

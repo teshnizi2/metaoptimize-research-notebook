@@ -16,7 +16,8 @@ From the command line:
 
   --check  every listed (run, job_id) is present EXACTLY once in results/all_runs.csv; no key is listed
            twice; with --runs, the run's own raw .out carries exactly the listed witness line (of the
-           intervention kind the witness names: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD, REST_HOLD or WINDOW_HOLD, see
+           intervention kind the witness names: VOTE_W, BETA_HOLD, GROUP_HOLD, COMP_HOLD, REST_HOLD, WINDOW_HOLD,
+           DECAY_MASK or SHADOW_VOTE, see
            KINDS), and
            every OTHER .out of a listed batch carries that kind's `off` line (so the list is complete for that
            batch);
@@ -28,6 +29,8 @@ From the command line:
            MULTI_KIND registers for its (batch, arm) -- so its other ON line is verified, not skipped;
            CORRECTIONS 251: any number of kinds, e.g. cvt8's forced arms (GROUP_HOLD + REST_HOLD), cvt9's held arms
            (BETA_HOLD + COMP_HOLD) and its EARLY / LATE (+ WINDOW_HOLD, three kinds);
+           CORRECTIONS 269: cwd2's HIGHWD0 / LOWWD0 (BETA_HOLD + COMP_HOLD + DECAY_MASK) and its HIGHHEADPATH (two);
+           cwd1's masked arms and csv1's switch arms turn on ONE kind each and register nothing there;
            ARGS-VALUE KINDS (CORRECTIONS 263): a run may deviate from the standard cell in a CLI FLAG alone
            (cmo1's `--momentum-param-base 0.9`, `--weight-decay-base 0`), which no CSV column carries and no patch
            line announces.  Such a row is listed with an ARGS witness `<KIND>: <flag>=<value>` (ARGS_KINDS);
@@ -118,9 +121,12 @@ KINDS = [
     ("COMP_HOLD", "COMP_HOLD: off"),  # patches/patch_comphold.py, CORRECTIONS 242 (cvt6)
     ("REST_HOLD", "REST_HOLD: off"),  # patches/patch_resthold.py, CORRECTIONS 248 (cvt8); added at 251
     ("WINDOW_HOLD", "WINDOW_HOLD: off"),  # patches/patch_windowhold.py, CORRECTIONS 249 (cvt9); added at 251
+    ("DECAY_MASK", "DECAY_MASK: off"),  # patches/patch_decaymask.py, CORRECTIONS 260 / 261 (cwd1, cwd2); added at 269
+    ("SHADOW_VOTE", "SHADOW_VOTE: off"),  # patches/patch_shadowvote.py, CORRECTIONS 262 (csv1); added at 269
 ]
-# No prefix above is a prefix of another (their first letters V / B / G / C / R / W differ), so no line starts with two of
+# No prefix above is a prefix of another (their first letters V / B / G / C / R / W / D / S differ), so no line starts with two of
 # them and every `startswith` reader selects each line for ONE kind (CORRECTIONS 245); check() FAILs if an entry breaks it.
+KINDS_AT_251 = 6   # CORRECTIONS 269: 251's `kinds scanned` line is frozen over the first six entries, so it stays byte-identical
 
 # ---- --check only: runs whose registered design turns ON more than one kind (CORRECTIONS 245) ----------------------
 # A TSV row carries ONE witness.  Such a run is listed ONCE, by any one of its ON lines; each (batch, arm) below must
@@ -172,6 +178,23 @@ MULTI_KIND.update({
     ("cvt9", "RESDOSE"): {"BETA_HOLD": _CVT9_BH_TRI_8609, "COMP_HOLD": _CVT6_CH_REC},
     ("cvt9", "EARLY"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "WINDOW_HOLD": _CVT9_WH_EARLY},
     ("cvt9", "LATE"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "WINDOW_HOLD": _CVT9_WH_LATE},
+})
+# CORRECTIONS 269: cwd2 (261), appended; every entry above is unchanged.  cwd2 runs cvt9's HEADPATH schedules with
+# PATCH_DECAYMASK on top, so its HIGHWD0 / LOWWD0 print THREE ON lines (BETA_HOLD + COMP_HOLD + DECAY_MASK) and its
+# HIGHHEADPATH the same TWO cvt9's HIGHHEADPATH prints.  Re-typed from the registered tables (NOT imported):
+# analysis/cwd_design.py CWD2.WITNESS_BH / WITNESS_CH (= cvt9's, by construction: 261.5 loads the sha-pinned cvt9
+# scorer) and CWD2.WITNESS_DM, which analysis/cWD2_carrierwd_score.py imports UNEDITED.  cwd2's BETA_HOLD tri:9428 /
+# floor lines and its COMP_HOLD line are byte-identical to cvt6's / cvt9's, so they are reused.  `cwd1` (260) and
+# `csv1` (262) register NO entry here: no arm of either turns on two kinds -- cwd1's masked arms print only
+# DECAY_MASK (VOTE_W / BETA_HOLD / GROUP_HOLD / REST_HOLD off) and csv1's switch arms only SHADOW_VOTE, while its
+# MUTE arm is a plain VOTE_W row of the kind 227 already knows.
+# tests/test_corpus_exclusions_check.py C33 pins every entry to those tables and proves the three batches' arm sets.
+_CWD2_DM = ("DECAY_MASK: on base=SGDm wd=0.1 spec=layer4.1.bn2.weight masked=1 of=53 numel=512 idx=50 "
+            "names=layer4.1.bn2.weight")
+MULTI_KIND.update({
+    ("cwd2", "HIGHHEADPATH"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC},
+    ("cwd2", "HIGHWD0"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "DECAY_MASK": _CWD2_DM},
+    ("cwd2", "LOWWD0"): {"BETA_HOLD": _CVT6_BH_FLOOR, "COMP_HOLD": _CVT6_CH_REC, "DECAY_MASK": _CWD2_DM},
 })
 
 
@@ -431,8 +454,13 @@ def check(runs_dirs):
         # CORRECTIONS 251: 245's line names 245's four kinds, byte for byte; the kinds added since are named on the next line
         print("  kinds scanned (CORRECTIONS 245): %s; no prefix is a prefix of another, so no line is read as two kinds: %s"
               % (" / ".join(kd for kd, _off in KINDS[:4]), not collide))
+        # CORRECTIONS 269: 251's line is frozen over the SIX kinds it registered (KINDS_AT_251), so it stays byte-identical
+        # as kinds are added; the kinds added since are named on the next line.  `collide` is computed over ALL of KINDS,
+        # so both verdicts are the stronger statement.
         print("  kinds scanned (CORRECTIONS 251): also %s, %d in all; no prefix of the %d is a prefix of another: %s"
-              % (" / ".join(kd for kd, _off in KINDS[4:]), len(KINDS), len(KINDS), not collide))
+              % (" / ".join(kd for kd, _off in KINDS[4:KINDS_AT_251]), KINDS_AT_251, KINDS_AT_251, not collide))
+        print("  kinds scanned (CORRECTIONS 269): also %s, %d in all; no prefix of the %d is a prefix of another: %s"
+              % (" / ".join(kd for kd, _off in KINDS[KINDS_AT_251:]), len(KINDS), len(KINDS), not collide))
         # TWO-KIND RUNS (CORRECTIONS 245): a listed run of a MULTI_KIND (batch, arm) prints exactly its registered line of
         # every kind registered there -- the kind its witness names and the one the TSV row cannot carry.
         nb = len(bad)

@@ -88,12 +88,23 @@ mapping is reviewable in one place and never applied ad hoc:
     names those 18 runs; ``args_deviation()`` reads such a row and ``args_witness_line()`` checks it against the run's own
     ``ARGS:`` line under argparse last-wins semantics. ``cst1``, ``cct1`` and ``cmg1`` own no exclusion row at all.
 
+13. The last four MUST-tier landings (MASTER-TABLE lines 232-235 at campaign commit 2972d48, CORRECTIONS 270-273) are
+    imported by ``MECH4_ROWS``. The pinned file may differ from the MUST-tier pin on header line 3 and on row 229, which
+    CORRECTIONS 273 amended in place, and no line may move; line 5 was again deliberately left unamended. ``docs/CORRECTIONS.md``
+    is append-only across the ingest 66a19fb (corpus 3,181 -> 3,253, +72 runs, 0 changed, 45 exclusion rows; entries 267-269)
+    and this landing (entries 270-273). All four batches owe exclusion rows, under the existing ``GROUP_HOLD`` and ``VOTE_W``
+    kinds and the two kinds CORRECTIONS 269 added, ``DECAY_MASK`` and ``SHADOW_VOTE``; six cwd2 rows carry three kinds at once.
+    ``MECH4_AMENDMENTS`` carries the row-229 amendment into MT229 and MOVES its outcome from Open to Mixed, because the frozen
+    successor registered at CORRECTIONS 268 reaches a branch whose registered clauses split -- the isolation rescue transfers
+    to a second meta step size, the vote-dominance nomination misses its bar by 41 records of 1,500. The Corrected badge is
+    NOT set: an outcome moved by later data is not a corrected earlier claim.
+
 Record text is plain text: ``clean()`` removes Markdown bold, emphasis and code marks from every MASTER-TABLE cell and
 from the text fields of the campaign's register export (``BASE_TEXT_FIELDS``), which copies the cells with their marks.
 
 IDs: existing IDs are never renumbered. New MASTER-TABLE rows are keyed
 ``MT<line>`` on their line in the pinned commit (MT175-MT211, then MT212-MT217, then MT218, then MT219, then MT220-MT221,
-then MT222-MT223, then MT224-MT225, then MT226-MT227, then MT228-MT231);
+then MT222-MT223, then MT224-MT225, then MT226-MT227, then MT228-MT231, then MT232-MT235);
 no ID from the original register is at or above MT167. Source anchors into
 MASTER-TABLE are resolved by row content, never by line number alone, because
 the site's IDs were assigned from an uncommitted MASTER-TABLE snapshot that is
@@ -256,6 +267,20 @@ ADDED_PHASES = [{
     # MUST_FIRST_ROW / MUST_LAST_ROW are 228 and 231; they are defined further down the file, so the four IDs are written out.
     "experimentIds": ["MT228", "MT229", "MT230", "MT231"],
     "source": "docs/CORRECTIONS.md 264-266 at 40d29cf",
+}, {
+    # The rest of the MUST-have tier of docs/LIMITS-PREP.md section 5.1 (R1 cvt10, S1b cwd1, N1 csv1, N4 cwd2), registered
+    # and launched on 18 Sep (CORRECTIONS 258, 260, 261, 262; campaign commits 8e341e4-635132f, 18:12-18:45 UTC), scored the
+    # same night, ingested once at 66a19fb (corpus 3,181 -> 3,253) and written up at 2972d48 (CORRECTIONS 270-273). A
+    # separate phase from phase-10: these four ask WHICH TENSORS carry the collapse and THROUGH WHICH ROUTE, and whether the
+    # carrier's step size is necessary -- a mechanism decomposition, not another thing the carrier account needs. The same
+    # landing amended row 229 in place (MT229), carrying CORRECTIONS 268's frozen successor into the record.
+    "id": "phase-11", "date": "2026-09-18", "period": "18-19 Sep", "title": "Which tensors, and through which route",
+    "test": "One carrier held against three at PlainNet's dose; the coupled weight decay masked on the normalisation scales, and on one carrier scale; one carrier's applied step size separated from the vote it casts",
+    "observed_result": "Any one of the three ResNet carriers held alone stalls the run, provided the others still vote; removing the coupled weight decay from the 20 BatchNorm scales removes the collapse entirely, and removing it from one PlainNet scale removes the held-step damage too; both the applied step and the vote carry part of that damage",
+    "next_question": "By what route the coupled decay acts, which the instrument cannot watch on the arms that stall",
+    # MECH4_FIRST_ROW / MECH4_LAST_ROW are 232 and 235; they are defined further down the file, so the four IDs are written out.
+    "experimentIds": ["MT232", "MT233", "MT234", "MT235"],
+    "source": "docs/CORRECTIONS.md 270-273 at 2972d48",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -387,7 +412,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     # Each pin must be a byte prefix of the next: the list may only grow by appended rows.
     for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256),
                              (CVT67_COMMIT, CVT67_INTERVENTIONS_TSV_SHA256), (CVT89_COMMIT, CVT89_INTERVENTIONS_TSV_SHA256),
-                             (MUST_COMMIT, MUST_INTERVENTIONS_TSV_SHA256)]:
+                             (MUST_COMMIT, MUST_INTERVENTIONS_TSV_SHA256), (MECH4_COMMIT, MECH4_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -397,7 +422,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     body = [line for line in raw.decode("utf-8").splitlines() if line and not line.startswith("#")]
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
-    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS}.items():
+    for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS,
+                      **MECH4_INTERVENTIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as a patch intervention with an ARGS-value witness")
@@ -430,8 +456,13 @@ def listed_rows(rows: list[dict], eid: str, spec: dict) -> list[dict]:
 # cvt9's EARLY / LATE BETA_HOLD, COMP_HOLD and WINDOW_HOLD). Each kind is named on the run page; an unknown patch stops
 # the export rather than being guessed. REST_HOLD forces the rest group (the complement of a GROUP_HOLD group) onto a
 # replay; WINDOW_HOLD cuts the run's BETA_HOLD trajectory to an update window <n0>:<n1|end>, the floor outside.
+# CORRECTIONS 269 added the last two, and cwd2's HIGHWD0 / LOWWD0 are the first rows to carry three kinds at once:
+# DECAY_MASK sets the BASE optimiser's coupled weight decay to 0 on a named tensor set (<spec>, in the weight update and in
+# the meta trace); SHADOW_VOTE separates one tensor's APPLIED step size from the term it casts into the shared
+# meta-gradient sum (<vote>:<applied>:<name>).
 INTERVENTION_KINDS = {"VOTE_W": "vote-weight", "BETA_HOLD": "step-size hold", "COMP_HOLD": "complement step-size hold",
-                      "GROUP_HOLD": "group step-size hold", "REST_HOLD": "rest-group step-size hold", "WINDOW_HOLD": "update-window hold"}
+                      "GROUP_HOLD": "group step-size hold", "REST_HOLD": "rest-group step-size hold", "WINDOW_HOLD": "update-window hold",
+                      "DECAY_MASK": "coupled weight-decay mask", "SHADOW_VOTE": "shadow-vote"}
 
 
 def intervention_kinds(intervention: str) -> list[tuple[str, str]]:
@@ -448,6 +479,16 @@ def intervention_kinds(intervention: str) -> list[tuple[str, str]]:
     return kinds
 
 
+def intervention_opening(looks_like: str) -> str:
+    """The run note's opening clause. cvt10's ISOSPLIT is the one listed arm with NO plain twin at its cell key, and the
+    exclusion list says so in the looks_like column instead of naming an arm (CORRECTIONS 258.9, 270.6 F4); "Not a plain
+    no free arm at this cell key (...) measurement" is not a sentence, so that row gets its own wording."""
+    if not looks_like.startswith("no free arm"):
+        return f"Not a plain {looks_like} measurement"
+    key = looks_like.split("(", 1)[1].rsplit(")", 1)[0] if "(" in looks_like else looks_like
+    return f"Not a plain measurement of its cell key ({key}), which no free arm anywhere in the corpus shares"
+
+
 def intervention_phrase(intervention: str) -> str:
     """'step-size hold intervention'; 'a and b interventions' for a two-kind run; 'a, b and c interventions' for three."""
     names = [INTERVENTION_KINDS[patch] for patch, _ in intervention_kinds(intervention)]
@@ -455,7 +496,11 @@ def intervention_phrase(intervention: str) -> str:
 
 
 def additional_witness(lines: list[str], patch: str, value: str) -> str:
-    """The run log's one '<patch>: on' line, checked against the listed value (floor, tri:<P>, rec:<id>, or <n0>:<n1|end> for WINDOW_HOLD).
+    """The run log's one '<patch>: on' line, checked against the listed value.
+
+    Each kind has its own value grammar, and a value written for another kind is refused rather than guessed: floor,
+    tri:<P> or rec:<id> for the step-size holds, <n0>:<n1|end> for WINDOW_HOLD, <spec> for DECAY_MASK, and
+    <vote>:<applied>:<name> for SHADOW_VOTE.
 
     The exclusion list carries the witness of a run's first hold only; every further hold is witnessed by the run's own log."""
     found = [line for line in lines if line.startswith(f"{patch}: on ")]
@@ -463,7 +508,20 @@ def additional_witness(lines: list[str], patch: str, value: str) -> str:
         raise ValueError(f"A run log must print exactly one '{patch}: on' line; found {len(found)}")
     mode = value.rsplit(":", 2)
     window = re.fullmatch(r"(\d+):(\d+|end)", value)
-    if patch == "WINDOW_HOLD" or window:
+    if patch == "DECAY_MASK":
+        # The mask names its tensor set, which the log echoes as spec=<value> beside the count it resolved to.
+        if not value or ":" in value or " " in value:
+            raise ValueError(f"Unreadable {patch} value: {value!r}")
+        expected = f" spec={value} "
+    elif patch == "SHADOW_VOTE":
+        vote, applied, name = (mode + ["", "", ""])[:3]
+        if len(mode) != 3 or not vote or not applied or not name:
+            raise ValueError(f"Unreadable {patch} value: {value!r}")
+        # The named tensor appears in the log's items= list, between its index and its element count.
+        if f":{name}:" not in found[0]:
+            raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
+        expected = f" vote={vote} applied={applied} "
+    elif patch == "WINDOW_HOLD" or window:
         if patch != "WINDOW_HOLD" or not window:
             raise ValueError(f"Unreadable {patch} value: {value!r}")
         expected = f" n0={window[1]} n1={window[2]} "
@@ -1571,6 +1629,286 @@ def must_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 13. The cvt10, cwd1, csv1 and cwd2 landings (CORRECTIONS 270-273): four appended rows, row 229 amended in place.
+# ---------------------------------------------------------------------------
+# Campaign commit 2972d48 (cycle 155, CORRECTIONS 270 + 271 + 272 + 273) appended the last four MUST-tier landings as
+# MASTER-TABLE lines 232-235, recounted header line 3 and amended row 229 (cst1, MT229) in place, carrying the supersession
+# CORRECTIONS 268.11 left owed. Nothing else may differ from the MUST-tier pin and no line may move. Line 5, the bottom-line
+# paragraph, was again deliberately left unamended (273.10: no verdict of this cycle moves the denominator result).
+# docs/CORRECTIONS.md is append-only across the two commits: the ingest 66a19fb (corpus 3,181 -> 3,253, +72 runs, 0 changed,
+# 45 exclusion rows) replaced the MUST-tier landing's closing "Next free number" trailer with entries 267, 268 and 269, and
+# this landing replaced that trailer with entries 270-273.
+MECH4_COMMIT = "2972d4858bf1f1cfcb81d8a7f2e1f87231f71312"
+MECH4_MASTER_TABLE_SHA256 = "b6128197755137e265cda5388733054c42aeab369ed015a1bfaf179203d2ac4e"
+MECH4_FIRST_ROW, MECH4_LAST_ROW = 232, 235
+MECH4_EDITED_LINES = {3, 229}
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+# All four are Goal met under VERDICT_RULES, as MT219, MT222, MT223, MT225 and MT230: each returns its registered branch in
+# the registered direction, each scorer exits 0 with every gate passing, each positive control reproduces, G-BITE excludes
+# the batch's own broken-patch null on records, and NO registered account misses a band and NO control fails -- the test the
+# MT218-MT231 precedent applies before Goal met is granted. What each row bounds (sufficiency only; one dose, one tensor set
+# or one tensor; one cell; one horizon; three or four seeds; heterogeneous ungated GPU hardware on cwd1 and cwd2; the
+# counterfactual shadow vote on csv1) is SCOPE that the reason and the record's scope carry, not a band the result missed,
+# exactly as MT230's association-not-causation bounds are. None of the four corrects an earlier published notebook claim, so
+# none carries the Corrected badge: the wording each landing fixed was the wording of its own report, fixed inside the same
+# entry before any of it reached the register (270.6, 271.6, 272.6, 273.6), and the RULE 16 defects each reports are
+# reported and NOT fixed.
+MECH4_ROWS = {
+    232: ("met", 9, ["cvt10"], ["page-19"], None, "ONE-SUFFICES+ONE50-STALLS+ONE59-STALLS+ONE53-STALLS+SPLIT-NO-EFFECT: on ResNet18_c100 at ciso1's cell, each of the three carriers isolated alone in its own step-size group and held on PlainNet's measured dose (tri:9428, from init) is SUFFICIENT to stall while its free twin rescues -- ONE50 64.7967 -> ONE50BIG 21.1340 (P_ONE50 +43.6627 pp = +78.50 SE), ONE59 67.7053 -> ONE59BIG 21.0973 (P_ONE59 +46.6080 pp = +83.80 SE), ONE53 57.5033 -> ONE53BIG 22.2893 (P_ONE53 +35.2140 pp = +63.31 SE) -- which CLOSES 252.8(1)'s held-set confound at this cell and carries 240 / 246's PlainNet sentence to ResNet for each carrier singly; but the same one-tensor hold does nothing once 53 and 59 leave the shared vote (ISOSPLIT 67.0893, P_SPLIT +3.0767 pp only), so the one-tensor stall needs the remaining carriers voting in the shared step size. The anchor reproduces (k01 22.7540, ISO 70.1660, D_ISO +47.4120 pp = +85.24 SE), cvt8's DOSE-FULL replicates in batch at fresh seeds (HOLDBIG3 18.7233, 6.0307 pp inside the REPLICATE-FAILED bar), the registered scorer exits 0 with every gate passing, G-BITE passes 30/30 and excludes the BROKEN-SINGLETON-HOLD null on records before any level is read, and no registered band is missed. Bounded: every reading is SUFFICIENCY and never necessity; all four stalled arms sit BELOW k01 rather than at it, so ...-AT-K01 is a LOCATION that H-FLOOR predicts equally; the tightest word is SPLIT-NO-EFFECT, which clears ISO - 5 by 1.9233 pp = 3.46 SE while the three -STALLS words clear k01 + 2 by 2.4647-3.6567 pp; ISOSPLIT has no free [59,1,2] control and no plain twin anywhere in the corpus; one dose, one network, one cell, 100 epochs, three seeds, no per-run GPU-hardware census; and one RULE 16 defect is reported and NOT fixed -- a host-dependent DESCRIPTIVE rounding cell that no gate, bar, level, contrast, branch word or stamp reads."),
+    233: ("met", 9, ["cwd1"], ["page-19"], None, "COLLAPSE-VANISHES: on ResNet18_c100 at ciso1's cell, masking the base optimiser's coupled weight decay on the 20 BatchNorm scales -- in the weight update AND in the meta trace -- removes the scalar collapse entirely: k01 22.9513 -> k01NWD 70.7760 (P_NWD +47.8247 pp = +85.99 SE), and the masked scalar arm sits ABOVE its own masked layerwise reference (kLNWD 69.3420, G_NWD -1.4340 pp = -2.58 SE, inside the MATCH bar 5.0), with RATIO 1.0207 so the collapse is not reduced but GONE. The registered scorer exits 0 with every gate passing, G-BITE passes 9/9 with the mask record audit k=20 on exactly the six masked runs and k=0 on exactly the three unmasked ones, excluding the BROKEN-MASK null that predicts COLLAPSE-PERSISTS exactly; a live-model check confirms the mask is the 20 BatchNorm2d scales by module type at the 20 registered indices; and no bar is near, VANISHES clearing by 6.4340 pp = 11.57 SE with the branch word unchanged under every single seed and every leave-one-seed-out. This is the decomposition cmo1's W0 half could not do, localising the precondition to 4,800 of 11,220,132 parameters. Bounded: the mask is ONE tensor set and BOTH routes at once, so the batch answers which tensors and NOT which route, and cannot say which of the 20 scales matters; the reference arm is also masked, so G_NWD is masked-vs-masked; there is no ISO arm; coupled decay only, one WD value, one network, one cell, 100 epochs, three seeds; 7 runs ran on an NVIDIA L4 and 2 on an RTX 2080 Ti, unregistered and ungated; the collapsing arm carries no weight-norm readout at all, and where the readout exists the scales grow rather than shrink; and two RULE 16 defects are reported and NOT fixed."),
+    234: ("met", 9, ["csv1"], ["page-19"], None, "BOTH-ROUTES: on PlainNet18_c100 at cvt1's cell, separating idx 50's APPLIED step size from the term it casts into the shared meta-gradient sum splits the damage between the two routes -- pinning the applied step at the clamp floor from init while the vote is rebuilt at the shared step size leaves the run BETWEEN (SHADOWLOW 49.8790, P_APPLIED +37.7610 pp = +72.58 SE), and removing that shadow term recovers HEAD's level (NAIVELOW 65.2420 against HEAD 64.4293, P_VOTE +15.3630 pp = +31.89 SE of the 52.3113 pp HEAD - k01 gap). The registered vote-share premise is MET (share(k01) 0.5271 >= 0.30 and share(SHADOWLOW) 0.3592 >= half of it, SHADOW-VOTE-DOMINANT), the identity control INERT is inside its registered +/-2.0 bar (P_INERT +0.2440 pp), MUTE reproduces 230 at the k01 location, the registered scorer exits 0 with every gate passing, no bar is near, and G-BITE passes 18/18 with a working negative control -- 47 counterfactual readings on this batch's own records, 0 passes, including the BROKEN-SHADOW null whose levels are exactly APPLIED-STEP-NECESSARY's. This gives the campaign the carrier NECESSITY statement L2 was missing and closes the RULE 20 half CORRECTIONS 267.2 left owed. Bounded: only ONE small dose was tested -- the clamp floor, from init -- so the honest sentence is that an applied step ABOVE THE CLAMP FLOOR on idx 50 is necessary for the FULL stall, not that a LARGE one is, which is a RULE 16 defect reported against the registered licence string itself and NOT fixed; the shadow vote is COUNTERFACTUAL, so nothing here speaks about unmodified MetaOptimize's own vote; INERT has n = 1 and the batch is unbalanced; MUTE sits 0.8153 pp below k01, a LOCATION; INERT is disclosed as NOT bitwise k01 over the landed 100-epoch run although 262.3 proved that on-path over 300 real steps, so the identity gate passes at its registered tolerance and the word bitwise belongs to the proof job; and a second RULE 16 defect, seven host-dependent DESCRIPTIVE display ties, is reported and NOT fixed."),
+    235: ("met", 9, ["cwd2"], ["page-19"], None, "WD-ROUTE + SCALAR-NEEDS-CARRIER-WD: on PlainNet18_c100 at cvt6 / cvt9's cell, masking coupled weight decay on layer4.1.bn2.weight alone -- 512 parameters of 11,046,308 -- removes the damage of the externally held large step on that scale (HIGHHEADPATH 10.7127 -> HIGHWD0 65.6260, P_WD +54.9133 pp = +98.73 SE against the damage to explain R_HIGH +54.2880, F_WD 1.012, the remainder P_LEFT -0.6253 pp inside the NULL bar) and removes the scalar collapse itself (k01 12.0673 -> k01WD0 65.7500, P_SC +53.6827 pp = +96.52 SE). In the three held arms every applied step size is exogenous, so the mask can change only tensor 50's weight update and the ROUTE reading is clean; the two anchors and the control replicate cvt6 and cvt9 between batch, REPLICATE-FAILED sits 3.3547 pp (6.03 SE) away while the two words that are read clear their bar by 5.6253 and 5.7493 pp, the registered scorer exits 0 with every gate passing, and G-BITE passes 15/15 with 15/15 cross-reads refused, excluding the BROKEN-MASK null whose levels are exactly STEP-ROUTE + SCALAR-WITHOUT-CARRIER-WD. 240's OWN-STEP-MAGNITUDE, 246's HIGHHEADPATH-AT-K01 and 253's DOSE-GRADED are therefore REINTERPRETED: the own large step acts through the shrinkage it multiplies. Bounded: heterogeneous GPU hardware, unregistered and ungated, with the arm-centred device effect measured at A100 +0.0460 / L4 -0.0375 / RTX 2080 Ti -0.0727 pp against the 54.9 pp the verdict turns on and seed confounded with device; the mechanism is NOT watched where it is claimed to act, because the patch records weight norms only on masked arms, so both stalling arms carry none and where it is measured there is no filter collapse at all, which leaves Zhou et al. arXiv:2001.11216 neither confirmed nor excluded; HIGHHEADPATH sits 1.3547 pp below k01, a LOCATION; k01WD0 changes both routes at once; the complement is forced onto a replay and the held arms are open loop; one tensor, one cell, one network, 100 epochs, three seeds, decoupled weight decay untested; and two RULE 16 defects are reported and NOT fixed."),
+}
+# Earlier records these rows bear on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH4_BEARS_ON = {
+    232: ["MT226", "MT225"],  # cvt8's DOSE-FULL, replicated in batch, and cvt7's TRANSFERS-GRADED: the held set, not the dose, was the open half
+    233: ["MT228", "MT162"],  # cmo1's W0 leg, decomposed by tensor set, on ciso1's collapse cell
+    234: ["MT218", "MT224"],  # cvt1's MUTE and cvt6's GRADED: the same carrier, with the applied step separated from the vote
+    235: ["MT224", "MT227"],  # cvt6's HIGHHEADPATH and cvt9's DOSE-GRADED, reinterpreted as acting through the coupled decay
+}
+# The 45 intervened rows of this ingest. cvt10's five held arms use the EXISTING GROUP_HOLD kind (258.7); cwd1, cwd2 and
+# csv1 use the two kinds CORRECTIONS 269 added to analysis/corpus_exclusions.py -- DECAY_MASK (the base optimiser's coupled
+# weight decay set to 0 on a named tensor set, in the weight update and in the meta trace) and SHADOW_VOTE (idx 50's applied
+# step size separated from the term it casts into the shared sum). Nine cwd2 rows are multi-kind and six of those carry
+# three kinds at once; csv1's MUTE rows keep the existing VOTE_W kind. The file is byte-identical at the ingest 66a19fb,
+# where the rows were appended, and at this landing, which did not touch it.
+MECH4_INTERVENTIONS_TSV_SHA256 = "7da3901cc1378ef10441f2055b03b53b8cb1a1fda2e32ee099117e6fe0ed572a"
+MECH4_INTERVENTIONS = {
+    "MT232": {
+        "batch": "cvt10", "arms": {"HOLDBIG3": 3, "ONE50BIG": 3, "ONE59BIG": 3, "ONE53BIG": 3, "ISOSPLIT": 3},
+        "title": "cvt10's five held arms are group step-size holds, not plain arms",
+        "source": f"{INTERVENTIONS_TSV} at {MECH4_COMMIT[:7]}; CORRECTIONS 258 and 270",
+        "note": ("HOLDBIG3, ONE50BIG, ONE59BIG, ONE53BIG and ISOSPLIT ran PATCH_GROUPHOLD (GROUP_HOLD=<names>:tri:9428 pins "
+                 "one step-size group's beta to cvt4 / cvt6 / cvt8's measured triangular trajectory from init -- PlainNet's "
+                 "measured dose). HOLDBIG3 holds all three carriers as one group of three, as cvt8's HOLDBIG did; ONE50BIG, "
+                 "ONE59BIG and ONE53BIG hold a group of ONE carrier, which is a new place in the patch's registered grammar; "
+                 "ISOSPLIT holds group 1 of a three-group partition, 50 held with {53,59} free in their own group. Each held "
+                 "arm's spec is byte-identical to its free twin's, so the run inventory writes the held rows with the free "
+                 "arm's cell key: seed for seed they differ from it only in run, job_id, node, wallclock_min and the accuracy "
+                 "columns. They are NOT plain measurements of those cells. ISOSPLIT is the one arm in the corpus with NO "
+                 "plain twin at its cell key, and its exclusion row says so. The 15 rows are listed in "
+                 "results/CORPUS-EXCLUSIONS.tsv under the existing GROUP_HOLD kind -- this batch added no new kind; drop them "
+                 "before pooling runs by cell. The five free arms print GROUP_HOLD: off and are ordinary measurements."),
+    },
+    "MT233": {
+        "batch": "cwd1", "arms": {"k01NWD": 3, "kLNWD": 3},
+        "title": "cwd1's two masked arms run with the coupled weight decay switched off on the 20 BatchNorm scales",
+        "source": f"{INTERVENTIONS_TSV} at {MECH4_COMMIT[:7]}; CORRECTIONS 260, 269 and 271",
+        "note": ("k01NWD and kLNWD ran PATCH_DECAYMASK (DECAY_MASK=normscale), which sets the BASE optimiser's coupled weight "
+                 "decay to 0 on a named tensor set -- in the weight update AND in the meta trace h <- gamma(1 - wd*a)h - delta. "
+                 "normscale is the 20 one-dimensional *.weight tensors, which on the live model are exactly the 20 "
+                 "BatchNorm2d scales by module type, 4,800 of 11,220,132 parameters, the three carriers 50 / 53 / 59 among "
+                 "them; the conv and linear tensors keep their decay. No column of results/all_runs.csv carries the mask, so "
+                 "the inventory writes k01NWD with plain k01's cell key (granularity scalar) and kLNWD with plain kL's "
+                 "(layerwise). They are NOT plain measurements of those cells. The 6 rows are listed in "
+                 "results/CORPUS-EXCLUSIONS.tsv under the DECAY_MASK witness kind added at CORRECTIONS 269; drop them before "
+                 "pooling runs by cell. The k01 anchor prints DECAY_MASK: off and is an ordinary measurement of its cell."),
+    },
+    "MT234": {
+        "batch": "csv1", "arms": {"INERT": 1, "SHADOWLOW": 4, "NAIVELOW": 4, "MUTE": 3},
+        "title": "csv1's four intervened arms separate one tensor's applied step size from the vote it casts",
+        "source": f"{INTERVENTIONS_TSV} at {MECH4_COMMIT[:7]}; CORRECTIONS 262, 269 and 272",
+        "note": ("INERT, SHADOWLOW and NAIVELOW ran PATCH_SHADOWVOTE (SHADOW_VOTE=<shadow or natural>:<floor or shared>:<name>), "
+                 "which separates layer4.1.bn2.weight's APPLIED step size from the term it casts into the shared "
+                 "meta-gradient sum: applied=floor pins idx 50's applied step at float32(exp(float32(-15))) from init, "
+                 "vote=shadow rebuilds 50's slot of the shared sum at the SHARED step size from 50's real momentum and "
+                 "weights -- a COUNTERFACTUAL vote, not MetaOptimize's own -- and vote=natural leaves the harness's own "
+                 "floor-built trace. INERT (shadow:shared) is the identity control, inside its registered +/-2.0 bar. MUTE ran "
+                 "PATCH_VOTEWEIGHT (VOTE_W=layer4.1.bn2.weight:0), cvt1's string. All 12 rows carry plain k01's cell key "
+                 "(granularity scalar): seed for seed they differ from it only in run, job_id, node, wallclock_min and the "
+                 "accuracy columns, and they are NOT plain scalar measurements. They are listed in "
+                 "results/CORPUS-EXCLUSIONS.tsv -- 9 under the SHADOW_VOTE witness kind added at CORRECTIONS 269 and 3 under "
+                 "the existing VOTE_W kind; drop them before pooling runs by cell. Track F proposed the same 12 rows "
+                 "independently (CORRECTIONS 269.7) and the ingest regenerated them without reading that file, finding the "
+                 "same 12 keys with 0 differing cells across all 9 columns. The k01 and HEAD arms are ordinary measurements."),
+    },
+    "MT235": {
+        "batch": "cwd2", "arms": {"k01WD0": 3, "HIGHHEADPATH": 3, "HIGHWD0": 3, "LOWWD0": 3},
+        "title": "cwd2's twelve intervened arms combine a step-size hold, a forced complement replay and a decay mask",
+        "source": f"{INTERVENTIONS_TSV} at {MECH4_COMMIT[:7]}; CORRECTIONS 261, 269 and 273",
+        "note": ("k01WD0 ran PATCH_DECAYMASK alone (DECAY_MASK=layer4.1.bn2.weight), masking the base optimiser's coupled "
+                 "weight decay on ONE tensor of 53 -- 512 parameters, idx 50 -- in the weight update and in the meta trace. "
+                 "HIGHHEADPATH is cvt6 / cvt9's stall arm replicated in batch: BETA_HOLD=layer4.1.bn2.weight:tri:9428 with "
+                 "the complement forced onto cvt6's recorded HEAD path (COMP_HOLD=rec:cvt6_headpath). HIGHWD0 and LOWWD0 add "
+                 "the mask to that pair, so those six runs carry THREE interventions at once; LOWWD0 freezes 50 at the -15 "
+                 "floor instead, as the control under the same mask. In every held arm the applied step sizes are exogenous "
+                 "(open loop), and the complement is FORCED onto a replay, so nothing here says a FREE complement behaves the "
+                 "same way. No column of results/all_runs.csv carries any of this, so k01WD0 takes plain k01's cell key and "
+                 "the three held arms take HEAD's. The 12 rows are listed in results/CORPUS-EXCLUSIONS.tsv -- the nine "
+                 "multi-kind rows by their BETA_HOLD line, with the further holds verified by the three MULTI_KIND entries "
+                 "registered at CORRECTIONS 269 and by each run's own log; drop them before pooling runs by cell."),
+    },
+}
+MECH4_INGEST_COMMIT = "66a19fbc9b29976d44ef74c03cd9b388ca742007"
+MECH4_INGEST_CORRECTIONS_SHA256 = "00d042175616d5bb8ae4016e48f7740564cdcde1b54d85f09947e37978e545ac"
+MECH4_CORRECTIONS_SHA256 = "8d1ff79bd11fec5a38bed44db9645e5be822d87d4d2ad13b2bc43c31c82272dc"
+MECH4_ENTRIES = (270, 271, 272, 273)
+MECH4_INGEST_ENTRIES = (267, 268, 269)
+# Row 229 (cst1, MT229), amended in place. CORRECTIONS 268 registered and PUSHED a frozen successor scorer before it was run
+# on a single cst1 record; 273 carries its reading into the row, keeping the predecessor's verdict verbatim in a SUPERSEDED
+# bracket. The registered predecessor is UNEDITED and STILL FROZEN (RULE 16), and 265.3's reading stands as the correct
+# output of a defective check, so nothing earlier is corrected and the Corrected badge is NOT set -- an outcome moved by
+# later data is not a corrected earlier claim (the CORRECTIONS 229 precedent). The outcome DOES move, because the verdict
+# column moved and the successor's registered clauses SPLIT: the isolation rescue transfers to a second meta step size and
+# the count-matched control stays null, but the vote-dominance nomination misses its frozen 750-record bar by 41 records of
+# 1,500 (TOP3_C by six), so the batch may not write the NOMINATED+ISO-RESCUES+CTL-NULL headline. That is VERDICT_RULES
+# "mixed", never "met": under the MT218-MT231 precedent a verdict whose registered account misses a band is not Goal met.
+MECH4_AMENDMENT_MARK = "[AMENDED at cycle 155, CORRECTIONS 273"
+MECH4_AMENDMENT_TAG = "CORRECTIONS 273"
+MECH4_AMENDMENTS = {
+    "MT229": {
+        "line": 229, "number": 273, "entry": "273", "previous": "unresolved", "outcome": "mixed",
+        # cells 3 and 5 gain one appended bracket that keeps everything before it; cell 4 is rewritten with the predecessor's
+        # verdict kept verbatim inside a SUPERSEDED bracket; cell 6 only gains citations. Cells 0-2 may not change at all.
+        "appended_cells": (3, 5), "verdict_cell": 4, "ref_cell": 6,
+        "superseded": "UNRESOLVED-DECOMPOSITION",
+        "branch": "NOMINATION-PARTIAL+ISO-RESCUES+CTL-NULL",
+        "citations": ("268 (the frozen successor registered and scored)", "273 (this amendment)"),
+        "reason": ("Outcome moved: Open -> Mixed. Amended at CORRECTIONS 273, carrying the supersession CORRECTIONS 268.11 "
+                   "left owed. The REGISTERED predecessor cST1_carrier_contrast_score.py is UNEDITED and STILL FROZEN under "
+                   "RULE 16, and 265.3's reading stands as the correct output of a defective check; a FROZEN SUCCESSOR, "
+                   "cST2_carriervote_score.py, was registered and pushed as commit 9581897 BEFORE it was run on a single "
+                   "cst1 record, with the ms-aware G-DECOMP tolerance 1e-3 + 4*ulp32(beta)/ms as its ONE change and every "
+                   "other bar the literal frozen at 256.5 -- proved mechanically over 27 scalar literals, 17 maps and licence "
+                   "tables, all 29 branches and licence strings and decide() on 4,000 random points, 0 differences, with the "
+                   "two scorers' stdouts differing on 11 of 115 lines and the old and new bars agreeing at cct1's ms 1e-3 on "
+                   "all 85,912 coordinates. Reading the same nine runs it PASSES G-DECOMP with 0 failing coordinates of "
+                   "6,876, so the numbers 265 could print only as DESCRIPTIVE are now the batch's REGISTERED levels: the "
+                   "isolation rescue TRANSFERS to meta step 3e-4 (D_ISO +41.1567 pp = +74.00 SE) and the count-matched "
+                   "control stays at k01's level (D_CTL +0.1807 pp), but the vote-dominance nomination does NOT -- DOM_C "
+                   "0.4727 is 709 records against a 750-record bar, MISSING BY 41, and TOP3_C 0.4960 is 744 against 750, "
+                   "MISSING BY SIX. The registered clauses therefore split between met and missed, which is Mixed and not "
+                   "Goal met, and the batch may not write the NOMINATED+ISO-RESCUES+CTL-NULL headline sentence. No earlier "
+                   "published claim is corrected, so the Corrected badge is not set and the superseded predecessor verdict "
+                   "is kept verbatim in the record."),
+    },
+}
+
+
+def mech4_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvt10/cwd1/csv1/cwd2 landing; only header line 3, row 229 and four appended rows may differ."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH4_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH4_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH4_COMMIT[:12]} does not match the pinned cvt10/cwd1/csv1/cwd2-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    before = must_master_table(repo)
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH4_LAST_ROW or len(before) != MECH4_FIRST_ROW - 1 or changed != MECH4_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH4_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH4_EDITED_LINES)}: {sorted(changed)}")
+    for spec in MECH4_AMENDMENTS.values():
+        check_row229_amendment(before[spec["line"] - 1], lines[spec["line"] - 1], spec)
+    return lines
+
+
+def check_row229_amendment(before: str, after: str, spec: dict) -> None:
+    """``after`` is ``before`` with the CORRECTIONS 273 amendment applied, or a ValueError.
+
+    The question, comparison and scale cells may not change; the result and so-what cells may only gain one appended
+    bracket carrying the mark; the verdict cell is rewritten but must keep the predecessor's verdict verbatim inside a
+    SUPERSEDED bracket; and the ref cell may only gain citations."""
+    old, new = table_cells(before), table_cells(after)
+    changed = [i for i in range(len(old)) if old[i] != new[i]]
+    expected = sorted({*spec["appended_cells"], spec["verdict_cell"], spec["ref_cell"]})
+    if len(old) != 7 or len(new) != 7 or changed != expected:
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the {MECH4_AMENDMENT_TAG} amendment must change exactly cells {expected}")
+    for cell in spec["appended_cells"]:
+        if not new[cell].startswith(old[cell]) or new[cell].count(MECH4_AMENDMENT_MARK) != 1:
+            raise ValueError(f"MASTER-TABLE line {spec['line']} cell {cell}: the amendment must be appended and keep every earlier word")
+        if strip_inserted_brackets(new[cell], MECH4_AMENDMENT_TAG).rstrip() != old[cell].rstrip():
+            raise ValueError(f"MASTER-TABLE line {spec['line']} cell {cell} changed more than the inserted {MECH4_AMENDMENT_TAG} bracket")
+    verdict = new[spec["verdict_cell"]]
+    if verdict.count(MECH4_AMENDMENT_MARK) != 1 or not clean(verdict).startswith(f"[{MECH4_AMENDMENT_MARK[1:]}"):
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the amended verdict must open with the {MECH4_AMENDMENT_TAG} bracket")
+    kept = clean(verdict).replace(" ", "")
+    if "[SUPERSEDED" not in clean(verdict) or clean(old[spec["verdict_cell"]]).replace(" ", "") not in kept:
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the amended verdict must keep the superseded wording verbatim")
+    if spec["branch"] not in clean(strip_inserted_brackets(verdict, MECH4_AMENDMENT_TAG)):
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the amended verdict does not carry {spec['branch']}")
+    if not new[spec["ref_cell"]].startswith(old[spec["ref_cell"]]):
+        raise ValueError(f"MASTER-TABLE line {spec['line']}: the ref cell may only gain citations")
+    for citation in spec["citations"]:
+        if citation not in clean(new[spec["ref_cell"]]):
+            raise ValueError(f"MASTER-TABLE line {spec['line']}: the ref cell does not cite {citation}")
+
+
+def mech4_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the landing and at its ingest; each file's closing trailer is the only line that may go."""
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH4_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH4_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH4_COMMIT[:12]} does not match the pinned bytes")
+    previous = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH4_INGEST_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(previous).hexdigest() != MECH4_INGEST_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH4_INGEST_COMMIT[:12]} does not match the pinned bytes")
+    lines, before = raw.decode("utf-8").splitlines(), previous.decode("utf-8").splitlines()
+    earlier, _ = must_corrections(repo)
+    for name, later, older, entries in [(MECH4_INGEST_COMMIT, before, earlier, MECH4_INGEST_ENTRIES), (MECH4_COMMIT, lines, before, MECH4_ENTRIES)]:
+        if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MUST_TRAILER):
+            raise ValueError(f"{CORRECTIONS_DOC} at {name[:7]} does not append entries below the previous closing trailer")
+        if later[:len(older) - 1] != older[:-1]:
+            changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+            raise ValueError(f"{CORRECTIONS_DOC} at {name[:7]} changed an earlier line: {changed[:8]}")
+        appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+        if [line.split(".")[0] for line in appended] != [f"## {number}" for number in entries]:
+            raise ValueError(f"{CORRECTIONS_DOC} at {name[:7]} does not append exactly entries {entries}: {appended[:4]}")
+    return lines, before
+
+
+def mech4_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 232-235 (cvt10, cwd1, csv1, cwd2) and attach their intervention notes."""
+    return with_interventions(appended_rows(lines, MECH4_ROWS, MECH4_FIRST_ROW, MECH4_LAST_ROW, MECH4_COMMIT), MECH4_INTERVENTIONS)
+
+
+def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
+    """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
+    lines, before = mech4_master_table(repo), must_master_table(repo)
+    mech4_corrections(repo)
+    if {spec["line"] for spec in MECH4_AMENDMENTS.values()} != MECH4_EDITED_LINES - {3}:
+        raise ValueError("Every row amended at CORRECTIONS 273 needs exactly one record amendment")
+    missing = set(MECH4_AMENDMENTS) - {row["id"] for row in rows}
+    if missing:
+        raise ValueError(f"CORRECTIONS 273 amendments name absent records: {sorted(missing)}")
+    amended = []
+    for row in rows:
+        spec = MECH4_AMENDMENTS.get(row["id"])
+        if not spec:
+            amended.append(row)
+            continue
+        line, number = spec["line"], spec["number"]
+        old, new = table_cells(before[line - 1]), table_cells(lines[line - 1])
+        if row["master_table_line"] != str(line):
+            raise ValueError(f"{row['id']} is not the record of MASTER-TABLE line {line}")
+        if row["outcome"] != spec["previous"]:
+            raise ValueError(f"{row['id']} outcome drifted before its CORRECTIONS {number} amendment: {row['outcome']} (expected {spec['previous']})")
+        row = dict(row)
+        # The record's result and scope take the amended cells, superseded wording and all; the verdict is re-read from the
+        # amended cell, with the amendment bracket and the SUPERSEDED bracket dropped before the tokens are split.
+        row["result"] = clean(new[3])
+        row["scope"] = f"{clean(new[2])}. {clean(new[5])}"
+        verdict = clean(strip_inserted_brackets(new[spec["verdict_cell"]], MECH4_AMENDMENT_TAG))
+        verdict = re.sub(r"\s*\[SUPERSEDED.*$", "", verdict)
+        tokens = [token.strip() for token in verdict.split(" + ") if token.strip()]
+        if tokens[0] != spec["branch"]:
+            raise ValueError(f"{row['id']}: the amended verdict does not open with {spec['branch']}")
+        rule = {value: key for key, value in RULE_OUTCOME.items() if value}[spec["outcome"]]
+        row["reason"] = (f"Verdict: {' + '.join(tokens)} {VERDICT_RULES[rule].split(':')[0]}: {spec['branch']}: "
+                         f"{spec['reason']} The predecessor's verdict, kept verbatim: {clean(old[spec['verdict_cell']])}.")
+        row["mapping_rule"] = rule
+        row["outcome"] = spec["outcome"]
+        sources = json.loads(row.get("sources") or "[]")
+        # The anchor that pinned the row's text at the MUST-tier landing now points at the amended row, and the citations
+        # the amendment added to the ref cell join the record's sources.
+        sources = [source | {"rowText": lines[line - 1]} if isinstance(source, dict) and source.get("rowText") == before[line - 1] else source for source in sources]
+        added = [clean(part) for part in split_references(new[spec["ref_cell"]]) if clean(part) not in sources
+                 and re.search(r"\b(?:CORRECTIONS|FINDINGS|CLOSEOUT)\b|[\w/]+\.(?:py|sh|md)", part)]
+        row["sources"] = json.dumps([*sources, *added, f"{CORRECTIONS_DOC} [CORRECTIONS {number}]"], ensure_ascii=False)
+        further = json.loads(row.get("further_amendments") or "[]")
+        further.append({"number": number, "line": line, "commit": MECH4_COMMIT, "previousOutcome": spec["previous"], "outcome": spec["outcome"],
+                        "reason": spec["reason"], "source": f"{MASTER_TABLE} line {line} at {MECH4_COMMIT[:7]}; CORRECTIONS {number}"})
+        row["further_amendments"] = json.dumps(further, ensure_ascii=False)
+        amended.append(row)
+    return amended
+
 def amended_master_table(repo: Path) -> list[str]:
     """MASTER-TABLE at the amendment commit; only the listed lines may differ from the appended-rows pin."""
     raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{AMENDMENT_COMMIT}:{MASTER_TABLE}"])
@@ -1830,9 +2168,11 @@ def load_register(workspace: Path, repo: Path) -> list[dict]:
     The cvt4 / cvt5 landing (CORRECTIONS 240-241) amended no row; CORRECTIONS 244 then amended rows 222 and 223 in place.
     The cvt6 / cvt7 landing (CORRECTIONS 246-247) amended no row either (only line 5, which feeds no record), nor did the
     cvt8 / cvt9 landing (CORRECTIONS 252-253); its final audit (CORRECTIONS 253.15) then corrected row 227 in place.
-    The four MUST-tier landings (CORRECTIONS 264-266) amended no row and did not touch line 5 either."""
+    The four MUST-tier landings (CORRECTIONS 264-266) amended no row and did not touch line 5 either. The cvt10 / cwd1 /
+    csv1 / cwd2 landing (CORRECTIONS 270-273) then amended row 229 in place, which moves MT229's outcome."""
     register = apply_cgn3_amendments(apply_row_amendments(load_unamended_register(workspace, repo), Path(repo)), Path(repo))
-    return apply_cvt89_amendments(apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo)), Path(repo))
+    register = apply_cvt89_amendments(apply_c244_amendments(apply_cvt23_amendments(register, Path(repo)), Path(repo)), Path(repo))
+    return apply_mech4_amendments(register, Path(repo))
 
 
 def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
@@ -1847,7 +2187,7 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + landed_rows(landed_master_table(Path(repo))) + cgn3_rows(cgn3_master_table(Path(repo)))
              + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo)))
              + cvt67_rows(cvt67_master_table(Path(repo))) + cvt89_rows(cvt89_master_table(Path(repo)))
-             + must_rows(must_master_table(Path(repo))))
+             + must_rows(must_master_table(Path(repo))) + mech4_rows(mech4_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

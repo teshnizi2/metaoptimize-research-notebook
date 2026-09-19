@@ -61,7 +61,7 @@ test('the published register is fully represented in the general review', async 
   const data = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8')) as ResearchData;
   const rows = areaOutcomeCounts(data.experiments, data.areas);
   assert.equal(rows.length, 10);
-  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 150);
+  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 154);
   assert.equal(rows.reduce((sum, row) => sum + row.methodChecks, 0), 18);
   for (const row of rows) {
     assert.equal(Object.values(row.counts).reduce((sum, count) => sum + count, 0), row.total);
@@ -69,7 +69,7 @@ test('the published register is fully represented in the general review', async 
   }
   const audit = rows.find(row => row.label === 'Count-matched partition audit')!;
   assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [34, { success: 12, fail: 5, mixed: 4, unresolved: 13 }, 3]);
-  // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1); line 218 (cvt1, Mixed) is a sixth mechanism row, line 219 (cgn3, Goal met) a seventh, lines 220-221 (cvt3, cvt2, both Mixed) the eighth and ninth, lines 222-223 (cvt4, cvt5, both Goal met) the tenth and eleventh, lines 224-225 (cvt6 Mixed, cvt7 Goal met) the twelfth and thirteenth, and lines 226-227 (cvt8, cvt9, both Mixed) the fourteenth and fifteenth, and lines 228-231 (cmo1 Mixed, cst1 Open, cct1 Goal met, cmg1 Mixed) the sixteenth to nineteenth.
-  assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [54, { success: 17, fail: 12, mixed: 16, unresolved: 9 }]);
+  // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1); line 218 (cvt1, Mixed) is a sixth mechanism row, line 219 (cgn3, Goal met) a seventh, lines 220-221 (cvt3, cvt2, both Mixed) the eighth and ninth, lines 222-223 (cvt4, cvt5, both Goal met) the tenth and eleventh, lines 224-225 (cvt6 Mixed, cvt7 Goal met) the twelfth and thirteenth, and lines 226-227 (cvt8, cvt9, both Mixed) the fourteenth and fifteenth, and lines 228-231 (cmo1 Mixed, cst1 Mixed since CORRECTIONS 273, cct1 Goal met, cmg1 Mixed) the sixteenth to nineteenth, and lines 232-235 (cvt10, cwd1, csv1, cwd2, all four Goal met) the twentieth to twenty-third.
+  assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [58, { success: 21, fail: 12, mixed: 17, unresolved: 8 }]);
   assert.deepEqual([rows.find(row => row.label === 'Baseline comparisons')!.total, rows.find(row => row.label === 'Baseline comparisons')!.counts], [8, { success: 7, fail: 1, mixed: 0, unresolved: 0 }], 'MT019 moved from Open to Goal met at CORRECTIONS 229');
 });

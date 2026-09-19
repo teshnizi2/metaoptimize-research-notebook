@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""l262_envaudit.py <prefix> <runsdir> -- CORRECTIONS 262: RULE 20's SEPARATE ENV / witness half for `csv1`.
+
+A copy of ~/l260_envaudit.py (sha 53e4cf28d6ab55629fca393e8c305f5e92ef1fe8f49b99d44f19c013869e3a7a, CORRECTIONS
+260/261) with TWO changes and nothing else:
+  (1) the batch table is `csv1`'s, re-typed from the REGISTERED scorer analysis/cSV1_shadowvote_score.py
+      (f62dbf9e...), which is NOT imported and NOT edited (RULE 16);
+  (2) `SHADOW_VOTE` is added to KINDS -- it is csv1's NEW witness kind (262: first letter S, not in V/B/G/C/R/W/D).
+
+A kind registered as None must print NO line (it is not in that batch's lineage: csv1 runs from cvt9's tree +
+PATCH_SHADOWVOTE, which has no GROUP_HOLD / REST_HOLD / DECAY_MASK).  Every other kind must print exactly ONE line
+equal to the arm's registered witness.  G-FOREIGN half: any line beginning with a witness prefix that is not the
+arm's registered one is a violation, and the `foreign` counter below also reports any OTHER known intervention
+prefix seen anywhere in the file.
+
+READ-ONLY.  For each <prefix>-<arm>-s<seed>-<jobid>.out it looks ONLY at lines that start with `NODE=`, `ENV:`,
+`PROBE_TENSOR:` or one of the eight witness prefixes; no accuracy number is touched.
+"""
+import os, re, sys, glob, collections
+
+WS = "/cluster/account_b/metaopt"
+COMMON = {"AUGMENT": "1", "BETA_CLIP": "-15:-2.3026", "HIER": "none", "LAM": "na",
+          "ETA_RATIO": "na", "COS_TOTAL": "default", "COS_WARMUP": "default",
+          "SCHED": "none", "SCHED_TOTAL": "none", "SCHED_WARMUP": "none",
+          "SCHED_MIN": "none", "PROBE": "100", "EB_RHO": "na", "EB_LOG": "0"}
+KINDS = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK", "SHADOW_VOTE")
+
+# ---- csv1's registered witness literals (CORRECTIONS 262; cSV1_shadowvote_score.py WITNESS_SV / WITNESS_VW /
+#      WITNESS_OFF), re-typed here, not imported ------------------------------------------------------------------
+_SV_OFF = "SHADOW_VOTE: off"
+_SV_INERT = ("SHADOW_VOTE: on type=scalar base=SGDm vote=shadow applied=shared floor=na "
+             "items=50:layer4.1.bn2.weight:numel=512")
+_SV_SHADOWLOW = ("SHADOW_VOTE: on type=scalar base=SGDm vote=shadow applied=floor floor=-15.0 "
+                 "items=50:layer4.1.bn2.weight:numel=512")
+_SV_NAIVELOW = ("SHADOW_VOTE: on type=scalar base=SGDm vote=natural applied=floor floor=-15.0 "
+                "items=50:layer4.1.bn2.weight:numel=512")
+_VW_OFF = "VOTE_W: off"
+_VW_MUTE = "VOTE_W: on type=scalar items=50:layer4.1.bn2.weight:w=0.0:group=0:groupsize=53"
+
+
+def _wit(sv, vw):
+    return {"VOTE_W": vw, "BETA_HOLD": "BETA_HOLD: off", "GROUP_HOLD": None, "REST_HOLD": None,
+            "COMP_HOLD": "COMP_HOLD: off", "WINDOW_HOLD": "WINDOW_HOLD: off", "DECAY_MASK": None,
+            "SHADOW_VOTE": sv}
+
+
+BATCH = {
+    'csv1': {
+        'arms': ['k01', 'INERT', 'SHADOWLOW', 'NAIVELOW', 'MUTE', 'HEAD'],
+        'seeds_of': {'k01': [136, 137, 138], 'INERT': [136], 'SHADOWLOW': [136, 137, 138, 139],
+                     'NAIVELOW': [136, 137, 138, 139], 'MUTE': [136, 137, 138], 'HEAD': [136, 137, 138]},
+        'ntens': 53,
+        'pt': {'k01': 'scalar', 'INERT': 'scalar', 'SHADOWLOW': 'scalar', 'NAIVELOW': 'scalar',
+               'MUTE': 'scalar', 'HEAD': 'blockwise'},
+        'wit': {'k01': _wit(_SV_OFF, _VW_OFF),
+                'INERT': _wit(_SV_INERT, _VW_OFF),
+                'SHADOWLOW': _wit(_SV_SHADOWLOW, _VW_OFF),
+                'NAIVELOW': _wit(_SV_NAIVELOW, _VW_OFF),
+                'MUTE': _wit(_SV_OFF, _VW_MUTE),
+                'HEAD': _wit(_SV_OFF, _VW_OFF)},
+    },
+}
+
+
+def main():
+    prefix, runsdir = sys.argv[1], sys.argv[2]
+    b = BATCH[prefix]
+    pat = re.compile(r"^%s-(%s)-s(\d+)-(\d+)\.out$" % (prefix, "|".join(b["arms"])))
+    found = collections.defaultdict(list)
+    for p in sorted(glob.glob(os.path.join(runsdir, prefix + "-*.out"))):
+        m = pat.match(os.path.basename(p))
+        if m:
+            found[(m.group(1), int(m.group(2)))].append((m.group(3), p))
+        else:
+            print("  NOTE unrecognised file %s" % os.path.basename(p))
+    bad = 0
+    distinct = collections.Counter()
+    pt_seen = collections.Counter()
+    seen = dict((k, collections.Counter()) for k in KINDS)
+    n_pt_missing = 0
+    for key in sorted(found):
+        arm, seed = key
+        if seed not in b["seeds_of"][arm]:
+            print("  VIOLATION %s-s%d is not a registered (arm, seed) of %s" % (arm, seed, prefix))
+            bad += 1
+            continue
+        if len(found[key]) > 1:
+            print("  NOTE %d .out files for %s-s%d" % (len(found[key]), arm, seed))
+        for jid, p in found[key]:
+            rn = "%s-%s-s%d" % (prefix, arm, seed)
+            node, env, pt = [], [], []
+            wl = dict((k, []) for k in KINDS)
+            with open(p, errors="replace") as fh:
+                for ln in fh:
+                    if ln.startswith("NODE="):
+                        node.append(ln.rstrip("\n"))
+                    elif ln.startswith("ENV:"):
+                        env.append(ln.rstrip("\n"))
+                    elif ln.startswith("PROBE_TENSOR:"):
+                        pt.append(ln.rstrip("\n"))
+                    else:
+                        for k in KINDS:
+                            if ln.startswith(k):
+                                wl[k].append(ln.rstrip("\n"))
+            errs = []
+            if len(env) != 1:
+                errs.append("%d ENV lines" % len(env))
+            else:
+                toks = env[0][len("ENV:"):].split()
+                kv = dict(t.split("=", 1) for t in toks if "=" in t)
+                want = dict(COMMON)
+                want["PROBE_DIR"] = "%s/runs/%s/probe_%s" % (WS, prefix, rn)
+                if len(toks) != len(kv) or set(kv) != set(want):
+                    errs.append("ENV keys %s differ from the runner's 15" % sorted(set(kv) ^ set(want)))
+                for k, w in want.items():
+                    if kv.get(k) != w:
+                        errs.append("ENV %s=%s want %s" % (k, kv.get(k), w))
+                distinct[re.sub(r" PROBE_DIR=\S+", "", env[0])] += 1
+            for k in KINDS:
+                w = b["wit"][arm][k]
+                want_l = [] if w is None else [w]
+                if wl[k] != want_l:
+                    errs.append("%s lines %r want %r" % (k, [x[:160] for x in wl[k]], want_l))
+                elif w is not None:
+                    seen[k][w] += 1
+            if len(node) != 1:
+                errs.append("%d NODE lines" % len(node))
+            else:
+                mm = re.match(r"^NODE=(\S+) \| JOB=(\S+) (\d+) \| AUGMENT=(\S+)$", node[0])
+                if not mm:
+                    errs.append("NODE header unparseable")
+                elif (mm.group(2), mm.group(3), mm.group(4)) != (rn, jid, "1"):
+                    errs.append("NODE header JOB=%s %s AUGMENT=%s, want %s %s 1" % (mm.group(2), mm.group(3), mm.group(4), rn, jid))
+            if not pt:
+                n_pt_missing += 1
+            else:
+                if len(pt) != 1:
+                    errs.append("%d PROBE_TENSOR lines" % len(pt))
+                s = pt[0]
+                ty = re.search(r"\btype=(\S+)", s)
+                nt = re.search(r"\btensors=(\d+)", s)
+                wty = b["pt"][arm]
+                if not ty or ty.group(1) != wty:
+                    errs.append("PROBE_TENSOR type=%s want %s" % (ty.group(1) if ty else None, wty))
+                if not nt or int(nt.group(1)) != b["ntens"]:
+                    errs.append("PROBE_TENSOR tensors=%s want %d" % (nt.group(1) if nt else None, b["ntens"]))
+                if ("dir=%s/runs/%s/probe_%s" % (WS, prefix, rn)) not in s:
+                    errs.append("PROBE_TENSOR dir is not the run's own probe dir")
+                pt_seen[re.sub(r" dir=.*", "", s)] += 1
+            if errs:
+                bad += 1
+                print("  VIOLATION %s: %s" % (os.path.basename(p), "; ".join(errs)))
+    n_exp = sum(len(v) for v in b["seeds_of"].values())
+    n = len(found)
+    print("  distinct ENV lines (PROBE_DIR stripped): %d" % len(distinct))
+    for line, c in distinct.items():
+        print("    x%d  %s" % (c, line))
+    print("  distinct PROBE_TENSOR lines (dir stripped): %d  (%d started runs have none yet)" % (len(pt_seen), n_pt_missing))
+    for line, c in sorted(pt_seen.items()):
+        print("    x%d  %s" % (c, line))
+    for k in KINDS:
+        if seen[k]:
+            print("  %s witness lines (exact match to the arm's registered line):" % k)
+            for line, c in sorted(seen[k].items()):
+                print("    x%d  %s" % (c, line[:200]))
+    if len(distinct) > 1:
+        bad += 1
+        print("  VIOLATION more than one distinct ENV line")
+    print("  coverage %d/%d runs with an .out, %d violations" % (n, n_exp, bad))
+    verdict = "FAIL" if bad else ("PASS" if n == n_exp and n_pt_missing == 0 else "UNVERIFIED (%d/%d present, %d without PROBE_TENSOR yet)" % (n, n_exp, n_pt_missing))
+    print("ENV AUDIT VERDICT %s: %s" % (prefix, verdict))
+    sys.exit(1 if bad else 0)
+
+
+main()

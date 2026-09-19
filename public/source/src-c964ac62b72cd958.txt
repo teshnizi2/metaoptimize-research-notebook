@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+# =============================================================================
+# csv1_attack_indep.py -- THE INDEPENDENT ATTACK PARSER OF `csv1` (CORRECTIONS 262).
+#
+# WHAT IT IS.  A second, independent implementation of EVERY line the FROZEN REGISTERED SCORER
+# analysis/cSV1_shadowvote_score.py (sha256 f62dbf9e8d099572ffb2794e4e3c2bf32d38284cb364e22bc3c2c88ddd4e16c0)
+# prints on the landed `csv1` batch.  It imports NO repo module -- not cSV1_shadowvote_score, not
+# cVT9_dosewindow_score, not corpus_exclusions, not csv1_registration_derivations: STDLIB ONLY, and not
+# even the stdlib `csv` reader for the corpus.  It also uses NO REGULAR EXPRESSION anywhere (the `re`
+# module is never imported); every line is tokenised by hand, so a shared regex cannot make the two
+# implementations agree by accident.
+#
+# It rebuilds, from scratch:
+#   * the 53-tensor PlainNet18_c100 parameter list, GENERATED from the ResNet-18 architecture with the
+#     nine shortcut tensors removed (block widths 64/128/256/512, two BasicBlocks each, 100-way linear
+#     head) -- not copied from the manifest it then checks;
+#   * PARTITION-MANIFEST.txt, byte for byte, from that list plus the registered design constants, with
+#     FLOOR_ALPHA and B0 re-derived through float32 round-trips of exp(-15) and log(1e-6);
+#   * every run's epoch curve from the RAW `.out` (the CSV `plateau` column is BANNED): plateau5 = mean
+#     TEST of epochs 95..99, train5 the same on TRAIN, tail slope = OLS of TEST over epochs 80..99;
+#   * G-ARGS / G-ENV / G-SVW / G-VOTEW / G-HOLDOFF / G-STRUCT / G-PROV, each re-derived from the raw files;
+#   * G-BITE: the Lion recompute on every group of every record of every run, the z_agg re-summation from
+#     z_tensor under each arm's own weights and grouping, the foreign-key scan, and the PATCH_SHADOWVOTE
+#     record audit (sv_n == step + 2, mode/idx, a_shared == exp(beta_pre), a_applied, sv_z_vote ==
+#     z_tensor[50], dapp/dref, the INERT identity, the physical applied-step check and the trace ordering);
+#   * the in-batch sigma, the SEs, the registered vote share, every contrast, every bar, the branch, the
+#     stamp list and FINAL;
+#   * the descriptive probe readout (peak / pin / share windows / trace medians) and the descriptive
+#     epoch table with its four "stays > 2 pp" onsets;
+#   * the corpus disclosure line, through its own CSV reader and its own exclusions-TSV reader.
+# Then it prints a REPLICA of the scorer's whole output and diffs it, line by line, against the scorer's
+# committed stdout.
+#
+#     python3 analysis/csv1_attack_indep.py <runsdir> --csv <all_runs.csv> --tsv <CORPUS-EXCLUSIONS.tsv> \
+#             [--scorer-out results/csv1_shadowvote_score_cluster_b.txt] \
+#             [--scorer-out results/csv1_shadowvote_score_mac.txt] \
+#             [--scorer-file analysis/cSV1_shadowvote_score.py]
+#
+# Exit 0 iff VIOLATIONS 0.
+#
+# BYTE-IDENTICAL ON BOTH HOSTS.  Absolute paths appear ONLY on the HOSTPATH lines printed after the body,
+# and the replica writes the scorer's two path lines as `<RUNSDIR>/...`; the comparison against a scorer
+# stdout normalises that stdout the same way.  The replica's own arithmetic is made host-stable by using
+# math.fsum for every mean it prints, so the body does not depend on whether the host's CPython `sum()`
+# is compensated (3.12+) or naive (<= 3.11).  ONE PRINTED CELL OF THE SCORER IS SENSITIVE TO EXACTLY THAT
+# DIFFERENCE -- see HOST-ROUNDING TIES below; the parser detects such cells from the RAW two-decimal
+# `.out` values, reports them by name, and does NOT count them as violations, because they are a display
+# tie in a DESCRIPTIVE, non-gating line and no gate, bar, contrast, stamp or FINAL token reads them.
+#
+# THE CORPUS COMMIT ITS CORPUS-DEPENDENT LINES USE.  Exactly one printed line of the scorer reads the
+# corpus -- the `corpus: N rows after corpus_exclusions.filter_rows, csv1- excluded` DISCLOSURE line (no
+# bar, sigma, branch or stamp reads it; O2).  This parser re-derives it from
+#     results/all_runs.csv          sha256 1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a  (3,127 rows)
+#     results/CORPUS-EXCLUSIONS.tsv sha256 ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191
+# which are those two files AT REPO COMMIT ca435b6b7d4ee7ad2ba53c2cf6fbb0f7e6eb3ff2 -- `csv1`'s OWN
+# REGISTRATION COMMIT (short `ca435b6b`, the value PROVENANCE.txt carries as REGISTERED_COMMIT), the
+# corpus the frozen SIGMA_PRIOR literal was derived from.  It CHECKS both shas and names the commit in
+# the body.  On a checkout past a later ingest the two files must be materialised with
+#     git show ca435b6b:results/all_runs.csv   /   git show ca435b6b:results/CORPUS-EXCLUSIONS.tsv
+# and passed in.  The parser ALSO re-derives the disclosure count for any other corpus it is given and
+# reports it outside the body, so a scorer stdout produced against a later corpus is explained rather
+# than silently mismatched.
+#
+# DEFINITIONS RE-TYPED FROM CORRECTIONS 262.4 / 262.5 / 262.6 (not imported):
+#   Lion meta update, per group:  L = b2*mom_pre + (1-b2)*z_agg, b2 = 0.9
+#                                 beta = clip(beta_pre - ms*sign(L), -15, -2.3026), ms = 1e-3
+#                                 a tie is |L| <= 1e-12*(|b2*mom_pre| + |(1-b2)*z_agg|); ties are skipped
+#                                 a group fails when |beta_recomputed - beta| > 1e-5
+#   plateau5 = mean TEST over epochs 95..99 of the run's OWN .out;  train5 the same on TRAIN
+#   FROZEN BARS (O2): GAP_MIN 20.0, K01_MAX 20.0, MATCH 5.0, NULL 2.0, INERT 2.0, RESCUE 10.0,
+#                     DIVERGED 5.0, FLOOR_MIN 15.0, CEIL_MAX 90.0, CHANCE 1.0
+#   SHARE: DOM_WIN epochs [16, 36), DOM_K01_MIN 0.30, DOM_FRAC 0.50
+#   G-BITE tolerances: BH_TOL 1e-5, TIE_REL 1e-12, SV_REL 1e-5, INERT_REL 1e-6, RATIO_REL 1e-3,
+#                      DREF_MIN 1e-3, DW_LOW_MAX 0.05, DW_INERT_REL 0.05, TRACE_FRAC 0.90,
+#                      TRACE_FACTOR 2.0, ZAGG_REL 1e-4
+#   SIGMA_PRIOR (frozen floor) 0.6811983409351905;  SIGMA_USED = max(floor, in-batch)
+#   BRANCH (first match wins): UNRESOLVED-DIVERGED -> SCALAR-NOT-COLLAPSED (k01 > 20)
+#       -> CONTROL-FAILED (HEAD - k01 < 20) -> INERT-DEPARTED (|INERT - k01| at s136 > 2)
+#       -> NAIVELOW AT-K01: APPLIED-STEP-NOT-NECESSARY | NAIVELOW BETWEEN: NAIVE-PARTIAL
+#       -> SHADOWLOW AT-K01: VOTE-ROUTE-SUFFICES | not dominant: SHADOW-VOTE-NOT-DOMINANT
+#       -> SHADOWLOW AT-HEAD: APPLIED-STEP-NECESSARY | else BOTH-ROUTES
+#   STATES: AT-HEAD iff L >= HEAD - 5;  AT-K01 iff L <= k01 + 2;  else BETWEEN
+#
+# WHAT IS "DERIVED" AND WHAT IS "STATIC".  Every line the parser emits is classified.  A DERIVED line is
+# one whose content depends on the batch's own files (a level, a gate verdict, a contrast, a stamp, the
+# manifest comparison, the corpus count).  A STATIC line is registered prose or a fixed banner (the
+# header, the licence table, the "does not license" block), re-typed here from CORRECTIONS 262 and the
+# registered LICENSE table; the parser compares it but does not claim to have derived it.  Both counts
+# are printed.
+# =============================================================================
+import argparse
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+from decimal import Decimal
+
+# ---- design constants, re-typed from CORRECTIONS 262 (NOT imported) --------------------------------
+PREFIX = "csv1"
+NET = "PlainNet18_c100"
+PARENT = "ResNet18_c100"
+DSET = "CIFAR100"
+EPOCHS = 100
+BATCH = 100
+SEEDS = (136, 137, 138, 139)
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+A0 = "1e-6"
+AUG = "1"
+PROBE = 100
+ARMS = ("k01", "INERT", "SHADOWLOW", "NAIVELOW", "MUTE", "HEAD")
+SEEDS_OF = {"k01": (136, 137, 138), "INERT": (136,), "SHADOWLOW": (136, 137, 138, 139),
+            "NAIVELOW": (136, 137, 138, 139), "MUTE": (136, 137, 138), "HEAD": (136, 137, 138)}
+RUNS = tuple((a, s) for s in SEEDS for a in ARMS if s in SEEDS_OF[a])
+N_JOBS = 18
+SV_ARMS = ("INERT", "SHADOWLOW", "NAIVELOW")
+LOW_ARMS = ("SHADOWLOW", "NAIVELOW")
+INERT_SEED = 136
+HEADSPEC = "sets:1-49,51-53/layer4.1.bn2.weight"
+SPEC = dict((a, HEADSPEC if a == "HEAD" else "scalar") for a in ARMS)
+PT_TYPE = dict((a, "scalar" if SPEC[a] == "scalar" else "blockwise") for a in ARMS)
+IDX_HEAD = 50
+NAME_HEAD = "layer4.1.bn2.weight"
+MS = 1e-3
+B2 = 0.9
+LO, HI = -15.0, -2.3026
+NTENS = 53
+TOTPAR = 11046308
+PARENT_NTENS = 62
+N_BATCHNORM = 17
+STEPS_PER_EPOCH = 50000 // BATCH
+N_RECORDS = EPOCHS * STEPS_PER_EPOCH // PROBE
+
+MODE = {"INERT": ("shadow", "shared"), "SHADOWLOW": ("shadow", "floor"), "NAIVELOW": ("natural", "floor")}
+
+POST_SHA = "e65e67738e45418045ccc7f737fb0ea5b2523a9294a4c3a288e543e95508a18b"
+HF_POST_SHA = "fc9bfb878afe3ded17f8e8475f31bb6811ee5fc25c8e11d189e299f761a61774"
+RUNNER_SHA = "60ac417bd4811a2a8132a8f74470a14265fd03c31d8c161c9bf7dfb0d1103c5d"
+SCORER_SHA = "f62dbf9e8d099572ffb2794e4e3c2bf32d38284cb364e22bc3c2c88ddd4e16c0"
+REG_CORPUS_SHA256 = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+REG_EXCL_SHA256 = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+REG_COMMIT = "ca435b6b"
+
+GAP_MIN = 20.0
+K01_MAX = 20.0
+RESCUE_BAR = 10.0
+NULL_BAR = 2.0
+MATCH_BAR = 5.0
+DIVERGED_BAR = 5.0
+INERT_BAR = 2.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+TIE_REL = 1e-12
+SV_REL = 1e-5
+INERT_REL = 1e-6
+RATIO_REL = 1e-3
+DREF_MIN = 1e-3
+DW_LOW_MAX = 0.05
+DW_INERT_REL = 0.05
+TRACE_FRAC = 0.90
+TRACE_FACTOR = 2.0
+ZAGG_REL = 1e-4
+DOM_WIN = (16.0, 36.0)
+DOM_K01_MIN = 0.30
+DOM_FRAC = 0.50
+SIGMA_PRIOR = 0.6811983409351905
+
+R_BETWEEN = (("cvt1", (("k01", 11.9493), ("MUTE", 10.9860), ("HEAD", 64.7940))),
+             ("cvt4", (("k01", 11.6947), ("HEAD", 64.7347), ("HOLDLOW(HEAD grouping, 50 floor, vote out)", 65.4607))),
+             ("cvt9", (("k01", 12.1347), ("LOWHEADPATH", 65.2080))))
+
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na "
+                "COS_TOTAL=default COS_WARMUP=default SCHED=none SCHED_TOTAL=none "
+                "SCHED_WARMUP=none SCHED_MIN=none PROBE=100 EB_RHO=na EB_LOG=0")
+
+SV_LIST_KEYS = ("sv_a_shared", "sv_a_applied", "sv_z_vote", "sv_z_other", "sv_dw", "sv_dref", "sv_dapp",
+                "sv_hv_norm", "sv_ho_norm")
+SV_KEYS = ("sv_n", "sv_vote", "sv_applied", "sv_idx") + SV_LIST_KEYS
+FOREIGN_PREFIXES = ("bh_", "ch_", "wh_")
+
+
+# ---- float32 round-trips, re-derived (no numpy) ----------------------------------------------------
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+B0 = f32(math.log(1e-6))
+FLOOR_ALPHA = f32(math.exp(f32(LO)))
+
+
+# ---- host-stable arithmetic ------------------------------------------------------------------------
+def mean(v):
+    v = list(v)
+    return math.fsum(v) / len(v) if v else None
+
+
+def sd(v):
+    v = list(v)
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(math.fsum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def median(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+# =============================================================================
+# 1.  THE PARAMETER LIST, GENERATED (not read from the manifest it then checks)
+# =============================================================================
+def r18_tensors(plain):
+    t = [("conv1.weight", 64 * 3 * 9, "Conv2d"), ("bn1.weight", 64, "BatchNorm2d"), ("bn1.bias", 64, "BatchNorm2d")]
+    inp = 64
+    for li, w in enumerate((64, 128, 256, 512), 1):
+        for b in (0, 1):
+            stride = 2 if (li > 1 and b == 0) else 1
+            cin = inp if b == 0 else w
+            pre = "layer%d.%d." % (li, b)
+            t += [(pre + "conv1.weight", w * cin * 9, "Conv2d"), (pre + "bn1.weight", w, "BatchNorm2d"),
+                  (pre + "bn1.bias", w, "BatchNorm2d"), (pre + "conv2.weight", w * w * 9, "Conv2d"),
+                  (pre + "bn2.weight", w, "BatchNorm2d"), (pre + "bn2.bias", w, "BatchNorm2d")]
+            if not plain and (stride != 1 or cin != w):
+                t += [(pre + "shortcut.0.weight", w * cin, "Conv2d"), (pre + "shortcut.1.weight", w, "BatchNorm2d"),
+                      (pre + "shortcut.1.bias", w, "BatchNorm2d")]
+        inp = w
+    return t + [("linear.weight", 512 * 100, "Linear"), ("linear.bias", 100, "Linear")]
+
+
+TENS = r18_tensors(True)
+NAMES = [n for n, _q, _o in TENS]
+NUMEL = [q for _n, q, _o in TENS]
+SHORTCUT_9 = tuple("layer%d.0.shortcut.%s" % (s, k) for s in (2, 3, 4) for k in ("0.weight", "1.weight", "1.bias"))
+BN512 = [(i + 1, NAMES[i]) for i in range(len(NAMES))
+         if TENS[i][2] == "BatchNorm2d" and TENS[i][1] == 512 and NAMES[i].endswith(".weight")]
+
+
+def parse_sets_nore(spec, names):
+    """`sets:` parser written WITHOUT regex: hand tokenisation only."""
+    assert spec.startswith("sets:"), spec
+    out = []
+    for grp in spec[5:].split("/"):
+        idx = []
+        for tok in grp.split(","):
+            if tok and "-" in tok and all(p.isdigit() and p for p in tok.split("-")) and len(tok.split("-")) == 2:
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif tok.isdigit():
+                idx.append(int(tok))
+            else:
+                idx.append(names.index(tok) + 1)
+        out.append(sorted(idx))
+    return out
+
+
+def arm_groups(arm, names=None):
+    names = names or NAMES
+    if SPEC[arm] == "scalar":
+        return [list(range(1, len(names) + 1))]
+    return parse_sets_nore(SPEC[arm], names)
+
+
+def shadowvote_of(arm):
+    if arm not in MODE:
+        return ""
+    return "%s:%s:%s" % (MODE[arm][0], MODE[arm][1], NAME_HEAD)
+
+
+def voteweight_of(arm):
+    return "%s:0" % NAME_HEAD if arm == "MUTE" else ""
+
+
+def witness_sv_of(arm):
+    if arm not in MODE:
+        return "SHADOW_VOTE: off"
+    vote, applied = MODE[arm]
+    return ("SHADOW_VOTE: on type=scalar base=SGDm vote=%s applied=%s floor=%s items=%d:%s:numel=512"
+            % (vote, applied, ("%r" % LO) if applied == "floor" else "na", IDX_HEAD, NAME_HEAD))
+
+
+def witness_vw_of(arm):
+    if arm != "MUTE":
+        return "VOTE_W: off"
+    return "VOTE_W: on type=scalar items=%d:%s:w=0.0:group=0:groupsize=53" % (IDX_HEAD, NAME_HEAD)
+
+
+SHADOWVOTE = dict((a, shadowvote_of(a)) for a in ARMS)
+VOTEW = dict((a, voteweight_of(a)) for a in ARMS)
+WITNESS_SV = dict((a, witness_sv_of(a)) for a in ARMS)
+WITNESS_VW = dict((a, witness_vw_of(a)) for a in ARMS)
+WITNESS_OFF = ("BETA_HOLD: off", "COMP_HOLD: off", "WINDOW_HOLD: off")
+
+
+def manifest_text():
+    lines = ["NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(TENS), "TOTAL_PARAMS %d" % sum(NUMEL),
+             "NORM BatchNorm2d %d GroupNorm 0" % N_BATCHNORM, "PARENT %s %d" % (PARENT, PARENT_NTENS),
+             "PARENT_REMOVED %s" % " ".join(SHORTCUT_9),
+             "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS, "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH)]
+    for i, (n, q, o) in enumerate(TENS, 1):
+        lines.append("TENSOR %d %s %d %s" % (i, n, q, o))
+    lines.append("W512 %s" % ",".join("%d:%s" % x for x in BN512))
+    lines.append("SHADOW B0 %r LO %r FLOOR_ALPHA %r IDX %d NAME %s" % (B0, LO, FLOOR_ALPHA, IDX_HEAD, NAME_HEAD))
+    for a in ARMS:
+        g = arm_groups(a)
+        if SPEC[a] == "scalar":
+            lines.append("ARMSPEC %s SPEC scalar TYPE scalar M 1" % a)
+        else:
+            lines.append("ARMSPEC %s SPEC %s TYPE blockwise M %d SIZES %s PARAMS %s GROUP1 %s"
+                         % (a, SPEC[a], len(g), ",".join(str(len(x)) for x in g),
+                            ",".join(str(sum(NUMEL[i - 1] for i in x)) for x in g),
+                            " ".join(NAMES[i - 1] for i in g[1])))
+        lines.append("SEEDS %s %s" % (a, ",".join(str(s) for s in SEEDS_OF[a])))
+        lines.append("SHADOWVOTE %s %s" % (a, SHADOWVOTE[a] or "off"))
+        lines.append("VOTEW %s %s" % (a, VOTEW[a] or "off"))
+        lines.append("SVWITNESS %s %s" % (a, WITNESS_SV[a]))
+        lines.append("VWWITNESS %s %s" % (a, WITNESS_VW[a]))
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
+# 2.  THE RAW .out READER -- no regex, and the CSV `plateau` column is NEVER read
+# =============================================================================
+def _num(tok):
+    """float() of a token, tolerating a trailing '%' or ','."""
+    t = tok.strip().rstrip("%").rstrip(",")
+    return float(t)
+
+
+def parse_epoch_line(ln):
+    """`Epoch 17, Train Accuracy: 12.34 %, Test Accuracy: 11.11 %` -> (n, train, test, train_txt, test_txt)."""
+    if not ln.startswith("Epoch "):
+        return None
+    try:
+        head, rest = ln.split(",", 1)
+        n = int(head[len("Epoch "):].strip())
+        if "Train Accuracy:" not in rest or "Test Accuracy:" not in rest:
+            return None
+        a = rest.split("Train Accuracy:", 1)[1]
+        tr_txt = a.split(",", 1)[0].strip().rstrip("%").strip()
+        b = rest.split("Test Accuracy:", 1)[1]
+        te_txt = b.split(",", 1)[0].strip().rstrip("%").strip()
+        return n, float(tr_txt), float(te_txt), tr_txt, te_txt
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def strip_probe_dir(env_line):
+    """drop ` PROBE_DIR=<token>` by hand (the scorer uses a regex; this does not)."""
+    out = []
+    for t in env_line.split(" "):
+        if t.startswith("PROBE_DIR="):
+            continue
+        out.append(t)
+    return " ".join(out)
+
+
+def parse_run(path):
+    with open(path, errors="replace") as fh:
+        txt = fh.read()
+    lines = txt.splitlines()
+    eps, eps_txt = {}, {}
+    for ln in lines:
+        p = parse_epoch_line(ln)
+        if p:
+            eps[p[0]] = (p[1], p[2])
+            eps_txt[p[0]] = (p[3], p[4])
+    rec = {"eps": eps, "eps_txt": eps_txt, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "vw": [ln for ln in lines if ln.startswith("VOTE_W")],
+           "sv": [ln for ln in lines if ln.startswith("SHADOW_VOTE")],
+           "bh": [ln for ln in lines if ln.startswith("BETA_HOLD")],
+           "ch": [ln for ln in lines if ln.startswith("COMP_HOLD")],
+           "wh": [ln for ln in lines if ln.startswith("WINDOW_HOLD")],
+           "plateau5": None, "train5": None}
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"]
+                       and not rec["traceback"] and rec["plateau5"] is not None)
+    return rec
+
+
+def out_name_parts(fn):
+    """`csv1-ARM-sSEED-JOB.out` -> (arm, seed, job) with NO regex."""
+    if not fn.startswith(PREFIX + "-") or not fn.endswith(".out"):
+        return None
+    core = fn[len(PREFIX) + 1:-4]
+    bits = core.rsplit("-", 1)
+    if len(bits) != 2 or not bits[1].isdigit():
+        return None
+    job = bits[1]
+    bits2 = bits[0].rsplit("-s", 1)
+    if len(bits2) != 2 or not bits2[1].isdigit():
+        return None
+    arm, seed = bits2[0], int(bits2[1])
+    if arm not in ARMS:
+        return None
+    return arm, seed, job
+
+
+def read_runs(runsdir):
+    runs = {}
+    for fn in sorted(os.listdir(runsdir)):
+        p = out_name_parts(fn)
+        if not p:
+            continue
+        arm, seed, _job = p
+        if seed not in SEEDS_OF[arm]:
+            continue
+        runs[(arm, seed)] = parse_run(os.path.join(runsdir, fn))
+    return runs
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = math.fsum((x - mx) ** 2 for x in xs)
+    return math.fsum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# 3.  PROBE RECORDS, G-BITE AND THE SHADOW_VOTE AUDIT
+# =============================================================================
+def load_probe(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            with open(p, errors="replace") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        r = json.loads(ln)
+                    except ValueError:
+                        recs.append(None)
+                        continue
+                    recs.append(r if isinstance(r, dict) else None)
+            return recs
+    return None
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    a, b = B2 * mom_pre, (1 - B2) * z
+    L = a + b
+    tie = abs(L) <= TIE_REL * (abs(a) + abs(b))
+    s = (L > 0) - (L < 0)
+    return max(LO, min(HI, beta_pre - MS * s)), tie
+
+
+def _groupvec(r, key, ng):
+    v = r.get(key)
+    if not (isinstance(v, list) and len(v) == 1 and isinstance(v[0], list) and len(v[0]) == ng):
+        return None
+    return [float(x) for x in v[0]]
+
+
+def _close(a, b, rel, absol=1e-30):
+    return abs(a - b) <= rel * max(abs(a), abs(b)) + absol
+
+
+def zagg_expected(arm, zt):
+    W = {IDX_HEAD - 1: 0.0} if arm == "MUTE" else {}
+    return [math.fsum(W.get(i - 1, 1.0) * zt[i - 1] for i in g) for g in arm_groups(arm)]
+
+
+def sv_audit(arm, recs):
+    vote, applied = MODE[arm]
+    d = {"sv_bad_keys": 0, "sv_bad_n": 0, "sv_bad_mode": 0, "sv_bad_ashared": 0, "sv_bad_aapplied": 0,
+         "sv_bad_zvote": 0, "sv_bad_ratio": 0, "sv_bad_inert": 0, "sv_phys_records": 0, "sv_bad_phys": 0,
+         "sv_trace_records": 0, "sv_trace_ok": 0, "sv_trace_reversed": 0, "sv_worst_zvote": 0.0}
+    for k, r in enumerate(recs):
+        if not isinstance(r, dict):
+            d["sv_bad_keys"] += 1
+            continue
+        try:
+            s = int(r["step"])
+            if any(key not in r for key in SV_KEYS) or any(
+                    not (isinstance(r[key], list) and len(r[key]) == 1) for key in SV_LIST_KEYS + ("sv_idx",)):
+                d["sv_bad_keys"] += 1
+                continue
+            a_sh, a_ap = float(r["sv_a_shared"][0]), float(r["sv_a_applied"][0])
+            zv, zo = float(r["sv_z_vote"][0]), float(r["sv_z_other"][0])
+            dw, dref, dapp = float(r["sv_dw"][0]), float(r["sv_dref"][0]), float(r["sv_dapp"][0])
+            hv, ho = float(r["sv_hv_norm"][0]), float(r["sv_ho_norm"][0])
+            bpre = float(r["beta_pre"][0][0])
+            zt50 = float(r["z_tensor"][IDX_HEAD - 1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            d["sv_bad_keys"] += 1
+            continue
+        vals = [a_sh, a_ap, zv, zo, dw, dref, dapp, hv, ho, bpre, zt50]
+        if not all(math.isfinite(x) for x in vals):
+            d["sv_bad_keys"] += 1
+            continue
+        d["sv_bad_n"] += int(r["sv_n"]) != s + 2
+        d["sv_bad_mode"] += not (r["sv_vote"] == vote and r["sv_applied"] == applied and r["sv_idx"] == [IDX_HEAD])
+        d["sv_bad_ashared"] += not _close(a_sh, math.exp(bpre), SV_REL)
+        if applied == "floor":
+            d["sv_bad_aapplied"] += not _close(a_ap, FLOOR_ALPHA, INERT_REL)
+        else:
+            d["sv_bad_aapplied"] += a_ap != a_sh
+        ez = abs(zv - zt50) / (max(abs(zv), abs(zt50)) + 1e-30)
+        d["sv_worst_zvote"] = max(d["sv_worst_zvote"], ez if (zv or zt50) else 0.0)
+        d["sv_bad_zvote"] += not _close(zv, zt50, SV_REL)
+        if dref > 0:
+            d["sv_bad_ratio"] += not _close(dapp / dref, a_ap / a_sh, RATIO_REL)
+        else:
+            d["sv_bad_ratio"] += 1
+        if applied == "shared":
+            d["sv_bad_inert"] += not (_close(zo, zv, INERT_REL) and _close(ho, hv, INERT_REL)
+                                      and _close(dapp, dref, INERT_REL))
+        if dref >= DREF_MIN:
+            d["sv_phys_records"] += 1
+            if applied == "floor":
+                d["sv_bad_phys"] += dw > DW_LOW_MAX * dref
+            else:
+                d["sv_bad_phys"] += abs(dw - dref) > DW_INERT_REL * dref
+        if k >= 1 and applied == "floor":
+            d["sv_trace_records"] += 1
+            big, small = (hv, ho) if vote == "shadow" else (ho, hv)
+            d["sv_trace_ok"] += big >= small
+            d["sv_trace_reversed"] += small >= TRACE_FACTOR * big
+    ok = (d["sv_bad_keys"] == 0 and d["sv_bad_n"] == 0 and d["sv_bad_mode"] == 0 and d["sv_bad_ashared"] == 0
+          and d["sv_bad_aapplied"] == 0 and d["sv_bad_zvote"] == 0 and d["sv_bad_ratio"] == 0
+          and d["sv_bad_inert"] == 0 and d["sv_bad_phys"] == 0)
+    if applied == "floor":
+        ok = (ok and d["sv_trace_records"] > 0 and d["sv_trace_ok"] >= TRACE_FRAC * d["sv_trace_records"]
+              and d["sv_trace_reversed"] == 0)
+    return ok, d
+
+
+def bite_check(arm, recs):
+    ng = len(arm_groups(arm))
+    d = {"n": 0, "nonfinite": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0, "bad_zagg": 0,
+         "keys_on_control": 0, "foreign_keys": 0, "worst_lion": 0.0, "worst_zagg": 0.0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) \
+                or len(r["beta"]) != ng or not isinstance(r.get("z_tensor"), list) or len(r["z_tensor"]) != NTENS:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre = _groupvec(r, "beta_pre", ng)
+            mom = _groupvec(r, "mom_pre", ng)
+            z = _groupvec(r, "z_agg", ng)
+            zt = [float(x) for x in r["z_tensor"]]
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z + zt):
+            d["nonfinite"] += 1
+            continue
+        if r["step"] != PROBE * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        for g in range(ng):
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst_lion"] = max(d["worst_lion"], e)
+            d["bad_lion"] += e > BH_TOL
+        tot = math.fsum(abs(x) for x in zt) + 1e-30
+        ez = max(abs(p - q) for p, q in zip(zagg_expected(arm, zt), z)) / tot
+        d["worst_zagg"] = max(d["worst_zagg"], ez)
+        d["bad_zagg"] += ez > ZAGG_REL
+        has_sv = any(key.startswith("sv_") for key in r)
+        d["foreign_keys"] += any(key.startswith(FOREIGN_PREFIXES) for key in r)
+        if arm not in SV_ARMS:
+            d["keys_on_control"] += has_sv
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS
+          and d["bad_step"] == 0 and d["bad_lion"] == 0 and d["bad_zagg"] == 0 and d["keys_on_control"] == 0
+          and d["foreign_keys"] == 0)
+    if arm in SV_ARMS:
+        ok2, d2 = sv_audit(arm, recs)
+        d.update(d2)
+        ok = ok and ok2
+    return ok, d
+
+
+def vote_share(recs, win=DOM_WIN):
+    v = []
+    for r in recs or []:
+        if not isinstance(r, dict) or not isinstance(r.get("z_tensor"), list) or len(r["z_tensor"]) != NTENS:
+            continue
+        ep = r.get("step", -1) / float(STEPS_PER_EPOCH)
+        if not (win[0] <= ep < win[1]):
+            continue
+        try:
+            zt = [abs(float(x)) for x in r["z_tensor"]]
+        except (TypeError, ValueError):
+            continue
+        tot = math.fsum(zt)
+        if tot > 0 and math.isfinite(tot):
+            v.append(zt[IDX_HEAD - 1] / tot)
+    return median(v)
+
+
+def beta_summary(recs, coord=0):
+    vals = []
+    for r in recs:
+        if isinstance(r, dict) and isinstance(r.get("beta"), list) and len(r["beta"]) > coord \
+                and isinstance(r.get("step"), int):
+            try:
+                v = float(r["beta"][coord])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v):
+                vals.append((r["step"], v))
+    if not vals:
+        return None
+    pk = max(vals, key=lambda sv: sv[1])
+    pin = None
+    for i in range(len(vals)):
+        if all(v <= LO + 0.01 for _s, v in vals[i:]):
+            pin = vals[i][0] / float(STEPS_PER_EPOCH)
+            break
+    return {"peak": pk[1], "peak_epoch": pk[0] / float(STEPS_PER_EPOCH), "pin": pin}
+
+
+# =============================================================================
+# 4.  THE CORPUS -- own CSV reader, own TSV reader (corpus_exclusions is NOT imported)
+# =============================================================================
+def read_csv_rows(path):
+    """a minimal RFC4180 reader written here; the `csv` module is not used."""
+    with open(path, newline="", errors="replace") as fh:
+        text = fh.read()
+    rows, field, row, inq, i, n = [], [], [], False, 0, len(text)
+    while i < n:
+        c = text[i]
+        if inq:
+            if c == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    field.append('"')
+                    i += 2
+                    continue
+                inq = False
+                i += 1
+                continue
+            field.append(c)
+            i += 1
+            continue
+        if c == '"':
+            inq = True
+            i += 1
+            continue
+        if c == ",":
+            row.append("".join(field))
+            field = []
+            i += 1
+            continue
+        if c == "\r":
+            i += 1
+            continue
+        if c == "\n":
+            row.append("".join(field))
+            rows.append(row)
+            field, row = [], []
+            i += 1
+            continue
+        field.append(c)
+        i += 1
+    if field or row:
+        row.append("".join(field))
+        rows.append(row)
+    if not rows:
+        return []
+    head = rows[0]
+    out = []
+    for r in rows[1:]:
+        if len(r) == 1 and r[0] == "":
+            continue
+        d = dict(zip(head, r))
+        out.append(d)
+    return out
+
+
+def read_excl_keys(path):
+    keys = set()
+    with open(path, errors="replace") as fh:
+        lines = [ln.rstrip("\n") for ln in fh if ln.strip() and not ln.startswith("#")]
+    head = lines[0].split("\t")
+    for ln in lines[1:]:
+        f = ln.split("\t")
+        if len(f) != len(head):
+            raise ValueError("bad arity in exclusions TSV")
+        d = dict(zip(head, f))
+        keys.add((d["run"], d["job_id"]))
+    return keys
+
+
+def corpus_disclosure(csvpath, tsvpath):
+    rows = read_csv_rows(csvpath)
+    rows = [r for r in rows if not (r.get("run") or "").startswith(PREFIX + "-")]
+    keys = read_excl_keys(tsvpath)
+    kept = [r for r in rows if (r.get("run"), r.get("job_id")) not in keys]
+    return len(rows), len(kept)
+
+
+# =============================================================================
+# 5.  THE BRANCH MAP
+# =============================================================================
+def state(L, M):
+    if L >= M["HEAD"] - MATCH_BAR:
+        return "AT-HEAD"
+    if L <= M["k01"] + NULL_BAR:
+        return "AT-K01"
+    return "BETWEEN"
+
+
+def decide(M, diverged, inert_gap, dominant):
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M["HEAD"] - M["k01"] < GAP_MIN:
+        return "CONTROL-FAILED"
+    if abs(inert_gap) > INERT_BAR:
+        return "INERT-DEPARTED"
+    sn, ss = state(M["NAIVELOW"], M), state(M["SHADOWLOW"], M)
+    if sn == "AT-K01":
+        return "APPLIED-STEP-NOT-NECESSARY"
+    if sn == "BETWEEN":
+        return "NAIVE-PARTIAL"
+    if ss == "AT-K01":
+        return "VOTE-ROUTE-SUFFICES"
+    if not dominant:
+        return "SHADOW-VOTE-NOT-DOMINANT"
+    if ss == "AT-HEAD":
+        return "APPLIED-STEP-NECESSARY"
+    return "BOTH-ROUTES"
+
+
+# ---- the registered licence text, RE-TYPED from CORRECTIONS 262.2 / 262.6 and the registered table.
+#      These are STATIC lines: the parser compares them, it does not claim to derive them. -----------
+READING = "the L2 sufficiency line (240 OWN-STEP-MAGNITUDE, 246 GRADED, 253 DOSE-GRADED) and 230's MUTE"
+NOT_UNMODIFIED = ("the shadow vote is COUNTERFACTUAL -- 50's term built at the shared step size from its REAL momentum and "
+                  "weights, which follow the floor path -- so nothing here is a statement about unmodified MetaOptimize's own "
+                  "vote.")
+LICENSE = {
+    "BOTH-ROUTES": [
+        "NAIVELOW keeps HEAD's level while SHADOWLOW sits BETWEEN, with the shadow term dominant by the registered share",
+        "criterion: 50's shadow vote alone costs a PARTIAL loss (read P_VOTE), and a large applied step on 50 is NECESSARY",
+        "for the full stall at this cell (holding it at the floor keeps SHADOWLOW above the k01 location).  EFFECT ON",
+        READING + ": both routes carry part of the damage.  Not licensed: an additive decomposition; a dose above the",
+        "floor; " + NOT_UNMODIFIED],
+}
+TAIL_BLOCK = [
+    "  * Anything about unmodified MetaOptimize's own vote: the shadow term is counterfactual (50's state follows the floor).",
+    "  * Any 'small' step other than the clamp floor from init; any dose, window or trajectory shape.",
+    "  * ResNet18_c100, VGG, GroupNorm, any other tensor set (N2 is the ResNet version), any other cell or horizon.",
+    "  * That 50's vote is irrelevant: MUTE (230) removes it and the stall stays.",
+    "  * Point agreement at k01 (floor readings are locations).",
+]
+
+
+# =============================================================================
+# 6.  THE REPLICA
+# =============================================================================
+class Replica(object):
+    def __init__(self):
+        self.lines = []
+        self.kind = []
+
+    def d(self, s):
+        self.lines.append(s)
+        self.kind.append("D")
+
+    def s(self, s):
+        self.lines.append(s)
+        self.kind.append("S")
+
+
+def build_replica(runsdir, csvpath, tsvpath):
+    R = Replica()
+    runs = read_runs(runsdir)
+    missing = [(a, s) for a, s in RUNS if (a, s) not in runs or not runs[(a, s)]["complete"]]
+
+    R.s("=" * 78)
+    R.s(" csv1 -- N1: IS A LARGE APPLIED STEP ON idx 50 NECESSARY FOR THE STALL, WITH ITS VOTE KEPT?  (PATCH_SHADOWVOTE)")
+    R.s(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+        % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        R.s("   %-10s %-38s SHADOW_VOTE %-40s VOTE_W %-24s seeds %s"
+            % (a, SPEC[a], SHADOWVOTE[a] or "(unset)", VOTEW[a] or "(unset)",
+               ",".join(str(s) for s in SEEDS_OF[a])))
+    R.s(" CO-PRIMARY: P_VOTE = NAIVELOW - SHADOWLOW; P_APPLIED = SHADOWLOW - k01.")
+    R.s(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)."
+        % (EPOCHS - 5, EPOCHS - 1))
+    R.s("=" * 78)
+
+    nraw, nkept = corpus_disclosure(csvpath, tsvpath)
+    R.d("corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- no bar, sigma, "
+        "branch or stamp reads it)" % (nkept, PREFIX))
+
+    R.s("")
+    R.s("COMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (N_JOBS, EPOCHS - 1))
+    for a, s in RUNS:
+        r = runs.get((a, s))
+        ok = r is not None and r["complete"]
+        R.d("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+            "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+            % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+    if missing:
+        R.d("")
+        R.d("FINAL: INCOMPLETE | %d/%d | missing %s"
+            % (N_JOBS - len(missing), N_JOBS, ",".join("%s-s%d" % m for m in missing)))
+        R.s("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return R, None, {}, runs
+
+    R.s("")
+    R.s("G-ARGS    every run's OWN ARGS line says what its file name registers")
+    for a, s in RUNS:
+        r = runs[(a, s)]
+        f = parse_args_line(r["args"][0])
+        dup = [k for k, v in f.items() if len(v) > 1]
+        want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                "momentum-param-base": "0.99", "weight-decay-base": "0.1", "momentum-param-meta": "0.99",
+                "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+        bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+        ok = (len(r["args"]) == 1) and not dup and not bad
+        R.d("  %-4s G-ARGS %s-s%d" % ("PASS" if ok else "FAIL", a, s))
+
+    R.s("")
+    R.s("G-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(strip_probe_dir(ln) for r in runs.values() for ln in r["env"]))
+    ok1 = len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values())
+    R.d("  %-4s G-ENV one distinct ENV line, one per run   %d distinct" % ("PASS" if ok1 else "FAIL", len(envs)))
+    for ln in envs:
+        R.d("        %s" % ln)
+    R.d("  %-4s G-ENV the ENV line is cvt1's / cvt4's / cvt6's / cvt9's, byte for byte (PROBE_DIR stripped)"
+        % ("PASS" if envs == [ENV_EXPECTED] else "FAIL"))
+    badpt = []
+    for (a, s), r in sorted(runs.items()):
+        good = False
+        if len(r["pt"]) == 1:
+            ln = r["pt"][0]
+            head = "PROBE_TENSOR: on every=%d type=" % PROBE
+            if ln.startswith(head):
+                ty = ln[len(head):].split(" ", 1)[0]
+                rest = ln[len(head):]
+                good = (ty == PT_TYPE[a]) and (" tensors=%d " % NTENS) in (" " + rest)
+        if not good:
+            badpt.append((a, s))
+    R.d("  %-4s G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`   %d runs"
+        % ("PASS" if not badpt else "FAIL", PROBE, NTENS, len(runs)))
+
+    R.s("")
+    R.s("G-SVW / G-VOTEW / G-HOLDOFF   one line of each kind per run == the arm's registered witness")
+    for a, s in RUNS:
+        r = runs[(a, s)]
+        R.d("  %-4s G-SVW %s-s%d" % ("PASS" if r["sv"] == [WITNESS_SV[a]] else "FAIL", a, s))
+        R.d("  %-4s G-VOTEW %s-s%d" % ("PASS" if r["vw"] == [WITNESS_VW[a]] else "FAIL", a, s))
+        okh = (r["bh"] == [WITNESS_OFF[0]] and r["ch"] == [WITNESS_OFF[1]] and r["wh"] == [WITNESS_OFF[2]])
+        R.d("  %-4s G-HOLDOFF %s-s%d BETA_HOLD / COMP_HOLD / WINDOW_HOLD: off, once each"
+            % ("PASS" if okh else "FAIL", a, s))
+
+    R.s("")
+    R.s("G-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp = os.path.join(runsdir, PREFIX, "PARTITION-MANIFEST.txt")
+    txt = open(mp).read()
+    want = manifest_text()
+    R.d("  manifest: <RUNSDIR>/csv1/PARTITION-MANIFEST.txt (<runsdir>/csv1/)")
+    R.d("  %-4s G-STRUCT byte-identical to synthetic_manifest_text() (53 tensors, HEAD [52,1], the SHADOW_VOTE / "
+        "VOTE_W tables)   %d vs %d bytes" % ("PASS" if txt == want else "FAIL", len(txt), len(want)))
+
+    R.s("")
+    R.s("G-PROV    PROVENANCE.txt")
+    pp = os.path.join(runsdir, PREFIX, "PROVENANCE.txt")
+    prov = {}
+    for ln in open(pp):
+        p = ln.split()
+        if len(p) >= 2:
+            prov.setdefault(p[0], " ".join(p[1:]))
+    R.d("  provenance: <RUNSDIR>/csv1/PROVENANCE.txt (<runsdir>/csv1/)")
+    R.d("  %-4s G-PROV MODE submit   submit" % ("PASS" if prov.get("MODE") == "submit" else "FAIL"))
+    R.d("  %-4s G-PROV build_network.py sha256 == POST_SHA %s...   %s"
+        % ("PASS" if prov.get("BUILD_NETWORK_SHA256") == POST_SHA else "FAIL", POST_SHA[:12],
+           str(prov.get("BUILD_NETWORK_SHA256"))[:16]))
+    R.d("  %-4s G-PROV HF.py sha256 == HF_POST_SHA %s... (csv1's PATCH_SHADOWVOTE tree)   %s"
+        % ("PASS" if prov.get("HF_SHA256") == HF_POST_SHA else "FAIL", HF_POST_SHA[:12],
+           str(prov.get("HF_SHA256"))[:16]))
+    R.d("  %-4s G-PROV RUNNER_SHA256 == csv1's runner %s...   %s"
+        % ("PASS" if prov.get("RUNNER_SHA256") == RUNNER_SHA else "FAIL", RUNNER_SHA[:12],
+           str(prov.get("RUNNER_SHA256"))[:16]))
+    R.d("  %-4s G-PROV SCORER_SHA256 == this scorer's sha256 %s...   %s"
+        % ("PASS" if prov.get("SCORER_SHA256") == SCORER_SHA else "FAIL", SCORER_SHA[:12],
+           str(prov.get("SCORER_SHA256"))[:16]))
+
+    R.s("")
+    R.s("LEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS_OF[a]]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS_OF[a]]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [tail_slope(runs[(a, s)]["eps"]) for s in SEEDS_OF[a]]
+        R.d("  %-10s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep   (n %d)"
+            % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl), len(v)))
+        R.d("               seeds: %s"
+            % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS_OF[a], v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    R.s("")
+    R.s("G-FLOOR / G-CEIL")
+    R.d("  %-4s G-FLOOR max arm mean >= %.2f pp (chance %.2f)   max %.4f"
+        % ("PASS" if hi >= FLOOR_MIN else "FAIL", FLOOR_MIN, CHANCE, hi))
+    R.d("  %-4s G-CEIL max arm mean <= %.2f pp   max %.4f" % ("PASS" if hi <= CEIL_MAX else "FAIL", CEIL_MAX, hi))
+
+    R.s("")
+    R.s("G-BITE    Lion on every arm; z_agg == the arm's sum of z_tensor; the SHADOW_VOTE audit on INERT / SHADOWLOW / NAIVELOW")
+    R.s("  (a) 500 records; (b) beta == Lion recomputed (tol %.0e) on every group of every arm; (c) z_agg == sum_i w_i z_tensor_i" % BH_TOL)
+    R.s("  (MUTE w_50 = 0; HEAD grouped); (d) no sv_ key on k01 / MUTE / HEAD, no bh_ / ch_ / wh_ key anywhere; (e) sv_* audit:")
+    R.s("  sv_n, mode, a_shared == exp(beta_pre), a_applied, sv_z_vote == z_tensor[50], dapp/dref, INERT identity, the physical")
+    R.s("  step on records with ||dref|| >= %.0e, and the trace ordering (>= on %.0f %% of records, never reversed x%.0f) on the LOW arms."
+        % (DREF_MIN, 100 * TRACE_FRAC, TRACE_FACTOR))
+    nonfin, phys, detail = {}, {}, {}
+    for a, s in RUNS:
+        recs = load_probe(runsdir, a, s)
+        ok, d = bite_check(a, recs)
+        detail[(a, s)] = d
+        nonfin[(a, s)] = d["nonfinite"]
+        phys[(a, s)] = d.get("sv_phys_records")
+        sv = ""
+        if a in SV_ARMS and "sv_bad_keys" in d:
+            sv = ("  sv: keys %d n %d mode %d a_sh %d a_ap %d zvote %d (worst %.1e) ratio %d inert %d phys %d/%d trace %d/%d"
+                  % (d["sv_bad_keys"], d["sv_bad_n"], d["sv_bad_mode"], d["sv_bad_ashared"], d["sv_bad_aapplied"],
+                     d["sv_bad_zvote"], d["sv_worst_zvote"], d["sv_bad_ratio"], d["sv_bad_inert"], d["sv_bad_phys"],
+                     d["sv_phys_records"], d["sv_trace_ok"], d["sv_trace_records"])
+                  + " reversed %d" % d["sv_trace_reversed"])
+        R.d("  %-4s G-BITE %-10s s%d  records %s  bad %d  nonfinite %d  lion-mismatch %d (ties %d, worst %.1e)  "
+            "zagg %d (worst %.1e)  keys-on-control %d  foreign %d%s%s"
+            % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), d["bad_rec"], d["nonfinite"],
+               d["bad_lion"], d["ties"], d["worst_lion"], d["bad_zagg"], d["worst_zagg"], d["keys_on_control"],
+               d["foreign_keys"], sv, ("  (%s)" % d["why"]) if "why" in d else ""))
+
+    R.s("")
+    R.s("SIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = math.fsum(math.fsum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS if len(arm_v[a]) > 1)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which = "SIGMA_PRIOR_frozen" if SIGMA_PRIOR >= sigma_in else "SIGMA_INBATCH"
+    sigma_used = max(SIGMA_PRIOR, sigma_in)
+    R.d("  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR))
+    R.d("  %-20s %.6f" % ("SIGMA_INBATCH", sigma_in))
+    R.d("  SIGMA_USED           %.6f  (= %s; df_inbatch %d)" % (sigma_used, which, df))
+    R.d("  SE(3 vs 3) %.6f ; SE(4 vs 4) %.6f ; SE(4 vs 3) %.6f"
+        % (sigma_used * math.sqrt(2 / 3.0), sigma_used * math.sqrt(0.5), sigma_used * math.sqrt(1 / 4.0 + 1 / 3.0)))
+
+    R.s("")
+    R.s("VOTE SHARE (registered): median over records in epochs [%.0f, %.0f) of |z_tensor[50]| / sum |z_tensor|" % DOM_WIN)
+    share = {}
+    for a in ARMS:
+        per = [vote_share(load_probe(runsdir, a, s)) for s in SEEDS_OF[a]]
+        share[a] = median([x for x in per if x is not None])
+        R.d("  %-10s arm median %s   runs %s" % (a, fmt(share[a], 4), " / ".join(fmt(x, 4) for x in per)))
+    dominant = (share["k01"] is not None and share["SHADOWLOW"] is not None and share["k01"] >= DOM_K01_MIN
+                and share["SHADOWLOW"] >= DOM_FRAC * share["k01"])
+    R.d("  DOMINANT iff share(k01) >= %.2f and share(SHADOWLOW) >= %.2f x share(k01):  %s"
+        % (DOM_K01_MIN, DOM_FRAC, dominant))
+
+    inert_gap = runs[("INERT", INERT_SEED)]["plateau5"] - runs[("k01", INERT_SEED)]["plateau5"]
+    R.s("")
+    R.d("INERT     INERT-s%d - k01-s%d = %+.4f pp  (bar |gap| <= %.1f)" % (INERT_SEED, INERT_SEED, inert_gap, INERT_BAR))
+
+    R.s("")
+    R.s("CONTRASTS (every one WITHIN batch)")
+
+    def se(x, y):
+        return sigma_used * math.sqrt(1.0 / len(arm_v[x]) + 1.0 / len(arm_v[y]))
+
+    CP = {}
+    for nm, (x, y) in (("P_VOTE", ("NAIVELOW", "SHADOWLOW")), ("P_APPLIED", ("SHADOWLOW", "k01"))):
+        CP[nm] = (M[x] - M[y], T[x] - T[y])
+        R.d("  PRIMARY  %-9s = %-9s - %-9s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+            % (nm, x, y, CP[nm][0], CP[nm][0] / se(x, y), CP[nm][1]))
+    for nm, x in (("D_HEAD", "HEAD"), ("P_NAIVE", "NAIVELOW"), ("P_MUTE", "MUTE")):
+        R.d("  KEY      %-9s = %-9s - k01       = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+            % (nm, x, M[x] - M["k01"], (M[x] - M["k01"]) / se(x, "k01"), T[x] - T["k01"]))
+    R.d("  KEY      P_INERT   = INERT-s136 - k01-s136 = %+.4f pp" % inert_gap)
+    I = (M["NAIVELOW"] - M["SHADOWLOW"]) - (M["MUTE"] - M["k01"])
+    R.d("  DESCR    I (2x2 interaction) = (NAIVELOW - SHADOWLOW) - (MUTE - k01) = %+.4f pp" % I)
+    R.d("  bars: GAP_MIN %.1f | MATCH %.1f pp | NULL %.1f pp | INERT %.1f pp | RESCUE %.1f pp (SE 3v3 %.3f)"
+        % (GAP_MIN, MATCH_BAR, NULL_BAR, INERT_BAR, RESCUE_BAR, sigma_used * math.sqrt(2 / 3.0)))
+    R.d("  state bars: AT-HEAD iff L >= %.4f ; AT-K01 iff L <= %.4f" % (M["HEAD"] - MATCH_BAR, M["k01"] + NULL_BAR))
+
+    R.s("")
+    R.s("G-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if len(arm_v[a]) > 1 and max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    R.d("  %s every multi-seed arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR,
+        "" if not div else "  diverged: %s" % div))
+
+    branch = decide(M, bool(div), inert_gap, dominant)
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "SCALAR-GROUPING", "SHADOW-IS-COUNTERFACTUAL",
+              "APPLIED-LOW-IS-FLOOR-FROM-INIT", "ONE-TENSOR-50", "ONE-NETWORK-PLAINNET", "HORIZON-100-ONLY",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    stamps.append("POSITIVE-CONTROL-REPRODUCES" if M["HEAD"] - M["k01"] >= GAP_MIN else "POSITIVE-CONTROL-FAILED")
+    if M["HEAD"] - M["k01"] >= GAP_MIN:
+        for a in ("NAIVELOW", "SHADOWLOW", "MUTE"):
+            stamps.append("%s-%s" % (a, state(M[a], M)))
+    stamps.append("INERT-GAP:%+.2f" % inert_gap)
+    stamps.append("SHARE-K01:%s" % fmt(share["k01"], 3))
+    stamps.append("SHARE-SHADOWLOW:%s" % fmt(share["SHADOWLOW"], 3))
+    stamps.append("SHARE-NAIVELOW:%s" % fmt(share["NAIVELOW"], 3))
+    stamps.append("SHADOW-VOTE-DOMINANT" if dominant else "SHADOW-VOTE-UNDER-SHARE-BAR")
+    stamps.append("PHYS-RECORDS-MIN:%d" % min(phys[(a, s)] or 0 for a, s in RUNS if a in LOW_ARMS))
+    for a in ARMS:
+        if a != "HEAD" and M[a] - M["HEAD"] > MATCH_BAR:
+            stamps.append("%s-ABOVE-HEAD" % a)
+        if a != "k01" and M[a] - M["k01"] < -NULL_BAR:
+            stamps.append("%s-BELOW-K01" % a)
+        if any(nonfin[(a, s)] for s in SEEDS_OF[a]):
+            stamps.append("NONFINITE-%s" % a)
+    if any(abs(M[a] - M["k01"]) <= NULL_BAR for a in ARMS if a != "k01"):
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    agree = all((t > 0) == (p > 0) for p, t in CP.values() if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    R.s("")
+    R.s("=" * 78)
+    R.d(final)
+    R.s("=" * 78)
+
+    R.s("")
+    R.s("BETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any csv1 bar or contrast):")
+    for b, kv in R_BETWEEN:
+        R.s("  %s: %s" % (b, "  ".join("%s %.4f" % x for x in kv)))
+    R.d("  csv1: %s" % "  ".join("%s %.4f" % (a, M[a]) for a in ARMS))
+
+    R.s("")
+    R.s("DESCRIPTIVE, NON-GATING -- the shared (group-0) beta, its pin epoch, 50's vote share, and the two traces")
+    for a, s in RUNS:
+        recs = load_probe(runsdir, a, s)
+        if not recs:
+            continue
+        bs = beta_summary(recs, 0)
+        sh = [vote_share(recs, w) for w in ((0, 16), (16, 36), (36, 100))]
+        extra = ""
+        if a in SV_ARMS:
+            rr = [r for r in recs if isinstance(r, dict) and "sv_z_vote" in r]
+            if rr:
+                rz = median([abs(r["sv_z_vote"][0]) / (abs(r["sv_z_other"][0]) + 1e-30) for r in rr[1:]] or [0.0])
+                rh = median([r["sv_hv_norm"][0] / (r["sv_ho_norm"][0] + 1e-30) for r in rr[1:]] or [0.0])
+                extra = "  |z_vote|/|z_other| med %.3g  ||h_vote||/||h_other|| med %.3g" % (rz, rh)
+        if bs:
+            R.d("  %-10s s%d  beta0 peak %.3f @%.1f  pin %s  share50 [0,16) %s [16,36) %s [36,100) %s%s"
+                % (a, s, bs["peak"], bs["peak_epoch"], "never" if bs["pin"] is None else "%.1f" % bs["pin"],
+                   fmt(sh[0], 3), fmt(sh[1], 3), fmt(sh[2], 3), extra))
+
+    ep_list = (9, 14, 16, 18, 20, 25, 30, 36, 49, 99)
+    R.s("")
+    R.s("DESCRIPTIVE, NON-GATING -- arm-mean TEST (TRAIN) at epoch lines %s" % " / ".join(str(e) for e in ep_list))
+    ties = []
+    for a in ARMS:
+        cells = []
+        for e in ep_list:
+            te = [runs[(a, s)]["eps"][e][1] for s in SEEDS_OF[a] if e in runs[(a, s)]["eps"]]
+            tr = [runs[(a, s)]["eps"][e][0] for s in SEEDS_OF[a] if e in runs[(a, s)]["eps"]]
+            if not te:
+                cells.append("n/a")
+                continue
+            cells.append("%.1f (%.1f)" % (mean(te), mean(tr)))
+            for lab, col in (("TEST", 1), ("TRAIN", 0)):
+                txt = [Decimal(runs[(a, s)]["eps_txt"][e][col]) for s in SEEDS_OF[a] if e in runs[(a, s)]["eps_txt"]]
+                exact = sum(txt) / Decimal(len(txt))
+                if (exact * 20) % 2 == 1:      # exactly halfway between two one-decimal values
+                    ties.append((a, e, lab, str(exact)))
+        R.d("  %-10s %s" % (a, " / ".join(cells)))
+    for x, y in (("NAIVELOW", "SHADOWLOW"), ("HEAD", "SHADOWLOW"), ("HEAD", "NAIVELOW"), ("SHADOWLOW", "k01")):
+        first = None
+        cx = dict((e, mean([runs[(x, s)]["eps"][e][1] for s in SEEDS_OF[x]])) for e in range(EPOCHS))
+        cy = dict((e, mean([runs[(y, s)]["eps"][e][1] for s in SEEDS_OF[y]])) for e in range(EPOCHS))
+        for e in range(EPOCHS):
+            if all(cx[f] - cy[f] > 2.0 for f in range(e, EPOCHS)):
+                first = e
+                break
+        R.d("  first epoch line from which arm-mean TEST %s - %s stays > 2 pp: %s"
+            % (x, y, "never" if first is None else first))
+
+    R.s("")
+    R.s("WHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        R.s("  " + ln)
+    R.s("")
+    R.s("WHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    for ln in TAIL_BLOCK:
+        R.s(ln)
+
+    info = {"M": M, "T": T, "share": share, "dominant": dominant, "inert_gap": inert_gap, "branch": branch,
+            "final": final, "sigma_in": sigma_in, "sigma_used": sigma_used, "CP": CP, "ties": ties,
+            "corpus_raw": nraw, "corpus_kept": nkept, "detail": detail, "arm_v": arm_v, "arm_t": arm_t}
+    return R, final, info, runs
+
+
+# =============================================================================
+# 7.  COMPARISON
+# =============================================================================
+def _cell_tie(g, w):
+    """`12.3 (45.6)` cells that differ by at most one unit in the last printed decimal."""
+    try:
+        gt, gr = g.split(" (")
+        wt, wr = w.split(" (")
+        return (abs(float(gt) - float(wt)) <= 0.1001
+                and abs(float(gr.rstrip(")")) - float(wr.rstrip(")"))) <= 0.1001)
+    except (ValueError, IndexError):
+        return False
+
+
+def normalise_scorer_line(ln):
+    for tag, tail in (("  manifest: ", "PARTITION-MANIFEST.txt (<runsdir>/csv1/)"),
+                      ("  provenance: ", "PROVENANCE.txt (<runsdir>/csv1/)")):
+        if ln.startswith(tag) and ln.endswith(tail):
+            base = "PARTITION-MANIFEST.txt" if "MANIFEST" in tail else "PROVENANCE.txt"
+            return "%s<RUNSDIR>/csv1/%s (<runsdir>/csv1/)" % (tag, base)
+    return ln
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir")
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--tsv", required=True)
+    ap.add_argument("--scorer-out", action="append", default=[])
+    ap.add_argument("--scorer-file", default="")
+    args = ap.parse_args()
+
+    csv_sha = file_sha(args.csv)
+    tsv_sha = file_sha(args.tsv)
+
+    R, final, info, runs = build_replica(args.runsdir, args.csv, args.tsv)
+
+    body = []
+    body.append("=" * 78)
+    body.append("csv1_attack_indep -- INDEPENDENT RE-DERIVATION OF THE REGISTERED SCORER'S OUTPUT (CORRECTIONS 262)")
+    body.append("  no repo import; no regular expression; own CSV and TSV readers; own .out and probe parsers")
+    body.append("  the corpus commit used by the one corpus-dependent line: %s (csv1's OWN registration commit)" % REG_COMMIT)
+    body.append("  results/all_runs.csv          sha256 %s   %s" % (csv_sha, "== REGISTERED" if csv_sha == REG_CORPUS_SHA256 else "!! NOT the registered corpus"))
+    body.append("  results/CORPUS-EXCLUSIONS.tsv sha256 %s   %s" % (tsv_sha, "== REGISTERED" if tsv_sha == REG_EXCL_SHA256 else "!! NOT the registered exclusions"))
+    body.append("  corpus rows read %d, kept after the exclusion keys %d" % (info.get("corpus_raw", 0), info.get("corpus_kept", 0)))
+    if args.scorer_file:
+        sfs = file_sha(args.scorer_file)
+        body.append("  scorer file sha256 %s   %s" % (sfs, "== REGISTERED f62dbf9e..." if sfs == SCORER_SHA else "!! NOT the registered scorer"))
+    body.append("  re-derived FLOOR_ALPHA = float32(exp(float32(-15.0))) = %r ; B0 = float32(log(1e-6)) = %r" % (FLOOR_ALPHA, B0))
+    body.append("  generated parameter list: %d tensors, %d parameters, idx %d = %s (%s, numel %d)"
+                % (len(TENS), sum(NUMEL), IDX_HEAD, NAMES[IDX_HEAD - 1], TENS[IDX_HEAD - 1][2], NUMEL[IDX_HEAD - 1]))
+    body.append("=" * 78)
+    body.append("")
+    body.append("REPLICA OF THE SCORER'S STDOUT (%d lines: %d DERIVED, %d STATIC registered text)"
+                % (len(R.lines), R.kind.count("D"), R.kind.count("S")))
+    body.append("-" * 78)
+    body.extend(R.lines)
+    body.append("-" * 78)
+
+    violations = 0
+    tie_lines = 0
+    for f in args.scorer_out:
+        with open(f, errors="replace") as fh:
+            got = [normalise_scorer_line(ln.rstrip("\n")) for ln in fh]
+        want = R.lines
+        body.append("")
+        body.append("DIFF against %s   (%d lines vs replica %d)" % (os.path.basename(f), len(got), len(want)))
+        n = max(len(got), len(want))
+        bad = 0
+        tied = 0
+        for i in range(n):
+            g = got[i] if i < len(got) else "<absent>"
+            w = want[i] if i < len(want) else "<absent>"
+            if g == w:
+                continue
+            # is this an arm-mean epoch-table line whose only difference is a one-decimal display tie?
+            is_tie = False
+            if w.startswith("  ") and " / " in w and info.get("ties"):
+                arm = w[2:].split(" ", 1)[0]
+                if arm in ARMS and any(t[0] == arm for t in info["ties"]):
+                    gt, wt = g[12:].split(" / "), w[12:].split(" / ")
+                    if len(gt) == len(wt) and g[:12] == w[:12]:
+                        diffs = [k for k in range(len(gt)) if gt[k] != wt[k]]
+                        is_tie = bool(diffs) and all(_cell_tie(gt[k], wt[k]) for k in diffs)
+            if is_tie:
+                tied += 1
+                body.append("  TIE   line %d" % (i + 1))
+                body.append("    scorer : %s" % g)
+                body.append("    replica: %s" % w)
+            else:
+                bad += 1
+                body.append("  DIFF  line %d" % (i + 1))
+                body.append("    scorer : %s" % g)
+                body.append("    replica: %s" % w)
+        body.append("  -> %d differing lines, of which %d are one-decimal DISPLAY TIES in the DESCRIPTIVE epoch table"
+                    % (bad + tied, tied))
+        violations += bad
+        tie_lines += tied
+
+    body.append("")
+    body.append("HOST-ROUNDING TIES FOUND IN THE RAW .out VALUES (exactly halfway between two one-decimal values):")
+    if info.get("ties"):
+        for a, e, lab, ex in info["ties"]:
+            d = Decimal(ex)
+            lo = (d - Decimal("0.05")).quantize(Decimal("0.1"))
+            hi = (d + Decimal("0.05")).quantize(Decimal("0.1"))
+            body.append("  %s epoch line %d %s: exact decimal arm mean %s -- prints %s when the float sum lands on or below"
+                        " the tie (round-half-even) and %s on any upward drift" % (a, e, lab, ex, lo, hi))
+        body.append("  A cell is listed here when the EXACT decimal mean of the run's own two-decimal .out values is exactly")
+        body.append("  halfway between two one-decimal values, so `%.1f` is decided by the last bit of the float sum, which")
+        body.append("  differs between a CPython with a compensated builtin sum() (3.12+) and one without (<= 3.11).")
+        body.append("  These cells are DESCRIPTIVE and NON-GATING: no gate, bar, contrast, share, stamp or FINAL token reads them.")
+    else:
+        body.append("  none")
+
+    body.append("")
+    body.append("VIOLATIONS %d   (display ties reported separately: %d)" % (violations, tie_lines))
+    body.append("FINAL (independently re-derived): %s" % (final or "n/a"))
+
+    out = "\n".join(body)
+    sys.stdout.write(out + "\n")
+    sys.stdout.write("\nHOSTPATH runsdir  %s\n" % os.path.abspath(args.runsdir))
+    sys.stdout.write("HOSTPATH csv      %s\n" % os.path.abspath(args.csv))
+    sys.stdout.write("HOSTPATH tsv      %s\n" % os.path.abspath(args.tsv))
+    sys.stdout.write("BODY sha256 %s\n" % hashlib.sha256((out + "\n").encode("utf-8")).hexdigest())
+    return 0 if violations == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

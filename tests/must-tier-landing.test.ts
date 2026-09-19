@@ -20,6 +20,10 @@ const CMO1_FINAL = ['M9:COLLAPSE-PERSISTS/ISO-RESCUES+W0:COLLAPSE-IS-CONFIG/ISO-
   'ALPHA0-1E-6', 'SIGMA-PRIOR-FROZEN', 'ANCHOR-REPRODUCES', 'M9-K01-AT-ANCHOR', 'W0-K01-LIFTED', 'W0-ISO-AT-REF', 'FLOOR-READINGS-ARE-BOUNDS',
   'TRAIN-AGREES'];
 const CST1_FINAL = ['UNRESOLVED-DECOMPOSITION', 'G-DECOMP k01-s112 -- a GATE, not a branch. The batch has NO verdict and NO licence'];
+// The frozen successor's FINAL, which CORRECTIONS 273 carried into row 229 in place, keeping CST1_FINAL as superseded wording.
+const CST2_FINAL = ['NOMINATION-PARTIAL+ISO-RESCUES+CTL-NULL', 'FLOOR-READINGS-ARE-BOUNDS', 'TRAIN-AGREES', 'DOM_C=0.4727', 'TOP3_C=0.4960',
+  'PINNED-FRAC=0.0000', 'HARNESS-CLEAN', 'SPEC-APPLIED', 'DECOMPOSITION-OK', 'ONE-CELL-MS-3E-4', 'ALPHA0-1E-6-ONLY', 'HORIZON-100-ONLY',
+  'ONE-NETWORK-RESNET18_C100', 'CTL-HAS-A-BIAS-MEMBER', 'NO-LAYERWISE-IN-BATCH', 'NOMINATION-FROM-K01-RECORDS-ONLY', 'SIGMA-PRIOR-FROZEN'];
 const CCT1_FINAL = ['NOT-COLLAPSED+CARRIERS-DO-NOT-DOMINATE', 'RATIO=0.9641', 'DOM_C=0.0000', 'TOP3_C=0.6940', 'KL-DOM_C=0.0000',
   'KL-CARRIERS-DO-NOT-DOMINATE', 'DOM_TOP3=0.0793', 'R_T=0.4770', 'DOWN=1.0000', 'PINNED-FRAC=0.0000', 'MODAL-TOP3={50,53,59}', 'ARGMAX=59',
   'GAP-IN-BATCH=3.2607', 'HARNESS-CLEAN', 'SPEC-APPLIED', 'DECOMPOSITION-OK', 'DATASET-AND-HEAD-CO-VARY', 'ONE-CELL-CIFAR10-MS1E-3',
@@ -30,13 +34,15 @@ const CMG1_FINAL = ['NO-MERGE-HARMS', 'HARNESS-LIVE-UNPATCHED', 'PARTITION-VERIF
   'ACCOUNT-A3-MERGE-HARMLESS'];
 
 test('MT228-MT231 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-4).map(e => e.id), ['MT228', 'MT229', 'MT230', 'MT231'], 'appended after every existing record, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [168, 150, 18, 3181]);
-  assert.deepEqual([CMO1_FINAL.length, CST1_FINAL.length, CCT1_FINAL.length, CMG1_FINAL.length], [18, 2, 22, 19]);
+  assert.deepEqual(data.experiments.slice(164, 168).map(e => e.id), ['MT228', 'MT229', 'MT230', 'MT231'], 'appended in line order, ahead of the next landing');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [172, 154, 18, 3253]);
+  assert.deepEqual([CMO1_FINAL.length, CST1_FINAL.length, CST2_FINAL.length, CCT1_FINAL.length, CMG1_FINAL.length], [18, 2, 17, 22, 19]);
   // Each reason opens with the row's returned branch words, as MT221, MT223, MT226 and MT227 did.
   const cases: [string, string, string[], number, string, string][] = [
     ['MT228', 'cmo1', CMO1_FINAL, 228, 'mixed', 'Mixed'],
-    ['MT229', 'cst1', CST1_FINAL, 229, 'unresolved', 'Open'],
+    // MT229's verdict, outcome and reason were AMENDED IN PLACE by the next landing (CORRECTIONS 273), which carried the
+    // frozen successor registered at CORRECTIONS 268 into the row; tests/mech4-landing.test.ts owns that amendment.
+    ['MT229', 'cst1', CST2_FINAL, 229, 'mixed', 'Mixed'],
     ['MT230', 'cct1', CCT1_FINAL, 230, 'success', 'Goal met'],
     ['MT231', 'cmg1', CMG1_FINAL, 231, 'mixed', 'Mixed'],
   ];
@@ -50,8 +56,10 @@ test('MT228-MT231 carry the outcome the documented rules give them, with every F
     assert.deepEqual([record.figureIds, record.eventIds], [['page-19'], ['phase-10']], id);
     assert.ok(data.activity.find(e => e.id === 'phase-10')!.experimentIds.includes(id));
     assert.ok(record.sourceRefs.some(ref => ref.sourceId === master.id && ref.line === line), `${id} anchors MASTER-TABLE line ${line}`);
-    // The landing amended no row and corrected no registration text, so neither warning kind exists on any of the four.
-    assert.ok(!warningsOf(id).some(w => /-amendment|-registration/.test(w.id)), id);
+    // The landing amended no row and corrected no registration text. The only amendment warning on any of the four is the
+    // one a LATER landing put on MT229 (CORRECTIONS 273), and no record of the four carries a registration warning.
+    assert.ok(!warningsOf(id).some(w => /-registration/.test(w.id)), id);
+    assert.deepEqual(warningsOf(id).filter(w => /-amendment/.test(w.id)).map(w => w.id), id === 'MT229' ? ['warning-MT229-amendment-273'] : [], id);
     assert.ok(!data.warnings.some(w => w.detail.includes(`Referenced source not available`) && w.experimentId === id), `${id} links every source it cites`);
   }
 });
@@ -72,17 +80,19 @@ test('MT228 (cmo1) is Mixed because the weight-decay leg leaves half its questio
   assert.match(record.scope, /no run prints its Epoch 99 line twice \(264\.6 W1\)/);
 });
 
-test('MT229 (cst1) is Open: a gate, not a branch, and nothing in it is a result', () => {
+test('MT229 (cst1) kept the gate it landed with, as superseded wording under its amendment', () => {
   const record = byId.get('MT229')!;
+  // What CORRECTIONS 265 published is still in the row: the registered scorer stopped at a gate and the batch owned nothing.
   assert.match(record.result, /NO NUMBER HERE IS A RESULT\. The registered scorer STOPPED at G-DECOMP on all nine runs and exited 1/);
   assert.match(record.result, /0\.5\*ulp\(beta\)\/ms = 1\.589e-03 at ms 3e-4/);
-  assert.match(record.reason, /^Verdict: UNRESOLVED-DECOMPOSITION \+ G-DECOMP k01-s112/);
-  assert.match(record.reason, /the batch reaches NO branch, owns NO licence sentence and NO number in its row is a result/);
-  assert.match(record.reason, /a FROZEN SUCCESSOR must be REGISTERED BEFORE its output is read/);
   assert.match(record.scope, /NOT licensed: anything\./);
-  // The scorer gate is a reported, unfixed defect (RULE 16), so the record must not read as a scientific refutation.
-  assert.match(record.reason, /reported under RULE 16 and deliberately NOT fixed/);
-  assert.equal(record.outcome, 'unresolved');
+  // The scorer gate is a reported, unfixed defect (RULE 16), so the record must not read as a scientific refutation, and
+  // the predecessor it blocked is still frozen and unedited after the amendment.
+  assert.match(record.result, /reported under RULE 16 and NOT fixed/);
+  assert.match(record.reason, /is UNEDITED and STILL FROZEN under RULE 16/);
+  // The predecessor's verdict is kept verbatim; the current one comes from the frozen successor (tests/mech4-landing.test.ts).
+  assert.match(record.reason, /UNRESOLVED-DECOMPOSITION \+ G-DECOMP k01-s112 -- a GATE, not a branch\. The batch has NO verdict and NO licence/);
+  assert.equal(record.outcome, 'mixed');
 });
 
 test('MT230 (cct1) is Goal met with both registered words returned and neither bar near', () => {
@@ -117,11 +127,12 @@ test('the ARGS-value deviation warning names cmo1 arms, the flags and the exclus
   assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 40d29cf; CORRECTIONS 255, 263 and 264\.$/);
   // Only cmo1 owes one; no other record of this landing gains an exclusion warning of either kind.
   assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation']);
-  for (const id of ['MT229', 'MT230', 'MT231']) assert.deepEqual(warningsOf(id).map(w => w.id), [`warning-${id}-verdict`]);
+  assert.deepEqual(warningsOf('MT229').map(w => w.id), ['warning-MT229-verdict', 'warning-MT229-amendment-273']);
+  for (const id of ['MT230', 'MT231']) assert.deepEqual(warningsOf(id).map(w => w.id), [`warning-${id}-verdict`]);
 });
 
 test('the 54 runs link to MT228-MT231 with sanitized logs; only cmo1 carries 18 ARGS-value marks', () => {
-  assert.equal(runs.length, 3181);
+  assert.equal(runs.length, 3253);
   const batches: [string, string, number, string[], string, string, number][] = [
     ['cmo1', 'MT228', 27, ['108', '109', '110'], 'ResNet18_c100', 'CIFAR100', 18],
     ['cst1', 'MT229', 9, ['112', '113', '114'], 'ResNet18_c100', 'CIFAR100', 0],
@@ -166,7 +177,8 @@ test('the 54 runs link to MT228-MT231 with sanitized logs; only cmo1 carries 18 
     assert.equal(linked.filter(run => run.parameters.argsDeviation).length, deviating, batch);
   }
   // The 108 patch interventions of the earlier landings are untouched by the new kind.
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 108);
+  // The MUST-tier batches ran no patch; the 108 of the earlier landings and the 45 of the next one carry every mark.
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 153);
   assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 18);
   // The arm means of the published plateau5 values reproduce the rows' levels.
   const mean = (batch: string, arm: string) => {

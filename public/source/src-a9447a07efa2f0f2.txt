@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cst2_attack_indep.py -- THE INDEPENDENT ATTACK PARSER OF THE `cst1` SUCCESSOR SCORER (CORRECTIONS 268).
+#
+# WHAT IT IS.  A second, independent implementation of every line the FROZEN SUCCESSOR
+# analysis/cST2_carriervote_score.py (sha 8300f757...) prints on the landed `cst1` batch.  It imports
+# NO repo module -- not cCV0_carrier_vote_core, not cST1, not cST2, not cst2_tol_crosscheck, not
+# corpus_exclusions: stdlib only.  It rebuilds the 62 tensors from the ResNet18_c100 architecture,
+# rebuilds PARTITION-MANIFEST.txt byte for byte, re-derives PROVENANCE, every run line, the ms-aware
+# decomposition counts, every vote statistic, the levels from the RAW `.out`, the beta trajectories,
+# the corpus sigma and anchors through the exclusions TSV, and the branch, licence and FINAL line --
+# then prints a REPLICA of the scorer's output from its `[G-DECOMP]` header to FINAL, so the two can
+# be diffed byte for byte.
+#
+# IT ALSO RE-DERIVES THE TOLERANCE FROM SCRATCH, by a DIFFERENT route than the scorer: the scorer's
+# ulp32() uses math.frexp, this one increments the float32 bit pattern with struct.  Both are checked
+# against each other over the whole BETA_CLIP band.  The claim under test is
+#     |q - sign(L)| <= |float32(ms) - ms|/ms + 0.5*ulp32(beta)/ms,  q = -(beta - beta_pre)/ms
+# together with the bitwise reconstruction beta == float32(beta_pre - float32(ms)*sign(L)), which is
+# what makes the residual attributable to float32 rounding rather than to a wrong applied step.
+#
+#     python3 analysis/cst2_attack_indep.py <runsdir> [--csv <all_runs.csv>] [--tsv <CORPUS-EXCLUSIONS.tsv>]
+#
+# Exit 0 iff VIOLATIONS 0.  Host paths appear only on the HOSTPATH lines at the end, so the output is
+# byte-identical on cluster_b and on the Mac apart from those lines.
+#
+# THE CORPUS IT USES: results/all_runs.csv and results/CORPUS-EXCLUSIONS.tsv at repo commit 1cb52f7
+# ("ingest cvt8 + cvt9"), sha256 1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a
+# (3,127 rows) and ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191 -- the corpus
+# `cst1` was REGISTERED against, which is what the scorer's frozen SIGMA_PRIOR and ANCHOR literals
+# were derived from.  The 266.9 ingest moved the live corpus to 3,181 rows, so (as 265.5 warned)
+# these two files must be materialised with `git show 1cb52f7:results/...` and passed in.
+#
+# DEFINITIONS RE-TYPED FROM CORRECTIONS 256.3 / 256.5 / 268 (not imported):
+#   L_i = b2*m_i + (1-b2)*z_i;  s = sign(b2*mom_pre + (1-b2)*z_agg) on a 1-coordinate run, else sign(sum L)
+#   DOM_C / TOP3_C / DOM_TOP3 / SHARE_C / R_T / CAR_EQ / DOWN as 256.3;  C = {50, 53, 59} 1-based
+#   plateau5 = mean TEST accuracy of epochs 95..99 from the RAW `.out` (the CSV `plateau` column is banned)
+#   G-DECOMP sign bar (THE successor's one change): |q - sign(L)| <= 1e-3 + 4*ulp32(beta)/ms
+# =============================================================================
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+import sys
+from collections import Counter
+
+BATCH = "cst1"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+N_CLASSES = 100
+MST = "3e-4"
+MS = 3e-4
+A0 = "1e-6"
+ARMS = ("k01", "ISO", "CTL")
+SEEDS = (112, 113, 114)
+SPEC = {"k01": "scalar",
+        "ISO": "sets:1-49,51-52,54-58,60-62/layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight",
+        "CTL": "sets:1-46,49-55,57-62/layer4.0.bn1.weight,layer4.0.bn1.bias,layer4.1.bn1.weight"}
+PT_TYPE = {"k01": "scalar", "ISO": "blockwise", "CTL": "blockwise"}
+N_COORDS = {"k01": 1, "ISO": 2, "CTL": 2}
+ISOLATED = {"ISO": (50, 53, 59), "CTL": (47, 48, 56)}
+C_IDX1 = (50, 53, 59)
+CARRIER_NAMES = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+B2 = 0.9
+BETA_LO, BETA_HI = -15.0, -2.3026
+PROBE_EVERY, META_STEPS, N_RECORDS, EPOCHS = 100, 50000, 500, 100
+TOL_Z, TOL_M = 1e-5, 1e-4
+DECOMP_FAIL_MAX = SIGN_FAIL_MAX = 0.01
+
+DOM_HI, DOM_LO, TOP3_BAR = 0.50, 0.10, 0.50
+RESCUE_BAR, NULL_BAR, K01_MAX = 20.0, 5.0, 34.0
+DIVERGED_BAR, LEVEL_MIN, LEVEL_MAX = 5.0, 5.0, 90.0
+SIGMA_PRIOR = 0.6811983409351905
+SE_PRIOR = SIGMA_PRIOR * math.sqrt(2.0 / 3.0)
+CALIB_SCALAR_DOM = (0.784, 0.820)
+CALIB_SCALAR_POOLED = 0.8069
+
+# the successor's ONE change, re-typed
+PRED_SIGN_BAR = 1e-3
+SIGN_ABS_BAR = 1e-3
+SIGN_ULP_K = 4.0
+ULP32_MAX_IN_CLIP = 2.0 ** -20
+MS_CROSSOVER = 0.5 * ULP32_MAX_IN_CLIP / PRED_SIGN_BAR
+
+REG_CSV_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+REG_TSV_SHA = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+CORPUS_COMMIT = "1cb52f7"
+REG_CORPUS_ROWS = 3127
+
+HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+BUILD_NETWORK_SHA = "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d"
+TRAIN_PY_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+RUNNER_SHA = "a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a"
+CORE_SHA = "0754ca84e44258fbe628d7985cb5268f69272f004e25af531950304ec148c5e6"
+PRED_SCORER_SHA = "05546791a0d9269a3f410fe0364f7afed97f711dd3f29186f28bce42973588a3"
+SUCC_SCORER_SHA = "8300f75786279566c5ef8a6931fddb1d9bf8abd5f3d99c980e8dee51fcf69122"
+
+ENV_FIXED = ("AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+             "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none "
+             "PROBE=100 EB_RHO=na EB_LOG=0")
+FOREIGN_PREFIXES = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD",
+                    "DECAY_MASK", "SHADOW_VOTE", "WD_SCALE")
+ARGS_FMT = ("ARGS: --optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 --alg-meta Lion "
+            "--momentum-param-meta 0.99 --Lion-beta2-meta 0.9 --weight-decay-meta 0 --dataset %s --NN-name %s "
+            "--batch-size 100 --max-time 999:00:00 --gamma 1 --meta-stepsize %s --alpha0 %s --num-epochs 100 "
+            "--stepsize-groups %s --seed %d --save-directory %s --run-name %s")
+EP_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+PT_RE = re.compile(r"^PROBE_TENSOR: on every=100 type=(scalar|layerwise|blockwise) tensors=62 meta_alg=Lion "
+                   r"momentum_param=0\.99 Lion_beta2=0\.9 dir=(\S+)$")
+
+# the frozen word tables, RE-TYPED from CORRECTIONS 256.5 (never imported from either scorer)
+NOM_SENT = {
+    "NOMINATED": "k01's own probe records nominate the same three carriers at ms 3e-4 (C alone fixes the shared vote "
+                 "on >= 50 % of records and C are the three largest terms on >= 50 %)",
+    "NOMINATION-PARTIAL": "at ms 3e-4 C fixes the shared vote on between 10 % and 50 % of k01's records (or is not the "
+                          "top three on half of them): a partial nomination, no identity sentence",
+    "NOT-NOMINATED": "at ms 3e-4 C fixes the shared vote on <= 10 % of k01's records: the carriers do NOT dominate the "
+                     "vote at this meta step",
+}
+ISO_SENT = {
+    "ISO-RESCUES": "isolating C recovers >= 20 pp over k01 (sufficiency of isolating C, at this cell)",
+    "ISO-PARTIAL": "isolating C recovers between 5 and 20 pp: a partial rescue",
+    "ISO-NO-RESCUE": "isolating C stays within 5 pp of k01 (a floor LOCATION, not a mechanism)",
+}
+CTL_SENT = {
+    "CTL-NULL": "the matched non-carrier set stays within 5 pp of k01 (a floor LOCATION)",
+    "CTL-PARTIAL": "the matched non-carrier set recovers between 5 and 20 pp",
+    "CTL-RESCUES": "the matched non-carrier set also recovers >= 20 pp: isolation of a matched layer4 set suffices",
+}
+HEADLINE = {
+    "NOMINATED+ISO-RESCUES+CTL-NULL": "THE CARRIER RESCUE HOLDS AT A SECOND META STEP SIZE (3e-4): same carriers "
+                                      "nominated, ISO >> CTL, at this cell only",
+    "NOMINATED+ISO-RESCUES+CTL-RESCUES": "carriers nominated, but at 3e-4 the rescue is NOT carrier-specific",
+    "NOMINATED+ISO-RESCUES+CTL-PARTIAL": "carriers nominated and rescue; the control recovers part -- identity "
+                                         "matters, not exclusively",
+    "NOMINATED+ISO-NO-RESCUE+CTL-NULL": "carriers nominated by the vote, yet isolating them does not rescue at 3e-4: "
+                                        "nomination is not sufficient for the rescue here",
+    "NOT-NOMINATED+ISO-RESCUES+CTL-NULL": "the carriers do not dominate the vote at 3e-4 yet their isolation rescues "
+                                          "and the control does not: the rescue does not need their vote dominance",
+    "NOT-NOMINATED+ISO-NO-RESCUE+CTL-NULL": "the carrier account does NOT transfer to meta step 3e-4: not nominated, "
+                                            "no rescue",
+}
+NOT_LICENSED = ("other datasets / networks / alpha0 / horizons; necessity of anything; why CTL sits where it sits; "
+                "the 3e-4 collapse's time course relative to 1e-3's; a scalar-vs-layerwise gap measured in batch")
+ANCHOR = {"k01@3e-4 (cru1 n3)": 28.634, "layerwise@3e-4 (cru1 n3)": 68.2927, "ISO@1e-3 (n12)": 70.1395,
+          "CTL@1e-3 (cdep1 DEPTH n3)": 23.5207, "k01@1e-3 (n44)": 22.9562}
+
+# what the SUCCESSOR printed on this batch (transcribed from its stdout; never read here)
+EXPECT_FINAL = ("FINAL: NOMINATION-PARTIAL+ISO-RESCUES+CTL-NULL | FLOOR-READINGS-ARE-BOUNDS | TRAIN-AGREES | "
+                "DOM_C=0.4727 | TOP3_C=0.4960 | PINNED-FRAC=0.0000 | HARNESS-CLEAN | SPEC-APPLIED | "
+                "DECOMPOSITION-OK | ONE-CELL-MS-3E-4 | ALPHA0-1E-6-ONLY | HORIZON-100-ONLY | "
+                "ONE-NETWORK-RESNET18_C100 | CTL-HAS-A-BIAS-MEMBER | NO-LAYERWISE-IN-BATCH | "
+                "NOMINATION-FROM-K01-RECORDS-ONLY | SIGMA-PRIOR-FROZEN")
+EXPECT_DECOMP = {   # arm-seed: (bad_shape, bad_z, bad_m, bad_sign_NEW, n_sign, clamped, bad_shared, bad_sign_OLD)
+    ("k01", 112): (0, 0, 0, 0, 500, 0, 0, 382), ("k01", 113): (0, 0, 0, 0, 500, 0, 0, 382),
+    ("k01", 114): (0, 0, 0, 0, 500, 0, 0, 380),
+    ("ISO", 112): (0, 0, 0, 0, 800, 200, 0, 608), ("ISO", 113): (0, 0, 0, 0, 785, 215, 0, 596),
+    ("ISO", 114): (0, 0, 0, 0, 810, 190, 0, 620),
+    ("CTL", 112): (0, 0, 0, 0, 995, 5, 0, 809), ("CTL", 113): (0, 0, 0, 0, 992, 8, 0, 809),
+    ("CTL", 114): (0, 0, 0, 0, 994, 6, 0, 808)}
+EXPECT_MANIFEST_BYTES = 3107
+EXPECT_ANCHOR = {"k01@3e-4 (cru1 n3)": (28.634, 3), "layerwise@3e-4 (cru1 n3)": (68.2927, 3),
+                 "ISO@1e-3 (n12)": (70.1395, 12), "CTL@1e-3 (cdep1 DEPTH n3)": (23.5207, 3),
+                 "k01@1e-3 (n44)": (22.9562, 44)}
+
+VIOL, OUT, REPLICA = [], [], []
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def R(s=""):
+    """A line of the REPLICA: what the successor scorer printed, rebuilt from scratch."""
+    REPLICA.append(s)
+
+
+def chk(cond, label, extra=""):
+    P("  %-4s %s%s" % ("OK" if cond else "BAD", label, ("   " + extra) if extra else ""))
+    if not cond:
+        VIOL.append(label + (("   " + extra) if extra else ""))
+    return bool(cond)
+
+
+# =============================================================================
+# the model, built from the architecture (NOT copied from any table)
+# =============================================================================
+def build_model(n_classes):
+    out = [("conv1.weight", 64 * 3 * 3 * 3), ("bn1.weight", 64), ("bn1.bias", 64)]
+    inp = 64
+    for stage, planes in enumerate((64, 128, 256, 512), start=1):
+        for blk in range(2):
+            pre = "layer%d.%d." % (stage, blk)
+            out.append((pre + "conv1.weight", planes * inp * 3 * 3))
+            out.append((pre + "bn1.weight", planes))
+            out.append((pre + "bn1.bias", planes))
+            out.append((pre + "conv2.weight", planes * planes * 3 * 3))
+            out.append((pre + "bn2.weight", planes))
+            out.append((pre + "bn2.bias", planes))
+            if inp != planes:
+                out.append((pre + "shortcut.0.weight", planes * inp))
+                out.append((pre + "shortcut.1.weight", planes))
+                out.append((pre + "shortcut.1.bias", planes))
+            inp = planes
+    out.append(("linear.weight", 512 * n_classes))
+    out.append(("linear.bias", n_classes))
+    return out
+
+
+MODEL = build_model(N_CLASSES)
+NAMES = tuple(n for n, _ in MODEL)
+NUMELS = tuple(q for _, q in MODEL)
+C_IDX0 = tuple(i - 1 for i in C_IDX1)
+
+
+def tclass(name):
+    if name.startswith("linear."):
+        return "linear"
+    if name.endswith(".bias"):
+        return "bn_bias"
+    if ".bn" in name or ".shortcut.1." in name or name.startswith("bn1."):
+        return "bn_scale"
+    return "conv"
+
+
+CLASSES = ("bn_scale", "bn_bias", "conv", "linear")
+CLASS_OF = tuple(tclass(n) for n in NAMES)
+
+
+def parse_sets(spec):
+    if spec == "scalar":
+        return [list(range(1, len(NAMES) + 1))]
+    if spec == "layerwise":
+        return [[i] for i in range(1, len(NAMES) + 1)]
+    assert spec.startswith("sets:")
+    groups = []
+    for g in spec[5:].split("/"):
+        idx = []
+        for tok in g.split(","):
+            if re.match(r"^\d+-\d+$", tok):
+                a, b = (int(x) for x in tok.split("-"))
+                idx += list(range(a, b + 1))
+            elif re.match(r"^\d+$", tok):
+                idx.append(int(tok))
+            else:
+                idx.append(NAMES.index(tok) + 1)
+        groups.append(sorted(idx))
+    return groups
+
+
+def manifest_text():
+    L = ["BATCH %s" % BATCH, "NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(NAMES),
+         "TOTAL_PARAMS %d" % sum(NUMELS)]
+    for i, (n, q) in enumerate(MODEL, 1):
+        L.append("TENSOR %d %s %d" % (i, n, q))
+    L.append("CARRIERS %s" % ",".join("%d:%s" % x for x in zip(C_IDX1, CARRIER_NAMES)))
+    for a in ARMS:
+        g = parse_sets(SPEC[a])
+        L.append("ARMSPEC %s SPEC %s GROUPS %s" % (a, SPEC[a], "/".join(",".join(str(i) for i in x) for x in g)))
+    return "\n".join(L) + "\n"
+
+
+# =============================================================================
+# helpers
+# =============================================================================
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def med(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return None
+    return v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0
+
+
+def avg(v):
+    v = list(v)
+    return sum(v) / len(v) if v else None
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def ulp32_bits(x):
+    """The float32 spacing at |x|, derived by INCREMENTING THE BIT PATTERN -- a different route from the
+    scorer's math.frexp implementation, so agreement between them is evidence, not a shared assumption."""
+    v = abs(float(x))
+    b = struct.unpack("<I", struct.pack("<f", v))[0]
+    lo = struct.unpack("<f", struct.pack("<I", b))[0]
+    hi = struct.unpack("<f", struct.pack("<I", b + 1))[0]
+    return hi - lo
+
+
+def ulp32_frexp(x):
+    v = abs(float(x))
+    if v == 0.0 or not math.isfinite(v):
+        return 2.0 ** -149
+    _m, e = math.frexp(v)
+    return math.ldexp(1.0, e - 24)
+
+
+def sign_tol(bpre, bpost, ms):
+    return SIGN_ABS_BAR + SIGN_ULP_K * ulp32_bits(max(abs(bpre), abs(bpost))) / ms
+
+
+def args_line(arm, seed, ws):
+    return ARGS_FMT % (DSET, NET, MST, A0, SPEC[arm], seed, ws + "/runs/" + BATCH,
+                       "%s-%s-s%d" % (BATCH, arm, seed))
+
+
+def find_out(runsdir, arm, seed):
+    pat = re.compile(r"^%s-%s-s%d-(\d+)\.out$" % (BATCH, arm, seed))
+    hits = []
+    for d in (runsdir, os.path.join(runsdir, BATCH)):
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                m = pat.match(fn)
+                if m:
+                    hits.append((int(m.group(1)), os.path.join(d, fn)))
+    return sorted(hits)
+
+
+def read_out(path):
+    txt = open(path, errors="replace").read()
+    lines = txt.splitlines()
+    te, tr = {}, {}
+    for e, a, b in EP_RE.findall(txt):
+        tr[int(e)] = float(a)
+        te[int(e)] = float(b)
+    r = {"path": path, "test": te, "train": tr,
+         "args": [l for l in lines if l.startswith("ARGS:")],
+         "env": [l for l in lines if l.startswith("ENV:")],
+         "pt": [l for l in lines if l.startswith("PROBE_TENSOR:")],
+         "foreign": [l for l in lines if l.startswith(FOREIGN_PREFIXES)],
+         "done": any(l.strip() == "RUN_DONE" for l in lines),
+         "tb": "Traceback (most recent call last)" in txt}
+    tail = [te.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    trl = [tr.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    r["p5"] = sum(tail) / 5.0 if all(isinstance(x, float) and math.isfinite(x) for x in tail) else None
+    r["t5"] = sum(trl) / 5.0 if all(isinstance(x, float) and math.isfinite(x) for x in trl) else None
+    r["complete"] = sorted(te) == list(range(EPOCHS)) and r["done"] and not r["tb"] and r["p5"] is not None
+    return r
+
+
+def read_probe(runsdir, arm, seed):
+    d = os.path.join(runsdir, BATCH, "probe_%s-%s-s%d" % (BATCH, arm, seed))
+    recs, bad = [], 0
+    for ln in open(os.path.join(d, "probe.jsonl"), errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(r, dict):
+            recs.append(r)
+    return {"dir": d, "recs": recs, "bad": bad,
+            "hdr": json.load(open(os.path.join(d, "probe_tensor.json")))}
+
+
+# =============================================================================
+# the statistics
+# =============================================================================
+def rec_L(r):
+    b2 = float(r.get("pt_b2", B2))
+    return [b2 * m + (1.0 - b2) * z for m, z in zip(r["m_tensor"], r["z_tensor"])], b2
+
+
+def shared_s(r, L, b2):
+    za, ma = r["z_agg"][0], r["mom_pre"][0]
+    if len(za) == 1 and len(ma) == 1:
+        return sgn(b2 * ma[0] + (1.0 - b2) * za[0])
+    return sgn(sum(L))
+
+
+def fixes(L, idx, s):
+    tot = sum(L[i] for i in idx)
+    rest = sum(abs(L[j]) for j in range(len(L)) if j not in idx)
+    return sgn(tot) == s and abs(tot) > rest
+
+
+def carrying(L, s):
+    order = sorted(range(len(L)), key=lambda i: -abs(L[i]))
+    rem = sum(abs(x) for x in L)
+    part = 0.0
+    for k, i in enumerate(order, 1):
+        part += L[i]
+        rem -= abs(L[i])
+        if sgn(part) == s and abs(part) > rem:
+            return order[:k]
+    return order
+
+
+def vote_stats(recs):
+    cs = set(C_IDX0)
+    n = indet = dom = t3 = dt3 = det = dis = careq = down = pinned = dompin = 0
+    shares, cls = [], {c: [] for c in CLASSES}
+    modal, argmax = Counter(), Counter()
+    dec = [[0, 0] for _ in range(10)]
+    for r in recs:
+        L, b2 = rec_L(r)
+        s = shared_s(r, L, b2)
+        if s == 0:
+            indet += 1
+            continue
+        n += 1
+        order = sorted(range(len(L)), key=lambda i: -abs(L[i]))
+        top3 = order[:3]
+        d = fixes(L, C_IDX0, s)
+        dom += d
+        t3 += set(top3) == cs
+        dt3 += fixes(L, top3, s)
+        modal[tuple(sorted(i + 1 for i in top3))] += 1
+        argmax[order[0] + 1] += 1
+        tot = sum(abs(x) for x in L)
+        shares.append(sum(abs(L[i]) for i in C_IDX0) / tot if tot > 0 else 0.0)
+        if tot > 0:
+            for c in CLASSES:
+                cls[c].append(sum(abs(L[i]) for i in range(len(L)) if CLASS_OF[i] == c) / tot)
+        st = r.get("step")
+        if isinstance(st, int) and 0 <= st < META_STEPS:
+            dd = dec[st * 10 // META_STEPS]
+            dd[0] += 1
+            dd[1] += d
+        if len(r.get("beta", [])) == 1 and (r.get("n_at_lo") or 0) >= 1:
+            pinned += 1
+            dompin += d
+        maj = sgn(sum(1 for x in L if x > 0) - sum(1 for x in L if x < 0))
+        if maj:
+            det += 1
+            if maj != s:
+                dis += 1
+                careq += set(carrying(L, s)) == cs
+                down += s > 0
+    return {"n": n, "indet": indet, "DOM_C": dom / n if n else None, "TOP3_C": t3 / n if n else None,
+            "DOM_TOP3": dt3 / n if n else None, "SHARE_C": med(shares) if shares else None,
+            "R_T": dis / det if det else None, "n_dis": dis, "CAR_EQ": careq / dis if dis else None,
+            "DOWN": down / dis if dis else None, "PINNED_FRAC": pinned / n if n else None,
+            "DOM_C_PINNED": dompin / pinned if pinned else None,
+            "MODAL_TOP3": modal.most_common(3), "ARGMAX": argmax.most_common(5),
+            "CLASS_SHARE": dict((c, med(v) if v else None) for c, v in cls.items()),
+            "DECILE": [(d[1] / d[0]) if d[0] else None for d in dec]}
+
+
+def describe(emit, tag, s):
+    emit("  %-22s n=%d  DOM_C %s  TOP3_C %s  DOM_TOP3 %s  SHARE_C(med) %s  R_T %s (DIS %d)  CAR_EQ %s  DOWN %s  "
+         "PINNED %s  DOM_C|pinned %s" % (tag, s["n"], fmt(s["DOM_C"]), fmt(s["TOP3_C"]), fmt(s["DOM_TOP3"]),
+                                         fmt(s["SHARE_C"]), fmt(s["R_T"]), s["n_dis"], fmt(s["CAR_EQ"]),
+                                         fmt(s["DOWN"]), fmt(s["PINNED_FRAC"]), fmt(s["DOM_C_PINNED"])))
+    emit("  %-22s modal top-3 %s; argmax %s" % (
+        "", ", ".join("{%s} x%d" % (",".join(str(i) for i in k), v) for k, v in s["MODAL_TOP3"]),
+        ", ".join("%d(%s) x%d" % (i, NAMES[i - 1], v) for i, v in s["ARGMAX"])))
+    emit("  %-22s class share of sum|L| (median): %s; DOM_C by decile %s" % (
+        "", " ".join("%s %s" % (c, fmt(s["CLASS_SHARE"][c], 3)) for c in CLASSES),
+        " ".join(fmt(x, 2) for x in s["DECILE"])))
+
+
+def decomposition(recs, groups1, ms):
+    """Both bars at once: `bad_sign` is the SUCCESSOR's ms-aware count, `old_bad` the predecessor's absolute one."""
+    g0 = [[i - 1 for i in g] for g in groups1]
+    n = bshape = bz = bm = nsign = bsign = obsign = clamped = bshared = exact32 = 0
+    wz = wm = worst_q = tol_max = 0.0
+    msf = f32(ms)
+    for r in recs:
+        n += 1
+        z, m = r["z_tensor"], r["m_tensor"]
+        za, ma = r["z_agg"][0], r["mom_pre"][0]
+        bpre, bpost = r["beta_pre"][0], r["beta"]
+        b2 = float(r.get("pt_b2", B2))
+        if not (len(z) == len(m) == 62 and len(za) == len(ma) == len(bpre) == len(bpost) == len(g0)):
+            bshape += 1
+            continue
+        sz = sum(abs(v) for v in z) + 1e-30
+        sm = sum(abs(v) for v in m) + 1e-30
+        dz = max(abs(sum(z[i] for i in g) - za[k]) for k, g in enumerate(g0)) / sz
+        dm = max(abs(sum(m[i] for i in g) - ma[k]) for k, g in enumerate(g0)) / sm
+        wz, wm = max(wz, dz), max(wm, dm)
+        bz += dz > TOL_Z
+        bm += dm > TOL_M
+        if len(g0) == 1:
+            L = [b2 * mi + (1 - b2) * zi for mi, zi in zip(m, z)]
+            Lh = b2 * ma[0] + (1 - b2) * za[0]
+            if abs(sum(L) - Lh) > 1e-4 * (sum(abs(x) for x in L) + 1e-30) and sgn(sum(L)) != sgn(Lh):
+                bshared += 1
+        for k in range(len(g0)):
+            if not (BETA_LO + 1e-9 < bpost[k] < BETA_HI - 1e-9):
+                clamped += 1
+                continue
+            nsign += 1
+            s = sgn(b2 * ma[k] + (1 - b2) * za[k])
+            q = -(bpost[k] - bpre[k]) / ms
+            resid = abs(q - s)
+            tol = sign_tol(bpre[k], bpost[k], ms)
+            worst_q = max(worst_q, resid)
+            tol_max = max(tol_max, tol)
+            bsign += resid > tol
+            obsign += resid > PRED_SIGN_BAR
+            exact32 += (f32(f32(bpre[k]) - f32(msf * s)) == bpost[k])
+    return {"n": n, "bad_shape": bshape, "bad_z": bz, "bad_m": bm, "worst_z": wz, "worst_m": wm,
+            "n_sign": nsign, "bad_sign": bsign, "old_bad": obsign, "clamped": clamped, "bad_shared": bshared,
+            "exact32": exact32, "worst_q": worst_q, "tol_max": tol_max}
+
+
+def decomp_ok(d):
+    n = max(d["n"], 1)
+    return (d["n"] > 0 and d["bad_shape"] == 0 and d["bad_z"] / n <= DECOMP_FAIL_MAX
+            and d["bad_m"] / n <= DECOMP_FAIL_MAX and d["n_sign"] > 0
+            and d["bad_sign"] / max(d["n_sign"], 1) <= SIGN_FAIL_MAX and d["bad_shared"] / n <= DECOMP_FAIL_MAX)
+
+
+# =============================================================================
+# the corpus
+# =============================================================================
+CELLKEYS = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+            "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+
+def load_corpus(csv_path, tsv_path):
+    rows = list(csv.DictReader(open(csv_path)))
+    lines = [l.rstrip("\n") for l in open(tsv_path) if l.strip() and not l.startswith("#")]
+    head = lines[0].split("\t")
+    excl = set()
+    for ln in lines[1:]:
+        f = dict(zip(head, ln.split("\t")))
+        excl.add((f["run"], f["job_id"]))
+    return rows, [r for r in rows if (r.get("run"), r.get("job_id")) not in excl], excl
+
+
+def usable(r):
+    return (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+            and (r.get("plateau5") or "").strip() != "")
+
+
+def std_cell(r, net, dset, ms, a0):
+    return (usable(r) and r.get("network") == net and r.get("dataset") == dset
+            and r.get("epochs_requested") == "100" and r.get("augment") == "1"
+            and r.get("beta_clip") == "-15:-2.3026" and r.get("meta_stepsize") == ms
+            and r.get("alpha0") == a0 and r.get("batch_size") == "100")
+
+
+def cell_rows(rows, net, dset, ms, a0, gran):
+    return [r for r in rows if std_cell(r, net, dset, ms, a0) and r.get("granularity") == gran
+            and r.get("hier", "") == "" and r.get("base") == "SGDm" and r.get("meta") == "Lion"
+            and r.get("gamma") == "1"]
+
+
+def pooled_sigma(rows, net, dset, ms="1e-3", a0="1e-6"):
+    cells = {}
+    for r in rows:
+        if not std_cell(r, net, dset, ms, a0):
+            continue
+        cells.setdefault(tuple(r.get(k, "") for k in CELLKEYS), []).append(float(r["plateau5"]))
+    ss, df, nc = 0.0, 0, 0
+    for v in cells.values():
+        if len(v) < 2:
+            continue
+        m = sum(v) / len(v)
+        ss += sum((x - m) ** 2 for x in v)
+        df += len(v) - 1
+        nc += 1
+    return (math.sqrt(ss / df) if df else None), df, nc
+
+
+# =============================================================================
+# main
+# =============================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir")
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap.add_argument("--csv", default=os.path.join(os.path.dirname(here), "results", "all_runs.csv"))
+    ap.add_argument("--tsv", default=os.path.join(os.path.dirname(here), "results", "CORPUS-EXCLUSIONS.tsv"))
+    a = ap.parse_args()
+    rd = a.runsdir
+
+    P("=" * 100)
+    P("cst2_attack_indep -- INDEPENDENT re-derivation of the FROZEN SUCCESSOR's output (no repo import)")
+    P("=" * 100)
+
+    P("\n[FILES] sha256 of every file read (host-independent)")
+    outs, probes = {}, {}
+    for arm in ARMS:
+        for s in SEEDS:
+            hits = find_out(rd, arm, s)
+            chk(len(hits) == 1, "one .out for %s-s%d" % (arm, s), "%d" % len(hits))
+            job, path = hits[-1]
+            outs[(arm, s)] = read_out(path)
+            outs[(arm, s)]["job"] = job
+            probes[(arm, s)] = read_probe(rd, arm, s)
+            P("  %-14s job %d  out %s" % ("%s-s%d" % (arm, s), job, sha256(path)))
+            P("  %-14s %11s probe.jsonl %s" % ("", "", sha256(os.path.join(probes[(arm, s)]["dir"], "probe.jsonl"))))
+    for f in ("PROVENANCE.txt", "PARTITION-MANIFEST.txt"):
+        P("  %-14s %s %s" % ("batch", f, sha256(os.path.join(rd, BATCH, f))))
+    csv_sha, tsv_sha = sha256(a.csv), sha256(a.tsv)
+    P("  %-14s all_runs.csv %s" % ("corpus", csv_sha))
+    P("  %-14s CORPUS-EXCLUSIONS.tsv %s" % ("corpus", tsv_sha))
+    P("  corpus commit %s -- the corpus `cst1` was REGISTERED against, and the corpus the scorer's frozen"
+      % CORPUS_COMMIT)
+    P("  SIGMA_PRIOR and ANCHOR literals come from.  The 266.9 ingest moved the live corpus to 3,181 rows,")
+    P("  so these two files are materialised with `git show %s:results/...` (CORRECTIONS 265.5)." % CORPUS_COMMIT)
+    chk(csv_sha == REG_CSV_SHA, "all_runs.csv sha == the scorer's REG_CORPUS_SHA")
+    chk(tsv_sha == REG_TSV_SHA, "CORPUS-EXCLUSIONS.tsv sha == the registered one")
+
+    P("\n[MODEL] names and numels built from the ResNet18_c100 architecture, then checked against each header")
+    chk(len(MODEL) == 62 and sum(NUMELS) == 11220132, "62 tensors, %d parameters" % sum(NUMELS))
+    chk(tuple(NAMES[i - 1] for i in C_IDX1) == CARRIER_NAMES, "C = {50, 53, 59} are the three carriers by name")
+    chk(tuple(NAMES[i - 1] for i in ISOLATED["CTL"]) == ("layer4.0.bn1.weight", "layer4.0.bn1.bias",
+                                                         "layer4.1.bn1.weight"),
+        "CTL = {47, 48, 56} is the matched non-carrier layer4 triple (one member is a bias)")
+    giso, gctl = parse_sets(SPEC["ISO"]), parse_sets(SPEC["CTL"])
+    chk([len(g) for g in giso] == [59, 3] and sorted(giso[1]) == list(C_IDX1),
+        "ISO parses to [59, 3] with the carriers isolated")
+    chk([len(g) for g in gctl] == [59, 3] and sorted(gctl[1]) == [47, 48, 56],
+        "CTL parses to [59, 3] with the control triple isolated")
+    chk(sum(NUMELS[i - 1] for i in C_IDX1) == 1536 and sum(NUMELS[i - 1] for i in (47, 48, 56)) == 1536,
+        "ISO and CTL isolate 1,536 parameters each (3 x 512) -- count-matched")
+    man = open(os.path.join(rd, BATCH, "PARTITION-MANIFEST.txt")).read()
+    mt = manifest_text()
+    chk(man == mt, "PARTITION-MANIFEST.txt rebuilt byte for byte (%d bytes)" % len(mt), "%d on disk" % len(man))
+    chk(len(mt) == EXPECT_MANIFEST_BYTES, "manifest length == the registered %d" % EXPECT_MANIFEST_BYTES)
+    for arm in ARMS:
+        for s in SEEDS:
+            chk(tuple(probes[(arm, s)]["hdr"].get("param_numels", ())) == NUMELS,
+                "header numels %s-s%d == the built model" % (arm, s))
+
+    P("\n[PROVENANCE] runs/%s/PROVENANCE.txt against the literals CORRECTIONS 256.10 records" % BATCH)
+    prov = {}
+    for ln in open(os.path.join(rd, BATCH, "PROVENANCE.txt")):
+        p = ln.split()
+        if len(p) >= 2:
+            prov.setdefault(p[0], " ".join(p[1:]))
+    for k, want in (("MODE", "submit"), ("HF_SHA256", HF_SHA), ("BUILD_NETWORK_SHA256", BUILD_NETWORK_SHA),
+                    ("TRAIN_PY_SHA256", TRAIN_PY_SHA), ("RUNNER_SHA256", RUNNER_SHA), ("CORE_SHA256", CORE_SHA),
+                    ("SCORER_SHA256", PRED_SCORER_SHA)):
+        chk(prov.get(k) == want, "PROVENANCE %s" % k, "got %s" % prov.get(k))
+    P("  NOTE PROVENANCE names the PREDECESSOR scorer (05546791...), which is what a file written at SUBMISSION")
+    P("  must name.  The successor checks that same literal; its own sha is %s." % SUCC_SCORER_SHA)
+    for nm, want in (("cST1_carrier_contrast_score.py", PRED_SCORER_SHA),
+                     ("cST2_carriervote_score.py", SUCC_SCORER_SHA),
+                     ("cCV0_carrier_vote_core.py", CORE_SHA)):
+        pth = os.path.join(here, nm)
+        if os.path.isfile(pth):
+            chk(sha256(pth) == want, "%s on disk is the registered file" % nm, sha256(pth)[:16])
+
+    P("\n[RUN LINES] ARGS / ENV / PROBE_TENSOR / foreign / records / coordinate count, from each run's own .out")
+    for arm in ARMS:
+        for s in SEEDS:
+            r, pr, tag = outs[(arm, s)], probes[(arm, s)], "%s-s%d" % (arm, s)
+            chk(r["complete"], "%s: RUN_DONE, epochs 0..99, no traceback" % tag)
+            m = re.match(r"^(.*--save-directory )(\S+)( --run-name \S+)$", r["args"][0]) if len(r["args"]) == 1 else None
+            ws = m.group(2)[:-len("/runs/" + BATCH)] if m and m.group(2).endswith("/runs/" + BATCH) else None
+            chk(ws is not None and r["args"][0] == args_line(arm, s, ws), "%s: ARGS == the registered line" % tag)
+            pdir = None
+            if len(r["env"]) == 1:
+                mm = re.search(r" PROBE_DIR=(\S+)", r["env"][0])
+                pdir = mm.group(1) if mm else None
+            chk(len(r["env"]) == 1 and re.sub(r" PROBE_DIR=\S+", "", r["env"][0]) == "ENV: " + ENV_FIXED
+                and pdir is not None and pdir.endswith("/runs/%s/probe_%s-%s" % (BATCH, BATCH, tag)),
+                "%s: ENV == the registered line, PROBE_DIR is the run's own" % tag)
+            mp = PT_RE.match(r["pt"][0]) if len(r["pt"]) == 1 else None
+            chk(mp is not None and mp.group(1) == PT_TYPE[arm] and mp.group(2) == pdir,
+                "%s: one PROBE_TENSOR line, type=%s, dir == PROBE_DIR" % (tag, PT_TYPE[arm]))
+            chk(not r["foreign"], "%s: no intervention line (the live tree ran)" % tag)
+            chk(pr["bad"] == 0 and [x.get("step") for x in pr["recs"]] == list(range(0, META_STEPS, PROBE_EVERY)),
+                "%s: 500 records at steps 0..49,900" % tag)
+            nc = set(len(x.get("beta", [])) for x in pr["recs"])
+            nz = set(len((x.get("z_agg") or [[]])[0]) for x in pr["recs"])
+            chk(nc == {N_COORDS[arm]} and nz == {N_COORDS[arm]},
+                "%s: every record carries %d coordinate(s) -- the BROKEN-SPEC null is excluded" % (tag, N_COORDS[arm]))
+
+    # ---- the tolerance, re-derived by a different route ------------------------------------------
+    P("\n[TOLERANCE] the successor's ONE change, re-derived here from the float32 BIT PATTERN (not frexp)")
+    grid = [-15.0, -14.0, -13.816511154174805, -13.8, -12.0, -8.0000001, -8.0, -7.9999995, -5.0, -4.0,
+            -3.9999998, -2.5, -2.3026]
+    chk(all(ulp32_bits(x) == ulp32_frexp(x) for x in grid),
+        "the bit-increment ulp32 and the frexp ulp32 agree on the whole BETA_CLIP band (13 points)")
+    chk(max(ulp32_bits(x) for x in grid) == ULP32_MAX_IN_CLIP == 9.5367431640625e-07,
+        "the widest float32 spacing BETA_CLIP -15:-2.3026 allows is 2^-20 = 9.5367431640625e-07 (the [8,16) binade)")
+    chk(abs(f32(MS) - MS) / MS < 2.0 ** -24,
+        "|float32(ms) - ms| / ms < 2^-24 = 5.96e-08 at ms 3e-4", "%.3e" % (abs(f32(MS) - MS) / MS))
+    chk(0.5 * ULP32_MAX_IN_CLIP / MS > PRED_SIGN_BAR,
+        "the round-to-nearest bound at ms 3e-4 is %.6e -- LARGER than the predecessor's absolute 1e-3 bar"
+        % (0.5 * ULP32_MAX_IN_CLIP / MS))
+    chk(abs(MS_CROSSOVER - 4.76837158203125e-04) < 1e-18 and 0.5 * ULP32_MAX_IN_CLIP / 1e-3 < PRED_SIGN_BAR,
+        "the crossover is ms = 4.76837158203125e-04; at ms 1e-3 the bound is %.6e, 52 %% under the old bar"
+        % (0.5 * ULP32_MAX_IN_CLIP / 1e-3))
+    chk(SIGN_ABS_BAR + SIGN_ULP_K * ULP32_MAX_IN_CLIP / MS < 1.0,
+        "the successor's bar at ms 3e-4 is %.6e -- below 1 (a missing step) and 2 (a flipped sign), so it still "
+        "discriminates" % (SIGN_ABS_BAR + SIGN_ULP_K * ULP32_MAX_IN_CLIP / MS))
+
+    # ---- the gate, re-derived under BOTH bars ----------------------------------------------------
+    P("\n[G-DECOMP] the successor's counts, and the predecessor's, side by side")
+    dec = {}
+    for arm in ARMS:
+        for s in SEEDS:
+            d = decomposition(probes[(arm, s)]["recs"], parse_sets(SPEC[arm]), MS)
+            dec[(arm, s)] = d
+            P("  %-10s shape %d z %d m %d (worst %.1e / %.1e) NEW sign %d/%d  OLD sign %d/%d  clamped %d shared %d  "
+              "bit-exact %d/%d" % ("%s-s%d" % (arm, s), d["bad_shape"], d["bad_z"], d["bad_m"], d["worst_z"],
+                                   d["worst_m"], d["bad_sign"], d["n_sign"], d["old_bad"], d["n_sign"],
+                                   d["clamped"], d["bad_shared"], d["exact32"], d["n_sign"]))
+            got = (d["bad_shape"], d["bad_z"], d["bad_m"], d["bad_sign"], d["n_sign"], d["clamped"],
+                   d["bad_shared"], d["old_bad"])
+            chk(got == EXPECT_DECOMP[(arm, s)], "%s-s%d: counts == the two scorers' own" % (arm, s), str(got))
+            chk(d["exact32"] == d["n_sign"],
+                "%s-s%d: every unclamped beta == float32(beta_pre - float32(ms)*sign(L))" % (arm, s))
+            chk(decomp_ok(d), "%s-s%d: PASSES the successor's G-DECOMP" % (arm, s))
+    tot_sign = sum(dec[k]["n_sign"] for k in dec)
+    tot_exact = sum(dec[k]["exact32"] for k in dec)
+    tot_old = sum(dec[k]["old_bad"] for k in dec)
+    worst_q = max(dec[k]["worst_q"] for k in dec)
+    P("  TOTAL unclamped %d; bit-exact %d; rejected by the OLD absolute bar %d; by the NEW ms-aware bar %d"
+      % (tot_sign, tot_exact, tot_old, sum(dec[k]["bad_sign"] for k in dec)))
+    P("  worst |-(beta - beta_pre)/ms - sign(L)| = %.4e, inside the bound 0.5*ulp32/ms = %.4e"
+      % (worst_q, 0.5 * ULP32_MAX_IN_CLIP / MS))
+    chk(worst_q <= 0.5 * ULP32_MAX_IN_CLIP / MS and tot_exact == tot_sign,
+        "the whole residual is float32 quantisation of beta: the harness applied EXACTLY the registered update")
+
+    # ---- the statistics, the levels, the decision ------------------------------------------------
+    per_seed = {s: vote_stats(probes[("k01", s)]["recs"]) for s in SEEDS}
+    nst = vote_stats([x for s in SEEDS for x in probes[("k01", s)]["recs"]])
+    iso_st = vote_stats([x for s in SEEDS for x in probes[("ISO", s)]["recs"]])
+    ctl_st = vote_stats([x for s in SEEDS for x in probes[("CTL", s)]["recs"]])
+    lev, rngs, trn = {}, {}, {}
+    for arm in ARMS:
+        v = [outs[(arm, s)]["p5"] for s in SEEDS]
+        t = [outs[(arm, s)]["t5"] for s in SEEDS]
+        lev[arm], rngs[arm], trn[arm] = avg(v), max(v) - min(v), avg(t)
+    d_iso, d_ctl, pp = lev["ISO"] - lev["k01"], lev["CTL"] - lev["k01"], lev["ISO"] - lev["CTL"]
+    ins = [outs[(arm, s)]["p5"] - lev[arm] for arm in ARMS for s in SEEDS]
+    sig_in = math.sqrt(sum(x * x for x in ins) / (len(ins) - len(ARMS)))
+
+    nom = ("NOMINATED" if (nst["DOM_C"] >= DOM_HI and nst["TOP3_C"] >= TOP3_BAR)
+           else "NOT-NOMINATED" if nst["DOM_C"] <= DOM_LO else "NOMINATION-PARTIAL")
+    isow = ("ISO-RESCUES" if d_iso >= RESCUE_BAR else "ISO-NO-RESCUE" if d_iso <= NULL_BAR else "ISO-PARTIAL")
+    ctlw = ("CTL-RESCUES" if d_ctl >= RESCUE_BAR else "CTL-NULL" if d_ctl <= NULL_BAR else "CTL-PARTIAL")
+    allruns = [outs[(arm, s)]["p5"] for arm in ARMS for s in SEEDS]
+    diverged = (any(rngs[arm] > DIVERGED_BAR for arm in ARMS)
+                or any(not (LEVEL_MIN <= x <= LEVEL_MAX) for x in allruns))
+    chk(not diverged, "no arm's seed range exceeds 5.0 pp and every run is inside [5, 90]",
+        "ranges %s" % " ".join("%s %.3f" % (a_, rngs[a_]) for a_ in ARMS))
+    chk(lev["k01"] <= K01_MAX, "k01 %.4f <= K01_MAX 34.0: the collapse gate is not tripped" % lev["k01"])
+    branch = "%s+%s+%s" % (nom, isow, ctlw)
+    stamps = []
+    if isow == "ISO-NO-RESCUE" or ctlw == "CTL-NULL":
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    if lev["ISO"] < lev["CTL"]:
+        stamps.append("CTL-ABOVE-ISO")
+    tiso = ("ISO-RESCUES" if trn["ISO"] - trn["k01"] >= RESCUE_BAR
+            else "ISO-NO-RESCUE" if trn["ISO"] - trn["k01"] <= NULL_BAR else "ISO-PARTIAL")
+    tctl = ("CTL-RESCUES" if trn["CTL"] - trn["k01"] >= RESCUE_BAR
+            else "CTL-NULL" if trn["CTL"] - trn["k01"] <= NULL_BAR else "CTL-PARTIAL")
+    tw = "%s+%s" % (tiso, tctl)
+    stamps.append("TRAIN-AGREES" if tw == "%s+%s" % (isow, ctlw) else "TRAIN-DISAGREES(%s)" % tw)
+    stamps += ["DOM_C=%.4f" % nst["DOM_C"], "TOP3_C=%.4f" % nst["TOP3_C"],
+               "PINNED-FRAC=%s" % fmt(nst["PINNED_FRAC"]), "HARNESS-CLEAN", "SPEC-APPLIED", "DECOMPOSITION-OK",
+               "ONE-CELL-MS-3E-4", "ALPHA0-1E-6-ONLY", "HORIZON-100-ONLY", "ONE-NETWORK-RESNET18_C100",
+               "CTL-HAS-A-BIAS-MEMBER", "NO-LAYERWISE-IN-BATCH", "NOMINATION-FROM-K01-RECORDS-ONLY",
+               "SIGMA-PRIOR-FROZEN"]
+    head = HEADLINE.get(branch)
+    body = "; ".join((NOM_SENT[nom], ISO_SENT[isow], CTL_SENT[ctlw]))
+    lic = ("%s. %s." % (head, body)) if head else (body + ".")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+
+    P("\n[BAR MARGINS AS RECORD COUNTS] the nomination word is the bar-sensitive one (CORRECTIONS 265)")
+    n_rec = nst["n"]
+    for nm, val, bar in (("DOM_C", nst["DOM_C"], DOM_HI), ("TOP3_C", nst["TOP3_C"], TOP3_BAR)):
+        got_r = int(round(val * n_rec))
+        need_r = int(round(bar * n_rec))
+        P("  %-7s %.4f = %d of %d records; the %.2f bar is %d records: MISSES BY %d RECORDS"
+          % (nm, val, got_r, n_rec, bar, need_r, need_r - got_r))
+    P("  %-7s %.4f = %d records; the NOT-NOMINATED bar 0.10 is %d records: CLEARS IT BY %d RECORDS"
+      % ("DOM_C", nst["DOM_C"], int(round(nst["DOM_C"] * n_rec)), int(round(DOM_LO * n_rec)),
+         int(round(nst["DOM_C"] * n_rec)) - int(round(DOM_LO * n_rec))))
+    P("  D_ISO %+.4f pp clears the 20.0 bar by %.4f pp (%.2f SE); D_CTL %+.4f pp is %.4f pp inside the 5.0 bar "
+      "(%.2f SE); k01 %.4f is %.4f pp under K01_MAX 34.0"
+      % (d_iso, d_iso - RESCUE_BAR, (d_iso - RESCUE_BAR) / SE_PRIOR, d_ctl, NULL_BAR - d_ctl,
+         (NULL_BAR - d_ctl) / SE_PRIOR, lev["k01"], K01_MAX - lev["k01"]))
+    chk(nst["TOP3_C"] < TOP3_BAR and nst["DOM_C"] < DOM_HI and nst["DOM_C"] > DOM_LO,
+        "both nomination bars are missed and the NOT-NOMINATED bar is cleared -> NOMINATION-PARTIAL")
+
+    P("\n[CORPUS] sigma and the anchors, re-derived through the exclusions TSV at commit %s" % CORPUS_COMMIT)
+    raw, kept, excl = load_corpus(a.csv, a.tsv)
+    P("  rows %d -> %d after %d exclusion keys" % (len(raw), len(kept), len(excl)))
+    chk(len(raw) == REG_CORPUS_ROWS, "the registration corpus has %d rows" % REG_CORPUS_ROWS)
+    sig, df, ncell = pooled_sigma(kept, NET, DSET)
+    P("  SIGMA_R18ALL filtered %r (df %d, %d cells)" % (sig, df, ncell))
+    chk(abs(sig - SIGMA_PRIOR) < 1e-12 and df == 221 and ncell == 46,
+        "SIGMA_R18ALL == SIGMA_PRIOR (df 221, 46 cells)")
+    nsig, ndf, nnc = pooled_sigma(raw, NET, DSET)
+    P("  the same WITHOUT the exclusions (the OPERATIONS 36 trap): %.6f (df %d, %d cells)" % (nsig, ndf, nnc))
+    chk(nsig > sig, "the naive sigma is larger than the filtered one")
+    anch = {"k01@3e-4 (cru1 n3)": cell_rows(kept, NET, DSET, "3e-4", A0, "scalar"),
+            "layerwise@3e-4 (cru1 n3)": cell_rows(kept, NET, DSET, "3e-4", A0, "layerwise"),
+            "k01@1e-3 (n44)": cell_rows(kept, NET, DSET, "1e-3", A0, "scalar")}
+    for k, rows in anch.items():
+        m = avg([float(r["plateau5"]) for r in rows])
+        want, wn = EXPECT_ANCHOR[k]
+        P("  anchor %-27s n=%d mean %.4f" % (k, len(rows), m))
+        chk(len(rows) == wn and abs(round(m, 4) - want) < 5e-5, "anchor %s == the registered literal" % k)
+    chk(not any(r["run"].startswith(BATCH + "-") for r in raw),
+        "no cst1- row in the REGISTRATION corpus (the pre-launch freshness 256.2 recorded)")
+
+    # ---- the REPLICA: the successor's own output, rebuilt from scratch ----------------------------
+    R("[G-DECOMP] per-group sums of the capture vs the harness; applied step vs sign(L)")
+    R("  tolerance (THE ONE CHANGE from cST1): |-(beta - beta_pre)/ms - sign(L)| <= %.1e + %.1f*ulp32(beta)/ms "
+      "= %.4e at ms %g, |beta| < 16" % (SIGN_ABS_BAR, SIGN_ULP_K, SIGN_ABS_BAR + SIGN_ULP_K * ULP32_MAX_IN_CLIP / MS,
+                                        MS))
+    R("  cST1 applied an absolute %.1e; the float32 bound 0.5*ulp32/ms is %.4e here and exceeds it for "
+      "ms < %.6e" % (PRED_SIGN_BAR, 0.5 * ULP32_MAX_IN_CLIP / MS, MS_CROSSOVER))
+    for arm in ARMS:
+        for s in SEEDS:
+            d = dec[(arm, s)]
+            R("  %-4s %s   %s" % ("PASS" if decomp_ok(d) else "FAIL", "G-DECOMP %s-s%d" % (arm, s),
+                                  "shape %d z %d m %d (worst %.1e / %.1e) sign %d/%d clamped %d shared %d | "
+                                  "worst|q-s| %.3e bar %.3e" % (d["bad_shape"], d["bad_z"], d["bad_m"], d["worst_z"],
+                                                                d["worst_m"], d["bad_sign"], d["n_sign"],
+                                                                d["clamped"], d["bad_shared"], d["worst_q"],
+                                                                d["tol_max"])))
+    R("")
+    R("[NOMINATION] k01's records only, pooled over seeds (the registered check)")
+    for s in SEEDS:
+        describe(R, "k01-s%d" % s, per_seed[s])
+    describe(R, "k01 POOLED", nst)
+    R("  calibration at ms 1e-3 (registration): scalar DOM_C %.3f-%.3f pooled %.4f; layerwise 0.0000"
+      % (CALIB_SCALAR_DOM + (CALIB_SCALAR_POOLED,)))
+    R("")
+    R("[LEVELS] plateau5 (train5) per run; arm means; contrasts in pp and SE (SE_PRIOR %.6f)" % SE_PRIOR)
+    for arm in ARMS:
+        v = [outs[(arm, s)]["p5"] for s in SEEDS]
+        t = [outs[(arm, s)]["t5"] for s in SEEDS]
+        R("  %-4s %s  mean %.4f  range %.3f  | train %s mean %.4f"
+          % (arm, " ".join("%.3f" % x for x in v), lev[arm], rngs[arm], " ".join("%.3f" % x for x in t), trn[arm]))
+    for nm, d in (("D_ISO = ISO - k01", d_iso), ("D_CTL = CTL - k01", d_ctl), ("P = ISO - CTL", pp)):
+        R("  %-20s %+8.4f pp = %+8.2f SE" % (nm, d, d / SE_PRIOR))
+    R("  in-batch sigma %.4f (df %d); SIGMA_PRIOR %.4f -> %s"
+      % (sig_in, len(ins) - len(ARMS), SIGMA_PRIOR, "SIGMA-PRIOR-FROZEN"))
+    R("")
+    R("[DESCRIPTIVE, gating nothing] the counterfactual shared vote inside ISO and CTL; beta per group")
+    describe(R, "ISO POOLED", iso_st)
+    describe(R, "CTL POOLED", ctl_st)
+    for arm in ARMS:
+        for s in SEEDS:
+            recs = probes[(arm, s)]["recs"]
+            for c in range(N_COORDS[arm]):
+                b = [x["beta"][c] for x in recs]
+                pk = max(range(len(b)), key=lambda i: b[i])
+                R("  beta %s-s%d g%d: peak %.3f at step %d; terminal %.3f; share at floor %.3f"
+                  % (arm, s, c, b[pk], recs[pk]["step"], b[-1], sum(1 for x in b if x <= BETA_LO + 1e-6) / len(b)))
+    R("  corpus anchors (non-gating, filtered): %s" % "; ".join("%s %.4f" % kv for kv in ANCHOR.items()))
+    R("")
+    R("BRANCH   %s" % branch)
+    R("LICENCE  %s" % lic)
+    R("NOT LICENSED  %s" % NOT_LICENSED)
+    R("")
+    R(final)
+
+    P("\n" + "=" * 100)
+    P("REPLICA -- the successor scorer's output from its [G-DECOMP] header to FINAL, rebuilt independently")
+    P("=" * 100)
+    for ln in REPLICA:
+        P(ln)
+    P("=" * 100)
+    chk(final == EXPECT_FINAL, "FINAL re-derived == the successor scorer's FINAL")
+    chk(branch == "NOMINATION-PARTIAL+ISO-RESCUES+CTL-NULL", "BRANCH re-derived", branch)
+    chk(head is None, "this branch has NO headline sentence: the licence is composed word by word")
+
+    P("\nVIOLATIONS %d" % len(VIOL))
+    for v in VIOL:
+        P("  ! %s" % v)
+    sys.stdout.write("\n".join(OUT) + "\n")
+    print("HOSTPATH runsdir  %s" % os.path.abspath(rd))
+    print("HOSTPATH corpus   %s" % os.path.abspath(a.csv))
+    return 0 if not VIOL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

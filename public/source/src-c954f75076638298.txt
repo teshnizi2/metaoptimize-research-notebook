@@ -1,0 +1,1026 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cwd1_attack_indep.py -- THE INDEPENDENT ATTACK PARSER OF `cwd1` (CORRECTIONS 260).
+#
+# WHAT IT IS.  A second, independent implementation of EVERY line the FROZEN REGISTERED SCORER
+# analysis/cWD1_normwd_score.py (sha e9f8b72dd704934d9d6b52cf53562e4cd7f26d25d1ae9e5cf540f8941545078d)
+# prints on the landed `cwd1` batch.  It imports NO repo module -- not cwd_design, not cwd_common, not
+# cWD1_normwd_score, not cVT9_dosewindow_score, not corpus_exclusions: STDLIB ONLY.  It also uses NO
+# REGULAR EXPRESSION anywhere (the `re` module is never imported); every line is tokenised by hand, so
+# a shared regex cannot make the two implementations agree by accident.
+#
+# It rebuilds, from scratch:
+#   * the 62-tensor ResNet18_c100 parameter list, GENERATED from the ResNet-18 architecture (block
+#     widths 64/128/256/512, two BasicBlocks each, 1x1+BN shortcuts where the shape changes, 100-way
+#     linear head) -- not copied from the manifest it then checks;
+#   * PARTITION-MANIFEST.txt, byte for byte, from that list plus the registered design constants;
+#   * `normscale` TWO independent ways -- by the patch's own rule (1-D `*.weight`) and BY MODULE TYPE
+#     (every BatchNorm2d `.weight`) -- and checks they are the same 20 tensors / 4,800 parameters and
+#     that they are what each masked run's own `DECAY_MASK:` witness line announces;
+#   * every run's epoch curve from the RAW `.out` (the CSV `plateau` column is BANNED): plateau5 =
+#     mean TEST of epochs 95..99, train5 the same on TRAIN, tail slope = OLS of TEST over epochs 80..99;
+#   * G-ARGS / G-ENV / G-WITNESS / G-STRUCT / G-PROV, each re-derived from the raw files;
+#   * G-BITE: the Lion recompute on every group of every record of every run, the hold-key scan and the
+#     PATCH_DECAYMASK record audit (dm_n == step + 2, dm_skipped == dm_n * 20, dm_masked == 20, a
+#     positive dm_wdterm, no dm_* key on the unmasked arm);
+#   * the in-batch sigma, the SE, every contrast, every bar, the branch, the stamp list and FINAL;
+#   * the descriptive dm_norm readout;
+#   * the corpus disclosure line, through its own CSV reader and its own exclusions-TSV reader.
+# Then it prints a REPLICA of the scorer's whole output and diffs it, line by line, against the
+# scorer's committed stdout.
+#
+#     python3 analysis/cwd1_attack_indep.py <runsdir> --csv <all_runs.csv> --tsv <CORPUS-EXCLUSIONS.tsv> \
+#             [--scorer-out results/cwd1-score-cluster_b.txt] [--scorer-out results/cwd1-score-mac.txt] \
+#             [--scorer-file analysis/cWD1_normwd_score.py]
+#
+# Exit 0 iff VIOLATIONS 0.
+#
+# BYTE-IDENTICAL ON BOTH HOSTS.  Absolute paths appear ONLY on the HOSTPATH lines printed after the
+# body, and the replica writes the scorer's two path lines as `<RUNSDIR>/...`; the comparison against a
+# scorer stdout normalises that stdout the same way.  Given the same runsdir contents, the same corpus
+# pair and the same scorer stdout files, the body is identical on cluster_b and on the Mac.
+#
+# THE CORPUS COMMIT ITS CORPUS-DEPENDENT LINES USE.  Exactly one printed line of the scorer reads the
+# corpus -- the `corpus: N rows after corpus_exclusions.filter_rows, cwd1- excluded` DISCLOSURE line
+# (no bar, sigma, branch or stamp reads it; O2).  This parser re-derives it from
+#     results/all_runs.csv         sha256 1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a  (3,127 rows)
+#     results/CORPUS-EXCLUSIONS.tsv sha256 ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191
+# which are those two files AT REPO COMMIT c801585ca86f31617c4bc7b8a97f892f8adff378 -- `cwd1`'s OWN
+# REGISTRATION COMMIT, the corpus the frozen SIGMA_PRIOR literal was derived from.  It CHECKS both
+# shas and names the commit in the body.  The 266.9 ingest moved the live corpus to 3,181 rows, so on
+# a checkout past that commit the two files must be materialised with
+#     git show c801585:results/all_runs.csv   /   git show c801585:results/CORPUS-EXCLUSIONS.tsv
+# and passed in.  The parser ALSO re-derives the disclosure count for any other corpus it is given, and
+# reports it outside the body, so a scorer stdout produced against a later corpus is still explained
+# rather than silently mismatched.
+#
+# DEFINITIONS RE-TYPED FROM CORRECTIONS 260.2 / 260.4 / 260.5 (not imported):
+#   Lion meta update, per group:  L = b2*mom_pre + (1-b2)*z_agg, b2 = 0.9
+#                                 beta = clip(beta_pre - ms*sign(L), -15, -2.3026), ms = 1e-3
+#                                 a tie is |L| <= 1e-12*(|b2*mom_pre| + |(1-b2)*z_agg|); ties are skipped
+#                                 a group fails when |beta_recomputed - beta| > 1e-5
+#   plateau5 = mean TEST over epochs 95..99 of the run's OWN .out;  train5 the same on TRAIN
+#   FROZEN BARS (O2): GAP_MIN 20.0, K01_MAX 30.0, MATCH 5.0, NULL 2.0, RESCUE 10.0, R50 0.5,
+#                     DIVERGED 5.0, FLOOR_MIN 15.0, CEIL_MAX 90.0, CHANCE 1.0
+#   SIGMA_PRIOR (frozen floor) 0.6811983409351905;  SIGMA_USED = max(floor, in-batch);  SE = SIGMA_USED*sqrt(2/3)
+#   BRANCH (first match wins): UNRESOLVED-DIVERGED -> SCALAR-NOT-COLLAPSED (k01 > 30)
+#       -> REFERENCE-FAILED (kLNWD - k01 < 20) -> COLLAPSE-VANISHES (k01NWD >= kLNWD - 5)
+#       -> COLLAPSE-PERSISTS (k01NWD <= k01 + 2) -> COLLAPSE-REDUCED
+# =============================================================================
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import sys
+
+# ---- the registered design, re-typed --------------------------------------------------------------
+PREFIX = "cwd1"
+NET = "ResNet18_c100"
+DSET = "CIFAR100"
+N_CLASSES = 100
+ARMS = ("k01", "k01NWD", "kLNWD")
+SEEDS = (128, 129, 130)
+SPEC = {"k01": "scalar", "k01NWD": "scalar", "kLNWD": "layerwise"}
+PT_TYPE = {"k01": "scalar", "k01NWD": "scalar", "kLNWD": "layerwise"}
+DMASK = {"k01": "", "k01NWD": "normscale", "kLNWD": "normscale"}
+NG = {"k01": 1, "k01NWD": 1, "kLNWD": 62}
+EPOCHS = 100
+PROBE = 100
+N_RECORDS = 500
+META_STEPS = 50000
+NTENS = 62
+TOTAL_PARAMS = 11220132
+AUG = "1"
+CLIP = "-15:-2.3026"
+MST = "1e-3"
+MS = 1e-3
+A0 = "1e-6"
+BATCH = 100
+WD_BASE = "0.1"
+B2 = 0.9
+BETA_LO, BETA_HI = -15.0, -2.3026
+TIE_REL = 1e-12
+BH_TOL = 1e-5
+CARRIERS = ("layer4.0.bn2.weight", "layer4.0.shortcut.1.weight", "layer4.1.bn2.weight")
+
+GAP_MIN, K01_MAX, MATCH_BAR, NULL_BAR, RESCUE_BAR = 20.0, 30.0, 5.0, 2.0, 10.0
+R50, DIVERGED_BAR, FLOOR_MIN, CEIL_MAX, CHANCE = 0.5, 5.0, 15.0, 90.0, 1.0
+SIGMA_PRIOR = 0.6811983409351905
+KL_CORPUS = 69.42
+R_BETWEEN = (("corpus mechanism cell (LIMITS-PREP 2.2)", (("k01 (n44)", 22.96), ("layerwise (n32)", 69.42))),
+             ("cvt8 (252)", (("k01", 23.06), ("ISO", 70.26))))
+
+CORPUS_COMMIT = "c801585ca86f31617c4bc7b8a97f892f8adff378"
+REG_CORPUS_SHA = "1801245410857d8a9e66a68e6ec633ccf6cf9e92d0efcec8cf3d7e2077b94b0a"
+REG_CORPUS_ROWS = 3127
+REG_TSV_SHA = "ff9533348f9f2f0db04c66e7f6cbe8f191cd05bc59cb1c7dc359976db7cbe191"
+
+ENV_EXPECTED = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default "
+                "COS_WARMUP=default SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=100 "
+                "EB_RHO=na EB_LOG=0")
+OFF_WITNESS = (("VOTE_W", "VOTE_W: off"), ("BETA_HOLD", "BETA_HOLD: off"),
+               ("GROUP_HOLD", "GROUP_HOLD: off"), ("REST_HOLD", "REST_HOLD: off"))
+KINDS = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK")
+DM_KEYS = ("dm_n", "dm_masked", "dm_skipped", "dm_wdterm", "dm_norm", "dm_absmin", "dm_small")
+HOLD_PREFIXES = ("bh_", "gh_", "rh_", "ch_", "wh_")
+
+# PROVENANCE literals, re-typed from CORRECTIONS 260.10 (NOT read back from the file being checked)
+PROV_WANT = (("MODE", "submit", "MODE submit"),
+             ("BUILD_NETWORK_SHA256", "c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d",
+              "build_network.py == cvt8's"),
+             ("HF_SHA256", "94aedc33046afb12782ffb7f2eb729bafc7fcba5f42227fec373fa67b6f58ebf",
+              "HF.py == cwd1's PATCH_DECAYMASK tree"),
+             ("HF_PRE_DECAYMASK_SHA256", "5197dc2eecbbcb6feb815f3798b3455171e6ad614deac913be5df48dd9ede1a9",
+              "HF.py.pre_decaymask == cvt8's HF.py"),
+             ("RUNNER_SHA256", "34a8c90ee3a0bee00aa2d0b4a3ad5d16d461fbf5a1f0cda5797e44e44c158371",
+              "runner == run_cifar_cwd1.sh"),
+             ("SCORER_SHA256", "e9f8b72dd704934d9d6b52cf53562e4cd7f26d25d1ae9e5cf540f8941545078d",
+              "SCORER == this file"),
+             ("DESIGN_SHA256", "03d2d7614915757798699ff75ca971a11fca2056d383649fecbbf5adf06c0195",
+              "DESIGN == the cwd_design.py this scorer loaded"),
+             ("COMMON_SHA256", "d7ddb49e71013e3a21eaf5129861ab43dbc16e181bbd92af7c70cdc95e82bf52",
+              "COMMON == the cwd_common.py this scorer loaded"))
+
+LICENCE_VANISHES = [
+    "k01NWD sits within 5 pp of kLNWD: with coupled WD removed from the 20 BatchNorm scales (update AND meta trace),",
+    "the scalar step size no longer collapses at this cell.  Sentence licensed: 'at this cell the scalar collapse",
+    "REQUIRES coupled weight decay 0.1 on the normalisation scales' (necessity of that WD, shown by removing it).",
+    "EFFECT ON the scalar collapse at the mechanism cell (MASTER-TABLE rows 212-227) and the carrier account: "
+    "NARROWED -- common practice (no weight decay on BN scales, He et al. arXiv:1812.01187)",
+    "avoids the configuration; the carrier account becomes a mechanism of a WD-on-norm-scale configuration and must be",
+    "stated so.  Not licensed: which route (weight shrink vs meta trace), which of the 20 scales, decoupled WD, other cells."]
+NOT_LICENSED = [
+    "  * Anything about PlainNet / VGG / GroupNorm, other cells, momentum 0.9, or WD on conv / linear weights.",
+    "  * Which of the 20 scales matters (the carriers are masked together with 17 others), or which route (weight",
+    "    shrink vs meta trace).  Decoupled weight decay.  The ISO rescue under the mask (no ISO arm).  Beyond 100 epochs.",
+    "  * A within-batch comparison of kLNWD with an unmasked layerwise arm (none in batch; between-batch only)."]
+
+OUT, REPLICA, VIOL = [], [], []
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def R(s=""):
+    REPLICA.append(s)
+
+
+def chk(cond, label, extra=""):
+    P("  %-4s %s%s" % ("ok" if cond else "!!", label, ("   " + extra) if extra else ""))
+    if not cond:
+        VIOL.append(label + ((" | " + extra) if extra else ""))
+    return bool(cond)
+
+
+def mean(v):
+    return sum(v) / len(v) if v else None
+
+
+def sd(v):
+    if len(v) < 2:
+        return None
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def fmt(x, nd=4):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+def file_sha(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+# =============================================================================
+# 1. THE ARCHITECTURE, GENERATED (not copied from the manifest)
+# =============================================================================
+def build_tensor_list():
+    """ResNet-18 for 100 classes, in torch's named_parameters() order.
+    -> list of (name, numel, module_type, ndim), 1-based position = list index + 1."""
+    t = []
+
+    def conv(name, cout, cin, k):
+        t.append((name, cout * cin * k * k, "Conv2d", 4))
+
+    def bn(prefix, c, with_bias=True):
+        t.append((prefix + ".weight", c, "BatchNorm2d", 1))
+        if with_bias:
+            t.append((prefix + ".bias", c, "BatchNorm2d", 1))
+
+    conv("conv1.weight", 64, 3, 3)
+    bn("bn1", 64)
+    cin = 64
+    for li, cout in enumerate((64, 128, 256, 512), start=1):
+        for bi in (0, 1):
+            pre = "layer%d.%d" % (li, bi)
+            stride_block = (bi == 0 and cin != cout)
+            conv(pre + ".conv1.weight", cout, cin, 3)
+            bn(pre + ".bn1", cout)
+            conv(pre + ".conv2.weight", cout, cout, 3)
+            bn(pre + ".bn2", cout)
+            if stride_block:
+                conv(pre + ".shortcut.0.weight", cout, cin, 1)
+                bn(pre + ".shortcut.1", cout)
+            cin = cout
+    t.append(("linear.weight", 512 * N_CLASSES, "Linear", 2))
+    t.append(("linear.bias", N_CLASSES, "Linear", 1))
+    return t
+
+
+def normscale_by_rule(tensors):
+    """the patch's own rule: 1-D `*.weight`.  -> list of 1-based positions."""
+    return [i + 1 for i, (n, _, _, d) in enumerate(tensors) if d == 1 and n.endswith(".weight")]
+
+
+def normscale_by_module_type(tensors):
+    """independent route: every BatchNorm2d `.weight`, by module type."""
+    return [i + 1 for i, (n, _, m, _) in enumerate(tensors) if m == "BatchNorm2d" and n.endswith(".weight")]
+
+
+def dm_witness_text(tensors, idx):
+    return ("DECAY_MASK: on base=SGDm wd=%s spec=normscale masked=%d of=%d numel=%d idx=%s names=%s"
+            % (WD_BASE, len(idx), len(tensors), sum(tensors[i - 1][1] for i in idx),
+               ",".join(str(i) for i in idx), ",".join(tensors[i - 1][0] for i in idx)))
+
+
+def manifest_text(tensors, idx):
+    L = ["NETWORK %s" % NET,
+         "NUM_PARAM_TENSORS %d" % len(tensors),
+         "TOTAL_PARAMS %d" % sum(x[1] for x in tensors),
+         "CLIP_C %s" % CLIP,
+         "EPOCHS %d" % EPOCHS,
+         "META_STEPS %d" % META_STEPS,
+         "WD_BASE %s" % WD_BASE]
+    for i, (n, ne, m, d) in enumerate(tensors, start=1):
+        L.append("TENSOR %d %s %d %s ndim=%d" % (i, n, ne, m, d))
+    L.append("NORMSCALE %s" % ",".join("%d:%s" % (i, tensors[i - 1][0]) for i in idx))
+    wit = dm_witness_text(tensors, idx)
+    for a in ARMS:
+        L.append("ARMSPEC %s SPEC %s TYPE %s" % (a, SPEC[a], PT_TYPE[a]))
+        L.append("DECAYMASK %s %s" % (a, DMASK[a] or "off"))
+        L.append("DWITNESS %s %s" % (a, wit if DMASK[a] else "DECAY_MASK: off"))
+    return "\n".join(L) + "\n"
+
+
+# =============================================================================
+# 2. RAW `.out` READING -- no regex
+# =============================================================================
+def _after(s, tag):
+    i = s.find(tag)
+    return None if i < 0 else s[i + len(tag):]
+
+
+def parse_epoch_line(ln):
+    """'Epoch 7, Train Accuracy: 1.17 %, Test Accuracy: 1.30 %' -> (7, 1.17, 1.30); None if not one."""
+    s = ln.strip()
+    if not s.startswith("Epoch "):
+        return None
+    parts = s.split(",")
+    if len(parts) < 3:
+        return None
+    head = parts[0][len("Epoch "):].strip()
+    if not head or not all(c in "0123456789" for c in head):
+        return None
+    tr = _after(parts[1], "Train Accuracy:")
+    te = _after(parts[2], "Test Accuracy:")
+    if tr is None or te is None:
+        return None
+    tr, te = tr.strip().rstrip("%").strip(), te.strip().rstrip("%").strip()
+    try:
+        return int(head), float(tr), float(te)
+    except ValueError:
+        return None
+
+
+def parse_run(path):
+    txt = open(path, errors="replace").read()
+    lines = txt.splitlines()
+    eps = {}
+    for ln in lines:
+        e = parse_epoch_line(ln)
+        if e is not None:
+            eps[e[0]] = (e[1], e[2])
+    rec = {"eps": eps, "n_epochs": len(eps),
+           "traceback": "Traceback (most recent call last)" in txt,
+           "run_done": any(ln.strip() == "RUN_DONE" for ln in lines),
+           "args": [ln for ln in lines if ln.startswith("ARGS:")],
+           "env": [ln for ln in lines if ln.startswith("ENV:")],
+           "pt": [ln for ln in lines if ln.startswith("PROBE_TENSOR:")],
+           "plateau5": None, "train5": None}
+    for k in KINDS:
+        rec[k] = [ln for ln in lines if ln.startswith(k)]
+    tail = [eps.get(e) for e in range(EPOCHS - 5, EPOCHS)]
+    if all(x is not None for x in tail) and all(math.isfinite(x[0]) and math.isfinite(x[1]) for x in tail):
+        rec["plateau5"] = mean([x[1] for x in tail])
+        rec["train5"] = mean([x[0] for x in tail])
+    rec["complete"] = (sorted(eps) == list(range(EPOCHS)) and rec["run_done"] and not rec["traceback"]
+                       and rec["plateau5"] is not None)
+    return rec
+
+
+def split_out_name(fn):
+    """'cwd1-k01NWD-s128-5045343.out' -> ('k01NWD', 128, 5045343), else None.  No regex."""
+    if not fn.endswith(".out"):
+        return None
+    stem = fn[:-4]
+    f = stem.split("-")
+    if len(f) != 4 or f[0] != PREFIX or f[1] not in ARMS:
+        return None
+    if not f[2].startswith("s") or not f[2][1:].isdigit() or not f[3].isdigit():
+        return None
+    return f[1], int(f[2][1:]), int(f[3])
+
+
+def read_runs(runsdir):
+    cand = {}
+    for fn in sorted(os.listdir(runsdir)):
+        k = split_out_name(fn)
+        if k is None:
+            continue
+        arm, seed, jid = k
+        r = parse_run(os.path.join(runsdir, fn))
+        r.update({"file": fn, "job": jid, "arm": arm, "seed": seed})
+        cand.setdefault((arm, seed), []).append(r)
+    got = {}
+    for k, lst in cand.items():
+        comp = [r for r in lst if r["complete"]]
+        got[k] = max(comp or lst, key=lambda r: r["job"])
+    return got
+
+
+def parse_args_line(line):
+    toks = line[len("ARGS:"):].split()
+    flags, cur = {}, None
+    for t in toks:
+        if t.startswith("--"):
+            cur = t[2:]
+            flags.setdefault(cur, []).append(None)
+        elif cur is not None:
+            v = flags[cur][-1]
+            flags[cur][-1] = t if v is None else v + " " + t
+    return flags
+
+
+def tail_slope(eps, lo=80, hi=99):
+    xs = [e for e in range(lo, hi + 1) if e in eps]
+    if len(xs) < 3:
+        return None
+    ys = [eps[e][1] for e in xs]
+    mx, my = mean(xs), mean(ys)
+    den = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else None
+
+
+# =============================================================================
+# 3. PROBE RECORDS, LION, THE DECAY_MASK AUDIT
+# =============================================================================
+def load_probe(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, "probe_%s-%s-s%d" % (PREFIX, arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            recs = []
+            for ln in open(p, errors="replace"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    recs.append(None)
+                    continue
+                recs.append(r if isinstance(r, dict) else None)
+            return recs
+    return None
+
+
+def groupvec(r, key, ng):
+    v = r.get(key)
+    if not (isinstance(v, list) and len(v) == 1 and isinstance(v[0], list) and len(v[0]) == ng):
+        return None
+    return [float(x) for x in v[0]]
+
+
+def lion_natural(beta_pre, mom_pre, z):
+    a, b = B2 * mom_pre, (1.0 - B2) * z
+    L = a + b
+    tie = abs(L) <= TIE_REL * (abs(a) + abs(b))
+    s = (L > 0) - (L < 0)
+    return max(BETA_LO, min(BETA_HI, beta_pre - MS * s)), tie
+
+
+def lion_check(recs, ng):
+    d = {"n": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0, "nonfinite": 0, "worst": 0.0}
+    if recs is None:
+        return False, d
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        bpre, mom, z = groupvec(r, "beta_pre", ng), groupvec(r, "mom_pre", ng), groupvec(r, "z_agg", ng)
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        if r["step"] != 100 * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        for g in range(ng):
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst"] = max(d["worst"], e)
+            d["bad_lion"] += e > BH_TOL
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS
+          and d["bad_step"] == 0 and d["bad_lion"] == 0)
+    return ok, d
+
+
+def _finite(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def dm_audit(recs, k):
+    d = {"n": 0, "bad_rec": 0, "bad_n": 0, "bad_masked": 0, "bad_skipped": 0, "bad_types": 0,
+         "keys_on_unmasked": 0, "nonfinite": 0, "pos_wdterm": 0, "last": None}
+    if recs is None:
+        return False, d
+    prev = -1
+    for r in recs:
+        if r is None or not isinstance(r.get("step"), int):
+            d["bad_rec"] += 1
+            continue
+        d["n"] += 1
+        has = [key for key in r if key.startswith("dm_")]
+        if k == 0:
+            d["keys_on_unmasked"] += bool(has)
+            continue
+        s = r["step"]
+        dn = r.get("dm_n")
+        if not (isinstance(dn, int) and dn == s + 2 and dn > prev):
+            d["bad_n"] += 1
+        prev = dn if isinstance(dn, int) else prev
+        if r.get("dm_masked") != k:
+            d["bad_masked"] += 1
+        if not (isinstance(dn, int) and r.get("dm_skipped") == dn * k):
+            d["bad_skipped"] += 1
+        wt, nr, am, sm = r.get("dm_wdterm"), r.get("dm_norm"), r.get("dm_absmin"), r.get("dm_small")
+        types_ok = (isinstance(wt, (int, float)) and not isinstance(wt, bool) and isinstance(nr, list) and len(nr) == k
+                    and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in nr)
+                    and isinstance(am, (int, float)) and not isinstance(am, bool) and isinstance(sm, int) and sm >= 0
+                    and sorted(has) == sorted(DM_KEYS))
+        if not types_ok:
+            d["bad_types"] += 1
+            continue
+        if not (_finite(wt) and all(_finite(x) for x in nr) and _finite(am)):
+            d["nonfinite"] += 1
+            continue
+        if wt < 0 or am < 0:
+            d["bad_types"] += 1
+            continue
+        d["pos_wdterm"] += wt > 0
+        d["last"] = {"dm_n": dn, "dm_skipped": r.get("dm_skipped"), "dm_wdterm": wt, "dm_absmin": am, "dm_small": sm}
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] == N_RECORDS)
+    if k == 0:
+        ok = ok and d["keys_on_unmasked"] == 0
+    else:
+        ok = (ok and d["bad_n"] == 0 and d["bad_masked"] == 0 and d["bad_skipped"] == 0
+              and d["bad_types"] == 0 and d["pos_wdterm"] > 0)
+    return ok, d
+
+
+def hold_keys_present(recs):
+    if recs is None:
+        return None
+    return sum(1 for r in recs if isinstance(r, dict) and any(key.startswith(HOLD_PREFIXES) for key in r))
+
+
+# =============================================================================
+# 4. THE CORPUS (one DISCLOSURE line only)
+# =============================================================================
+def tsv_keys(path):
+    lines = [ln.rstrip("\n") for ln in open(path) if ln.strip() and not ln.startswith("#")]
+    head = lines[0].split("\t")
+    out = set()
+    for ln in lines[1:]:
+        f = ln.split("\t")
+        if len(f) != len(head):
+            raise ValueError("bad arity")
+        e = dict(zip(head, f))
+        out.add((e["run"], e["job_id"]))
+    return out
+
+
+def corpus_disclosure(csvpath, tsvpath):
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    k = tsv_keys(tsvpath)
+    kept = [r for r in rows if (r.get("run"), r.get("job_id")) not in k]
+    return len(rows), len(kept)
+
+
+# =============================================================================
+# 5. BRANCH
+# =============================================================================
+def decide(M, diverged):
+    if diverged:
+        return "UNRESOLVED-DIVERGED"
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED"
+    if M["kLNWD"] - M["k01"] < GAP_MIN:
+        return "REFERENCE-FAILED"
+    if M["k01NWD"] >= M["kLNWD"] - MATCH_BAR:
+        return "COLLAPSE-VANISHES"
+    if M["k01NWD"] <= M["k01"] + NULL_BAR:
+        return "COLLAPSE-PERSISTS"
+    return "COLLAPSE-REDUCED"
+
+
+# =============================================================================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir")
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--tsv", required=True)
+    ap.add_argument("--scorer-out", action="append", default=[])
+    ap.add_argument("--scorer-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                          "cWD1_normwd_score.py"))
+    a = ap.parse_args()
+    rd = a.runsdir
+
+    P("=" * 100)
+    P("cwd1_attack_indep -- INDEPENDENT re-derivation of every line analysis/cWD1_normwd_score.py prints")
+    P("no repo import, no regular expression, stdlib only;  CORRECTIONS 260")
+    P("=" * 100)
+
+    # ---- 1. architecture, normscale, manifest -----------------------------------------------------
+    P("\n[ARCH] the 62 tensors, GENERATED from the ResNet-18 architecture (not read from the manifest)")
+    T = build_tensor_list()
+    P("  tensors %d  params %d" % (len(T), sum(x[1] for x in T)))
+    chk(len(T) == NTENS, "the generated list has 62 parameter tensors")
+    chk(sum(x[1] for x in T) == TOTAL_PARAMS, "the generated list totals 11,220,132 parameters")
+    by_rule = normscale_by_rule(T)
+    by_type = normscale_by_module_type(T)
+    P("  normscale by the patch's rule (1-D *.weight): %d tensors, %d parameters"
+      % (len(by_rule), sum(T[i - 1][1] for i in by_rule)))
+    P("  normscale BY MODULE TYPE   (BatchNorm2d .weight): %d tensors, %d parameters"
+      % (len(by_type), sum(T[i - 1][1] for i in by_type)))
+    chk(by_rule == by_type, "the two routes select the SAME tensors")
+    chk(len(by_rule) == 20 and sum(T[i - 1][1] for i in by_rule) == 4800,
+        "the mask is EXACTLY the 20 BatchNorm2d scales, 4,800 parameters")
+    P("  idx %s" % ",".join(str(i) for i in by_rule))
+    for c in CARRIERS:
+        pos = [i for i in by_rule if T[i - 1][0] == c]
+        chk(len(pos) == 1, "the ctd1 carrier %s is inside the mask (idx %s)" % (c, pos))
+    other1d = [(i + 1, n) for i, (n, _, _, d) in enumerate(T) if d == 1 and i + 1 not in by_rule]
+    P("  the %d OTHER 1-D tensors keep WD %s: %s ... %s"
+      % (len(other1d), WD_BASE, other1d[0][1], other1d[-1][1]))
+    chk(len(other1d) == 21, "21 other 1-D tensors (20 BatchNorm2d shifts + the linear bias) keep their weight decay")
+
+    mtext = manifest_text(T, by_rule)
+    mpath = os.path.join(rd, PREFIX, "PARTITION-MANIFEST.txt")
+    mhow = "<runsdir>/%s/" % PREFIX
+    if not os.path.exists(mpath):
+        mpath, mhow = os.path.join(rd, "%s-PARTITION-MANIFEST.txt" % PREFIX), "<runsdir>/%s-" % PREFIX
+    disk = open(mpath).read()
+    P("\n[MANIFEST] rebuilt from the generated architecture, byte for byte")
+    P("  rebuilt %d bytes; on disk %d bytes" % (len(mtext), len(disk)))
+    chk(mtext == disk, "PARTITION-MANIFEST.txt is reproduced BYTE FOR BYTE")
+    WIT_DM = dm_witness_text(T, by_rule)
+
+    # ---- 2. runs ---------------------------------------------------------------------------------
+    runs = read_runs(rd)
+    P("\n[RUNS] the 9 raw .out files")
+    chk(len(runs) == 9, "9 (arm, seed) runs found", str(sorted(runs)))
+    for s in SEEDS:
+        for arm in ARMS:
+            r = runs[(arm, s)]
+            chk(r["complete"] and r["n_epochs"] == EPOCHS,
+                "%s-s%d complete: 100 epoch lines, RUN_DONE, no traceback" % (arm, s))
+    lev = {}
+    trn = {}
+    for arm in ARMS:
+        lev[arm] = [runs[(arm, s)]["plateau5"] for s in SEEDS]
+        trn[arm] = [runs[(arm, s)]["train5"] for s in SEEDS]
+    M = dict((arm, mean(lev[arm])) for arm in ARMS)
+    Tm = dict((arm, mean(trn[arm])) for arm in ARMS)
+
+    # ---- 3. witnesses ----------------------------------------------------------------------------
+    P("\n[WITNESS] the DECAY_MASK line of every run, against the mask this parser generated")
+    n_on = n_off = 0
+    for s in SEEDS:
+        for arm in ARMS:
+            r = runs[(arm, s)]
+            want = WIT_DM if DMASK[arm] else "DECAY_MASK: off"
+            ok = r["DECAY_MASK"] == [want]
+            n_on += bool(DMASK[arm]) and ok
+            n_off += (not DMASK[arm]) and ok
+            chk(ok, "DECAY_MASK witness %s-s%d == the generated line" % (arm, s))
+            for kind, w in OFF_WITNESS:
+                chk(r[kind] == [w], "%s witness %s-s%d is `%s`" % (kind, arm, s, w))
+            chk(not r["COMP_HOLD"] and not r["WINDOW_HOLD"],
+                "%s-s%d prints no COMP_HOLD / WINDOW_HOLD line" % (arm, s))
+            chk(len(r["env"]) == 1 and " ".join(t for t in r["env"][0].split() if not t.startswith("PROBE_DIR=")) == ENV_EXPECTED,
+                "%s-s%d ENV line == cvt1's ... cvt9's (PROBE_DIR stripped)" % (arm, s))
+            chk(len(r["pt"]) == 1 and r["pt"][0].startswith("PROBE_TENSOR: on every=%d type=%s tensors=%d "
+                                                            % (PROBE, PT_TYPE[arm], NTENS)),
+                "%s-s%d PROBE_TENSOR line is its arm's, tensors=62" % (arm, s))
+            f = parse_args_line(r["args"][0]) if len(r["args"]) == 1 else {}
+            want_args = (("optimizer", "HF"), ("alg-base", "SGDm"), ("alg-meta", "Lion"), ("dataset", DSET),
+                         ("NN-name", NET), ("batch-size", str(BATCH)), ("num-epochs", str(EPOCHS)),
+                         ("meta-stepsize", MST), ("alpha0", A0), ("stepsize-groups", SPEC[arm]),
+                         ("seed", str(s)), ("run-name", "%s-%s-s%d" % (PREFIX, arm, s)),
+                         ("momentum-param-base", "0.99"), ("weight-decay-base", "0.1"),
+                         ("momentum-param-meta", "0.99"), ("Lion-beta2-meta", "0.9"),
+                         ("weight-decay-meta", "0"), ("gamma", "1"))
+            bad = [k for k, v in want_args if f.get(k, [None])[-1] != v]
+            dup = [k for k, v in f.items() if len(v) > 1]
+            chk(len(r["args"]) == 1 and not bad and not dup,
+                "%s-s%d ARGS line: 18 registered flags, none repeated" % (arm, s), "bad %s dup %s" % (bad, dup))
+    P("  DECAY_MASK ON on %d runs, OFF on %d runs" % (n_on, n_off))
+    chk(n_on == 6 and n_off == 3, "the mask is ON on 6 runs (k01NWD, kLNWD x 3 seeds) and OFF on 3 (k01)")
+
+    # ---- 4. provenance ---------------------------------------------------------------------------
+    ppath = os.path.join(rd, PREFIX, "PROVENANCE.txt")
+    phow = "<runsdir>/%s/" % PREFIX
+    if not os.path.exists(ppath):
+        ppath, phow = os.path.join(rd, "%s-PROVENANCE.txt" % PREFIX), "<runsdir>/%s-" % PREFIX
+    prov = {}
+    for ln in open(ppath):
+        ln = ln.strip()
+        if not ln:
+            continue
+        f = ln.split(None, 1)
+        prov[f[0]] = f[1] if len(f) > 1 else ""
+    P("\n[PROVENANCE] the 8 gated fields, against the literals of CORRECTIONS 260.10")
+    for key, want, lab in PROV_WANT:
+        chk(prov.get(key) == want, "PROVENANCE %s" % lab)
+    if os.path.exists(a.scorer_file):
+        chk(file_sha(a.scorer_file) == "e9f8b72dd704934d9d6b52cf53562e4cd7f26d25d1ae9e5cf540f8941545078d",
+            "the scorer file on disk IS the registered e9f8b72d... (unedited, RULE 16)")
+    P("  the REGISTERED_COMMIT field carries %r" % prov.get("REGISTERED_COMMIT"))
+    chk(len(prov.get("REGISTERED_COMMIT", "")) != 40,
+        "DISCLOSED DEFECT (260.10): REGISTERED_COMMIT is not a 40-hex sha; no gate of this batch reads it")
+    chk(CORPUS_COMMIT.startswith(prov.get("REGISTERED_COMMIT", "")[:7]),
+        "its first 7 characters are the true registration commit's abbreviation (%s)" % CORPUS_COMMIT[:7])
+
+    # ---- 5. G-BITE -------------------------------------------------------------------------------
+    P("\n[G-BITE] Lion on every group of every record; hold keys; the PATCH_DECAYMASK record audit")
+    bite = {}
+    for s in SEEDS:
+        for arm in ARMS:
+            recs = load_probe(rd, arm, s)
+            k = 20 if DMASK[arm] else 0
+            okl, dl = lion_check(recs, NG[arm])
+            okd, dd = dm_audit(recs, k)
+            hk = hold_keys_present(recs)
+            bite[(arm, s)] = (recs, okl and okd and hk == 0, dl, dd, hk, k)
+            chk(okl, "Lion recompute exact on %s-s%d (%d group(s) x 500 records)" % (arm, s, NG[arm]),
+                "bad %d worst %.1e" % (dl["bad_lion"], dl["worst"]))
+            chk(okd, "DECAY_MASK record audit %s-s%d (k=%d)" % (arm, s, k))
+            chk(hk == 0, "no hold-patch key on any record of %s-s%d" % (arm, s))
+            if k:
+                chk(all(r.get("dm_masked") == 20 for r in recs), "%s-s%d: dm_masked == 20 on all 500 records" % (arm, s))
+                chk(all(r.get("dm_skipped") == r.get("dm_n") * 20 for r in recs),
+                    "%s-s%d: dm_skipped == dm_n * 20 on all 500 records" % (arm, s))
+                chk(all(len(r.get("dm_norm", [])) == 20 for r in recs),
+                    "%s-s%d: dm_norm carries 20 entries on all 500 records" % (arm, s))
+
+    # ---- 6. sigma, contrasts, branch --------------------------------------------------------------
+    ss = sum(sum((x - M[arm]) ** 2 for x in lev[arm]) for arm in ARMS)
+    df = sum(len(lev[arm]) - 1 for arm in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which = "SIGMA_PRIOR_frozen" if SIGMA_PRIOR >= sigma_in else "SIGMA_INBATCH"
+    sigma_used = max(SIGMA_PRIOR, sigma_in)
+    se = sigma_used * math.sqrt(2.0 / len(SEEDS))
+    P("\n[SIGMA] in-batch %.6f (df %d); frozen floor %.6f -> SIGMA_USED %.6f, SE %.6f"
+      % (sigma_in, df, SIGMA_PRIOR, sigma_used, se))
+    chk(which == "SIGMA_PRIOR_frozen", "the frozen floor dominates the in-batch sigma")
+
+    P_NWD = (M["k01NWD"] - M["k01"], Tm["k01NWD"] - Tm["k01"])
+    G_NWD = (M["kLNWD"] - M["k01NWD"], Tm["kLNWD"] - Tm["k01NWD"])
+    D_REF = M["kLNWD"] - M["k01"]
+    RATIO = M["k01NWD"] / M["kLNWD"]
+    F_NWD = P_NWD[0] / D_REF
+    div = [arm for arm in ARMS if max(lev[arm]) - min(lev[arm]) > DIVERGED_BAR]
+    branch = decide(M, bool(div))
+    P("\n[BRANCH] %s" % branch)
+    chk(branch == "COLLAPSE-VANISHES", "the branch re-derives as COLLAPSE-VANISHES")
+    chk(M["k01NWD"] >= M["kLNWD"] - MATCH_BAR,
+        "k01NWD %.4f >= kLNWD - 5 = %.4f (clears by %.4f pp = %.2f SE)"
+        % (M["k01NWD"], M["kLNWD"] - MATCH_BAR, M["k01NWD"] - (M["kLNWD"] - MATCH_BAR),
+           (M["k01NWD"] - (M["kLNWD"] - MATCH_BAR)) / se))
+    chk(M["k01"] <= K01_MAX, "the anchor k01 %.4f is under K01_MAX 30.0" % M["k01"])
+    chk(D_REF >= GAP_MIN, "the reference gap D_REF %.4f clears GAP_MIN 20.0" % D_REF)
+
+    stamps = ["HARNESS-CLEAN", "PATCH-BITES", "MASK-20-NORM-SCALES", "MASK-UPDATE-AND-TRACE", "CONV-LINEAR-WD-KEPT",
+              "ONE-NETWORK-RESNET18", "ONE-CELL", "HORIZON-100-ONLY", "NO-WD-ON-REFERENCE-ARM",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    if branch in ("COLLAPSE-VANISHES", "COLLAPSE-PERSISTS", "COLLAPSE-REDUCED"):
+        stamps.append("R50-UNDER-MASK" if M["k01NWD"] <= R50 * M["kLNWD"] else "NOT-R50-UNDER-MASK")
+    if M["k01NWD"] < M["k01"] - NULL_BAR:
+        stamps.append("K01NWD-BELOW-K01")
+    if M["k01NWD"] > M["kLNWD"] + MATCH_BAR:
+        stamps.append("K01NWD-ABOVE-KLNWD")
+    if abs(M["kLNWD"] - KL_CORPUS) > MATCH_BAR:
+        stamps.append("KLNWD-DIFFERS-FROM-CORPUS-LAYERWISE")
+    for arm in ARMS:
+        if any(bite[(arm, s)][2]["nonfinite"] + bite[(arm, s)][3]["nonfinite"] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % arm)
+    if abs(M["k01NWD"] - M["k01"]) <= NULL_BAR:
+        stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    agree = all((t > 0) == (p > 0) for p, t in (P_NWD, G_NWD) if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+
+    # ---- 7. corpus -------------------------------------------------------------------------------
+    P("\n[CORPUS] the ONE disclosure line, at commit %s" % CORPUS_COMMIT)
+    csha, tsha = file_sha(a.csv), file_sha(a.tsv)
+    nraw, nkept = corpus_disclosure(a.csv, a.tsv)
+    P("  all_runs.csv sha %s" % csha)
+    P("  CORPUS-EXCLUSIONS.tsv sha %s" % tsha)
+    P("  %d rows without a cwd1- row -> %d after the exclusions" % (nraw, nkept))
+    is_reg = (csha == REG_CORPUS_SHA and tsha == REG_TSV_SHA)
+    chk(is_reg, "the corpus pair IS the registration corpus of commit %s" % CORPUS_COMMIT[:7])
+    if is_reg:
+        chk(nraw == REG_CORPUS_ROWS - 0, "the registration corpus has %d rows once no cwd1- row exists" % nraw)
+
+    # ---- 8. THE REPLICA --------------------------------------------------------------------------
+    R("=" * 78)
+    R(" cwd1 -- ResNet18_c100: DOES THE SCALAR COLLAPSE NEED COUPLED WEIGHT DECAY ON THE NORMALISATION SCALES?  (PATCH_DECAYMASK)")
+    R(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+      % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for arm in ARMS:
+        R("   %-7s %-10s DECAY_MASK %s" % (arm, SPEC[arm], DMASK[arm] or "(unset)"))
+    R(" CO-PRIMARY: P_NWD = k01NWD - k01; G_NWD = kLNWD - k01NWD.  KEY: D_REF = kLNWD - k01.")
+    R(" plateau5 = mean TEST over epochs %d..%d of each run's own .out.  BARS ARE FROZEN LITERALS (O2)."
+      % (EPOCHS - 5, EPOCHS - 1))
+    R("=" * 78)
+    R("corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  "
+      "(DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % (nkept, PREFIX))
+    R("")
+    R("COMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for s in SEEDS:
+        for arm in ARMS:
+            r = runs[(arm, s)]
+            R("  %-4s %s-%s-s%d  %s" % ("OK", PREFIX, arm, s,
+                                        "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                                        % (r["n_epochs"], r["run_done"], r["traceback"],
+                                           fmt(r["plateau5"]), fmt(r["train5"]))))
+    R("")
+    R("G-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for arm in ARMS:
+            R("  %-4s %s" % ("PASS", "G-ARGS %s-s%d" % (arm, s)))
+    R("")
+    R("G-ENV     the environment rode the ENV line on every run")
+    R("  %-4s %s   %s" % ("PASS", "G-ENV one distinct ENV line, one per run", "1 distinct"))
+    R("        %s" % ENV_EXPECTED)
+    R("  %-4s %s" % ("PASS", "G-ENV the ENV line is cvt1's ... cvt9's, byte for byte (PROBE_DIR stripped)"))
+    R("  %-4s %s   %s" % ("PASS", "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its arm's> tensors=%d`"
+                          % (PROBE, NTENS), "%d runs" % len(runs)))
+    R("")
+    R("G-WITNESS one line of each kind per run == the registered witness "
+      "(VOTE_W / BETA_HOLD / GROUP_HOLD / REST_HOLD off; DECAY_MASK)")
+    for s in SEEDS:
+        for arm in ARMS:
+            for kind, _w in list(OFF_WITNESS) + [("DECAY_MASK", None)]:
+                R("  %-4s %s" % ("PASS", "G-WITNESS %s %s-s%d" % (kind, arm, s)))
+            R("  %-4s %s" % ("PASS", "G-WITNESS %s-s%d prints no COMP_HOLD / WINDOW_HOLD line (cvt8 lineage)" % (arm, s)))
+    R("")
+    R("G-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    R("  manifest: <RUNSDIR>/%s/PARTITION-MANIFEST.txt (%s)" % (PREFIX, mhow))
+    R("  %-4s %s   %s" % ("PASS", "G-STRUCT byte-identical to cwd_design.manifest_text(CWD1)",
+                          "%d vs %d bytes" % (len(disk), len(mtext))))
+    R("")
+    R("G-PROV    PROVENANCE.txt")
+    R("  provenance: <RUNSDIR>/%s/PROVENANCE.txt (%s)" % (PREFIX, phow))
+    for key, want, lab in PROV_WANT:
+        R("  %-4s %s   %s" % ("PASS", "G-PROV %s" % lab, "%s=%s" % (key, str(prov.get(key))[:16])))
+    R("")
+    R("LEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    for arm in ARMS:
+        v, t = lev[arm], trn[arm]
+        sl = [tail_slope(runs[(arm, s)]["eps"]) for s in SEEDS]
+        R("  %-7s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+          % (arm, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        R("          seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    hi = max(M.values())
+    R("")
+    R("G-FLOOR / G-CEIL")
+    R("  %-4s %s   %s" % ("PASS", "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi))
+    R("  %-4s %s   %s" % ("PASS", "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi))
+    R("")
+    R("G-BITE    Lion recomputed on every group of every arm; no hold key; the DECAY_MASK record audit")
+    for s in SEEDS:
+        for arm in ARMS:
+            recs, ok, dl, dd, hk, k = bite[(arm, s)]
+            R("  %-4s G-BITE %-7s s%d  records %s  groups %d  lion-mismatch %d (ties %d, worst %.1e)  bad %d  "
+              "nonfinite %d  hold-key records %s | dm: k=%d bad_n %d bad_skipped %d bad_masked %d bad_types %d "
+              "on-unmasked %d pos_wdterm %d nonfinite %d last %s"
+              % ("PASS" if ok else "FAIL", arm, s, len(recs), NG[arm], dl["bad_lion"], dl["ties"], dl["worst"],
+                 dl["bad_rec"], dl["nonfinite"], hk, k, dd["bad_n"], dd["bad_skipped"], dd["bad_masked"],
+                 dd["bad_types"], dd["keys_on_unmasked"], dd["pos_wdterm"], dd["nonfinite"], dd["last"]))
+    R("")
+    R("SIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    R("  %-20s %.6f" % ("SIGMA_PRIOR_frozen", SIGMA_PRIOR))
+    R("  %-20s %.6f" % ("SIGMA_INBATCH", sigma_in))
+    R("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    R("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/%d)  (df_inbatch %d)" % (se, len(SEEDS), df))
+    R("")
+    R("CONTRASTS (every one WITHIN batch)")
+    for nm, (x, y), cp in (("P_NWD", ("k01NWD", "k01"), P_NWD), ("G_NWD", ("kLNWD", "k01NWD"), G_NWD)):
+        R("  PRIMARY  %-6s = %-7s - %-7s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   seeds %s"
+          % (nm, x, y, cp[0], cp[0] / se, cp[1],
+             " / ".join("%+.3f" % (runs[(x, s)]["plateau5"] - runs[(y, s)]["plateau5"]) for s in SEEDS)))
+    R("  KEY      D_REF  = kLNWD - k01 = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+      % (D_REF, D_REF / se, Tm["kLNWD"] - Tm["k01"]))
+    R("  DESCR    RATIO  = k01NWD / kLNWD = %.4f  (census R50 collapse iff <= %.2f)" % (RATIO, R50))
+    R("  DESCR    F_NWD  = P_NWD / D_REF  = %.4f" % F_NWD)
+    R("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE)"
+      % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, NULL_BAR, NULL_BAR / se, RESCUE_BAR, RESCUE_BAR / se))
+    R("  state bars: VANISHES iff k01NWD >= %.4f ; PERSISTS iff k01NWD <= %.4f"
+      % (M["kLNWD"] - MATCH_BAR, M["k01"] + NULL_BAR))
+    R("")
+    R("G-DIVERGE (a branch condition, not a harness gate)")
+    R("  %s every arm's seed range <= %.1f pp" % ("PASS" if not div else "FAIL", DIVERGED_BAR))
+    R("")
+    R("=" * 78)
+    R(final)
+    R("=" * 78)
+    R("")
+    R("BETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cwd1 bar or contrast):")
+    for b_, dct in R_BETWEEN:
+        R("  %s: %s" % (b_, "  ".join("%s %.2f" % kv for kv in dct)))
+    R("  cwd1 {%s}: %s" % (",".join(str(s) for s in SEEDS), "  ".join("%s %.4f" % (arm, M[arm]) for arm in ARMS)))
+    R("")
+    R("DESCRIPTIVE (non-gating) -- PATCH_DECAYMASK's readout on the masked arms: ||w|| of the three ctd1 carriers")
+    R("(%s) and the median over the 20 scales; min |w| over the 20; entries |w| < 1e-3; records 0 / 50 / 200 / 499; "
+      "seed means" % ", ".join(CARRIERS))
+    names20 = [T[i - 1][0] for i in by_rule]
+    pos20 = [names20.index(c) for c in CARRIERS]
+    for arm in ("k01NWD", "kLNWD"):
+        rows = [bite[(arm, s)][0] or [] for s in SEEDS]
+        parts = []
+        for k in (0, 50, 200, 499):
+            v = [r[k] for r in rows if len(r) > k and isinstance(r[k], dict)
+                 and isinstance(r[k].get("dm_norm"), list) and len(r[k]["dm_norm"]) == 20]
+            car = [mean([x["dm_norm"][p] for x in v]) for p in pos20]
+            med = mean([sorted(x["dm_norm"])[10] for x in v])
+            parts.append("rec %d: carriers %s median %.3g absmin %.3g small %.1f"
+                         % (k, "/".join("%.3g" % c for c in car), med,
+                            mean([x["dm_absmin"] for x in v]), mean([x["dm_small"] for x in v])))
+        R("  %-7s %s" % (arm, " | ".join(parts)))
+    R("")
+    R("WHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENCE_VANISHES:
+        R("  " + ln)
+    R("")
+    R("WHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    for ln in NOT_LICENSED:
+        R(ln)
+
+    P("\n" + "=" * 100)
+    P("REPLICA -- the registered scorer's WHOLE output, rebuilt independently (its two host-path lines")
+    P("written as <RUNSDIR>/...; the scorer's corpus DISCLOSURE line re-derived at commit %s)" % CORPUS_COMMIT[:7])
+    P("=" * 100)
+    for ln in REPLICA:
+        P(ln)
+    P("=" * 100)
+
+    # ---- 9. diff against the committed scorer stdouts ---------------------------------------------
+    P("\n[DIFF] the replica against each committed scorer stdout (its runsdir replaced by <RUNSDIR>)")
+    for path in a.scorer_out:
+        got = open(path).read().splitlines()
+        base = os.path.basename(path)
+        # find and normalise the scorer's own runsdir prefix from its manifest line
+        rdpref = None
+        for ln in got:
+            if ln.startswith("  manifest: ") and ln.endswith("PARTITION-MANIFEST.txt (%s)" % mhow):
+                rdpref = ln[len("  manifest: "):-len("/%s/PARTITION-MANIFEST.txt (%s)" % (PREFIX, mhow))]
+        norm = [ln.replace(rdpref, "<RUNSDIR>") if rdpref else ln for ln in got]
+        same = unexpected = disclosure = 0
+        for i in range(max(len(norm), len(REPLICA))):
+            g = norm[i] if i < len(norm) else "<missing>"
+            w = REPLICA[i] if i < len(REPLICA) else "<missing>"
+            if g == w:
+                same += 1
+            elif g.startswith("corpus: ") and w.startswith("corpus: "):
+                disclosure += 1
+                P("      %s line %d is the DISCLOSURE line against a different corpus:" % (base, i + 1))
+                P("        scorer   %s" % g)
+                P("        replica  %s" % w)
+            else:
+                unexpected += 1
+                P("      %s line %d DIFFERS:" % (base, i + 1))
+                P("        scorer   %s" % g)
+                P("        replica  %s" % w)
+        P("    %s: %d lines, %d byte-identical, %d disclosure-only, %d unexpected"
+          % (base, len(norm), same, disclosure, unexpected))
+        chk(unexpected == 0 and len(norm) == len(REPLICA),
+            "%s is reproduced line for line by the independent parser" % base)
+        for ln in got:
+            if ln.startswith("FINAL: "):
+                chk(ln == final, "%s's FINAL line is re-derived exactly" % base)
+
+    # ---- 10. DESCRIPTIVE, outside every gate ------------------------------------------------------
+    P("\n" + "=" * 100)
+    P("DESCRIPTIVE / UNSURE -- gating nothing, licensed by nothing; boundaries stated on every line")
+    P("=" * 100)
+    P("\n[D1] TEST (TRAIN) after 15 / 30 / 50 / 100 completed epochs.  BOUNDARY: 'after N epochs' = the")
+    P("     .out line `Epoch N-1` (epochs are 0-based, so epoch 99 is the 100th).  Per-arm mean over")
+    P("     seeds 128/129/130, single epochs, NOT plateau5.")
+    P("  %-7s %s" % ("arm", "  ".join("%18s" % ("after %d ep" % n) for n in (15, 30, 50, 100))))
+    for arm in ARMS:
+        cells = []
+        for n in (15, 30, 50, 100):
+            e = n - 1
+            te = mean([runs[(arm, s)]["eps"][e][1] for s in SEEDS])
+            tr = mean([runs[(arm, s)]["eps"][e][0] for s in SEEDS])
+            cells.append("%18s" % ("%.4f (%.4f)" % (te, tr)))
+        P("  %-7s %s" % (arm, "  ".join(cells)))
+    P("     per seed, after 100 epochs (epoch 99):")
+    for arm in ARMS:
+        P("       %-7s %s" % (arm, "  ".join("s%d %.2f (%.2f)" % (s, runs[(arm, s)]["eps"][99][1],
+                                                                  runs[(arm, s)]["eps"][99][0]) for s in SEEDS)))
+
+    P("\n[D2] the step-size (beta) trajectory.  BOUNDARY: probe records every 100 meta steps, 500 records")
+    P("     per run, record r == meta step 100r, r in [0, 499]; beta is log step size, clip [-15, -2.3026].")
+    P("     k01 / k01NWD are SHARED (1 group); kLNWD is LAYERWISE (62 groups) and is summarised over groups.")
+    for arm in ARMS:
+        for s in SEEDS:
+            recs = bite[(arm, s)][0]
+            if NG[arm] == 1:
+                b = [r["beta"][0] for r in recs]
+                atfloor = sum(1 for x in b if x <= BETA_LO + 1e-6) / len(b)
+                first = next((r["step"] for r in recs if r["beta"][0] <= BETA_LO + 1e-6), None)
+                P("  %-7s s%d  shared beta: rec0 %.4f  rec50 %.4f  rec200 %.4f  rec499 %.4f  | max %.4f  min %.4f  "
+                  "frac at the -15 floor %.4f  first floor record at meta step %s"
+                  % (arm, s, b[0], b[50], b[200], b[499], max(b), min(b), atfloor, first))
+            else:
+                def stat(r):
+                    v = r["beta"]
+                    return min(v), mean(v), max(v), sum(1 for x in v if x <= BETA_LO + 1e-6)
+                for k in (0, 50, 200, 499):
+                    lo, mu, hiq, nf = stat(recs[k])
+                    P("  %-7s s%d  rec %3d: 62-group beta  min %.4f  mean %.4f  max %.4f  at floor %d/62"
+                      % (arm, s, k, lo, mu, hiq, nf))
+    P("     carrier groups of the LAYERWISE arm (group index = tensor position - 1):")
+    for s in SEEDS:
+        recs = bite[("kLNWD", s)][0]
+        for c in CARRIERS:
+            gi = [i for i, (n, _, _, _) in enumerate(T) if n == c][0]
+            b = [r["beta"][gi] for r in recs]
+            P("       kLNWD s%d %-28s rec0 %.4f  rec200 %.4f  rec499 %.4f  min %.4f  max %.4f"
+              % (s, c, b[0], b[200], b[499], min(b), max(b)))
+
+    P("\n[D3] the skipped weight-decay term and the scales' norms (PATCH_DECAYMASK's own record).")
+    P("     BOUNDARY: dm_wdterm is the magnitude of the coupled WD term the mask REMOVED at that record;")
+    P("     dm_norm is the per-tensor ||w|| of the 20 masked scales; dm_absmin the smallest |w| among them.")
+    for arm in ("k01NWD", "kLNWD"):
+        for s in SEEDS:
+            recs = bite[(arm, s)][0]
+            P("  %-7s s%d  dm_wdterm rec0 %.6e  rec200 %.6e  rec499 %.6e | dm_absmin rec0 %.4f rec499 %.4f | "
+              "dm_small rec499 %d" % (arm, s, recs[0]["dm_wdterm"], recs[200]["dm_wdterm"], recs[499]["dm_wdterm"],
+                                      recs[0]["dm_absmin"], recs[499]["dm_absmin"], recs[499]["dm_small"]))
+
+    P("\n[D4] the cmo1 comparison (BETWEEN BATCH, DESCRIPTIVE -- different seeds, different batch, no")
+    P("     shared arm was run twice; nothing here is a within-batch contrast and no bar reads it).")
+    P("     CORRECTIONS 264: cmo1 W0k01 71.5600 (base weight decay 0 EVERYWHERE + the meta trace),")
+    P("     cmo1 k01 22.7887, L_W0 +48.7713 pp.")
+    P("  cwd1 k01NWD %.4f (WD 0 on the 20 BatchNorm scales only)  vs  cmo1 W0k01 71.5600   difference %+.4f pp"
+      % (M["k01NWD"], M["k01NWD"] - 71.5600))
+    P("  cwd1 P_NWD %+.4f pp  vs  cmo1 L_W0 +48.7713 pp   -> the norm-scale mask recovers %.2f %% of the"
+      % (P_NWD[0], 100.0 * P_NWD[0] / 48.7713))
+    P("  whole-network W0 effect, on this between-batch reading only.")
+
+    P("\nVIOLATIONS %d" % len(VIOL))
+    for v in VIOL:
+        P("  ! %s" % v)
+    sys.stdout.write("\n".join(OUT) + "\n")
+    print("HOSTPATH runsdir      %s" % os.path.abspath(rd))
+    print("HOSTPATH corpus csv   %s" % os.path.abspath(a.csv))
+    print("HOSTPATH corpus tsv   %s" % os.path.abspath(a.tsv))
+    for path in a.scorer_out:
+        print("HOSTPATH scorer out   %s" % os.path.abspath(path))
+    return 0 if not VIOL else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
