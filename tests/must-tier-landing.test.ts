@@ -35,7 +35,7 @@ const CMG1_FINAL = ['NO-MERGE-HARMS', 'HARNESS-LIVE-UNPATCHED', 'PARTITION-VERIF
 
 test('MT228-MT231 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(164, 168).map(e => e.id), ['MT228', 'MT229', 'MT230', 'MT231'], 'appended in line order, ahead of the next landing');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [172, 154, 18, 3253]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [173, 155, 18, 3268]);
   assert.deepEqual([CMO1_FINAL.length, CST1_FINAL.length, CST2_FINAL.length, CCT1_FINAL.length, CMG1_FINAL.length], [18, 2, 17, 22, 19]);
   // Each reason opens with the row's returned branch words, as MT221, MT223, MT226 and MT227 did.
   const cases: [string, string, string[], number, string, string][] = [
@@ -132,7 +132,7 @@ test('the ARGS-value deviation warning names cmo1 arms, the flags and the exclus
 });
 
 test('the 54 runs link to MT228-MT231 with sanitized logs; only cmo1 carries 18 ARGS-value marks', () => {
-  assert.equal(runs.length, 3253);
+  assert.equal(runs.length, 3268);
   const batches: [string, string, number, string[], string, string, number][] = [
     ['cmo1', 'MT228', 27, ['108', '109', '110'], 'ResNet18_c100', 'CIFAR100', 18],
     ['cst1', 'MT229', 9, ['112', '113', '114'], 'ResNet18_c100', 'CIFAR100', 0],
@@ -178,7 +178,7 @@ test('the 54 runs link to MT228-MT231 with sanitized logs; only cmo1 carries 18 
   }
   // The 108 patch interventions of the earlier landings are untouched by the new kind.
   // The MUST-tier batches ran no patch; the 108 of the earlier landings and the 45 of the next one carry every mark.
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 153);
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 165);
   assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 18);
   // The arm means of the published plateau5 values reproduce the rows' levels.
   const mean = (batch: string, arm: string) => {

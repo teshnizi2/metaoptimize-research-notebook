@@ -33,8 +33,8 @@ const CWD2_FINAL = ['WD-ROUTE', 'SCALAR-NEEDS-CARRIER-WD', 'HARNESS-CLEAN', 'PAT
   'SIGMA-PRIOR-FROZEN', 'POSITIVE-CONTROL-REPRODUCES', 'FLOOR-READINGS-ARE-BOUNDS', 'TRAIN-AGREES (two branch tokens + 14 stamps)'];
 
 test('MT232-MT235 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-4).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended after every existing record, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [172, 154, 18, 3253]);
+  assert.deepEqual(data.experiments.slice(-5, -1).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended in line order, before the later cwd3 row');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [173, 155, 18, 3268]);
   assert.deepEqual([CVT10_FINAL.length, CWD1_FINAL.length, CSV1_FINAL.length, CWD2_FINAL.length], [23, 13, 22, 16]);
   // cwd2 is the one row of the cycle whose FINAL carries two branch tokens, so its reason opens with both.
   const cases: [string, string, string[], number, string][] = [
@@ -141,7 +141,7 @@ test('the four intervention warnings name the arms, the patches and the exclusio
 });
 
 test('the 72 runs link to MT232-MT235 with sanitized logs, and exactly the 45 intervened runs are marked', () => {
-  assert.equal(runs.length, 3253);
+  assert.equal(runs.length, 3268);
   const batches: [string, string, number, string[], string, number][] = [
     ['cvt10', 'MT232', 30, ['120', '121', '122'], 'ResNet18_c100', 15],
     ['cwd1', 'MT233', 9, ['128', '129', '130'], 'ResNet18_c100', 6],
@@ -198,7 +198,7 @@ test('the 72 runs link to MT232-MT235 with sanitized logs, and exactly the 45 in
   // ISOSPLIT is the one listed arm with no plain twin at its cell key, so its note cannot name one.
   assert.match(armOf('cvt10-ISOSPLIT-s120').parameters.interventionNote!, /^Not a plain measurement of its cell key \(granularity sets:1-49,51-52,54-58,60-62\//);
   assert.match(armOf('cvt10-ISOSPLIT-s120').parameters.interventionNote!, /which no free arm anywhere in the corpus shares/);
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 153, 'the 108 earlier patch interventions plus these 45');
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 165, 'the 108 earlier patch interventions, these 45, and cwd3\'s 12');
   // The arm means of the published plateau5 values reproduce every level the four rows read.
   const mean = (batch: string, arm: string) => {
     const armRuns = runs.filter(run => run.batch === batch && run.parameters.runLabel.split('-')[1] === arm);

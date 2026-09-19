@@ -49,8 +49,8 @@ test('the four other amended rows keep their outcome and carry the amendment not
 });
 
 test('the 93 runs of the landed batches link to MT212-MT217 with sanitized raw logs', () => {
-  assert.equal(runs.length, 3253);
-  assert.equal(data.meta.stats.runs, 3253);
+  assert.equal(runs.length, 3268);
+  assert.equal(data.meta.stats.runs, 3268);
   const batches: Record<string, [string, number]> = { cgn1: ['MT212', 6], cpl1: ['MT213', 15], cvh1: ['MT214', 12], cuc1: ['MT215', 30], cgn2: ['MT216', 15], cpl2: ['MT217', 15] };
   const landed = runs.filter(run => run.batch in batches);
   assert.equal(landed.length, 93);
