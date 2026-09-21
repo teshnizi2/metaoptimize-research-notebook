@@ -37,6 +37,11 @@ From the command line:
            `--check --runs` verifies it against the run's OWN `ARGS:` line read with argparse semantics, requires
            every INGESTED standard-cell run whose ARGS deviates to be listed, holds the unlisted runs of a listed
            batch to the standard values, and FAILs if one 15-key cell pools unlisted rows with different values;
+           TWO-AXIS RUNS (CORRECTIONS 284): a run may do BOTH -- cwd5's CARW2 prints an ON DECAY_MASK line AND runs
+           at a non-standard weight decay -- and a TSV row carries ONE witness.  Such a run is listed with its ARGS
+           witness and its ON kinds are registered in MULTI_KIND: the only listing both readers accept, since the
+           completeness reader has that escape and the ARGS-value reader has none.  Each ON line is still held to
+           its registered string, and the reverse listing still FAILs;
            then prints the noise-floor demonstration: the registered cvt1 sigmas (227.6) re-derived on
            the current corpus three ways -- as 227 did (every `cvt1-` row dropped), as a future
            registration should (only the listed rows dropped), and naively (nothing dropped).
@@ -196,6 +201,33 @@ MULTI_KIND.update({
     ("cwd2", "HIGHWD0"): {"BETA_HOLD": _CVT6_BH_TRI, "COMP_HOLD": _CVT6_CH_REC, "DECAY_MASK": _CWD2_DM},
     ("cwd2", "LOWWD0"): {"BETA_HOLD": _CVT6_BH_FLOOR, "COMP_HOLD": _CVT6_CH_REC, "DECAY_MASK": _CWD2_DM},
 })
+# ---- CORRECTIONS 284: TWO-AXIS RUNS -- an ON `<KIND>` line AND a deviating ARGS value on the SAME run --------------
+# `cwd5`'s `CARW2` (CORRECTIONS 281) is the first run of the campaign that deviates on BOTH axes this module reads: it
+# prints an ON `DECAY_MASK` line (the three `ctd1` carriers masked) AND runs at `--weight-decay-base 1e-2` instead of
+# the standard cell's `0.1` (it sits on the ladder's rung W2).  A TSV row carries ONE witness, and 281.12 proved on an
+# isolated copy that BOTH listings FAILed the real check(): the KINDS reader (completeness, below) refuses an ON line
+# whose kind the witness does not name, and the ARGS-VALUE reader refuses a deviating run listed with another kind.
+#
+# THE RULE, and it is FORCED, not preferred: such a run is listed with its **ARGS** witness, and every kind it turns ON
+# is registered here.  The completeness reader has a MULTI_KIND escape and the ARGS-value reader has none, so the ARGS
+# listing is the ONLY one either reader can accept; the reverse listing still FAILs at "deviates on <KIND> but is
+# listed with a <KIND> witness", so the module enforces the rule rather than documenting it (C35a).  Nothing is
+# weakened: the MULTI_KIND loop below then holds the run's ON line to the registered string byte for byte, the batch
+# rule holds the batch's unlisted runs to `DECAY_MASK: off`, and an ON line of a kind NOT registered here still FAILs.
+# An entry may register ONE kind for this reason, where 245's entries register two or more.
+#
+# Re-typed (NOT imported) from the frozen table `analysis/cwd5_design.py` `CWD5.WITNESS_DM["CARW2"]`, which the
+# registered `analysis/cWD5_wdladder_score.py` imports UNEDITED; the `wd=0.01` token is the ARM'S OWN rung, the string
+# PATCH_DECAYMASK had never printed before this batch (281.6 RW3).  tests/test_corpus_exclusions_check.py C36 pins the
+# literal to that table; C34 / C35 run the rule and its corruptions.
+_CWD5_DM_CARW2 = ("DECAY_MASK: on base=SGDm wd=0.01 spec=layer4.0.bn2.weight+layer4.0.shortcut.1.weight+"
+                  "layer4.1.bn2.weight masked=3 of=62 numel=1536 idx=50,53,59 "
+                  "names=layer4.0.bn2.weight,layer4.0.shortcut.1.weight,layer4.1.bn2.weight")
+MULTI_KIND.update({
+    ("cwd5", "CARW2"): {"DECAY_MASK": _CWD5_DM_CARW2},
+})
+MULTI_KINDS_AT_251 = 2  # 251's `multi-kind runs` line is computed over the entries registering 2+ kinds, so it stays
+#                         byte-identical as one-kind two-axis entries are added; the added ones get their own line.
 
 
 # ---- --check only: ARGS-VALUE witness kinds (CORRECTIONS 263) ---------------------------------------------------
@@ -470,16 +502,46 @@ def check(runs_dirs):
             des = multi_kind_of(fn)
             if des is None or fn not in wl:
                 continue
-            n_two += 1
-            n_by[len(des)] = n_by.get(len(des), 0) + 1
+            # CORRECTIONS 284: a one-kind (two-axis) entry is VERIFIED here like any other, but it is not counted on
+            # 245's / 251's lines -- those two stay about the 2+-kind runs, and it is counted on the 284 line below.
+            if len(des) >= MULTI_KINDS_AT_251:
+                n_two += 1
+                n_by[len(des)] = n_by.get(len(des), 0) + 1
             for kd, _off in KINDS:
                 if kd in des and wl[fn][kd] != [des[kd]]:
                     bad.append("%s is registered with %s ON but prints %r, not the registered line (MULTI_KIND)"
                                % (fn, kd, wl[fn][kd]))
         print("  two-kind runs (CORRECTIONS 245): %d listed runs of a registered two-kind (batch, arm), every one printing"
               " exactly its registered ON line of each kind: %s" % (n_two, len(bad) == nb))
+        # CORRECTIONS 284: 251's line is frozen over the entries registering MULTI_KINDS_AT_251 or more kinds, so it
+        # stays byte-identical as one-kind two-axis entries are added; those are counted on their own line below.
         print("  multi-kind runs (CORRECTIONS 251): those runs by the number of kinds MULTI_KIND registers for them: %s"
-              % ", ".join("%d kinds %d" % (n, n_by.get(n, 0)) for n in sorted(set(len(d) for d in MULTI_KIND.values()))))
+              % ", ".join("%d kinds %d" % (n, n_by.get(n, 0)) for n in sorted(set(len(d) for d in MULTI_KIND.values()
+                                                                                  if len(d) >= MULTI_KINDS_AT_251))))
+        # ---- TWO-AXIS RUNS (CORRECTIONS 284) -----------------------------------------------------------------------
+        # A listed run that deviates on an ARGS value AND turns a registered kind ON (cwd5's CARW2).  It is listed with
+        # its ARGS witness -- the only listing both readers accept -- and its ON kinds are registered in MULTI_KIND,
+        # where the loop above holds each to its registered line.  Both halves are re-checked here, independently of
+        # the two readers, so this line's verdict is a statement and not a label.
+        nb = len(bad)
+        n_axis = 0
+        for fn in sorted(listed):
+            des = multi_kind_of(fn)
+            ekd = kind_of(listed[fn]["witness"])
+            if des is None or fn not in wl or ekd not in args_kind_names():
+                continue
+            n_axis += 1
+            dev = args_deviations(args_factors(outs[fn]) or {})
+            if dev.get(ekd) != listed[fn]["witness"]:
+                bad.append("%s is a two-axis run listed with %r but its own ARGS line gives %r"
+                           % (fn, listed[fn]["witness"], dev.get(ekd)))
+            for kd in sorted(des):
+                if wl[fn][kd] != [des[kd]]:
+                    bad.append("%s is a two-axis run registered with %s ON but prints %r (MULTI_KIND)"
+                               % (fn, kd, wl[fn][kd]))
+        print("  two-axis runs (CORRECTIONS 284): %d listed runs deviate on an ARGS value AND print an ON line of a"
+              " registered kind; each carries its ARGS witness (the only listing both readers accept) and its ON kinds"
+              " are registered in MULTI_KIND, both verified here: %s" % (n_axis, len(bad) == nb))
         # ---- ARGS-VALUE WITNESSES (CORRECTIONS 263) ----------------------------------------------------------------
         # A listed ARGS row carries its run's own value; every INGESTED standard-cell run whose ARGS deviates is
         # listed; a batch with ARGS listings holds its other runs to the standard values; and no 15-key cell pools

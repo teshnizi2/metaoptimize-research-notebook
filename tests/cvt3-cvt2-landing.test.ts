@@ -21,7 +21,7 @@ const CVT2_FINAL = ['GRADED', 'TOP-ATTENUATED', 'HARNESS-CLEAN', 'PATCH-BITES', 
 
 test('MT220 and MT221 are the cvt3 and cvt2 rows, both Mixed under the documented rules, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(156, 158).map(e => e.id), ['MT220', 'MT221'], 'appended after every record that existed before them, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [173, 155, 18, 3268]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [175, 157, 18, 3316]);
   const cases: [string, string, string[], number][] = [['MT220', 'cvt3', CVT3_FINAL, 220], ['MT221', 'cvt2', CVT2_FINAL, 221]];
   for (const [id, batch, final, line] of cases) {
     const record = byId.get(id)!;
@@ -60,7 +60,7 @@ test('the intervention warnings name every intervened arm and the exclusion list
 });
 
 test('the 36 runs link to MT220 / MT221 with sanitized logs, and exactly the 24 intervened runs are marked', () => {
-  assert.equal(runs.length, 3268);
+  assert.equal(runs.length, 3316);
   const batches: [string, string, string[], Record<string, [number, string]>][] = [
     ['cvt3', 'MT220', ['84', '85', '86'], { MUTE50: [3, 'k01'], MUTEDOWN: [3, 'k01'], MUTECTL: [3, 'k01'] }],
     ['cvt2', 'MT221', ['87', '88', '89'], { K13: [3, 'HEAD'], K33: [3, 'HEAD'], K152: [3, 'HEAD'], K691: [3, 'HEAD'], K2000: [3, 'HEAD'] }],
@@ -99,7 +99,7 @@ test('the 36 runs link to MT220 / MT221 with sanitized logs, and exactly the 24 
   assert.equal(runs.filter(run => ['cvt1', 'cvt2', 'cvt3'].includes(run.batch) && run.parameters.intervention).length, 33, 'cvt1 9 + cvt3 9 + cvt2 15');
   // cvt4 and cvt5 add 12 and 6 (tests/cvt4-cvt5-landing.test.ts), cvt6 and cvt7 15 and 9 (tests/cvt6-cvt7-landing.test.ts).
   // cvt8 and cvt9 add 15 and 18 (tests/cvt8-cvt9-landing.test.ts); cvt10, cwd1, csv1 and cwd2 add 15, 6, 12 and 12 (tests/mech4-landing.test.ts).
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 165, 'cvt1 9 + cvt3 9 + cvt2 15 + cvt4 12 + cvt5 6 + cvt6 15 + cvt7 9 + cvt8 15 + cvt9 18 + cvt10 15 + cwd1 6 + csv1 12 + cwd2 12 + cwd3 12');
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 183, 'cvt1 9 + cvt3 9 + cvt2 15 + cvt4 12 + cvt5 6 + cvt6 15 + cvt7 9 + cvt8 15 + cvt9 18 + cvt10 15 + cwd1 6 + csv1 12 + cwd2 12 + cwd3 12 + cwd4 18');
   // The arm means of the published plateau5 values reproduce the rows' levels.
   const mean = (batch: string, arm: string) => {
     const armRuns = runs.filter(run => run.batch === batch && run.parameters.runLabel.split('-')[1] === arm);

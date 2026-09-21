@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""writeup_artefact_paths.py -- RESOLVE EVERY ARTEFACT PATH `docs/WRITEUP-mechanism.md` CITES.
+
+WHY THIS EXISTS.  A methodology pass found that the write-up cited
+`results/cgn2_gn_isolation_score_cluster_b.txt`, a file that DOES NOT EXIST -- no `results/cgn*` file exists at all.
+The CONTENT of that row was correct; the POINTER was not.  In a document whose whole discipline is provenance, an
+unresolvable pointer is disqualifying on its own, and one instance means the class was never checked.  This script
+applies the document's own discipline to itself: it extracts every path-shaped token the document cites and resolves
+each one against the tree, so the failure mode cannot recur silently.
+
+    python3 analysis/writeup_artefact_paths.py [DOC ...]          # default: docs/WRITEUP-mechanism.md
+    python3 analysis/writeup_artefact_paths.py --all-docs         # every docs/*.md
+
+Exit code 0 iff every extracted path resolves somewhere OR is declared absent BY THE DOCUMENT ITSELF; 1 otherwise.
+The report lists, for each path, the line numbers that cite it and where it resolved:
+
+    REPO      -- a file tracked in / present under the repository root
+    SIBLING   -- a file under the repository's PARENT (`cluster_a-backup/`), i.e. NOT in the repository: the raw run
+                 directories `runs_cluster_b/` and `runs/` live there and are NOT committed.  A citation that resolves
+                 only here is a PROVENANCE GAP: a reader who clones the repository cannot open it.
+    OFF-HOST  -- a `host:path` citation (`cluster_b:~/l225_logs/score_cgn2.log`): it names a file on another machine and
+                 is UNRESOLVABLE FROM HERE BY CONSTRUCTION.  Reported and counted, never resolved, never a failure --
+                 but it is a PROVENANCE GAP of the same species as SIBLING and the document must say so.
+    GLOB      -- a wildcard citation (`results/*_score_cluster_b.txt`); reported with the number of files it matches,
+                 which is the only sense in which a wildcard can "resolve".  A glob matching ZERO files is a FAILURE
+                 unless it is declared absent (see ABSENT-BY-DECLARATION).
+    MODULE    -- `analysis/<module>.<attribute>`: the file resolves AND the attribute is defined in it (checked by
+                 reading the source for a `def <attr>` / `<attr> =` at column 0).  A module whose attribute is NOT
+                 defined is reported MISSING, because that is the same defect as a missing file.
+    ELIDED    -- the citation is abbreviated with an ellipsis (`results/cmg1_…`) and therefore names no file.  It is
+                 counted as a FAILURE: a pointer a reader cannot follow is not a pointer.
+    SKIPPED-BY-RULE -- anything under `paper/`.  This tree is NEVER read, opened or stat-ed by this script, by
+                 standing instruction; its citations in the document are statements that it was not touched, not
+                 artefact pointers.
+    MISSING   -- resolves nowhere.  This is the P1 class.
+    ABSENT-BY-DECLARATION -- the token is MISSING / ELIDED / a zero-match GLOB *and* the document declares it as such
+                 in its own machine-readable block (below).  This is how a document QUOTES a dead pointer while
+                 talking about it -- the P1 finding itself names the file that does not exist -- without the check
+                 either failing forever or being silently weakened.  The declaration is VERIFIED, not trusted: a
+                 declared token that actually resolves is reported DECLARED-BUT-RESOLVES and is a FAILURE, so the
+                 list cannot rot into an exemption for real defects.
+
+THE DECLARATION BLOCK lives in the DOCUMENT, not in this script, so a reader sees the exemptions next to the check:
+
+    <!-- ARTEFACT-PATH-DECLARED-ABSENT
+    results/cgn2_gn_isolation_score_cluster_b.txt
+    -->
+
+One token per line between the marker and the closing `-->`; blank lines and lines beginning `#` are ignored.
+
+DISCIPLINE.  Stdlib only.  No regular expressions (the document's own convention for independent parsers).  It READS
+the document and the filesystem and writes nothing.  It is NOT a registered scorer, reads no bar, level, contrast,
+state, branch or stamp, and nothing in the campaign's verdict path imports it (RULE 16 is untouched).
+
+WHAT IS AND IS NOT A PATH, stated because the extractor's recall is the whole value of the check.  A backticked token
+is treated as a path when it contains "/" and either begins with a known repository directory prefix or ends in a
+known artefact suffix.  Directory citations (a trailing "/", e.g. `results/`) are resolved as directories.  Tokens
+that merely contain a slash but are neither -- `SGDm(0.99, wd 0.1)`, `beta/gamma`, `TRAIN/TEST`, `DOI 10.1145/3643860`,
+arXiv ids, `n/a` -- are reported under SKIPPED with the reason, so the skip list can be audited rather than trusted.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+PARENT = os.path.dirname(REPO)
+
+DIR_PREFIXES = (
+    "results/", "docs/", "analysis/", "patches/", "tests/", "bin/", "harness/",
+    "runs_cluster_b/", "runs/", "paper/", "cluster_a-backup/", "src/", "data/",
+)
+SUFFIXES = (
+    ".txt", ".md", ".py", ".csv", ".tsv", ".sh", ".json", ".out", ".log", ".html", ".yaml", ".yml",
+)
+# tokens that contain "/" but are not paths; each carries the reason it is skipped
+SKIP_REASONS = (
+    ("arxiv:", "arXiv identifier"),
+    ("10.1145/", "DOI"),
+    ("doi ", "DOI"),
+    ("http", "URL"),
+)
+
+
+DECL_OPEN = "<!-- ARTEFACT-PATH-DECLARED-ABSENT"
+
+
+def declared_absent(text):
+    """Read the document's own declaration block: tokens it deliberately names as NOT resolving."""
+    out = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(DECL_OPEN):
+            for rest in lines[i + 1:]:
+                s = rest.strip()
+                if s.startswith("-->"):
+                    break
+                if not s or s.startswith("#"):
+                    continue
+                out.append(s.strip("`"))
+    return out
+
+
+def backticked(text):
+    """Yield (line_number, token) for every single-backtick-delimited token in the document."""
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        parts = line.split("`")
+        # parts[1], parts[3], ... are inside backticks when the line has balanced pairs
+        for i in range(1, len(parts), 2):
+            tok = parts[i].strip()
+            if tok:
+                yield lineno, tok
+
+
+def looks_like_path(tok):
+    low = tok.lower()
+    for needle, reason in SKIP_REASONS:
+        if needle in low:
+            return False, reason
+    if "/" not in tok:
+        return False, "no separator"
+    if " " in tok or "(" in tok or ")" in tok or "," in tok or "=" in tok:
+        return False, "not a bare path"
+    if tok.startswith(DIR_PREFIXES):
+        return True, ""
+    if tok.endswith(SUFFIXES):
+        return True, ""
+    if tok.endswith("/"):
+        return True, ""
+    return False, "no known prefix or suffix"
+
+
+def glob_count(pattern):
+    """Count files matching a single-'*' pattern under the repo, without importing glob or using regexes."""
+    head, sep, tail = pattern.partition("*")
+    if not sep:
+        return None
+    d = os.path.join(REPO, os.path.dirname(head))
+    prefix = os.path.basename(head)
+    if not os.path.isdir(d):
+        return 0
+    return sum(1 for f in os.listdir(d) if f.startswith(prefix) and f.endswith(tail))
+
+
+def module_attr(tok):
+    """For `analysis/mod.attr`, return (file_exists, attr_defined) or None if the token is not of that shape."""
+    if tok.endswith(SUFFIXES):
+        return None          # a real filename, not module.attribute
+    base, sep, attr = tok.rpartition(".")
+    if not sep or "/" not in base or not attr.isidentifier():
+        return None
+    cand = os.path.join(REPO, base + ".py")
+    if not os.path.exists(cand):
+        return None
+    with open(cand, "r", encoding="utf-8") as fh:
+        src = fh.read()
+    defined = ("def " + attr + "(") in src or ("\n" + attr + " =") in src
+    return (True, defined)
+
+
+def resolve(tok):
+    """Return (status, resolved_path_or_None)."""
+    if tok.startswith("paper/") or tok == "paper/":
+        return "SKIPPED-BY-RULE", "paper/ is never opened or stat-ed"
+    head, sep, tail = tok.partition(":")
+    if sep and "/" not in head and tail.startswith(("~", "/")):
+        return "OFF-HOST", "on host %r -- unresolvable from here by construction" % head
+    if "…" in tok or "..." in tok:
+        return "ELIDED", None
+    if "*" in tok:
+        n = glob_count(tok)
+        n = n if n is not None else 0
+        if n == 0:
+            return "MISSING", "wildcard matches 0 files"
+        return "GLOB", "%d file(s) match under the repo" % n
+    ma = module_attr(tok)
+    if ma is not None:
+        _, defined = ma
+        if defined:
+            return "MODULE", tok.rpartition(".")[0] + ".py (attribute defined)"
+        return "MISSING", None
+    rel = tok.rstrip("/") if tok.endswith("/") else tok
+    # a citation may be written relative to the repo root or relative to cluster_a-backup/
+    cand_repo = os.path.join(REPO, rel)
+    if os.path.exists(cand_repo):
+        return "REPO", os.path.relpath(cand_repo, REPO)
+    cand_parent = os.path.join(PARENT, rel)
+    if os.path.exists(cand_parent):
+        return "SIBLING", os.path.relpath(cand_parent, PARENT)
+    # `cluster_a-backup/runs_cluster_b/x` written from one level above the parent
+    if rel.startswith("cluster_a-backup/"):
+        cand = os.path.join(os.path.dirname(PARENT), rel)
+        if os.path.exists(cand):
+            return "SIBLING", os.path.relpath(cand, PARENT)
+    return "MISSING", None
+
+
+def check(doc_path):
+    with open(doc_path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    cited = {}
+    skipped = {}
+    for lineno, tok in backticked(text):
+        ok, reason = looks_like_path(tok)
+        if ok:
+            cited.setdefault(tok, []).append(lineno)
+        elif "/" in tok:
+            skipped.setdefault((tok, reason), []).append(lineno)
+    decl = declared_absent(text)
+    rows = []
+    for tok in sorted(cited):
+        status, resolved = resolve(tok)
+        if tok in decl:
+            if status in ("MISSING", "ELIDED"):
+                status, resolved = "ABSENT-BY-DECLARATION", (resolved or "declared absent by the document; verified absent")
+            else:
+                status, resolved = "DECLARED-BUT-RESOLVES", "declared absent but it RESOLVES (%s)" % (resolved,)
+        rows.append((status, tok, resolved, cited[tok]))
+    undeclared = [d for d in decl if d not in cited]
+    return rows, skipped, undeclared
+
+
+def main(argv):
+    docs = [a for a in argv if not a.startswith("--")]
+    if "--all-docs" in argv:
+        docs = sorted(
+            os.path.join("docs", f) for f in os.listdir(os.path.join(REPO, "docs")) if f.endswith(".md")
+        )
+    if not docs:
+        docs = ["docs/WRITEUP-mechanism.md"]
+    bad = 0
+    for doc in docs:
+        full = doc if os.path.isabs(doc) else os.path.join(REPO, doc)
+        rows, skipped, undeclared = check(full)
+        order = ("MISSING", "ELIDED", "DECLARED-BUT-RESOLVES", "ABSENT-BY-DECLARATION",
+                 "OFF-HOST", "SIBLING", "GLOB", "MODULE", "SKIPPED-BY-RULE", "REPO")
+        counts = dict((k, 0) for k in order)
+        for status, _, _, _ in rows:
+            counts[status] += 1
+        print("=" * 100)
+        print("DOC %s -- %d distinct path citations" % (doc, len(rows)))
+        print("    " + "   ".join("%s %d" % (k, counts[k]) for k in order))
+        print("=" * 100)
+        for want in order:
+            sel = [r for r in rows if r[0] == want]
+            if not sel:
+                continue
+            print("\n[%s]" % want)
+            for status, tok, resolved, lines in sel:
+                shown = ",".join(str(n) for n in lines[:8])
+                if len(lines) > 8:
+                    shown += ",+%d" % (len(lines) - 8)
+                print("  %-9s %-62s lines %s" % (status, tok, shown))
+        if skipped:
+            print("\n[SKIPPED -- contains '/' but judged not a path]")
+            for (tok, reason), lines in sorted(skipped.items()):
+                print("  %-62s %-24s lines %s"
+                      % (tok[:62], reason, ",".join(str(n) for n in lines[:6])))
+        if undeclared:
+            print("\n[DECLARED BUT NEVER CITED -- a stale exemption, which is itself a defect]")
+            for tok in undeclared:
+                print("  %s" % tok)
+        bad += counts["MISSING"] + counts["ELIDED"] + counts["DECLARED-BUT-RESOLVES"] + len(undeclared)
+    print()
+    print("VERDICT: %s (%d unresolvable and undeclared: MISSING + ELIDED + DECLARED-BUT-RESOLVES + stale declarations)"
+          % ("PASS" if bad == 0 else "FAIL", bad))
+    return 0 if bad == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

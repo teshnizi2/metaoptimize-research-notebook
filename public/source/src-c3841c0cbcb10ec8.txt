@@ -1,0 +1,57 @@
+#!/bin/bash
+# cWD5_rule20.sh -- CORRECTIONS 281: RULE 20 at current coverage for `cwd5` (a copy of l260_rule20.sh with cwd5's
+# table; the ENV half is analysis/cwd5_rule20_envaudit.py).  READ-ONLY: no accuracy number is opened.
+# analysis/argsline_guard.py is used UNEDITED from the stage.
+#
+# TWO THINGS DIFFER FROM EVERY EARLIER BATCH, AND BOTH ARE DELIBERATE:
+#   * `weight-decay-base` and `stepsize-groups` VARY BY ARM, so the batch-consistency half is given
+#     `--vary weight-decay-base --vary stepsize-groups` in addition to `--vary seed --vary run-name`.  The
+#     per-run half then pins BOTH to the arm's own registered value, so nothing is left unchecked: a run that
+#     carried the wrong rung's weight decay is a PER-RUN VIOLATION here.
+#   * the runner's ENV line carries NO weight decay, so the ENV half cannot discriminate the rungs.  It
+#     discriminates the GRAIN (PROBE_TENSOR type) and the mask (the whole DECAY_MASK line).  Said here rather
+#     than discovered later.
+#   bash bin/cWD5_rule20.sh            (run from ~/stage_cwd5 on cluster_b)
+set +u
+source /etc/profile >/dev/null 2>&1
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+source /cluster/account_b/metaopt/envs/mo/bin/activate
+export METAOPT_WS=/cluster/account_b/metaopt
+WS=$METAOPT_WS; R=$WS/runs; P=cwd5
+S="$(cd "$(dirname "$0")/.." && pwd)"
+G=$S/analysis/argsline_guard.py
+echo "RULE20 run utc=$(date -u +%FT%TZ) host=$(hostname) batch=$P guard_sha=$(sha256sum $G | cut -c1-16)"
+HF="--expect optimizer=HF --expect alg-base=SGDm --expect momentum-param-base=0.99 --expect alg-meta=Lion --expect momentum-param-meta=0.99 --expect Lion-beta2-meta=0.9 --expect weight-decay-meta=0 --expect dataset=CIFAR100 --expect batch-size=100 --expect max-time=999:00:00 --expect gamma=1"
+NET=ResNet18_c100
+echo "  .out files: $(ls $R/$P-*.out 2>/dev/null | wc -l)   with ARGS: $(grep -l -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | wc -l)   squeue: $(squeue -h -u account_b -o '%j %T' | awk -v p="^$P-" '$1 ~ p {print $2}' | sort | uniq -c | tr '\n' ' ')"
+OUT=$(python3 $G $R --name $P- --batch-consistency --strict --vary seed --vary run-name --vary weight-decay-base --vary stepsize-groups 2>&1); RC=$?
+echo "  BATCH-CONSISTENCY --name $P- --vary seed --vary run-name --vary weight-decay-base --vary stepsize-groups -> rc=$RC  $(echo "$OUT" | grep -E '^argsline_guard:|^VERDICT|no candidate|NONE carried|ACROSS-RUN|^    --' | tr '\n' ' ')"
+n=0; bad=0; noargs=0
+for f in $(ls $R/$P-*.out 2>/dev/null); do
+  b=$(basename $f .out); rn=${b%-*}; rest=${rn#$P-}; arm=${rest%-s*}; seed=${rest##*-s}
+  grep -q -m1 '^ARGS:' "$f" || { noargs=$((noargs+1)); continue; }
+  n=$((n+1))
+  case $arm in
+    k01W1)  WD=0.1;  GR=scalar ;;
+    kLW1)   WD=0.1;  GR=layerwise ;;
+    k01W2)  WD=1e-2; GR=scalar ;;
+    kLW2)   WD=1e-2; GR=layerwise ;;
+    k01W3)  WD=1e-3; GR=scalar ;;
+    kLW3)   WD=1e-3; GR=layerwise ;;
+    k01W4)  WD=5e-4; GR=scalar ;;
+    kLW4)   WD=5e-4; GR=layerwise ;;
+    CARW2)  WD=1e-2; GR=scalar ;;
+    *) bad=$((bad+1)); echo "  PER-RUN VIOLATION $b: UNKNOWN ARM"; continue ;;
+  esac
+  E="$HF --expect meta-stepsize=1e-3 --expect alpha0=1e-6 --expect NN-name=$NET --expect num-epochs=100 --expect stepsize-groups=$GR --expect weight-decay-base=$WD"
+  O=$(python3 $G "$f" $E --expect seed=$seed --expect save-directory=$R/$P --expect run-name=$rn 2>&1); RCX=$?
+  NFG=$(echo "$O" | grep -o 'no repeated flag ([0-9]* flags)' | grep -o '[0-9]*')
+  if [ $RCX != 0 ] || [ "$NFG" != 20 ]; then bad=$((bad+1)); echo "  PER-RUN VIOLATION $b rc=$RCX flags=$NFG want 20 (wd=$WD grain=$GR)"; echo "$O" | grep -E '!!!|DESIGN|declared' | sed 's/^/      /'; fi
+done
+echo "  PER-RUN --expect ($P, each run pinned to its OWN rung's weight decay and its OWN grain): $n runs with an ARGS line checked, $bad violations, $noargs .out without ARGS yet"
+echo "  WD COVERAGE across the started runs (the ladder's own axis, read from the runs' ARGS lines):"
+grep -h -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | grep -o -- '--weight-decay-base [^ ]*' | sort | uniq -c | sed 's/^/    /'
+echo "  GRAIN COVERAGE:"
+grep -h -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | grep -o -- '--stepsize-groups [^ ]*' | sort | uniq -c | sed 's/^/    /'
+python3 $S/analysis/cwd5_rule20_envaudit.py $R | sed 's/^/  /'
+echo "RULE20 end utc=$(date -u +%FT%TZ)"

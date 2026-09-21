@@ -30,10 +30,10 @@ test('no published record text carries a Markdown bold or code mark (**, __, `)'
 test('every record keeps its ID, section, area, kind, outcome and Corrected badge; a title changes only by losing marks', () => {
   assert.equal(fixture.experiments.length, 160);
   const byId = new Map(data.experiments.map(e => [e.id, e]));
-  // MT224-MT236 (cvt6, cvt7, cvt8, cvt9, the four MUST-tier batches, then cvt10, cwd1, csv1, cwd2 and cwd3) were appended after
-  // the fix (tests/cvt6-cvt7-landing.test.ts, tests/cvt8-cvt9-landing.test.ts, tests/must-tier-landing.test.ts, tests/mech4-landing.test.ts, tests/mech5-landing.test.ts).
+  // MT224-MT238 (cvt6, cvt7, cvt8, cvt9, the four MUST-tier batches, then cvt10, cwd1, csv1, cwd2, cwd3, cwd4 and cwd5) were appended after
+  // the fix (tests/cvt6-cvt7-landing.test.ts, tests/cvt8-cvt9-landing.test.ts, tests/must-tier-landing.test.ts, tests/mech4-landing.test.ts, tests/mech5-landing.test.ts, tests/mech6-landing.test.ts).
   assert.deepEqual(data.experiments.slice(0, 160).map(e => e.id), fixture.experiments.map(e => e.id));
-  assert.deepEqual(data.experiments.slice(160).map(e => e.id), ['MT224', 'MT225', 'MT226', 'MT227', 'MT228', 'MT229', 'MT230', 'MT231', 'MT232', 'MT233', 'MT234', 'MT235', 'MT236']);
+  assert.deepEqual(data.experiments.slice(160).map(e => e.id), ['MT224', 'MT225', 'MT226', 'MT227', 'MT228', 'MT229', 'MT230', 'MT231', 'MT232', 'MT233', 'MT234', 'MT235', 'MT236', 'MT237', 'MT238']);
   const plain = (text: string) => text.replace(/\*\*|`/g, '').replace(/\s+/g, ' ').trim();
   let retitled = 0;
   for (const old of fixture.experiments) {

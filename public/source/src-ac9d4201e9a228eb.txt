@@ -1,0 +1,1287 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cWD4_countwd_score.py -- THE REGISTERED SCORER FOR `cwd4`  (CORRECTIONS 280):
+#   ResNet18_c100 -- SEPARATE CARRIER IDENTITY FROM COUNT / DOSE IN THE DECAY MASK (278's bound (5), open item O-12).
+#   ONE SUBMISSION, 21 JOBS (7 arms x 3 seeds), 100 EPOCHS, SEEDS {143,144,145}, ResNet18_c100 / CIFAR-100,
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM, EVERY ARM IN THE SCALAR GROUPING, --constraint=L4 ON EVERY JOB,
+#   run from cwd1's EXISTING isolated tree $WS/harness_cwd1 (cvt8's tree + PATCH_DECAYMASK, HF.py 94aedc33..., UNCHANGED)
+#   with cwd1's EXISTING runner (run_cifar_cwd1.sh, 34a8c90e..., UNCHANGED).  NO NEW HARNESS CODE.
+#
+# Committed and pushed BEFORE any cwd4 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cWD4_countwd_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# FROZEN BARS (O2): every bar, sigma and tolerance score() uses is a LITERAL here; the only data-dependent terms are the
+# in-batch arm means and SIGMA_INBATCH through compose_sigma(), a max() with the frozen floor.  The noise floor literal
+# was read through corpus_exclusions.filter_rows on the 3,268-row corpus AFTER cwd3's ingest (278.9; OPERATIONS 36);
+# the selftest re-derives it.
+#
+# WHY THIS BATCH EXISTS.  `cwd3` (278) showed the three ctd1 carriers' own decay suffices (P_CAR +47.2787 pp = +89.34 SE)
+# while two matched non-carrier sets stayed on k01's floor -- but its bound (5) could NOT exclude a COUNT / DOSE account
+# ("any three genuine 512-wide layer4 BN scales would do"), because only FIVE 512-wide BN scales exist (47,50,53,56,59)
+# and THREE are carriers, so no class-pure carrier-free triple can exist at that depth.  AT COUNT TWO IT CAN:
+# {50,53} (carriers) against {47,56} (the only carrier-free 512-wide layer4 BN scales) is count-, class-, width-,
+# depth- and numel-matched.  Three SINGLE-carrier masks put the carrier side on a 1 / 2 / 3 dose ladder in the same batch.
+#
+# THE ARMS (cwd1's / cwd3's cell: SGDm 0.99 / wd 0.1 + Lion 0.99/0.9, ms 1e-3, alpha0 1e-6, clip -15:-2.3026, aug 1,
+#           bs 100; EVERY ARM SCALAR; no hold patch on any arm)
+#   k01      DECAY_MASK unset                          the in-batch collapse anchor (corpus 22.96; cwd3 22.9853)
+#   CARWD0   50+53+59   the three ctd1 CARRIERS         1,536 params -- cwd3's CARWD0 IN BATCH; the RECOVERED reference
+#   TWOWD0   50+53      TWO carriers (278's O-12)       1,024 params
+#   CTL2WD0  47+56      TWO non-carriers, CLASS-PURE    1,024 params -- the COUNT-MATCHED control that cannot exist at 3
+#   ONE50    50         one carrier (Kim gamma_last)      512 params
+#   ONE53    53         one carrier (Kim gamma_down)      512 params
+#   ONE59    59         one carrier (Kim gamma_last)      512 params
+#   Every unmasked tensor keeps coupled WD 0.1; the mask removes the decay in the weight update AND in the meta trace h.
+#
+# PER-ARM STATE (X in TWOWD0 / CTL2WD0 / ONE50 / ONE53 / ONE59), against the IN-BATCH anchors:
+#   REC  iff X >= CARWD0 - MATCH (5)   NULL iff X <= k01 + NULL (2)   PART otherwise
+#   A NULL state is a LOCATION at k01's floor, not a measured zero effect (164.6): stamped FLOOR-READINGS-ARE-BOUNDS.
+#   RECOVERY IS DEFINED AGAINST THE IN-BATCH CARWD0 (stamp RECOVERY-AGAINST-CARWD0); cwd3's levels are BETWEEN-BATCH
+#   and enter NO bar and NO contrast.
+#
+# BRANCH (decide(); first match wins): UNRESOLVED-DIVERGED (a seed range > 5) -> SCALAR-NOT-COLLAPSED (k01 > 30)
+#   -> REPLICATE-FAILED (CARWD0 - k01 < 20: cwd3's CARRIER-DECAY-SUFFICES did not replicate in batch)
+#   -> CONTROL-EXCEEDS-AT-TWO (the class-pure carrier-free pair reaches AT LEAST AS HIGH A STATE as the carrier pair,
+#      and is not itself NULL) -> ONE ACCOUNT from (m1 = the best single's state, r2 = TWOWD0's state):
+#     m1 REC                 -> ANY-ONE-SUFFICES (all three singles REC) | ONE-SUFFICES-PARTIAL (not all three)
+#     m1 < REC, r2 REC       -> TWO-SUFFICES
+#     m1 < REC, r2 PART      -> COUNT-GRADED
+#     m1 PART, r2 NULL       -> PARTIAL-NON-MONOTONE
+#     m1 NULL, r2 NULL       -> ALL-THREE-NEEDED
+#   and the state word TWO-<s>+CTL2-<s>+ONE50-<s>+ONE53-<s>+ONE59-<s> printed beside it.
+# CO-PRIMARIES (in batch, bounded in NEITHER direction):
+#   P_2SPEC = TWOWD0 - CTL2WD0   identity vs count at MATCHED count 2, class-pure on both sides
+#   D_TWO   = CARWD0 - TWOWD0    is the third carrier needed (0 -> two suffice; ~P_CAR -> three needed)
+#   P_ONE53 = ONE53 - k01        the LOWEST-term-magnitude carrier alone (mean |L| 1.9526e-01 vs 2.9155e-01 / 3.2984e-01,
+#                                SCORE-cdep1 [P]) -- the single whose recovery would refute count AND magnitude grading
+# KEYS: P_CAR = CARWD0 - k01 (the cwd3 replicate); P_TWO = TWOWD0 - k01; P_CTL2 = CTL2WD0 - k01;
+#       P_ONE50 = ONE50 - k01; P_ONE59 = ONE59 - k01.
+# DESCRIPTIVE, boundaries defined, NOT effects: D_MAG = ONE59 - ONE53 (|L| ratio 1.69, but Kim class ALSO differs);
+#       D_CLASS = ONE59 - ONE50 (both Kim gamma_last, |L| ratio 1.13 -- the only within-class magnitude contrast this
+#       network offers, and it is small); D_ONEMEAN = CARWD0 - mean(ONE50, ONE53, ONE59).
+#       IF EVERY SINGLE IS IN THE SAME STATE the ordering is SATURATED and is a BOUND, not a measurement: stamped
+#       SINGLES-SATURATED and no ordering stamp is printed.
+# ACCOUNTS (UNSURE levels; K01 18-28, FREE 62-78, PART 32-55); every account: k01 K01, CARWD0 FREE.
+# THE BROKEN-MASK NULLS: (i) a mask that bites on CARWD0 but NOT on the subset arms predicts ALL-THREE-NEEDED EXACTLY --
+#   the dangerous null, because it forges the count account; (ii) no mask biting at all predicts REPLICATE-FAILED.
+#   BOTH are separated ONLY by G-BITE's DECAY_MASK record audit and G-WITNESS's names / idx.
+# G-BITE (-> PATCH-NOT-VERIFIED, before any level): 500 records; beta == Lion recomputed on the ONE group of every arm;
+#   no hold key; dm_n == step+2, dm_skipped == dm_n * k, dm_masked == k (3 / 2 / 2 / 1 / 1 / 1), a positive dm_wdterm on
+#   every masked arm; no dm_* key on k01.
+#   DECLARED LIMIT (280.4): k does NOT separate TWOWD0 from CTL2WD0 (both 2) nor the three singles from each other
+#   (all 1).  That separation rests on G-WITNESS (each run's own line carries idx and names, byte-identical to its arm's
+#   registered string), on G-SETSEP (the registered witnesses and idx tuples are pairwise distinct), and on the bite
+#   job's RR4 set discrimination on the real GPU path.  Stated, not papered over.
+# G-HW (DISCLOSURE, NON-GATING, 271.4(5)): the GPU each run's own nvidia-smi line names; stamped HW-UNIFORM-<name> or
+#   HW-MIXED.  The launcher pins --constraint=L4; this scorer never gates on hardware.
+# plateau5 PRIMARY (epochs 95..99 of each run's own .out); TRAIN beside TEST; the dm_* readout after FINAL is DESCRIPTIVE.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("cwd4_design", os.path.join(HERE, "cwd4_design.py"))
+C = _load("cwd_common", os.path.join(HERE, "cwd_common.py"))
+W = D.W
+S9 = D.S9
+B = D.CWD4
+
+PREFIX = B.PREFIX
+NET = B.NET
+DSET = D.DSET
+EPOCHS = D.EPOCHS
+BATCH = D.BATCH
+SEEDS = B.SEEDS
+CLIP = D.CLIP
+MST = D.MST
+A0 = D.A0
+AUG = D.AUG
+PROBE = D.PROBE
+N_RECORDS = D.N_RECORDS
+ARMS = B.ARMS
+SPEC = B.SPEC
+PT_TYPE = B.PT_TYPE
+MASKED = B.MASKED
+SINGLES = B.SINGLES
+REF = B.REF                      # "CARWD0" -- the in-batch recovered reference
+NTENS = B.NTENS
+K_MASKED = dict((a, len(D.dm_indices(B.DMASK[a], B.TENSORS)) if B.DMASK[a] else 0) for a in ARMS)
+NG = dict((a, 1) for a in ARMS)
+ENV_EXPECTED = D.ENV_EXPECTED
+OFF_WITNESS = {"VOTE_W": "VOTE_W: off", "BETA_HOLD": "BETA_HOLD: off", "GROUP_HOLD": "GROUP_HOLD: off", "REST_HOLD": "REST_HOLD: off"}
+STATEARMS = ("TWOWD0", "CTL2WD0", "ONE50", "ONE53", "ONE59")
+
+# ---- FROZEN noise floor (read through corpus_exclusions.filter_rows on the 3,268-row POST-cwd3-INGEST corpus) ---------
+SIGMA_R18ALL = 0.6451413439065666      # ResNet18_c100 std cell, FILTERED, df 258, 51 cells (278.9's 0.645141 / 258)
+SIGMA_R18ALL_NAIVE = 12.482176983761198  # UNFILTERED -- disclosure only (the OPERATIONS 36 trap), df 332
+SIGMA_PRIOR = 0.6451413439065666       # = SIGMA_R18ALL (ResNet18_c100 only, as cwd1 / cwd3)
+SE_PRIOR = 0.526756                    # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_SHA256 = "fe3874d3e5b3489e4fd1f0f404547978441fc81dcbf883ec32a44ab90fd7ce84"
+REG_CORPUS_ROWS = 3268
+REG_EXCLUSIONS_SHA256 = "50f75cde4cabc23af84318131e98c5aa3397ab848b18cff4cdfc6ed40706aa6b"
+
+# ---- FROZEN bars (O2) --------------------------------------------------------------------------------------------------
+GAP_MIN = 20.0
+K01_MAX = 30.0
+RESCUE_BAR = 10.0
+NULL_BAR = 2.0
+MATCH_BAR = 5.0
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+
+R_BETWEEN = {"corpus mechanism cell (LIMITS-PREP 2.2)": {"k01 (n44)": 22.96, "layerwise (n32)": 69.42},
+             "cwd3 (278.3)": D.CWD3_LEVELS}
+CAR_CWD3 = D.CWD3_LEVELS["CARWD0"]      # 70.2640 -- BETWEEN-BATCH, used ONLY for a non-gating replication stamp
+CTL2_CWD3 = D.CWD3_LEVELS["CTL2WD0"]    # 22.9333 -- likewise
+PL_PER_RUN_GPUH = 0.7141                # cwd3's measured sacct mean over 15 identical-cell runs (278.1)
+
+K01_PL = (18.0, 28.0)
+FREE_PL = (62.0, 78.0)
+PART_PL = (32.0, 55.0)
+
+
+def _acct(two, ctl2, o50, o53, o59):
+    return {"k01": K01_PL, "CARWD0": FREE_PL, "TWOWD0": two, "CTL2WD0": ctl2, "ONE50": o50, "ONE53": o53, "ONE59": o59}
+
+
+ACCOUNTS = {
+    # the three singles all recover: count is irrelevant and the three are interchangeable at this grain
+    "ANY-ONE-SUFFICES": _acct(FREE_PL, K01_PL, FREE_PL, FREE_PL, FREE_PL),
+    # at least one single recovers but not all three: carrier-specific WITHIN the carriers, and NOT count-graded
+    "ONE-SUFFICES-PARTIAL": _acct(FREE_PL, K01_PL, FREE_PL, K01_PL, FREE_PL),
+    # no single recovers, the carrier PAIR does
+    "TWO-SUFFICES": _acct(FREE_PL, K01_PL, K01_PL, K01_PL, K01_PL),
+    # the pair is only partial: the effect grows with the number of masked carrier scales
+    "COUNT-GRADED": _acct(PART_PL, K01_PL, K01_PL, K01_PL, K01_PL),
+    # a single does part while the pair containing it does nothing -- non-monotone in count
+    "PARTIAL-NON-MONOTONE": _acct(K01_PL, K01_PL, PART_PL, K01_PL, K01_PL),
+    # only the full three-carrier mask lifts the run
+    "ALL-THREE-NEEDED": _acct(K01_PL, K01_PL, K01_PL, K01_PL, K01_PL),
+    # the class-pure carrier-free pair does at least as much as the carrier pair: identity is NOT what matters
+    "CONTROL-EXCEEDS-AT-TWO": _acct(FREE_PL, FREE_PL, FREE_PL, FREE_PL, FREE_PL),
+    # cwd3's own result did not replicate in batch: no reading at all
+    "REPLICATE-FAILED": {"k01": K01_PL, "CARWD0": K01_PL, "TWOWD0": K01_PL, "CTL2WD0": K01_PL,
+                         "ONE50": K01_PL, "ONE53": K01_PL, "ONE59": K01_PL},
+}
+# (i) the DANGEROUS null: the mask bites on CARWD0 but on NO subset arm -> levels EXACTLY ALL-THREE-NEEDED's
+BROKEN_SUBSET_NULL = _acct(K01_PL, K01_PL, K01_PL, K01_PL, K01_PL)
+# (ii) no mask bites at all -> levels EXACTLY REPLICATE-FAILED's
+BROKEN_ALL_NULL = dict((a, K01_PL) for a in ARMS)
+ACCOUNT_TOKENS = ["ANY-ONE-SUFFICES", "ONE-SUFFICES-PARTIAL", "TWO-SUFFICES", "COUNT-GRADED", "PARTIAL-NON-MONOTONE",
+                  "ALL-THREE-NEEDED", "CONTROL-EXCEEDS-AT-TWO"]
+TOKENS = (["INCOMPLETE", "HARNESS-UNSOUND", "PATCH-NOT-VERIFIED", "UNRESOLVED-DIVERGED", "SCALAR-NOT-COLLAPSED",
+           "REPLICATE-FAILED"] + ACCOUNT_TOKENS)
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+fmt, mean, sd = C.fmt, C.mean, C.sd
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def gpu_of(path):
+    """the GPU name from the run's own nvidia-smi line (`<name>, <n> MiB`), or None.  DISCLOSURE ONLY."""
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if ln.endswith(" MiB") and ", " in ln and not ln.startswith(("ARGS:", "ENV:", "Epoch")):
+            return ln.split(",")[0].strip()
+    return None
+
+
+# =============================================================================
+# G-BITE: Lion on the one group, no hold key, the DECAY_MASK audit
+# =============================================================================
+def lion_natural(beta_pre, mom_pre, z):
+    return S9.lion_natural(beta_pre, mom_pre, z)
+
+
+def lion_check(recs, ng):
+    d = {"n": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0, "nonfinite": 0, "worst": 0.0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre, mom, z = S9._groupvec(r, "beta_pre", ng), S9._groupvec(r, "mom_pre", ng), S9._groupvec(r, "z_agg", ng)
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        if r["step"] != 100 * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        for g in range(ng):
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst"] = max(d["worst"], e)
+            d["bad_lion"] += e > BH_TOL
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS and d["bad_step"] == 0
+          and d["bad_lion"] == 0)
+    return ok, d
+
+
+def bite_run(arm, recs):
+    okl, dl = lion_check(recs, NG[arm])
+    hk = C.hold_keys_present(recs)
+    okd, dd = C.dm_audit(recs, K_MASKED[arm], N_RECORDS)
+    return okl and okd and hk == 0, dl, dd, hk
+
+
+# =============================================================================
+# decide
+# =============================================================================
+RANK = {"NULL": 0, "PART": 1, "REC": 2}
+
+
+def state(M, x):
+    if M[x] >= M[REF] - MATCH_BAR:
+        return "REC"
+    if M[x] <= M["k01"] + NULL_BAR:
+        return "NULL"
+    return "PART"
+
+
+def account_of(two, ctl2, singles):
+    """two / ctl2: state words.  singles: the three singles' state words in ARM order (ONE50, ONE53, ONE59)."""
+    if RANK[ctl2] >= RANK[two] and RANK[ctl2] >= 1:
+        return "CONTROL-EXCEEDS-AT-TWO"
+    m1 = max(RANK[s] for s in singles)
+    r2 = RANK[two]
+    if m1 == 2:
+        return "ANY-ONE-SUFFICES" if all(RANK[s] == 2 for s in singles) else "ONE-SUFFICES-PARTIAL"
+    if r2 == 2:
+        return "TWO-SUFFICES"
+    if r2 == 1:
+        return "COUNT-GRADED"
+    return "PARTIAL-NON-MONOTONE" if m1 == 1 else "ALL-THREE-NEEDED"
+
+
+def decide(M, diverged=False):
+    """-> (token, state word or None)."""
+    if diverged:
+        return "UNRESOLVED-DIVERGED", None
+    if M["k01"] > K01_MAX:
+        return "SCALAR-NOT-COLLAPSED", None
+    if M[REF] - M["k01"] < GAP_MIN:
+        return "REPLICATE-FAILED", None
+    st = dict((a, state(M, a)) for a in STATEARMS)
+    tok = account_of(st["TWOWD0"], st["CTL2WD0"], [st[a] for a in SINGLES])
+    return tok, "TWO-%s+CTL2-%s+ONE50-%s+ONE53-%s+ONE59-%s" % tuple(st[a] for a in STATEARMS)
+
+
+READING = ("the carrier account of the scalar collapse at the mechanism cell, and specifically cwd3's "
+           "CARRIER-DECAY-SUFFICES (CORRECTIONS 278, MASTER-TABLE row 236)")
+NOT_ROUTE = "Not licensed: which ROUTE acts (weight shrink vs meta trace -- the mask changes both), decoupled WD, other cells."
+FLOOR_NOTE = "A NULL state is a location at k01's floor (164.6), a BOUND on the effect, not a measured zero."
+NOT_MAG = ("Not licensed either way: IDENTITY vs TERM MAGNITUDE.  On this network no carrier-free control can be "
+           "magnitude-matched.  Mean |L| on the scalar anchor's PINNED records (SCORE-cdep1 [P]): the three carriers "
+           "are ranks 1/2/3 of 62 (59 3.2984e-01, 50 2.9155e-01, 53 1.9526e-01); the ONLY carrier-free 512-wide "
+           "layer4 BN scales are ranks 33 and 36 (56 1.5166e-03, 47 1.1298e-03).  The SMALLEST carrier exceeds the "
+           "LARGEST admissible control tensor by 128.8x, and SCORE-cdep1's registered sum ratio is 308.4.  cmg1's "
+           "MAGNITUDE-NOT-SEPARATED stands: this batch matches COUNT, class, width, depth and numel, never magnitude.")
+NOT_KIM = ("Not licensed: ctd1 IDENTITY vs Kim et al.'s POSITION CLASS (arXiv:2205.07260) -- {50,59} are gamma_last, "
+           "53 is gamma_down, {47,56} are gamma_others, and no carrier-free gamma_last/gamma_down exists at this depth.")
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement about the" % (FLOOR_MIN, CEIL_MAX),
+                        "harness only; " + READING + " untouched."],
+    "PATCH-NOT-VERIFIED": [
+        "G-BITE failed: on at least one run the meta update does not recompute as Lion, a hold key appears, the DECAY_MASK",
+        "record (dm_n / dm_skipped / dm_masked k / a positive dm_wdterm) is missing or wrong, a dm_* key sits on k01, or",
+        "records are missing / short.  This is a BROKEN-MASK null or an unreadable witness: NO level is read.  A mask that",
+        "bit on CARWD0 but on NO subset arm predicts EXACTLY ALL-THREE-NEEDED, which is why this gate runs first.",
+        READING + " untouched."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch; " + READING + " untouched."],
+    "SCALAR-NOT-COLLAPSED": ["k01 (no mask) did not collapse in batch (> %.0f pp).  Nothing to explain; the batch cannot" % K01_MAX,
+                             "speak to any mask."],
+    "REPLICATE-FAILED": [
+        "CARWD0 (WD 0 on the three ctd1 carriers) is not %.0f pp above k01: cwd3's CARRIER-DECAY-SUFFICES did NOT" % GAP_MIN,
+        "replicate in batch, so there is no recovered level to read the subset arms against.  IDENTICAL IN LEVEL to the",
+        "null in which NO mask bites (G-BITE excluded it).  No count or identity sentence; cwd3's result is QUESTIONED,",
+        "not overturned (between-batch)."],
+    "ANY-ONE-SUFFICES": [
+        "Each of the three carrier scales, masked ALONE, reaches within %.0f pp of the three-carrier mask, while the" % MATCH_BAR,
+        "class-pure count-matched carrier-free pair {47,56} stays at k01.  SENTENCE LICENSED, at this cell: 'removing the",
+        "coupled weight decay from ANY ONE of the three carrier BatchNorm scales alone removes the collapse; the effect is",
+        "NOT graded in the NUMBER of masked scales, and removing it from two matched non-carrier scales does not lift the",
+        "run off the floor.'  EFFECT ON " + READING + ": 278's COUNT / DOSE rival (T19) is REFUTED at this cell -- one",
+        "genuine 512-wide layer4 BN scale suffices if it is a carrier, and two do not if they are not.  " + FLOOR_NOTE,
+        NOT_MAG, NOT_KIM, NOT_ROUTE],
+    "ONE-SUFFICES-PARTIAL": [
+        "At least one carrier scale masked ALONE reaches within %.0f pp of the three-carrier mask, but NOT all three do" % MATCH_BAR,
+        "(read the state word and the per-single contrasts).  SENTENCE LICENSED: 'at this cell one named carrier scale's",
+        "own decay suffices, and the effect is carrier-SPECIFIC WITHIN the three carriers -- it is not a function of the",
+        "number of masked scales alone.'  EFFECT ON " + READING + ": 278's COUNT / DOSE rival (T19) is REFUTED at this",
+        "cell, and a new within-carrier asymmetry is opened.  WHICH single sufficed is read from the state word only;",
+        "any ordering among the singles is DESCRIPTIVE (D_MAG / D_CLASS) and is a BOUND wherever they saturate.",
+        FLOOR_NOTE, NOT_MAG, NOT_KIM, NOT_ROUTE],
+    "TWO-SUFFICES": [
+        "No single carrier scale lifts the run, the carrier PAIR {50,53} reaches within %.0f pp of the three-carrier" % MATCH_BAR,
+        "mask, and the COUNT-MATCHED, class-pure, width-, depth- and numel-matched carrier-free pair {47,56} stays at",
+        "k01.  SENTENCE LICENSED, at this cell: 'two of the three carrier scales suffice and one does not, while two",
+        "matched NON-carrier 512-wide layer4 BN scales do not lift the run off the floor: at count two the effect is",
+        "specific to the carriers.'  EFFECT ON " + READING + ": this is the contrast 278 could not build at count three",
+        "-- the COUNT / DOSE rival (T19) is REFUTED AT COUNT TWO, and the dose ladder is resolved as 1 < 2 = 3.",
+        FLOOR_NOTE, NOT_MAG, NOT_KIM, NOT_ROUTE],
+    "COUNT-GRADED": [
+        "No single lifts the run and the carrier pair reaches only PART of the way to the three-carrier mask: the effect",
+        "GROWS WITH THE NUMBER of masked carrier scales and is not complete at two.  SENTENCE LICENSED: 'the rescue is",
+        "graded in the number of carrier scales exempted from the decay; all three are needed for the full effect.'",
+        "EFFECT ON " + READING + ": 278's COUNT / DOSE rival (T19) is SUPPORTED on the carrier side.  Whether the count",
+        "or the identity is what matters is then decided by CTL2WD0's state: with CTL2WD0 at k01 the count account still",
+        "needs the scales to be carriers (P_2SPEC), and that pair of facts must be written together.",
+        FLOOR_NOTE, NOT_MAG, NOT_KIM, NOT_ROUTE],
+    "PARTIAL-NON-MONOTONE": [
+        "A single carrier scale reaches PART of the way while the PAIR containing carriers does not lift the run at all:",
+        "the dose ladder is NON-MONOTONE.  NO count sentence and NO identity sentence is licensed; the result must be",
+        "reported as a non-monotonicity with the per-arm levels, and it questions whether a single number ('how many",
+        "scales') describes this intervention at all.  " + FLOOR_NOTE, NOT_MAG, NOT_KIM, NOT_ROUTE],
+    "ALL-THREE-NEEDED": [
+        "Neither any single carrier scale nor the carrier pair lifts the run off k01 (all within %.0f pp), while the" % NULL_BAR,
+        "three-carrier mask recovers.  SENTENCE LICENSED: 'at this cell the rescue needs ALL THREE carrier scales",
+        "exempted; no one of them and no two of them suffice.'  EFFECT ON " + READING + ": cwd3's sentence stands but",
+        "becomes a statement about the SET, not about any member, and 278's COUNT / DOSE rival (T19) is SUPPORTED at",
+        "count 1 and 2 -- the campaign may NOT write that a named single scale carries the precondition on ResNet.",
+        "IDENTICAL IN LEVEL TO THE BROKEN-SUBSET-MASK NULL, which G-BITE excluded.  " + FLOOR_NOTE, NOT_MAG, NOT_KIM],
+    "CONTROL-EXCEEDS-AT-TWO": [
+        "The class-pure, count-, width-, depth- and numel-matched carrier-free pair {47,56} reaches AT LEAST AS HIGH A",
+        "STATE as the carrier pair {50,53}, and is not itself at k01's floor.  AT MATCHED COUNT TWO THE CARRIER IDENTITY",
+        "IS NOT WHAT MATTERS.  SENTENCE LICENSED: 'exempting any two 512-wide layer4 BatchNorm scales from the coupled",
+        "decay does at least as much as exempting two carriers: at the decay grain the effect follows the COUNT (or the",
+        "class or the depth), not the ctd1 carrier identity.'  EFFECT ON " + READING + ": 278's COUNT / DOSE rival (T19)",
+        "is SUPPORTED and cwd3's specificity reading is CONTRADICTED at count two -- the mechanism line must be rewritten",
+        "as a statement about last-block normalisation scales in general, not about the three nominated tensors.",
+        "This is an ADVERSE outcome for the campaign's own account and is registered as such BEFORE any run.  " + NOT_ROUTE],
+}
+
+
+def dm_readout(runsdir):
+    print("\nDESCRIPTIVE (non-gating) -- PATCH_DECAYMASK's readout on the masked arms: ||w|| per masked tensor (seed means)")
+    print("and min |w|, entries |w| < 1e-3, at records 0 / 50 / 200 / 499.  k01 carries no readout (the mask is off there).")
+    for a in MASKED:
+        rows = [C.load_probe(runsdir, PREFIX, a, s) or [] for s in SEEDS]
+        parts = []
+        k = K_MASKED[a]
+        for r_ in (0, 50, 200, 499):
+            v = [r[r_] for r in rows if len(r) > r_ and isinstance(r[r_], dict) and isinstance(r[r_].get("dm_norm"), list)
+                 and len(r[r_]["dm_norm"]) == k]
+            if not v:
+                parts.append("rec %d n/a" % r_)
+                continue
+            nrm = "/".join("%.3g" % mean([x["dm_norm"][p] for x in v]) for p in range(k))
+            parts.append("rec %d: %s absmin %.3g small %.1f" % (r_, nrm, mean([x["dm_absmin"] for x in v]), mean([x["dm_small"] for x in v])))
+        print("  %-8s idx %-8s %s" % (a, ",".join("%d" % i for i in B.SET_IDX[a]), " | ".join(parts)))
+    print("  (the median of a dm_norm vector is NOT printed here: 278.6 D1 reported cWD3's upper-middle median as a")
+    print("   RULE 16 defect in a registered file; this scorer prints the per-tensor norms and no median at all.)")
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    print("=" * 78)
+    print(" cwd4 -- ResNet18_c100: IDENTITY vs COUNT (and, as far as this network allows, vs MAGNITUDE) IN THE DECAY MASK")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1  every arm scalar"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for a in ARMS:
+        print("   %-8s k=%d  idx %-9s DECAY_MASK %s" % (a, K_MASKED[a], ",".join("%d" % i for i in B.SET_IDX.get(a, ())) or "-",
+                                                        B.DMASK[a] or "(unset)"))
+    print(" CO-PRIMARY: P_2SPEC = TWOWD0 - CTL2WD0; D_TWO = CARWD0 - TWOWD0; P_ONE53 = ONE53 - k01 (bounded in neither direction).")
+    print(" RECOVERY IS AGAINST THE IN-BATCH CARWD0.  plateau5 = mean TEST over epochs %d..%d of each run's own .out."
+          % (EPOCHS - 5, EPOCHS - 1))
+    print(" BARS ARE FROZEN LITERALS (O2).")
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+
+    runs, rnotes = C.read_runs(runsdir, PREFIX, ARMS, EPOCHS)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    every run's OWN ARGS line says what its file name registers")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = C.parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                    "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                    "momentum-param-base": "0.99", "weight-decay-base": "0.1", "momentum-param-meta": "0.99",
+                    "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d" % (a, s),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad]) if (dup or bad) else "")
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(" ".join(t for t in ln.split() if not t.startswith("PROBE_DIR=")) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()), "G-ENV one distinct ENV line (PROBE_DIR stripped), one per run", "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is cvt1's ... cvt9's / cwd1's / cwd3's, byte for byte (PROBE_DIR stripped)")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not r["pt"][0].startswith("PROBE_TENSOR: on every=%d type=%s tensors=%d " % (PROBE, PT_TYPE[a], NTENS))]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=scalar tensors=%d`" % (PROBE, NTENS),
+         "bad: %s" % badpt[:5] if badpt else "%d runs" % len(runs))
+
+    print("\nG-SETSEP  the structural precondition for G-WITNESS to discriminate arms that G-BITE's k cannot (280.4)")
+    wits = dict((a, B.WITNESS_DM[a]) for a in ARMS)
+    idxs = dict((a, B.SET_IDX[a]) for a in MASKED)
+    kcoll = sorted(set(K_MASKED[a] for a in MASKED if sum(K_MASKED[x] == K_MASKED[a] for x in MASKED) > 1))
+    hchk(len(set(wits.values())) == len(ARMS), "G-SETSEP the %d registered DECAY_MASK witnesses are PAIRWISE DISTINCT" % len(ARMS),
+         "%d distinct" % len(set(wits.values())))
+    hchk(len(set(idxs.values())) == len(MASKED), "G-SETSEP the %d masked idx tuples are PAIRWISE DISTINCT" % len(MASKED))
+    print("  DECLARED: k collides on %s -- TWOWD0 vs CTL2WD0 (both k=2) and the three singles (all k=1) are NOT separated"
+          % (kcoll,))
+    print("  by G-BITE's k.  They are separated by G-WITNESS (idx + names in each run's own line) and by the bite job's")
+    print("  RR4 set discrimination on the real GPU path.  This limit is registered, not discovered afterwards.")
+
+    print("\nG-WITNESS one line of each kind per run == the registered witness (VOTE_W / BETA_HOLD / GROUP_HOLD / REST_HOLD off; DECAY_MASK)")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            for kind, want in list(OFF_WITNESS.items()) + [("DECAY_MASK", B.WITNESS_DM[a])]:
+                hchk(r[kind] == [want], "G-WITNESS %s %s-s%d" % (kind, a, s), "" if r[kind] == [want] else "got %r" % ([x[:170] for x in r[kind][:2]],))
+            others = [k for k in ("COMP_HOLD", "WINDOW_HOLD") if r[k]]
+            hchk(not others, "G-WITNESS %s-s%d prints no COMP_HOLD / WINDOW_HOLD line (cvt8 lineage)" % (a, s), str(others) if others else "")
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == D.manifest_text(B), "G-STRUCT byte-identical to cwd4_design.manifest_text(CWD4)", "%d vs %d bytes" % (len(txt), len(D.manifest_text(B))))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        me = file_sha(os.path.abspath(__file__))
+        for key, want, lab in (("MODE", "submit", "MODE submit"),
+                               ("BUILD_NETWORK_SHA256", B.BN_SHA, "build_network.py == cvt8's"),
+                               ("HF_SHA256", B.HF_POST_SHA, "HF.py == cwd1's PATCH_DECAYMASK tree, UNCHANGED"),
+                               ("HF_PRE_DECAYMASK_SHA256", B.HF_PARENT_SHA, "HF.py.pre_decaymask == cvt8's HF.py"),
+                               ("RUNNER_SHA256", B.RUNNER_SHA, "runner == run_cifar_cwd1.sh, UNCHANGED"),
+                               ("SCORER_SHA256", me, "SCORER == this file"),
+                               ("DESIGN_SHA256", file_sha(D.__file__), "DESIGN == the cwd4_design.py this scorer loaded"),
+                               ("CWD_DESIGN_SHA256", file_sha(W.__file__), "the reused cwd_design.py this scorer loaded"),
+                               ("COMMON_SHA256", file_sha(C.__file__), "COMMON == the cwd_common.py this scorer loaded")):
+            hchk(prov.get(key) == want, "G-PROV %s" % lab, "%s=%s" % (key, str(prov.get(key))[:16]))
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [C.tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-8s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        print("           seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    Lion recomputed on the one group of every arm; no hold key; the DECAY_MASK record audit (k per arm)")
+    bite_fail = []
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = C.load_probe(runsdir, PREFIX, a, s)
+            ok, dl, dd, hk = bite_run(a, recs)
+            nonfin[(a, s)] = dl["nonfinite"] + dd["nonfinite"]
+            print("  %-4s G-BITE %-8s s%d  records %s  groups %d  lion-mismatch %d (ties %d, worst %.1e)  bad %d  nonfinite %d  "
+                  "hold-key records %s | dm: k=%d bad_n %d bad_skipped %d bad_masked %d bad_types %d on-unmasked %d pos_wdterm %d "
+                  "nonfinite %d last %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), NG[a], dl["bad_lion"], dl["ties"],
+                     dl["worst"], dl["bad_rec"], dl["nonfinite"], hk, K_MASKED[a], dd["bad_n"], dd["bad_skipped"], dd["bad_masked"],
+                     dd["bad_types"], dd["keys_on_unmasked"], dd["pos_wdterm"], dd["nonfinite"], dd["last"],
+                     ("  (%s)" % (dl.get("why") or dd.get("why"))) if (dl.get("why") or dd.get("why")) else ""))
+            if not ok:
+                bite_fail.append("%s-s%d" % (a, s))
+    if bite_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | G-BITE failed on %s" % ",".join(bite_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-HW      DISCLOSURE ONLY (271.4(5)): the GPU each run's own nvidia-smi line names -- NO gate reads it")
+    hw = dict(((a, s), gpu_of(os.path.join(runsdir, runs[(a, s)]["file"]))) for s in SEEDS for a in ARMS)
+    for a in ARMS:
+        print("  %-8s %s" % (a, "  ".join("s%d %s" % (s, hw[(a, s)]) for s in SEEDS)))
+    hwset = sorted(set(str(v) for v in hw.values()))
+    print("  distinct devices: %s" % hwset)
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / len(SEEDS))
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/%d)  (df_inbatch %d)" % (se, len(SEEDS), df))
+    print("  2 SE (the HALF-WIDTH of a +/-2 SE interval, NOT a bound on any effect -- 278.6 C1): %.6f" % (2 * se))
+
+    print("\nCONTRASTS (every one WITHIN batch)")
+    CP = {}
+    for kind, nm, (x, y) in (("PRIMARY", "P_2SPEC", ("TWOWD0", "CTL2WD0")), ("PRIMARY", "D_TWO", ("CARWD0", "TWOWD0")),
+                             ("PRIMARY", "P_ONE53", ("ONE53", "k01")), ("KEY", "P_CAR", ("CARWD0", "k01")),
+                             ("KEY", "P_TWO", ("TWOWD0", "k01")), ("KEY", "P_CTL2", ("CTL2WD0", "k01")),
+                             ("KEY", "P_ONE50", ("ONE50", "k01")), ("KEY", "P_ONE59", ("ONE59", "k01"))):
+        CP[nm] = (M[x] - M[y], T[x] - T[y])
+        print("  %-8s %-8s = %-7s - %-7s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   seeds %s"
+              % (kind, nm, x, y, CP[nm][0], CP[nm][0] / se, CP[nm][1],
+                 " / ".join("%+.3f" % (runs[(x, s)]["plateau5"] - runs[(y, s)]["plateau5"]) for s in SEEDS)))
+        print("           +/-2 SE interval [%+.4f, %+.4f]" % (CP[nm][0] - 2 * se, CP[nm][0] + 2 * se))
+    print("  DESCR    D_MAG    = ONE59 - ONE53 = %+.4f pp   (mean |L| 3.2984e-01 vs 1.9526e-01, ratio 1.69 -- but Kim"
+          % (M["ONE59"] - M["ONE53"]))
+    print("           class ALSO differs, gamma_last vs gamma_down: this contrast does NOT isolate magnitude)")
+    print("  DESCR    D_CLASS  = ONE59 - ONE50 = %+.4f pp   (BOTH Kim gamma_last; mean |L| 3.2984e-01 vs 2.9155e-01,"
+          % (M["ONE59"] - M["ONE50"]))
+    print("           ratio 1.13 -- the ONLY within-class magnitude contrast this network offers, and it is small)")
+    print("  DESCR    D_ONEMEAN = CARWD0 - mean(ONE50,ONE53,ONE59) = %+.4f pp"
+          % (M["CARWD0"] - mean([M[a] for a in SINGLES])))
+    print("  bars: GAP_MIN %.1f (%.2f SE) | MATCH %.1f pp (%.2f SE) | NULL %.1f pp (%.2f SE) | RESCUE %.1f pp (%.2f SE)"
+          % (GAP_MIN, GAP_MIN / se, MATCH_BAR, MATCH_BAR / se, NULL_BAR, NULL_BAR / se, RESCUE_BAR, RESCUE_BAR / se))
+    print("  state bars: REC iff arm >= %.4f (CARWD0 - %.0f) ; NULL iff arm <= %.4f (k01 + %.0f)"
+          % (M[REF] - MATCH_BAR, MATCH_BAR, M["k01"] + NULL_BAR, NULL_BAR))
+    for a in STATEARMS:
+        print("  STATE    %-8s %.4f -> %-4s  (to REC bar %+.4f pp, to NULL bar %+.4f pp)   k=%d  idx %s  Kim %s"
+              % (a, M[a], state(M, a), M[a] - (M[REF] - MATCH_BAR), M[a] - (M["k01"] + NULL_BAR), K_MASKED[a],
+                 ",".join("%d" % i for i in B.SET_IDX[a]), ",".join(B.KIM_CLASS[i] for i in B.SET_IDX[a])))
+
+    print("\nG-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR, "" if not div else "  diverged: %s" % div))
+
+    branch, word = decide(M, bool(div))
+    st = dict((a, state(M, a)) for a in STATEARMS)
+    stamps = ([word] if word else []) + [
+        "HARNESS-CLEAN", "PATCH-BITES", "MASK-UPDATE-AND-TRACE", "CONV-LINEAR-WD-KEPT", "ALL-ARMS-SCALAR",
+        "RECOVERY-AGAINST-CARWD0", "CTL2-CLASS-PURE-COUNT-MATCHED", "CTL-NOT-MAGNITUDE-MATCHED", "MAGNITUDE-NOT-SEPARATED",
+        "POSITION-CLASS-NOT-SEPARATED", "ONE-NETWORK-RESNET18", "ONE-CELL", "HORIZON-100-ONLY",
+        "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    if word:
+        if st["TWOWD0"] == "REC" and st["CTL2WD0"] == "NULL":
+            stamps.append("TWO-SPECIFIC")
+        if st["CTL2WD0"] == "PART":
+            stamps.append("CTL2-PARTIAL")
+        if any(RANK[st[a]] > RANK[st["TWOWD0"]] for a in SINGLES):
+            stamps.append("NON-MONOTONE-IN-COUNT")
+        if M["TWOWD0"] > M[REF] + MATCH_BAR:
+            stamps.append("TWO-ABOVE-CAR")
+        if len(set(st[a] for a in SINGLES)) == 1:
+            stamps.append("SINGLES-SATURATED")
+        else:
+            stamps.append("ONE-ORDER-" + "-".join(sorted(SINGLES, key=lambda a: -M[a])))
+        if any(st[a] == "NULL" for a in STATEARMS):
+            stamps.append("FLOOR-READINGS-ARE-BOUNDS")
+    for a in ARMS[1:]:
+        if M[a] < M["k01"] - NULL_BAR:
+            stamps.append("%s-BELOW-K01" % a)
+    if abs(M["CARWD0"] - CAR_CWD3) > MATCH_BAR:
+        stamps.append("CARWD0-DIFFERS-FROM-CWD3")
+    if abs(M["CTL2WD0"] - CTL2_CWD3) > MATCH_BAR:
+        stamps.append("CTL2-DIFFERS-FROM-CWD3")
+    for a in ARMS:
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % a)
+    stamps.append(("HW-UNIFORM-%s" % hwset[0].replace(" ", "_")) if len(hwset) == 1 else "HW-MIXED")
+    agree = all((t > 0) == (p > 0) for p, t in CP.values() if abs(p) >= RESCUE_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cwd4 bar or contrast):")
+    for b_, dct in R_BETWEEN.items():
+        print("  %s: %s" % (b_, "  ".join("%s %.4f" % kv for kv in dct.items())))
+    print("  cwd4 {%s}: %s" % (",".join(str(s) for s in SEEDS), "  ".join("%s %.4f" % (a, M[a]) for a in ARMS)))
+    print("  CARWD0 - cwd3's CARWD0 = %+.4f pp; CTL2WD0 - cwd3's CTL2WD0 = %+.4f pp; k01 - cwd3's k01 = %+.4f pp"
+          % (M["CARWD0"] - CAR_CWD3, M["CTL2WD0"] - CTL2_CWD3, M["k01"] - D.CWD3_LEVELS["k01"]))
+    try:
+        dm_readout(runsdir)
+    except Exception as ex:
+        print("  (descriptive dm readout skipped: %s)" % type(ex).__name__)
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        print("  " + ln)
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * Anything about PlainNet / VGG / GroupNorm, other cells, momentum 0.9, or WD on conv / linear weights.")
+    print("  * Which ROUTE (weight shrink vs meta trace -- one switch changes both), decoupled weight decay, other WD values.")
+    print("  * IDENTITY vs TERM MAGNITUDE: no magnitude-matched carrier-free control exists on this network.  The three")
+    print("    carriers are mean-|L| ranks 1/2/3 of 62 on the scalar anchor's pinned records AND the only tensors that")
+    print("    vote DOWN on 100 %% of them; the only carrier-free 512-wide layer4 BN scales are ranks 33 and 36, so the")
+    print("    SMALLEST carrier exceeds the LARGEST admissible control tensor by 128.8x.  The next-largest terms in the")
+    print("    whole model (linear.weight rank 4, layer4.0.conv2.weight rank 5) vote UP on 100 %% of pinned records and")
+    print("    are neither normalisation scales nor numel-matched, so they are not an admissible control either.")
+    print("    D_MAG / D_CLASS are DESCRIPTIVE and are BOUNDS wherever the singles saturate (stamp SINGLES-SATURATED).")
+    print("  * ctd1 IDENTITY vs Kim et al.'s POSITION CLASS (arXiv:2205.07260) at count 3 or 1; at count TWO the carrier")
+    print("    pair is {gamma_last, gamma_down} and the control is {gamma_others, gamma_others}, so class and carrier")
+    print("    status remain confounded there too -- this batch separates COUNT, not CLASS.")
+    print("  * Any statement about the layerwise grouping (no layerwise arm) or beyond 100 epochs.")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_ENV = ENV_EXPECTED.replace(" PROBE=100 ", " PROBE=100 PROBE_DIR=/x/probe ")
+# base scenario = TWO-SUFFICES (no single recovers, the carrier pair does, the matched control stays at the floor)
+_E_BASE = {"k01": 23.0, "CARWD0": 70.0, "TWOWD0": 69.0, "CTL2WD0": 22.8, "ONE50": 23.2, "ONE53": 23.1, "ONE59": 23.4}
+
+
+def _e_curve(level):
+    return [level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0)) for e in range(EPOCHS)]
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, dm=None, extra=None, gpu="NVIDIA L4, 23034 MiB"):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base 0.1 "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cwd4 --run-name %s" % (NET, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env, gpu]
+    lines += list(OFF_WITNESS.values()) + [B.WITNESS_DM[arm] if dm is None else dm, "Files already downloaded and verified",
+                                           "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9 dir=/x" % (PT_TYPE[arm], NTENS)]
+    lines += list(extra or [])
+    curve = _e_curve(level)
+    for e in range(n_ep):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.4f %%" % (e, min(99.9, curve[e] + 15.0), curve[e]))
+    if run_done:
+        lines += ["43  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_records(arm, seed, ng=None, touch=False, add_bh=False, nodm=False, adddm=False, dmforge=None, n=N_RECORDS, k=None):
+    rnd = random.Random(7600 + seed + 17 * ARMS.index(arm))
+    ng = ng or NG[arm]
+    out = []
+    for kk in range(n):
+        s = 100 * kk
+        mom = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        z = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        bpre = [S9.f32(max(S9.LO, min(S9.HI, -13.8 + 0.3 * math.sin(kk / 30.0 + g) - 0.004 * kk))) for g in range(ng)]
+        beta = [S9.f32(lion_natural(bpre[g], mom[g], z[g])[0]) for g in range(ng)]
+        if touch:
+            beta[0] = S9.f32(beta[0] + 0.002)
+        rec = {"step": s, "pt_b2": 0.9, "pt_mp": 0.99, "beta": beta, "beta_pre": [bpre], "mom_pre": [mom], "z_agg": [z]}
+        if add_bh:
+            rec.update({"bh_n": s + 2, "bh_active": 0, "bh_nat": beta[0], "bh_held": beta[0]})
+        out.append(rec)
+    kk_ = K_MASKED[arm] if k is None else k
+    if (kk_ and not nodm) or adddm:
+        out = C.add_dm_keys(out, kk_ or 3, forge=dmforge)
+    return out
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            p = os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for r in _e_records(a, s):
+                    f.write(json.dumps(r) + "\n")
+
+
+def _e_prov(d, over=None):
+    kv = {"MODE": "submit", "BUILD_NETWORK_SHA256": B.BN_SHA, "HF_SHA256": B.HF_POST_SHA, "HF_PRE_DECAYMASK_SHA256": B.HF_PARENT_SHA,
+          "RUNNER_SHA256": B.RUNNER_SHA, "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+          "DESIGN_SHA256": file_sha(D.__file__), "CWD_DESIGN_SHA256": file_sha(W.__file__), "COMMON_SHA256": file_sha(C.__file__)}
+    kv.update(over or {})
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+
+
+def _e_build(d, template, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None, env_break=None,
+             spec_break=None, dm_break=None, extra_break=None, manifest=None, prov=None, probe_break=None, probe_drop=None,
+             gpu=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(manifest if manifest is not None else D.manifest_text(B))
+    _e_prov(d, prov)
+    jid = 9760000
+    pb = probe_break or {}
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                p = os.path.join(d, PREFIX, pname)
+                os.makedirs(p)
+                with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                    for r in pb[(a, s)]:
+                        f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = "layerwise" if spec_break == (a, s) else None
+            dm = dm_break[1] if dm_break and dm_break[0] == (a, s) else None
+            extra = extra_break[1] if extra_break and extra_break[0] == (a, s) else None
+            g = (gpu or {}).get((a, s), "NVIDIA L4, 23034 MiB")
+            _e_write(d, a, s, jid, L, env=env, spec=spec, dm=dm, extra=extra, gpu=g)
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0, "gamma": "1",
+            "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH), "epochs_requested": str(EPOCHS), "hier": "none",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (gran, v) in enumerate([("scalar", 1.0), ("scalar", 70.0), ("scalar", 35.0), ("layerwise", 3.0), ("layerwise", 95.0),
+                                   ("layerwise", 40.0)]):
+        inv.append(dict(base, network=NET, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + S9.CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _mid(pl):
+    return (pl[0] + pl[1]) / 2.0
+
+
+# the corpus_exclusions KIND names as of THIS registration, as a LITERAL tuple (cSV1's pattern, 271.6 F2): the prefix
+# proof below is over this literal, so a later KIND added to the live registry cannot make section A false by construction.
+KINDS_AT_REGISTRATION = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD", "DECAY_MASK", "SHADOW_VOTE")
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cWD4 --selftest: design and witnesses, G-BITE on REAL landed cwd1 / cwd3 records incl. BOTH broken-mask nulls,")
+    print("the noise floor through corpus_exclusions.filter_rows, the account tables, the REAL score() on synthetic runs,")
+    print("the O2 invariance proof and the documented one-argument invocation.\n")
+
+    print("A. DESIGN, WITNESSES, ARITHMETIC")
+    chk(file_sha(S9.__file__) == W.S9_SHA, "A cvt9's registered scorer (Lion helper) is the file 249 registered")
+    chk(file_sha(W.__file__) == D.CWD_DESIGN_SHA and file_sha(C.__file__) == D.CWD_COMMON_SHA,
+        "A the REUSED cwd_design.py / cwd_common.py are cwd1's registered files, byte for byte (RULE 16)")
+    chk(file_sha(os.path.join(REPO, "patches", "patch_decaymask.py")) == D.PATCH_DECAYMASK_SHA,
+        "A patches/patch_decaymask.py is cwd1's registered file (RULE 16): NO NEW HARNESS CODE")
+    chk(ARMS == ("k01", "CARWD0", "TWOWD0", "CTL2WD0", "ONE50", "ONE53", "ONE59") and SEEDS == (143, 144, 145),
+        "A arms and seeds {143,144,145}")
+    chk(all(SPEC[a] == "scalar" for a in ARMS), "A every arm is scalar")
+    T_ = B.TENSORS
+    for a in MASKED:
+        idx = D.dm_indices(B.DMASK[a], T_)
+        chk(tuple(i + 1 for i in idx) == B.SET_IDX[a] and sum(T_[i][1] for i in idx) == B.SET_NUMEL[a] and len(idx) == K_MASKED[a]
+            and all(T_[i][2] == "BatchNorm2d" and T_[i][0].endswith(".weight") and T_[i][1] == 512
+                    and T_[i][0].startswith("layer4.") for i in idx),
+            "A %-8s = idx %s, %d params, k %d, every tensor a 512-wide layer4 BatchNorm2d SCALE"
+            % (a, B.SET_IDX[a], B.SET_NUMEL[a], K_MASKED[a]))
+    car, two, ctl2 = (set(D.dm_indices(B.DMASK[a], T_)) for a in ("CARWD0", "TWOWD0", "CTL2WD0"))
+    ns = set(D.dm_indices("normscale", T_))
+    chk(two < car and car <= ns and ctl2 <= ns and not (car & ctl2) and len(two) == len(ctl2) == 2,
+        "A TWOWD0 is a PROPER SUBSET of CARWD0; CTL2WD0 is disjoint from CARWD0; both pairs are inside normscale and"
+        " COUNT-MATCHED at 2 -- the control cwd3 could not build at three")
+    chk(sum(T_[i][1] for i in two) == sum(T_[i][1] for i in ctl2) == 1024,
+        "A TWOWD0 and CTL2WD0 are NUMEL-MATCHED (1,024 each): same count, same width, same depth, same class")
+    s512 = sorted(i + 1 for i in ns if T_[i][1] == 512)
+    chk(s512 == list(B.W512_IDX) and len([i for i in s512 if i not in B.SET_IDX["CARWD0"]]) == 2,
+        "A every 512-wide BN scale is one of 47/50/53/56/59 and only TWO are non-carriers (275.2 / 188.1) -- which is"
+        " exactly WHY the matched control exists at count 2 and cannot exist at count 3")
+    sing = [set(D.dm_indices(B.DMASK[a], T_)) for a in SINGLES]
+    chk(all(len(x) == 1 for x in sing) and set().union(*sing) == car and len(set(map(frozenset, sing))) == 3,
+        "A the three singles are the three carriers, one each, pairwise distinct")
+    chk(B.WITNESS_DM["k01"] == "DECAY_MASK: off"
+        and B.WITNESS_DM["ONE50"] == ("DECAY_MASK: on base=SGDm wd=0.1 spec=layer4.0.bn2.weight masked=1 of=62 numel=512"
+                                      " idx=50 names=layer4.0.bn2.weight")
+        and B.WITNESS_DM["TWOWD0"] == ("DECAY_MASK: on base=SGDm wd=0.1 spec=layer4.0.bn2.weight+layer4.0.shortcut.1.weight"
+                                       " masked=2 of=62 numel=1024 idx=50,53 names=layer4.0.bn2.weight,layer4.0.shortcut.1.weight")
+        and B.WITNESS_DM["CARWD0"] == ("DECAY_MASK: on base=SGDm wd=0.1 spec=layer4.0.bn2.weight+"
+                                       "layer4.0.shortcut.1.weight+layer4.1.bn2.weight masked=3 of=62 numel=1536"
+                                       " idx=50,53,59 names=layer4.0.bn2.weight,layer4.0.shortcut.1.weight,"
+                                       "layer4.1.bn2.weight"),
+        "A the k=1, k=2 and k=3 DECAY_MASK witnesses, as literals (CARWD0's is cwd3's CARWD0 byte for byte, 275.2)")
+    chk(len(set(B.WITNESS_DM[a] for a in ARMS)) == len(ARMS) and len(set(B.SET_IDX[a] for a in MASKED)) == len(MASKED),
+        "A G-SETSEP's precondition: the 7 witnesses and the 6 idx tuples are PAIRWISE DISTINCT, so G-WITNESS separates"
+        " the arms whose k collides (TWOWD0/CTL2WD0 at k=2; the three singles at k=1)")
+    chk(sorted(set(K_MASKED[a] for a in MASKED)) == [1, 2, 3] and sum(K_MASKED[a] == 2 for a in MASKED) == 2
+        and sum(K_MASKED[a] == 1 for a in MASKED) == 3,
+        "A the k collision is REGISTERED: k in {1,2,3}, two arms at k=2 and three at k=1 (280.4's declared limit)")
+    chk(all(not "DECAY_MASK".startswith(k) and not k.startswith("DECAY_MASK") for k in KINDS_AT_REGISTRATION if k != "DECAY_MASK"),
+        "A prefix rule (245/251) over the LITERAL registration tuple: no other KIND prefixes or is prefixed by DECAY_MASK")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE_PRIOR) < 1e-6 and SIGMA_PRIOR == SIGMA_R18ALL, "A SE_PRIOR = SIGMA_PRIOR*sqrt(2/3); SIGMA_PRIOR = SIGMA_R18ALL")
+    chk(all(compose_sigma(s)[1] == max(SIGMA_PRIOR, s) for s in (0.0, 0.3, SIGMA_PRIOR, 0.9, 3.0)), "A SIGMA_USED == max(frozen floor, in-batch)")
+    src = open(os.path.abspath(__file__)).read()
+    sc_src = src[src.index("def score("):src.index("# SECTION E HELPERS")]
+    chk("pooled_sigma" not in sc_src and sc_src.count("read_corpus(") == 1 and "gpu_of(" in sc_src
+        and sc_src.index("gpu_of(") > sc_src.index("bite_fail = []"),
+        "A O2: score() calls no sigma routine and reads the corpus once (disclosure); G-HW is read only AFTER every gate")
+    chk("CWD3_LEVELS" not in sc_src.split("BETWEEN-BATCH")[0] and "CAR_CWD3" not in sc_src.split("stamps = ")[0],
+        "A no cwd3 level enters a LEVEL, a SIGMA, a CONTRAST or a STATE BAR -- only a non-gating stamp and the disclosure block")
+    chk(K_MASKED == {"k01": 0, "CARWD0": 3, "TWOWD0": 2, "CTL2WD0": 2, "ONE50": 1, "ONE53": 1, "ONE59": 1} and set(NG.values()) == {1},
+        "A masked counts; one group per arm")
+    mt = D.manifest_text(B)
+    chk(mt.count("\n") == 7 + 62 + 1 + 3 * 7 + 6 and mt.startswith(W.manifest_text(B))
+        and "SET TWOWD0 idx=50,53 numel=1024 owners=BatchNorm2d,BatchNorm2d widths=512,512 classes=scale,scale" in mt
+        and "SET CTL2WD0 idx=47,56 numel=1024 owners=BatchNorm2d,BatchNorm2d widths=512,512 classes=scale,scale" in mt,
+        "A the frozen manifest: cwd_design.manifest_text (unedited) + 6 SET lines; the two count-matched pairs read alike"
+        " on every column but their idx")
+    chk(ENV_EXPECTED == S9.ENV_EXPECTED == W.ENV_EXPECTED, "A the ENV line is cvt9's (= cvt8's = cwd1's = cwd3's)")
+    chk(B.HF_POST_SHA == W.CWD1.HF_POST_SHA and B.RUNNER_SHA == W.CWD1.RUNNER_SHA and B.BN_SHA == W.CWD1.BN_SHA,
+        "A the tree, the runner and build_network are cwd1's, UNCHANGED")
+    chk(D.MEAN_ABS_L_PINNED[59][1] == 1 and D.MEAN_ABS_L_PINNED[50][1] == 2 and D.MEAN_ABS_L_PINNED[53][1] == 3
+        and D.MEAN_ABS_L_PINNED[56][1] == 33 and D.MEAN_ABS_L_PINNED[47][1] == 36
+        and abs(D.L_RATIO_ISO_DEPTH - 308.4) < 1e-9,
+        "A the FROZEN, NON-GATING magnitude table is SCORE-cdep1 [P]'s: carriers are |L| ranks 1/2/3 of 62 and the only"
+        " carrier-free 512-wide layer4 scales are ranks 33 and 36 -- NO magnitude-matched control can exist here")
+
+    print("\nB. G-BITE ON REAL LANDED RECORDS (this host's runs directory)")
+    have1 = runsdir and all(C.load_probe(runsdir, "cwd1", a, s) is not None for a in ("k01",) for s in (128, 129, 130))
+    have3 = runsdir and all(C.load_probe(runsdir, "cwd3", a, s) is not None for a in ("CARWD0", "CTL2WD0") for s in (140, 141, 142))
+    if not (have1 or have3):
+        skip("B landed cwd1 / cwd3 records not found under %s" % runsdir)
+    if have1:
+        pos0 = null1 = 0
+        for s in (128, 129, 130):
+            r0 = C.load_probe(runsdir, "cwd1", "k01", s)
+            pos0 += bite_run("k01", r0)[0]
+            okm, dlm, ddm, hkm = bite_run("TWOWD0", r0)
+            null1 += (not okm) and dlm["bad_lion"] == 0 and hkm == 0 and ddm["bad_types"] == N_RECORDS
+        chk(pos0 == 3, "B the 3 landed cwd1 k01 runs PASS G-BITE read as cwd4's k01 (Lion, no hold key, no dm key)", "%d/3" % pos0)
+        chk(null1 == 3, "B THE BROKEN NAME-LIST-MASK NULL ON REAL RECORDS: the 3 landed cwd1 k01 runs read as TWOWD0 pass"
+                        " Lion and FAIL the DECAY_MASK audit on every record", "%d/3" % null1)
+        r0 = C.load_probe(runsdir, "cwd1", "k01", 128)
+        broken = lion_check([dict(r, beta=[x + 0.01 for x in r["beta"]]) if isinstance(r, dict) and r.get("step") == 20000 else r
+                             for r in r0], 1)[0]
+        chk(not broken, "B ... and the Lion recompute FAILS when one real record's beta is moved by 0.01")
+    else:
+        skip("B landed cwd1 k01 records not found under %s" % runsdir)
+    if have3:
+        pos3 = wrongk = k2ok = 0
+        for s in (140, 141, 142):
+            rc_ = C.load_probe(runsdir, "cwd3", "CARWD0", s)
+            r2_ = C.load_probe(runsdir, "cwd3", "CTL2WD0", s)
+            pos3 += bite_run("CARWD0", rc_)[0]
+            k2ok += bite_run("CTL2WD0", r2_)[0]          # cwd3's CTL2WD0 IS cwd4's CTL2WD0 set, k = 2
+            okw, dlw, ddw, hkw = bite_run("TWOWD0", rc_)  # a k=3 run read as a k=2 arm
+            wrongk += (not okw) and dlw["bad_lion"] == 0 and hkw == 0 and ddw["bad_masked"] == N_RECORDS
+        chk(pos3 == 3, "B the 3 landed cwd3 CARWD0 runs PASS G-BITE read as cwd4's CARWD0 (k = 3 on every record)", "%d/3" % pos3)
+        chk(k2ok == 3, "B the 3 landed cwd3 CTL2WD0 runs PASS G-BITE read as cwd4's CTL2WD0 (k = 2 on every record) --"
+                       " cwd4's control arm is byte-identical in spec to cwd3's, and its real records satisfy the audit", "%d/3" % k2ok)
+        chk(wrongk == 3, "B THE WRONG-COUNT NULL ON REAL RECORDS: the 3 landed cwd3 CARWD0 runs (k = 3) read as TWOWD0"
+                         " (k = 2) FAIL dm_masked on every record", "%d/3" % wrongk)
+        note("B DECLARED (280.4): no record-level check can tell TWOWD0's k=2 from CTL2WD0's k=2, nor one single from"
+             " another -- only G-WITNESS and the bite job's RR4 do.  This is stated at registration, not afterwards.")
+    else:
+        skip("B landed cwd3 CARWD0 / CTL2WD0 records not found under %s" % runsdir)
+
+    print("\nC. THE NOISE FLOOR (OPERATIONS 36) AND FRESHNESS")
+    ce = _exclusions()
+    if csvpath and os.path.exists(csvpath):
+        rows_all = [r for r in csv.DictReader(open(csvpath))]
+        filt = ce.filter_rows(rows_all)
+        sR, nR = S9.pooled_sigma(filt, S9.net_is(NET)), S9.pooled_sigma(rows_all, S9.net_is(NET))
+        if file_sha(csvpath) == REG_CORPUS_SHA256 and file_sha(ce.DEFAULT_TSV) == REG_EXCLUSIONS_SHA256:
+            chk(abs(sR[0] - SIGMA_R18ALL) < 1e-12 and sR[1] == 258, "SIGMA_R18ALL: the FROZEN literal %r IS the FILTERED value (df 258)" % SIGMA_R18ALL)
+            chk(abs(nR[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and nR[0] > 5 * SIGMA_R18ALL, "the NAIVE (unfiltered) value is the disclosed trap, not the literal")
+            chk(len(rows_all) == REG_CORPUS_ROWS, "the registration corpus has %d rows (post-cwd3-ingest, 278.9)" % REG_CORPUS_ROWS)
+        else:
+            note("the corpus or exclusion list moved since registration: the literal stays frozen (O2); filtered now %.6f" % sR[0])
+        hit = [r["run"] for r in rows_all if r.get("seed") in set(str(s) for s in SEEDS) and not r["run"].startswith(PREFIX + "-")]
+        chk(not hit, "ZERO corpus rows OUTSIDE cwd4 carry seed 143, 144 or 145", str(hit[:3]))
+        pre = [r["run"] for r in rows_all if r["run"].startswith(PREFIX + "-")]
+        if file_sha(csvpath) == REG_CORPUS_SHA256:
+            chk(not pre, "ZERO corpus rows carry the cwd4- prefix (registration corpus)")
+        else:
+            note("post-registration corpus: %d cwd4- rows (expected only after the landing's ingest)" % len(pre))
+    else:
+        skip("C no corpus at %s" % csvpath)
+
+    print("\nD. ACCOUNTS -> TOKENS (each account's midpoints through the real decide())")
+    for name, lv in ACCOUNTS.items():
+        M = dict((a, _mid(pl)) for a, pl in lv.items())
+        chk(decide(M)[0] == name, "D account %s midpoints -> %s" % (name, name), str(decide(M)))
+    chk(decide(dict((a, _mid(pl)) for a, pl in BROKEN_SUBSET_NULL.items()))[0] == "ALL-THREE-NEEDED",
+        "D THE DANGEROUS NULL: a mask that bites on CARWD0 but on NO subset arm reaches ALL-THREE-NEEDED -- the COUNT"
+        " account, forged.  Only G-BITE / G-WITNESS separate it")
+    chk(decide(dict((a, _mid(pl)) for a, pl in BROKEN_ALL_NULL.items()))[0] == "REPLICATE-FAILED",
+        "D the ALL-MASKS-BROKEN null's levels reach REPLICATE-FAILED (only G-BITE separates it)")
+    chk(PART_PL[0] - K01_PL[1] >= 4 and FREE_PL[0] - PART_PL[1] >= 6, "D the K01 / PART / FREE bands are disjoint")
+    reach = set()
+    for two in ("REC", "PART", "NULL"):
+        for c2 in ("REC", "PART", "NULL"):
+            for a_ in ("REC", "PART", "NULL"):
+                for b_ in ("REC", "PART", "NULL"):
+                    for c_ in ("REC", "PART", "NULL"):
+                        reach.add(account_of(two, c2, [a_, b_, c_]))
+    chk(reach == set(ACCOUNT_TOKENS), "D every one of the %d registered accounts is reachable and NOTHING ELSE is"
+        % len(ACCOUNT_TOKENS), str(sorted(reach ^ set(ACCOUNT_TOKENS))))
+    chk(account_of("REC", "REC", ["NULL"] * 3) == "CONTROL-EXCEEDS-AT-TWO"
+        and account_of("PART", "PART", ["NULL"] * 3) == "CONTROL-EXCEEDS-AT-TWO"
+        and account_of("NULL", "REC", ["NULL"] * 3) == "CONTROL-EXCEEDS-AT-TWO"
+        and account_of("REC", "PART", ["NULL"] * 3) != "CONTROL-EXCEEDS-AT-TWO"
+        and account_of("REC", "NULL", ["NULL"] * 3) != "CONTROL-EXCEEDS-AT-TWO",
+        "D the adverse gate fires iff the carrier-free pair reaches AT LEAST the carrier pair's state and is not NULL")
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="cwd4_selftest_")
+    try:
+        tpl = os.path.join(tmp, "template")
+        _e_probe_template(tpl)
+        csvs = _e_csv_variants(csvpath, tmp)
+        n = [0]
+
+        def case(label, want_rc, want_prefix, **kw):
+            n[0] += 1
+            d = os.path.join(tmp, "b%03d" % n[0])
+            os.makedirs(d)
+            _e_build(d, tpl, **kw)
+            rc, fin, out = _e_score(d, csvs["real" if "real" in csvs else "minimal-invented"])
+            ok = rc == want_rc and fin.startswith("FINAL: " + want_prefix)
+            chk(ok, "E %s -> rc %d, %s" % (label, want_rc, want_prefix), "" if ok else "got rc %r %s" % (rc, fin[:180]))
+            return d, fin, out
+
+        _d0, fin0, out0 = case("base (TWO-SUFFICES)", 0, "TWO-SUFFICES |")
+        chk("TWO-REC+CTL2-NULL+ONE50-NULL+ONE53-NULL+ONE59-NULL" in fin0 and "FLOOR-READINGS-ARE-BOUNDS" in fin0
+            and "PATCH-BITES" in fin0 and "HW-UNIFORM-NVIDIA_L4" in fin0 and "TWO-SPECIFIC" in fin0
+            and "SINGLES-SATURATED" in fin0 and "RECOVERY-AGAINST-CARWD0" in fin0 and "CTL2-CLASS-PURE-COUNT-MATCHED" in fin0
+            and "MAGNITUDE-NOT-SEPARATED" in fin0 and "POSITION-CLASS-NOT-SEPARATED" in fin0,
+            "E base stamps (state word, floor bound, bite, HW, TWO-SPECIFIC, SINGLES-SATURATED, the four scope stamps)")
+        _d, fr, _o = case("ANY-ONE-SUFFICES", 0, "ANY-ONE-SUFFICES",
+                          levels={"ONE50": 69.0, "ONE53": 68.5, "ONE59": 69.5})
+        chk("SINGLES-SATURATED" in fr and "ONE-ORDER-" not in fr,
+            "E when every single is in the SAME state the ordering is SATURATED -- a BOUND, and NO ordering stamp is printed")
+        _d, fr, _o = case("ONE-SUFFICES-PARTIAL", 0, "ONE-SUFFICES-PARTIAL", levels={"ONE59": 69.5})
+        chk("ONE-ORDER-ONE59-ONE50-ONE53" in fr or "ONE-ORDER-ONE59-ONE53-ONE50" in fr,
+            "E a split among the singles prints the DESCRIPTIVE descending ONE-ORDER stamp", fr[:200])
+        case("COUNT-GRADED", 0, "COUNT-GRADED", levels={"TWOWD0": 45.0})
+        _d, fr, _o = case("PARTIAL-NON-MONOTONE", 0, "PARTIAL-NON-MONOTONE", levels={"TWOWD0": 23.2, "ONE50": 45.0})
+        chk("NON-MONOTONE-IN-COUNT" in fr, "E a single above the pair containing it is stamped NON-MONOTONE-IN-COUNT")
+        _dA, finA, outA = case("ALL-THREE-NEEDED", 0, "ALL-THREE-NEEDED", levels={"TWOWD0": 23.2})
+        _d, fr, _o = case("CONTROL-EXCEEDS-AT-TWO (control recovers)", 0, "CONTROL-EXCEEDS-AT-TWO", levels={"CTL2WD0": 68.5})
+        chk("TWO-SPECIFIC" not in fr, "E the adverse account is NOT stamped TWO-SPECIFIC")
+        case("CONTROL-EXCEEDS-AT-TWO (both pairs partial)", 0, "CONTROL-EXCEEDS-AT-TWO",
+             levels={"TWOWD0": 45.0, "CTL2WD0": 45.0})
+        _d, fr, _o = case("control partial BELOW the carrier pair (not adverse)", 0, "TWO-SUFFICES", levels={"CTL2WD0": 45.0})
+        chk("CTL2-PARTIAL" in fr and "TWO-SPECIFIC" not in fr,
+            "E a PART control below the carrier pair is stamped CTL2-PARTIAL and removes TWO-SPECIFIC, without flipping the account")
+        case("REPLICATE-FAILED", 0, "REPLICATE-FAILED", levels={"CARWD0": 30.0, "TWOWD0": 29.0})
+        case("near bar: TWO = CAR - 5 + 0.05", 0, "TWO-SUFFICES", levels={"TWOWD0": 70.0 - 5 + 0.05})
+        case("near bar: TWO = CAR - 5 - 0.05", 0, "COUNT-GRADED", levels={"TWOWD0": 70.0 - 5 - 0.05})
+        case("near bar: CTL2 = k01 + 2 - 0.05", 0, "TWO-SUFFICES", levels={"CTL2WD0": 23.0 + 2 - 0.05})
+        _d, fr, _o = case("near bar: CTL2 = k01 + 2 + 0.05", 0, "TWO-SUFFICES", levels={"CTL2WD0": 23.0 + 2 + 0.05})
+        chk("CTL2-PARTIAL" in fr, "E a control just above the NULL bar is PART, stamped, and does not flip the account")
+        case("near bar: ONE59 = CAR - 5 + 0.05", 0, "ONE-SUFFICES-PARTIAL", levels={"ONE59": 70.0 - 5 + 0.05})
+        case("near bar: ONE59 = CAR - 5 - 0.05", 0, "TWO-SUFFICES", levels={"ONE59": 70.0 - 5 - 0.05})
+        _d, fr, _o = case("TWO above CAR", 0, "TWO-SUFFICES", levels={"TWOWD0": 76.0})
+        chk("TWO-ABOVE-CAR" in fr, "E a pair above the three-carrier reference by more than MATCH is stamped TWO-ABOVE-CAR")
+        _d, fr, _o = case("ONE50 below k01", 0, "TWO-SUFFICES", levels={"ONE50": 18.0})
+        chk("ONE50-BELOW-K01" in fr, "E a deeper collapse under a mask is stamped <arm>-BELOW-K01")
+        _d, fr, _o = case("CARWD0 far from cwd3", 0, "TWO-SUFFICES", levels={"CARWD0": 63.0, "TWOWD0": 62.5})
+        chk("CARWD0-DIFFERS-FROM-CWD3" in fr, "E a CARWD0 more than 5 pp from cwd3's is stamped (non-gating)")
+        _d, fr, _o = case("mixed hardware (NON-GATING)", 0, "TWO-SUFFICES", gpu={("CTL2WD0", 144): "NVIDIA GeForce RTX 2080 Ti, 11264 MiB"})
+        chk("HW-MIXED" in fr, "E mixed hardware changes a STAMP only, never the account")
+        case("diverged arm", 0, "UNRESOLVED-DIVERGED", over={("TWOWD0", 144): 40.0})
+        case("k01 not collapsed", 0, "SCALAR-NOT-COLLAPSED", levels={"k01": 45.0})
+        case("floor: every arm under 15", 1, "HARNESS-UNSOUND", levels=dict((a, 5.0) for a in ARMS))
+        for lab, kw in (("ENV break", {"env_break": ("TWOWD0", 143)}), ("ARGS spec break (layerwise)", {"spec_break": ("CTL2WD0", 144)}),
+                        ("DECAY_MASK witness off on TWOWD0", {"dm_break": (("TWOWD0", 145), "DECAY_MASK: off")}),
+                        ("TWOWD0 carries CTL2WD0's witness (the k-COLLIDING swap)", {"dm_break": (("TWOWD0", 143), B.WITNESS_DM["CTL2WD0"])}),
+                        ("CTL2WD0 carries TWOWD0's witness (the k-COLLIDING swap, other way)", {"dm_break": (("CTL2WD0", 144), B.WITNESS_DM["TWOWD0"])}),
+                        ("ONE50 carries ONE53's witness (a k=1 swap)", {"dm_break": (("ONE50", 145), B.WITNESS_DM["ONE53"])}),
+                        ("ONE59 carries ONE50's witness (a k=1 swap)", {"dm_break": (("ONE59", 143), B.WITNESS_DM["ONE50"])}),
+                        ("CARWD0 carries TWOWD0's witness (subset swap)", {"dm_break": (("CARWD0", 144), B.WITNESS_DM["TWOWD0"])}),
+                        ("DECAY_MASK on k01", {"dm_break": (("k01", 144), B.WITNESS_DM["ONE50"])}),
+                        ("a COMP_HOLD line", {"extra_break": (("k01", 143), ["COMP_HOLD: off"])}),
+                        ("manifest break (the two pairs' idx swapped)",
+                         {"manifest": D.manifest_text(B).replace("SET TWOWD0 idx=50,53", "SET TWOWD0 idx=47,56")}),
+                        ("prov HF = cvt8's", {"prov": {"HF_SHA256": B.HF_PARENT_SHA}}), ("prov scorer sha", {"prov": {"SCORER_SHA256": "0" * 64}}),
+                        ("prov design sha", {"prov": {"DESIGN_SHA256": "1" * 64}}), ("prov cwd_design sha", {"prov": {"CWD_DESIGN_SHA256": "3" * 64}}),
+                        ("prov common sha", {"prov": {"COMMON_SHA256": "2" * 64}}), ("prov runner = cvt8's", {"prov": {"RUNNER_SHA256": B.RUNNER_PARENT_SHA}}),
+                        ("prov MODE dry-run", {"prov": {"MODE": "dry-run"}})):
+            case("harness: %s" % lab, 1, "HARNESS-UNSOUND", **kw)
+        nullpb = dict((((a, s), _e_records(a, s, nodm=True)) for a in STATEARMS for s in SEEDS))
+        _dn, _fn, out_null = case("G-BITE: THE DANGEROUS NULL (the mask bites on CARWD0 and on NO subset arm)", 1,
+                                  "PATCH-NOT-VERIFIED", probe_break=nullpb, levels={"TWOWD0": 23.2})
+
+        def _levels(o):
+            L_ = o.splitlines()
+            i_ = [k for k, ln in enumerate(L_) if ln.startswith("LEVELS")]
+            j_ = [k for k, ln in enumerate(L_) if ln.startswith("G-FLOOR")]
+            return L_[i_[0] + 1:j_[0] - 1] if i_ and j_ else []
+        chk(_levels(out_null) == _levels(outA) and len(_levels(outA)) == 2 * len(ARMS),
+            "E the DANGEROUS NULL's LEVELS block is BYTE-IDENTICAL to the ALL-THREE-NEEDED case's: only G-BITE separates them")
+        for lab, pb in (("TWOWD0 without dm keys", {("TWOWD0", 143): _e_records("TWOWD0", 143, nodm=True)}),
+                        ("TWOWD0 records carry k = 3 (the CARWD0 set)", {("TWOWD0", 144): _e_records("TWOWD0", 144, k=3)}),
+                        ("ONE53 records carry k = 2", {("ONE53", 145): _e_records("ONE53", 145, k=2)}),
+                        ("CARWD0 records carry k = 2", {("CARWD0", 143): _e_records("CARWD0", 143, k=2)}),
+                        ("CTL2WD0 dm_skipped forged", {("CTL2WD0", 144): _e_records("CTL2WD0", 144, dmforge="skipped")}),
+                        ("ONE50 dm_n off by one", {("ONE50", 145): _e_records("ONE50", 145, dmforge="n")}),
+                        ("TWOWD0 dm_masked wrong", {("TWOWD0", 143): _e_records("TWOWD0", 143, dmforge="masked")}),
+                        ("ONE59 zero dm_wdterm", {("ONE59", 144): _e_records("ONE59", 144, dmforge="zero-wdterm")}),
+                        ("CARWD0 dm_norm not a list", {("CARWD0", 145): _e_records("CARWD0", 145, dmforge="types")}),
+                        ("dm keys on k01", {("k01", 143): _e_records("k01", 143, adddm=True)}),
+                        ("k01 Lion broken", {("k01", 144): _e_records("k01", 144, touch=True)}),
+                        ("ONE53 Lion broken", {("ONE53", 144): _e_records("ONE53", 144, touch=True)}),
+                        ("a hold key on CTL2WD0", {("CTL2WD0", 143): _e_records("CTL2WD0", 143, add_bh=True)}),
+                        ("TWOWD0 records with 62 groups", {("TWOWD0", 145): _e_records("TWOWD0", 145, ng=62)}),
+                        ("short probe file", {("k01", 145): _e_records("k01", 145)[:499]}),
+                        ("garbled record", {("ONE59", 143): _e_records("ONE59", 143)[:499] + ["{not json"]})):
+            case("G-BITE: %s" % lab, 1, "PATCH-NOT-VERIFIED", probe_break=pb)
+        case("G-BITE: missing probe file", 1, "PATCH-NOT-VERIFIED", probe_drop=("CTL2WD0", 144))
+        case("dropped run -> INCOMPLETE", 2, "INCOMPLETE", drop=("ONE53", 145))
+        case("truncated resubmission beside a complete run is ignored", 0, "TWO-SUFFICES", shadow=("TWOWD0", 144))
+
+        print("\n   O2 INVARIANCE: FINAL identical across corpora (bars never read the corpus)")
+        for lab, kw in (("TWO-SUFF", {}), ("ALL-THREE", {"levels": {"TWOWD0": 23.2}}),
+                        ("ANY-ONE", {"levels": {"ONE50": 69.0, "ONE53": 68.5, "ONE59": 69.5}}),
+                        ("ADVERSE", {"levels": {"CTL2WD0": 68.5}})):
+            n[0] += 1
+            d = os.path.join(tmp, "o%03d" % n[0])
+            os.makedirs(d)
+            _e_build(d, tpl, **kw)
+            fins = dict((k, _e_score(d, v)[1]) for k, v in csvs.items())
+            chk(len(set(fins.values())) == 1 and "real+invented" in fins, "O2 %-10s %s" % (lab, "real+invented " + " ".join(sorted(fins))),
+                "" if len(set(fins.values())) == 1 else str(fins)[:200])
+        if "real+invented" in csvs:
+            a1 = S9.pooled_sigma(ce.filter_rows(list(csv.DictReader(open(csvs["real"])))), S9.net_is(NET))[0]
+            a2 = S9.pooled_sigma(ce.filter_rows(list(csv.DictReader(open(csvs["real+invented"])))), S9.net_is(NET))[0]
+            chk(a1 is not None and a2 is not None and abs(a1 - a2) > 1e-3, "O2 non-vacuity: the invented rows MOVE the filtered ResNet18_c100 sigma (%.4f -> %.4f), FINAL does not" % (a1, a2))
+
+        print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION")
+        d = os.path.join(tmp, "doc")
+        os.makedirs(d)
+        _e_build(d, tpl)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL: TWO-SUFFICES |" in p.stdout, "`python3 cWD4_countwd_score.py <runsdir>` exits 0 and prints FINAL")
+        os.remove([os.path.join(d, f) for f in os.listdir(d) if f.startswith("cwd4-ONE53-s144")][0])
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 2 and "FINAL: INCOMPLETE" in p.stdout, "... and on a dropped run exits 2 (INCOMPLETE)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nF. TOTALITY: decide() over 6,000 random draws returns a registered token")
+    rnd = random.Random(280)
+    bad = 0
+    for _ in range(6000):
+        M = dict((a, rnd.uniform(0, 85)) for a in ARMS)
+        bad += decide(M, rnd.random() < 0.05)[0] not in TOKENS
+    chk(bad == 0, "F every draw's token is registered", "%d bad" % bad)
+
+    print("\n%s" % ("SELFTEST PASS" if not GATE_FAIL else "SELFTEST FAIL: %d  %r" % (len(GATE_FAIL), GATE_FAIL[:10])))
+    return 0 if not GATE_FAIL else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--csv", default=S9.DEFAULT_CSV)
+    ap.add_argument("--manifest", default="")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt", default="")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir is required")
+    rc, _fin = score(a.runsdir, a.csv, a.manifest)
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()

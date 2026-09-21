@@ -23,7 +23,7 @@ const CVT5_FINAL = ['K-DEPENDENT-EQUILIBRIUM', 'RESCUE-SURVIVES', 'K33-HOLDS-PIN
 
 test('MT222 and MT223 are the cvt4 and cvt5 rows, both Goal met under the documented rules, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(158, 160).map(e => e.id), ['MT222', 'MT223'], 'appended after every record that existed before them, in line order');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [173, 155, 18, 3268]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [175, 157, 18, 3316]);
   assert.equal(CVT4_FINAL.length, 16);
   assert.equal(CVT5_FINAL.length, 32);
   const cases: [string, string, string[], number, string][] = [
@@ -76,7 +76,7 @@ test('the intervention warnings name every intervened arm and the exclusion list
 });
 
 test('the 30 runs link to MT222 / MT223 with sanitized logs, and exactly the 18 intervened runs are marked', () => {
-  assert.equal(runs.length, 3268);
+  assert.equal(runs.length, 3316);
   const batches: [string, string, string[], number, number, Record<string, [number, string, string]>][] = [
     ['cvt4', 'MT222', ['90', '91', '92'], 18, 100, {
       HOLDLOW: [3, 'BETA_HOLD', 'step-size hold'], HOLDSHARED: [3, 'BETA_HOLD', 'step-size hold'],
@@ -121,7 +121,7 @@ test('the 30 runs link to MT222 / MT223 with sanitized logs, and exactly the 18 
   }
   assert.equal(runs.filter(run => ['cvt1', 'cvt2', 'cvt3', 'cvt4', 'cvt5'].includes(run.batch) && run.parameters.intervention).length, 51, 'cvt1 9 + cvt3 9 + cvt2 15 + cvt4 12 + cvt5 6');
   // cvt6 and cvt7 add 15 and 9 (tests/cvt6-cvt7-landing.test.ts), cvt8 and cvt9 15 and 18 (tests/cvt8-cvt9-landing.test.ts).
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 165);
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 183);
   // The arm means of the published plateau5 values reproduce the rows' levels (cvt5 at 300 epochs).
   const mean = (batch: string, arm: string) => {
     const armRuns = runs.filter(run => run.batch === batch && run.parameters.runLabel.split('-')[1] === arm);

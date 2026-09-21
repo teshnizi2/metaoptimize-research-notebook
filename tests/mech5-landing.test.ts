@@ -23,8 +23,8 @@ const CWD3_FINAL = ['CARRIER-DECAY-SUFFICES', 'CAR-REC+CTL-NULL+CTL2-NULL', 'HAR
 
 test('MT236 carries the outcome the documented rules give it, with every FINAL token quoted', () => {
   assert.equal(CWD3_FINAL.length, 17);
-  assert.deepEqual(data.experiments.slice(-1).map(e => e.id), ['MT236'], 'appended after every existing record');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [173, 155, 18, 3268]);
+  assert.deepEqual(data.experiments.slice(-3, -2).map(e => e.id), ['MT236'], 'appended before the later cwd4 and cwd5 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [175, 157, 18, 3316]);
   // A research question, Goal met; it corrects no earlier published claim, so it carries no Corrected badge.
   assert.deepEqual([record.section, record.area, record.kind, record.outcome, record.corrected, record.batches],
     [9, 'Mechanism and isolation', 'research', 'success', false, ['cwd3']]);
@@ -75,12 +75,12 @@ test('the intervention warning names the four arms, the patch and the single exc
   assert.match(warning.detail, /one kind only, no run of this batch carries a second/);
   assert.match(warning.detail, /The three k01 runs print DECAY_MASK: off/);
   assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 97eb049; CORRECTIONS 269, 275 and 278\.$/);
-  // No base-optimiser flag deviates, so the ARGS-value kind stays cmo1's alone.
-  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation']);
+  // No base-optimiser flag deviates in cwd3, so this landing added no ARGS-value mark; cwd5 later added its own.
+  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation']);
 });
 
 test('the 15 runs link to MT236 with sanitized logs, and exactly the 12 masked runs are marked', () => {
-  assert.equal(runs.length, 3268);
+  assert.equal(runs.length, 3316);
   const linked = runs.filter(run => run.batch === 'cwd3');
   assert.equal(linked.length, 15);
   assert.deepEqual([...record.runIds].sort(), linked.map(run => run.id).sort());
@@ -114,7 +114,7 @@ test('the 15 runs link to MT236 with sanitized logs, and exactly the 12 masked r
   assert.equal(armOf('cwd3-CTL2WD0-s140').parameters.intervention,
     'CTL2WD0: DECAY_MASK=layer4.0.bn1.weight+layer4.1.bn1.weight');
   assert.equal(armOf('cwd3-NWD-s140').parameters.intervention, 'NWD: DECAY_MASK=normscale', 'NWD re-runs cwd1 mask in batch');
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 165, 'the 153 earlier patch interventions plus these 12');
+  assert.equal(runs.filter(run => run.parameters.intervention).length, 183, 'the 153 earlier patch interventions, these 12, and cwd4\'s 18');
   // The arm means of the published plateau5 values reproduce every level the row reads.
   const mean = (arm: string) => {
     const armRuns = runs.filter(run => run.batch === 'cwd3' && run.parameters.runLabel.split('-')[1] === arm);

@@ -1,0 +1,1374 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cWD5_wdladder_score.py -- THE REGISTERED SCORER FOR `cwd5`  (CORRECTIONS 281):
+#   ResNet18_c100 -- THE COUPLED WEIGHT-DECAY LADDER.  DOES THE SHARED-STEP-SIZE COLLAPSE EXIST AT NORMAL
+#   WEIGHT-DECAY VALUES, OR ONLY AT THE CAMPAIGN'S 0.1?
+#   ONE SUBMISSION, 27 JOBS (9 arms x 3 seeds), 100 EPOCHS, SEEDS {146,147,148}, ResNet18_c100 / CIFAR-100,
+#   PROBE=100, PROBE_TENSOR=1 ON EVERY ARM, --constraint=L4 ON EVERY JOB, run from cwd1's EXISTING isolated tree
+#   $WS/harness_cwd1 (cvt8's tree + PATCH_DECAYMASK, HF.py 94aedc33..., UNCHANGED) with cwd1's EXISTING runner
+#   (run_cifar_cwd1.sh, 34a8c90e..., UNCHANGED).  NO NEW HARNESS CODE: `--weight-decay-base` is an EXISTING
+#   registered CLI float of train.py (default 0.1; cmo1 already ran it at 0).
+#
+# Committed and pushed BEFORE any cwd5 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cWD5_wdladder_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# FROZEN BARS (O2): every bar, sigma and tolerance score() uses is a LITERAL here; the only data-dependent terms are
+# the in-batch arm means and SIGMA_INBATCH through compose_sigma(), a max() with the frozen floor.  The noise floor
+# literal was read through corpus_exclusions.filter_rows on the 3,268-row corpus (OPERATIONS 36); the selftest
+# re-derives it to 1e-12 on both hosts.
+#
+# WHY THIS BATCH EXISTS.  Every number in the mechanism line -- and every SCALAR cell of the audit's own granularity
+# table -- sits at coupled base weight decay 0.1, ~200x the value a CIFAR ResNet is normally trained with (5e-4).
+# `cmo1` (264) fixed the two ENDPOINTS and nothing between: at wd 0.1 the scalar arm collapses (k01 22.79), at wd 0
+# it does not (W0k01 71.56, ABOVE its own layerwise arm).  Until the space between them is measured, a referee's
+# question -- "is the scalar-vs-layerwise gap a GRANULARITY effect or a broken scalar CONFIGURATION?" -- has no
+# answer.  cwd5 measures G(w) = layerwise - scalar at FOUR coupled weight decays, BOTH GRAINS IN BATCH at each.
+#
+# THE ARMS (cwd3's / cwd4's cell byte for byte EXCEPT the weight decay, which is the axis; no hold patch anywhere)
+#   rung W1  wd 0.1   k01W1 scalar | kLW1 layerwise      the campaign's anchor; replicates the mechanism cell in batch
+#   rung W2  wd 1e-2  k01W2 scalar | kLW2 layerwise      + CARW2: scalar, DECAY_MASK = the three ctd1 carriers
+#   rung W3  wd 1e-3  k01W3 scalar | kLW3 layerwise
+#   rung W4  wd 5e-4  k01W4 scalar | kLW4 layerwise      the standard CIFAR SGD value
+#
+# PER-RUNG STATE, all WITHIN rung (never across rungs, never against another batch):
+#   UNREADABLE iff layerwise < REF_MIN (55)   -- the reference arm is not healthy enough to define a collapse
+#   COLLAPSE   iff scalar <= R50 (0.50) x layerwise        -- LIMITS-PREP 2.2's primary collapse definition
+#   NOGAP      iff layerwise - scalar < GAP_BAR (10 pp)
+#   PARTIAL    otherwise
+#
+# BRANCH (decide(); first match wins): UNRESOLVED-DIVERGED (a seed range > 5)
+#   -> UNRESOLVED-REFERENCE (any rung's layerwise arm below REF_MIN)
+#   -> ANCHOR-NOT-COLLAPSED (k01W1 > 30, or rung W1 is not COLLAPSE: the batch did not reproduce the cell)
+#   -> NON-MONOTONE (a COLLAPSE at a LOWER wd than a non-collapsed rung)
+#   -> COLLAPSE-AT-ALL-VALUES | THRESHOLD-W<c>-W<c+1> | GRADED-ABOVE-THRESHOLD-W<c>
+#   with the state word W1-<s>+W2-<s>+W3-<s>+W4-<s>+<carrier word> printed beside it.
+#
+# CO-PRIMARY: G_W4 = kLW4 - k01W4, the granularity gap at the STANDARD CIFAR weight decay.  That one number decides
+#   whether the audit's scalar arm is a granularity result or a configuration artefact.
+# KEYS: G_W1, G_W2, G_W3 (the same gap at the other rungs); R_W1..R_W4 (the R50 ratios).
+# CARRIER HALF (rung W2 only): P_CARW2 = CARW2 - k01W2 and D_CARW2 = kLW2 - CARW2, READ ONLY IF rung W2 is COLLAPSE.
+#   Recovery is defined against the IN-BATCH kLW2 (stamp CARRIER-AGAINST-KLW2).  If rung W2 is not COLLAPSE the
+#   carrier arm is UNREADABLE, exactly as cmo1's ISO arm was unreadable at wd 0 (264) -- registered before any run.
+# DESCRIPTIVE, boundaries defined: the scalar ladder k01W1..k01W4 and the layerwise ladder kLW1..kLW4 as levels.
+#
+# G-BITE IS SPLIT, AND THE SPLIT IS REGISTERED.  The LADDER's reading uses NO patch: all eight ladder arms are
+#   unmasked, so a patch defect cannot forge a threshold.  The LADDER gate (Lion recomputed on each arm's own group
+#   count, no hold key, NO dm_* key on any unmasked arm, 500 records) is HARD -> PATCH-NOT-VERIFIED before any level.
+#   The CARRIER gate (CARW2's dm_n / dm_skipped / dm_masked == 3 / positive dm_wdterm) suppresses ONLY the carrier
+#   word and the carrier contrasts -> stamp CARRIER-PATCH-NOT-VERIFIED.  THE DANGEROUS NULL OF THE CARRIER HALF: a
+#   mask that does not bite makes CARW2 == k01W2, which reads as CAR-NULL, i.e. "the carrier account fails at 1e-2".
+#   Only G-BITE separates that from a real CAR-NULL.
+# G-WDPATH: each run's own ARGS line carries its arm's registered `--weight-decay-base` token.  That the flag reaches
+#   the update is proved OUTSIDE this scorer, on the real GPU path, by the bite job (bitwise w'/h'/m' at all four
+#   values) and, in batch, by CARW2's own witness line, which prints wd=0.01.
+# G-HW (DISCLOSURE, NON-GATING, 271.4(5)): the GPU each run's own nvidia-smi line names.  The launcher pins
+#   --constraint=L4; this scorer never gates on hardware.
+# plateau5 PRIMARY (epochs 95..99 of each run's own .out); TRAIN beside TEST.
+#
+# WHAT THIS BATCH CANNOT DO, STAMPED UNCONDITIONALLY: DECOUPLED-NOT-TESTED (the base optimiser has no decoupled path
+#   and no matched lambda exists -- 281.2), ONE-NETWORK-RESNET18, ONE-CELL-OTHERWISE, HORIZON-100-ONLY,
+#   LADDER-IS-FOUR-POINTS (a threshold is localised only to the bracketing PAIR, never finer), THREE-SEEDS.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("cwd5_design", os.path.join(HERE, "cwd5_design.py"))
+C = _load("cwd_common", os.path.join(HERE, "cwd_common.py"))
+W = D.W
+S9 = D.S9
+B = D.CWD5
+
+PREFIX = B.PREFIX
+NET = B.NET
+DSET = D.DSET
+EPOCHS = D.EPOCHS
+BATCH = D.BATCH
+SEEDS = B.SEEDS
+CLIP = D.CLIP
+MST = D.MST
+A0 = D.A0
+AUG = D.AUG
+PROBE = D.PROBE
+N_RECORDS = D.N_RECORDS
+ARMS = B.ARMS
+SPEC = B.SPEC
+PT_TYPE = B.PT_TYPE
+MASKED = B.MASKED
+NTENS = B.NTENS
+RUNG_IDS = D.RUNG_IDS
+SCALAR_OF = B.SCALAR_OF
+LAYER_OF = B.LAYER_OF
+CAR = B.CARRIER_ARM
+CARRIER_RUNG = D.CARRIER_RUNG
+LADDER_ARMS = tuple(a for a in ARMS if a != CAR)
+K_MASKED = dict((a, len(D.dm_indices(B.DMASK[a], B.TENSORS)) if B.DMASK[a] else 0) for a in ARMS)
+NG = dict((a, 1 if SPEC[a] == "scalar" else NTENS) for a in ARMS)
+ENV_EXPECTED = D.ENV_EXPECTED
+OFF_WITNESS = {"VOTE_W": "VOTE_W: off", "BETA_HOLD": "BETA_HOLD: off", "GROUP_HOLD": "GROUP_HOLD: off",
+               "REST_HOLD": "REST_HOLD: off"}
+
+# ---- FROZEN noise floor (read through corpus_exclusions.filter_rows on the 3,268-row corpus; OPERATIONS 36) ----------
+SIGMA_R18ALL = 0.6451413439065666        # ResNet18_c100 std cell, FILTERED, df 258, 51 cells, 309 rows
+SIGMA_R18ALL_NAIVE = 12.482176983761198  # UNFILTERED -- disclosure only (the OPERATIONS 36 trap), df 332
+SIGMA_PRIOR = 0.6451413439065666
+SE_PRIOR = 0.526756                      # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_SHA256 = "fe3874d3e5b3489e4fd1f0f404547978441fc81dcbf883ec32a44ab90fd7ce84"
+REG_CORPUS_ROWS = 3268
+REG_EXCLUSIONS_SHA256 = "50f75cde4cabc23af84318131e98c5aa3397ab848b18cff4cdfc6ed40706aa6b"
+
+# ---- FROZEN bars (O2) ------------------------------------------------------------------------------------------------
+R50 = 0.50           # LIMITS-PREP 2.2's PRIMARY collapse definition: scalar <= 0.50 x the reference arm
+GAP_BAR = 10.0       # below this the two grains are NOGAP at that rung (the campaign's RESCUE bar)
+REF_MIN = 55.0       # a layerwise arm below this cannot define a collapse at its rung
+K01_MAX = 30.0       # the anchor's scalar arm must still be collapsed in batch
+MATCH_BAR = 5.0      # CARW2 REC iff within this of kLW2
+NULL_BAR = 2.0       # CARW2 NULL iff within this of k01W2
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+CHANCE = 1.0
+BH_TOL = 1e-5
+
+# ---- BETWEEN-BATCH, NON-GATING.  Printed in the disclosure block and used for ONE non-gating replication stamp.
+# ---- No bar, level, sigma, state, contrast or branch reads any of these.  The selftest proves it from the source.
+R_BETWEEN = dict(D.LANDED_DISCLOSURE)
+K01_CWD3 = 22.9853                       # cwd3's k01 at wd 0.1 (278.3) -- replication stamp ONLY
+PL_PER_RUN_GPUH = 0.7141                 # cwd3's measured sacct mean over 15 identical-cell runs (278.1)
+
+K01_PL = (18.0, 28.0)                    # a collapsed scalar arm
+FREE_PL = (62.0, 78.0)                   # a healthy arm (either grain)
+PART_PL = (40.0, 55.0)                   # a partially collapsed scalar arm
+
+
+def _acct(s1, s2, s3, s4, car=FREE_PL, lay=(FREE_PL, FREE_PL, FREE_PL, FREE_PL)):
+    d = {"k01W1": s1, "k01W2": s2, "k01W3": s3, "k01W4": s4, CAR: car}
+    for r, pl in zip(RUNG_IDS, lay):
+        d[LAYER_OF[r]] = pl
+    return d
+
+
+LOWREF_PL = (35.0, 45.0)
+
+ACCOUNTS = {
+    # the collapse survives all the way down to the standard CIFAR weight decay: it is NOT a corner-case configuration
+    "COLLAPSE-AT-ALL-VALUES": _acct(K01_PL, K01_PL, K01_PL, K01_PL),
+    # it dies between the anchor and one decade down -- the referee's corner-case charge, landing
+    "THRESHOLD-W1-W2": _acct(K01_PL, FREE_PL, FREE_PL, FREE_PL),
+    "THRESHOLD-W2-W3": _acct(K01_PL, K01_PL, FREE_PL, FREE_PL),
+    "THRESHOLD-W3-W4": _acct(K01_PL, K01_PL, K01_PL, FREE_PL),
+    # the collapse ends at rung c but a substantial granularity gap survives above it
+    "GRADED-ABOVE-THRESHOLD-W1": _acct(K01_PL, PART_PL, FREE_PL, FREE_PL),
+    "GRADED-ABOVE-THRESHOLD-W2": _acct(K01_PL, K01_PL, PART_PL, FREE_PL),
+    "GRADED-ABOVE-THRESHOLD-W3": _acct(K01_PL, K01_PL, K01_PL, PART_PL),
+    # a lower weight decay collapses while a higher one does not: no threshold sentence at all
+    "NON-MONOTONE": _acct(K01_PL, FREE_PL, K01_PL, FREE_PL),
+    # the batch did not reproduce the mechanism cell: no reading
+    "ANCHOR-NOT-COLLAPSED": _acct(FREE_PL, K01_PL, K01_PL, K01_PL),
+    # a rung's layerwise reference is unhealthy: that rung cannot define a collapse, and the ladder is not readable
+    "UNRESOLVED-REFERENCE": _acct(K01_PL, K01_PL, K01_PL, K01_PL, lay=(FREE_PL, FREE_PL, FREE_PL, LOWREF_PL)),
+}
+ACCOUNT_TOKENS = ["COLLAPSE-AT-ALL-VALUES", "THRESHOLD-W1-W2", "THRESHOLD-W2-W3", "THRESHOLD-W3-W4",
+                  "GRADED-ABOVE-THRESHOLD-W1", "GRADED-ABOVE-THRESHOLD-W2", "GRADED-ABOVE-THRESHOLD-W3",
+                  "NON-MONOTONE"]
+TOKENS = (["INCOMPLETE", "HARNESS-UNSOUND", "PATCH-NOT-VERIFIED", "UNRESOLVED-DIVERGED", "UNRESOLVED-REFERENCE",
+           "ANCHOR-NOT-COLLAPSED"] + ACCOUNT_TOKENS)
+
+GATE_FAIL = []
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        GATE_FAIL.append(label)
+    return bool(cond)
+
+
+def note(label, extra=""):
+    print("  NOTE %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+
+
+fmt, mean, sd = C.fmt, C.mean, C.sd
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def gpu_of(path):
+    """the GPU name from the run's own nvidia-smi line (`<name>, <n> MiB`), or None.  DISCLOSURE ONLY."""
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if ln.endswith(" MiB") and ", " in ln and not ln.startswith(("ARGS:", "ENV:", "Epoch")):
+            return ln.split(",")[0].strip()
+    return None
+
+
+# =============================================================================
+# G-BITE: Lion on each arm's own group count, no hold key, the DECAY_MASK audit
+# =============================================================================
+def lion_natural(beta_pre, mom_pre, z):
+    return S9.lion_natural(beta_pre, mom_pre, z)
+
+
+def lion_check(recs, ng):
+    d = {"n": 0, "bad_rec": 0, "bad_step": 0, "bad_lion": 0, "ties": 0, "nonfinite": 0, "worst": 0.0}
+    if recs is None:
+        d["why"] = "no probe.jsonl"
+        return False, d
+    for k, r in enumerate(recs):
+        if r is None or not isinstance(r.get("step"), int) or not isinstance(r.get("beta"), list) or len(r["beta"]) != ng:
+            d["bad_rec"] += 1
+            continue
+        try:
+            beta = [float(x) for x in r["beta"]]
+            bpre, mom, z = S9._groupvec(r, "beta_pre", ng), S9._groupvec(r, "mom_pre", ng), S9._groupvec(r, "z_agg", ng)
+        except (TypeError, ValueError):
+            d["bad_rec"] += 1
+            continue
+        if bpre is None or mom is None or z is None:
+            d["bad_rec"] += 1
+            continue
+        if not all(math.isfinite(x) for x in beta + bpre + mom + z):
+            d["nonfinite"] += 1
+            continue
+        if r["step"] != 100 * k:
+            d["bad_step"] += 1
+        d["n"] += 1
+        for g in range(ng):
+            nat, tie = lion_natural(bpre[g], mom[g], z[g])
+            if tie:
+                d["ties"] += 1
+                continue
+            e = abs(nat - beta[g])
+            d["worst"] = max(d["worst"], e)
+            d["bad_lion"] += e > BH_TOL
+    ok = (len(recs) == N_RECORDS and d["bad_rec"] == 0 and d["n"] + d["nonfinite"] == N_RECORDS and d["bad_step"] == 0
+          and d["bad_lion"] == 0)
+    return ok, d
+
+
+def bite_run(arm, recs):
+    okl, dl = lion_check(recs, NG[arm])
+    hk = C.hold_keys_present(recs)
+    okd, dd = C.dm_audit(recs, K_MASKED[arm], N_RECORDS)
+    return okl and okd and hk == 0, dl, dd, hk
+
+
+# =============================================================================
+# decide
+# =============================================================================
+def rung_state(M, r):
+    k, L = M[SCALAR_OF[r]], M[LAYER_OF[r]]
+    if L < REF_MIN:
+        return "UNREADABLE"
+    if L > 0 and k <= R50 * L:
+        return "COLLAPSE"
+    if L - k < GAP_BAR:
+        return "NOGAP"
+    return "PARTIAL"
+
+
+def carrier_state(M, states):
+    """the carrier companion at rung W2.  UNREADABLE unless that rung is COLLAPSE (cmo1's ISO-UNREADABLE precedent)."""
+    if states[RUNG_IDS.index(CARRIER_RUNG)] != "COLLAPSE":
+        return "CAR-UNREADABLE"
+    if M[CAR] >= M[LAYER_OF[CARRIER_RUNG]] - MATCH_BAR:
+        return "CAR-REC"
+    if M[CAR] <= M[SCALAR_OF[CARRIER_RUNG]] + NULL_BAR:
+        return "CAR-NULL"
+    return "CAR-PART"
+
+
+def account_of(states):
+    """states: the four rung states in RUNG_IDS order, none UNREADABLE and the first COLLAPSE."""
+    c = 0
+    while c < len(states) and states[c] == "COLLAPSE":
+        c += 1
+    if "COLLAPSE" in states[c:]:
+        return "NON-MONOTONE"
+    if c == len(states):
+        return "COLLAPSE-AT-ALL-VALUES"
+    if "PARTIAL" in states[c:]:
+        return "GRADED-ABOVE-THRESHOLD-%s" % RUNG_IDS[c - 1]
+    return "THRESHOLD-%s-%s" % (RUNG_IDS[c - 1], RUNG_IDS[c])
+
+
+def decide(M, diverged=False, carrier_ok=True):
+    """-> (token, state word or None)."""
+    if diverged:
+        return "UNRESOLVED-DIVERGED", None
+    bad_ref = [r for r in RUNG_IDS if M[LAYER_OF[r]] < REF_MIN]
+    if bad_ref:
+        return "UNRESOLVED-REFERENCE", "REF-BELOW-%.0f-AT-%s" % (REF_MIN, "-".join(bad_ref))
+    states = [rung_state(M, r) for r in RUNG_IDS]
+    if M[SCALAR_OF["W1"]] > K01_MAX or states[0] != "COLLAPSE":
+        return "ANCHOR-NOT-COLLAPSED", "W1-%s" % states[0]
+    tok = account_of(states)
+    cw = carrier_state(M, states) if carrier_ok else "CAR-PATCH-NOT-VERIFIED"
+    return tok, "+".join("%s-%s" % (r, s) for r, s in zip(RUNG_IDS, states)) + "+" + cw
+
+
+READING = ("the audit's own SCALAR arm (scalar ~22.8 vs layerwise ~69.1 at the CIFAR-100 cells) and the mechanism "
+           "line's configuration scope (LIMITS-PREP L1, CORRECTIONS 264 / 271 / 273 / 278)")
+FLOOR_NOTE = ("A COLLAPSE state whose scalar arm sits at the floor is a LOCATION, a BOUND on the size of the gap, "
+              "never a point effect (164.6); a NOGAP state is a bound in the other direction, set by GAP_BAR.")
+NOT_DECOUPLED = ("Not licensed, unconditionally: anything about DECOUPLED weight decay.  The base optimiser has no "
+                 "decoupled path (SGDm_base_update multiplies the decay by the LEARNED step size in the weight update "
+                 "AND bakes (1 - wd*a) into the meta trace), and no lambda can match the coupled dose, which is wd*a "
+                 "with `a` learned and clamped to exp([-15,-2.3026]).  DESCOPED WITH REASONS at 281.2.")
+NOT_FINER = ("Not licensed: any weight-decay threshold finer than the bracketing PAIR of rungs.  The ladder has FOUR "
+             "points; nothing between two adjacent rungs was run.")
+NOT_ELSE = ("Not licensed: any other network, dataset, meta step size, alpha0, momentum, horizon or grouping; the "
+            "carrier account at any rung other than W2; which ROUTE the decay acts through.")
+
+LICENSE = {
+    "INCOMPLETE": ["No branch.  No number is quotable."],
+    "HARNESS-UNSOUND": ["A harness gate failed (or every arm is under %.0f / over %.0f pp).  A statement about the"
+                        % (FLOOR_MIN, CEIL_MAX), "harness only; " + READING + " untouched."],
+    "PATCH-NOT-VERIFIED": [
+        "The LADDER's G-BITE gate failed: on at least one of the EIGHT UNMASKED arms the meta update does not recompute",
+        "as Lion on that arm's own group count, a hold key appears, a dm_* key sits on an unmasked arm, or records are",
+        "missing / short.  NO level is read.  (A failure on CARW2 alone does NOT reach here: it suppresses the carrier",
+        "word only -- see CARRIER-PATCH-NOT-VERIFIED.)  " + READING + " untouched."],
+    "UNRESOLVED-DIVERGED": ["A bimodal arm must be reported, not averaged.  No branch; " + READING + " untouched."],
+    "UNRESOLVED-REFERENCE": [
+        "At least one rung's LAYERWISE arm is below %.0f pp, so at that rung there is no healthy reference against" % REF_MIN,
+        "which a collapse can be defined, and the ladder cannot be read end to end.  This is a GATE, not a finding: it",
+        "says the experiment did not deliver a usable reference at that weight decay, which is itself worth reporting",
+        "as a fact about the configuration.  No threshold sentence, no corner-case verdict either way."],
+    "ANCHOR-NOT-COLLAPSED": [
+        "At the ANCHOR rung (wd 0.1) the batch did not reproduce the mechanism cell -- either k01W1 is above %.0f pp" % K01_MAX,
+        "or the scalar arm is not at or below %.2f x its own layerwise arm.  The ladder has no baseline, so NOTHING" % R50,
+        "about weight-decay dependence is licensed.  This questions the in-batch reproduction, not the landed corpus",
+        "cells (between-batch); report it as a failed replication and do not read any other rung."],
+    "COLLAPSE-AT-ALL-VALUES": [
+        "The scalar arm sits at or below %.2f x its own layerwise arm at ALL FOUR weight decays, including %s -- the" % (R50, D.WD_TOKEN["W4"]),
+        "standard CIFAR SGD value.  SENTENCE LICENSED, at this cell: 'the shared-step-size collapse is not an artefact",
+        "of the campaign's large coupled weight decay: at a standard CIFAR weight decay the scalar grouping still falls",
+        "to at most half the layerwise level.'  EFFECT ON " + READING + ": the CORNER-CASE CONFIGURATION CHARGE IS",
+        "REFUTED at this cell, and the audit's scalar arm may be reported as a granularity result rather than a",
+        "configuration artefact -- with G_W4 quoted, since the SIZE of the gap may still vary along the ladder.",
+        FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "THRESHOLD-W1-W2": [
+        "The collapse exists at the anchor (wd %s) and at NO lower rung: it dies between %s and %s." % (D.WD_TOKEN["W1"], D.WD_TOKEN["W1"], D.WD_TOKEN["W2"]),
+        "SENTENCE LICENSED: 'the shared-step-size collapse at this cell requires a coupled weight decay within a decade",
+        "of 0.1; at 1e-2 and below the two grains do not differ by the collapse bar.'  EFFECT ON " + READING + ": THIS IS",
+        "THE REFEREE'S CORNER-CASE CHARGE LANDING.  The mechanism line must be written as a diagnostic of ONE extreme",
+        "configuration, and the audit's scalar cells must be reported with the disclosure that they sit at a weight",
+        "decay ~200x the standard value, at which the scalar configuration is broken.  The honest framing is then that",
+        "the subsection PROTECTS the audit's scalar arm by naming the configuration, not that it explains a general",
+        "granularity effect.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "THRESHOLD-W2-W3": [
+        "The collapse survives one decade down (wd %s) and dies between %s and %s." % (D.WD_TOKEN["W2"], D.WD_TOKEN["W2"], D.WD_TOKEN["W3"]),
+        "SENTENCE LICENSED: 'the collapse has a coupled weight-decay threshold between 1e-2 and 1e-3 at this cell; it is",
+        "not confined to 0.1, and it is not present at the standard CIFAR value.'  EFFECT ON " + READING + ": the charge",
+        "is PARTLY answered -- the phenomenon is a decade wide, not a single point -- but the audit's scalar cells still",
+        "sit above the threshold and that must be disclosed.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "THRESHOLD-W3-W4": [
+        "The collapse survives to wd %s and dies between %s and %s." % (D.WD_TOKEN["W3"], D.WD_TOKEN["W3"], D.WD_TOKEN["W4"]),
+        "SENTENCE LICENSED: 'the collapse persists across two decades of coupled weight decay and is absent only at the",
+        "standard CIFAR value.'  EFFECT ON " + READING + ": the corner-case charge is LARGELY answered -- the effect is",
+        "not a knife edge -- but the boundary sits exactly at the value a referee will name, and the subsection must say",
+        "so in the same breath.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "GRADED-ABOVE-THRESHOLD-W1": [
+        "The COLLAPSE bar is crossed only at the anchor, but at least one higher rung still shows a PARTIAL gap (above",
+        "%.0f pp, below the %.2f ratio bar).  SENTENCE LICENSED: 'the granularity gap is GRADED in the coupled weight" % (GAP_BAR, R50),
+        "decay, not a threshold: it is total at 0.1 and shrinks with the decay, remaining substantial at lower values.'",
+        "EFFECT ON " + READING + ": the corner-case charge is answered in PART -- the gap does not vanish outside the",
+        "campaign's configuration -- but the word 'collapse' is licensed only at the anchor.  Quote G_W2..G_W4 as the",
+        "finding; do not report a threshold.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "GRADED-ABOVE-THRESHOLD-W2": [
+        "The COLLAPSE bar is crossed at wd %s and above, and at least one lower rung still shows a PARTIAL gap." % D.WD_TOKEN["W2"],
+        "SENTENCE LICENSED: 'the collapse is complete down to 1e-2 and the granularity gap then decays smoothly rather",
+        "than vanishing.'  EFFECT ON " + READING + ": the charge is answered in PART; report the graded curve, not a",
+        "threshold.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "GRADED-ABOVE-THRESHOLD-W3": [
+        "The COLLAPSE bar is crossed at wd %s and above, and the lowest rung still shows a PARTIAL gap." % D.WD_TOKEN["W3"],
+        "SENTENCE LICENSED: 'the collapse persists across two decades and, at the standard CIFAR value, becomes a",
+        "substantial but sub-bar granularity gap.'  EFFECT ON " + READING + ": the corner-case charge is answered -- the",
+        "gap exists at the standard value too, though below the collapse bar.  Quote G_W4 as the number that answers the",
+        "referee.  " + FLOOR_NOTE, NOT_FINER, NOT_DECOUPLED, NOT_ELSE],
+    "NON-MONOTONE": [
+        "A LOWER coupled weight decay collapses while a HIGHER one does not.  NO threshold sentence and NO corner-case",
+        "verdict is licensed in either direction: the intervention is not described by 'how much weight decay' alone at",
+        "this cell, and the result must be reported as the non-monotonicity it is, with all four rungs' levels and the",
+        "seed spreads.  This outcome is registered BEFORE any run precisely so it cannot be re-described afterwards as a",
+        "threshold with one rung explained away.  " + FLOOR_NOTE, NOT_DECOUPLED, NOT_ELSE],
+}
+
+CARRIER_LICENSE = {
+    "CAR-REC": ("the carrier account HOLDS at this rung: masking the three ctd1 carriers' coupled decay brings the "
+                "scalar arm within %.0f pp of its own layerwise arm at wd %s, as it does at 0.1 (cwd3).  ONE rung, "
+                "ONE network, between-batch only against cwd3." % (MATCH_BAR, D.WD_TOKEN[CARRIER_RUNG])),
+    "CAR-PART": ("the carrier mask does PART of the work at this rung: it lifts the scalar arm off the floor but not "
+                 "to the layerwise level.  Read P_CARW2 and D_CARW2 together; neither is a share of anything."),
+    "CAR-NULL": ("the carrier mask does NOT lift the run at this rung -- a LOCATION at k01W2's floor, a BOUND, not a "
+                 "measured zero (164.6).  The carrier account, which holds at wd 0.1 (cwd3), does NOT transfer to wd "
+                 "%s at this cell.  That is an ADVERSE reading for the carrier account and is registered as such."
+                 % D.WD_TOKEN[CARRIER_RUNG]),
+    "CAR-UNREADABLE": ("rung %s is NOT in the COLLAPSE state, so there is no collapse for the carrier mask to remove "
+                       "and NOTHING about the carrier account is licensed here.  This is cmo1's ISO-UNREADABLE at wd 0 "
+                       "(CORRECTIONS 264) repeating one rung higher, and it was registered as a reachable outcome "
+                       "before any run." % CARRIER_RUNG),
+    "CAR-PATCH-NOT-VERIFIED": ("CARW2's DECAY_MASK record audit failed, so the carrier arm is NOT READ AT ALL.  A mask "
+                               "that never bit would read as CAR-NULL -- 'the carrier account fails at 1e-2' -- and "
+                               "only this gate separates the two."),
+}
+
+
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound / patch-not-verified, 2 incomplete."""
+    print("=" * 78)
+    print(" cwd5 -- ResNet18_c100: THE COUPLED WEIGHT-DECAY LADDER.  Does the shared-step-size collapse exist at")
+    print("         NORMAL weight-decay values, or only at the campaign's 0.1?")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (NET, DSET, EPOCHS, ",".join(str(s) for s in SEEDS), AUG, CLIP, PROBE))
+    for r in RUNG_IDS:
+        print("   rung %s  --weight-decay-base %-5s   %-7s (scalar) | %-7s (layerwise)%s"
+              % (r, D.WD_TOKEN[r], SCALAR_OF[r], LAYER_OF[r],
+                 "   + %s (scalar, DECAY_MASK = the three ctd1 carriers)" % CAR if r == CARRIER_RUNG else ""))
+    print(" CO-PRIMARY: G_W4 = %s - %s, the granularity gap at the STANDARD CIFAR weight decay."
+          % (LAYER_OF["W4"], SCALAR_OF["W4"]))
+    print(" Every state is WITHIN its rung.  plateau5 = mean TEST over epochs %d..%d of each run's own .out."
+          % (EPOCHS - 5, EPOCHS - 1))
+    print(" BARS ARE FROZEN LITERALS (O2).  DECOUPLED WEIGHT DECAY IS NOT TESTED (281.2) and is stamped on every FINAL.")
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+
+    runs, rnotes = C.read_runs(runsdir, PREFIX, ARMS, EPOCHS)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        note(n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        print("No branch is taken and NO NUMBER HERE IS QUOTABLE.")
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS / G-WDPATH   every run's OWN ARGS line says what its file name registers, INCLUDING its rung's")
+    print("          --weight-decay-base token and its grain.  That the flag reaches the update is proved on the real")
+    print("          GPU path by the bite job (bitwise w'/h'/m' at all four values) and in batch by %s's wd=0.01 witness." % CAR)
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = C.parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = {"optimizer": "HF", "alg-base": "SGDm", "alg-meta": "Lion", "dataset": DSET,
+                    "NN-name": NET, "batch-size": str(BATCH), "num-epochs": str(EPOCHS),
+                    "meta-stepsize": MST, "alpha0": A0, "stepsize-groups": SPEC[a],
+                    "seed": str(s), "run-name": "%s-%s-s%d" % (PREFIX, a, s),
+                    "momentum-param-base": "0.99", "weight-decay-base": B.WD[a], "momentum-param-meta": "0.99",
+                    "Lion-beta2-meta": "0.9", "weight-decay-meta": "0", "gamma": "1"}
+            bad = [k for k, v in want.items() if f.get(k, [None])[-1] != v]
+            hchk(not dup and not bad, "G-ARGS %s-s%d (wd %s, %s)" % (a, s, B.WD[a], SPEC[a]),
+                 "repeated %s; wrong %s" % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad]) if (dup or bad) else "")
+    wds = sorted(set(C.parse_args_line(runs[(a, s)]["args"][0]).get("weight-decay-base", [None])[-1]
+                     for a in ARMS for s in SEEDS if len(runs[(a, s)]["args"]) == 1))
+    hchk(wds == sorted(set(D.WD_TOKEN[r] for r in RUNG_IDS)),
+         "G-WDPATH the batch carries EXACTLY the four registered weight-decay tokens and no other", str(wds))
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(" ".join(t for t in ln.split() if not t.startswith("PROBE_DIR=")) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "G-ENV one distinct ENV line (PROBE_DIR stripped), one per run", "%d distinct" % len(envs))
+    for ln in envs:
+        print("        %s" % ln)
+    hchk(envs == [ENV_EXPECTED], "G-ENV the ENV line is cvt1's ... cvt9's / cwd1's / cwd3's / cwd4's, byte for byte")
+    print("  DECLARED: the runner's ENV line carries NO weight decay, so the ENV half cannot discriminate the rungs.")
+    print("  The rungs are discriminated by each run's OWN ARGS line (G-ARGS above and RULE 20's per-run --expect) and")
+    print("  the grains by the PROBE_TENSOR type below.  Stated at registration, not discovered afterwards.")
+    badpt = [(a, s) for (a, s), r in sorted(runs.items())
+             if len(r["pt"]) != 1 or not r["pt"][0].startswith("PROBE_TENSOR: on every=%d type=%s tensors=%d "
+                                                               % (PROBE, PT_TYPE[a], NTENS))]
+    hchk(not badpt, "G-ENV every run printed ONE `PROBE_TENSOR: on every=%d type=<its own grain> tensors=%d`" % (PROBE, NTENS),
+         "bad: %s" % badpt[:5] if badpt else "%d runs (%d scalar, %d layerwise)"
+         % (len(runs), sum(1 for a in ARMS if SPEC[a] == "scalar") * len(SEEDS),
+            sum(1 for a in ARMS if SPEC[a] == "layerwise") * len(SEEDS)))
+
+    print("\nG-WITNESS one line of each kind per run == the registered witness (VOTE_W / BETA_HOLD / GROUP_HOLD / REST_HOLD off; DECAY_MASK)")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            for kind, want in list(OFF_WITNESS.items()) + [("DECAY_MASK", B.WITNESS_DM[a])]:
+                hchk(r[kind] == [want], "G-WITNESS %s %s-s%d" % (kind, a, s),
+                     "" if r[kind] == [want] else "got %r" % ([x[:170] for x in r[kind][:2]],))
+            others = [k for k in ("COMP_HOLD", "WINDOW_HOLD") if r[k]]
+            hchk(not others, "G-WITNESS %s-s%d prints no COMP_HOLD / WINDOW_HOLD line (cvt8 lineage)" % (a, s),
+                 str(others) if others else "")
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == the frozen manifest, byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        txt = open(mp).read()
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(txt == D.manifest_text(B), "G-STRUCT byte-identical to cwd5_design.manifest_text(CWD5)",
+             "%d vs %d bytes" % (len(txt), len(D.manifest_text(B))))
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        me = file_sha(os.path.abspath(__file__))
+        for key, want, lab in (("MODE", "submit", "MODE submit"),
+                               ("BUILD_NETWORK_SHA256", B.BN_SHA, "build_network.py == cvt8's"),
+                               ("HF_SHA256", B.HF_POST_SHA, "HF.py == cwd1's PATCH_DECAYMASK tree, UNCHANGED"),
+                               ("HF_PRE_DECAYMASK_SHA256", B.HF_PARENT_SHA, "HF.py.pre_decaymask == cvt8's HF.py"),
+                               ("RUNNER_SHA256", B.RUNNER_SHA, "runner == run_cifar_cwd1.sh, UNCHANGED"),
+                               ("SCORER_SHA256", me, "SCORER == this file"),
+                               ("DESIGN_SHA256", file_sha(D.__file__), "DESIGN == the cwd5_design.py this scorer loaded"),
+                               ("CWD_DESIGN_SHA256", file_sha(W.__file__), "the reused cwd_design.py this scorer loaded"),
+                               ("COMMON_SHA256", file_sha(C.__file__), "COMMON == the cwd_common.py this scorer loaded")):
+            hchk(prov.get(key) == want, "G-PROV %s" % lab, "%s=%s" % (key, str(prov.get(key))[:16]))
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [C.tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-7s wd %-5s %-9s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, B.WD[a], SPEC[a], mean(v), fmt(sd(v), 4), max(v) - min(v), mean(t), "/".join(fmt(x, 3) for x in sl)))
+        print("           seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    hi = max(M.values())
+    print("\nG-FLOOR / G-CEIL")
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp (chance %.2f)" % (FLOOR_MIN, CHANCE), "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (len(harness), "; ".join(h.split()[0] for h in harness))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nG-BITE    SPLIT, as registered.  LADDER gate (the 8 unmasked arms) is HARD; CARRIER gate (%s) suppresses" % CAR)
+    print("          only the carrier word.  Lion is recomputed on each arm's OWN group count (scalar 1, layerwise %d)." % NTENS)
+    ladder_fail, carrier_fail = [], []
+    nonfin = {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = C.load_probe(runsdir, PREFIX, a, s)
+            ok, dl, dd, hk = bite_run(a, recs)
+            nonfin[(a, s)] = dl["nonfinite"] + dd["nonfinite"]
+            print("  %-4s G-BITE %-7s s%d  records %s  groups %d  lion-mismatch %d (ties %d, worst %.1e)  bad %d  "
+                  "nonfinite %d  hold-key records %s | dm: k=%d bad_n %d bad_skipped %d bad_masked %d bad_types %d "
+                  "on-unmasked %d pos_wdterm %d nonfinite %d last %s%s"
+                  % ("PASS" if ok else "FAIL", a, s, "absent" if recs is None else len(recs), NG[a], dl["bad_lion"],
+                     dl["ties"], dl["worst"], dl["bad_rec"], dl["nonfinite"], hk, K_MASKED[a], dd["bad_n"],
+                     dd["bad_skipped"], dd["bad_masked"], dd["bad_types"], dd["keys_on_unmasked"], dd["pos_wdterm"],
+                     dd["nonfinite"], dd["last"],
+                     ("  (%s)" % (dl.get("why") or dd.get("why"))) if (dl.get("why") or dd.get("why")) else ""))
+            if not ok:
+                (carrier_fail if a == CAR else ladder_fail).append("%s-s%d" % (a, s))
+    if ladder_fail:
+        final = "FINAL: PATCH-NOT-VERIFIED | the LADDER's G-BITE gate failed on %s" % ",".join(ladder_fail)
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for ln in LICENSE["PATCH-NOT-VERIFIED"]:
+            print("  " + ln)
+        return 1, final
+    carrier_ok = not carrier_fail
+    if carrier_fail:
+        print("  CARRIER GATE FAILED on %s -- the carrier word is SUPPRESSED; the ladder is read as registered."
+              % ",".join(carrier_fail))
+
+    print("\nG-HW      DISCLOSURE ONLY (271.4(5)): the GPU each run's own nvidia-smi line names -- NO gate reads it")
+    hw = dict(((a, s), gpu_of(os.path.join(runsdir, runs[(a, s)]["file"]))) for s in SEEDS for a in ARMS)
+    for a in ARMS:
+        print("  %-7s %s" % (a, "  ".join("s%d %s" % (s, hw[(a, s)]) for s in SEEDS)))
+    hwset = sorted(set(str(v) for v in hw.values()))
+    print("  distinct devices: %s" % hwset)
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / len(SEEDS))
+    print("  SIGMA_USED           %.6f  (= %s)" % (sigma_used, which))
+    print("  SE_ARM_DIFF          %.6f  = SIGMA_USED * sqrt(2/%d)  (df_inbatch %d)" % (se, len(SEEDS), df))
+    print("  2 SE (the HALF-WIDTH of a +/-2 SE interval, NOT a bound on any effect -- 278.6 C1): %.6f" % (2 * se))
+
+    print("\nTHE LADDER (every contrast WITHIN its rung)")
+    states = [rung_state(M, r) for r in RUNG_IDS]
+    CP = {}
+    for r, st in zip(RUNG_IDS, states):
+        k, L = SCALAR_OF[r], LAYER_OF[r]
+        g = M[L] - M[k]
+        CP["G_" + r] = (g, T[L] - T[k])
+        ratio = (M[k] / M[L]) if M[L] else float("nan")
+        print("  %-3s wd %-5s  scalar %7.4f  layerwise %7.4f   G_%s = %+.4f pp = %+.2f SE   R_%s = %.4f   -> %s"
+              % (r, D.WD_TOKEN[r], M[k], M[L], r, g, g / se, r, ratio, st))
+        print("           +/-2 SE interval [%+.4f, %+.4f]   TRAIN gap %+.4f   seeds %s"
+              % (g - 2 * se, g + 2 * se, T[L] - T[k],
+                 " / ".join("%+.3f" % (runs[(L, s)]["plateau5"] - runs[(k, s)]["plateau5"]) for s in SEEDS)))
+        print("           bars at this rung: COLLAPSE iff scalar <= %.4f (%.2f x layerwise) ; NOGAP iff G < %.1f pp ;"
+              " reference healthy iff layerwise >= %.1f" % (R50 * M[L], R50, GAP_BAR, REF_MIN))
+    print("  CO-PRIMARY G_W4 = %+.4f pp = %+.2f SE -- the granularity gap at the STANDARD CIFAR weight decay %s"
+          % (CP["G_W4"][0], CP["G_W4"][0] / se, D.WD_TOKEN["W4"]))
+    print("  DESCRIPTIVE ladders (levels, not effects): scalar %s"
+          % "  ".join("%s %.4f" % (D.WD_TOKEN[r], M[SCALAR_OF[r]]) for r in RUNG_IDS))
+    print("                                            layerwise %s"
+          % "  ".join("%s %.4f" % (D.WD_TOKEN[r], M[LAYER_OF[r]]) for r in RUNG_IDS))
+
+    cw = carrier_state(M, states) if carrier_ok else "CAR-PATCH-NOT-VERIFIED"
+    print("\nTHE CARRIER COMPANION at rung %s (wd %s), read ONLY if that rung is COLLAPSE" % (CARRIER_RUNG, D.WD_TOKEN[CARRIER_RUNG]))
+    if not carrier_ok:
+        print("  %s -- G-BITE's carrier gate failed; NO carrier number is read." % cw)
+    elif states[RUNG_IDS.index(CARRIER_RUNG)] != "COLLAPSE":
+        print("  %s -- rung %s is %s, so there is no collapse for the mask to remove.  %s %.4f is PRINTED as a level"
+              % (cw, CARRIER_RUNG, states[RUNG_IDS.index(CARRIER_RUNG)], CAR, M[CAR]))
+        print("  and NOTHING is read from it (cmo1's ISO-UNREADABLE at wd 0, CORRECTIONS 264).")
+    else:
+        k2, l2 = SCALAR_OF[CARRIER_RUNG], LAYER_OF[CARRIER_RUNG]
+        CP["P_CARW2"] = (M[CAR] - M[k2], T[CAR] - T[k2])
+        CP["D_CARW2"] = (M[l2] - M[CAR], T[l2] - T[CAR])
+        print("  %-8s %-9s = %-7s - %-7s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)   seeds %s"
+              % ("KEY", "P_CARW2", CAR, k2, CP["P_CARW2"][0], CP["P_CARW2"][0] / se, CP["P_CARW2"][1],
+                 " / ".join("%+.3f" % (runs[(CAR, s)]["plateau5"] - runs[(k2, s)]["plateau5"]) for s in SEEDS)))
+        print("  %-8s %-9s = %-7s - %-7s = %+.4f pp = %+.2f SE   (TRAIN %+.4f)"
+              % ("KEY", "D_CARW2", l2, CAR, CP["D_CARW2"][0], CP["D_CARW2"][0] / se, CP["D_CARW2"][1]))
+        print("  state bars: CAR-REC iff %s >= %.4f (%s - %.0f) ; CAR-NULL iff %s <= %.4f (%s + %.0f)  -> %s"
+              % (CAR, M[l2] - MATCH_BAR, l2, MATCH_BAR, CAR, M[k2] + NULL_BAR, k2, NULL_BAR, cw))
+
+    print("\nG-DIVERGE (a branch condition, not a harness gate)")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    print("  %s every arm's seed range <= %.1f pp%s" % ("PASS" if not div else "FAIL", DIVERGED_BAR,
+                                                        "" if not div else "  diverged: %s" % div))
+
+    branch, word = decide(M, bool(div), carrier_ok)
+    stamps = ([word] if word else []) + [
+        "HARNESS-CLEAN", "LADDER-BITES", "ALL-RUNGS-IN-BATCH", "BOTH-GRAINS-AT-EVERY-RUNG",
+        "REFERENCE-IS-IN-BATCH-LAYERWISE", "CARRIER-AGAINST-KLW2", "COUPLED-DECAY-ONLY", "DECOUPLED-NOT-TESTED",
+        "LADDER-IS-FOUR-POINTS", "ONE-NETWORK-RESNET18", "ONE-CELL-OTHERWISE", "HORIZON-100-ONLY", "THREE-SEEDS",
+        "WD-IS-AN-ARGS-DEVIATION", "FLOOR-READINGS-ARE-BOUNDS",
+        "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    if carrier_fail:
+        stamps.append("CARRIER-PATCH-NOT-VERIFIED")
+    else:
+        stamps.append("MASK-UPDATE-AND-TRACE")
+    if word and "UNREADABLE" not in (word or "") and branch in ACCOUNT_TOKENS:
+        gg = [CP["G_" + r][0] for r in RUNG_IDS]
+        if all(gg[i] >= gg[i + 1] - 2 * se for i in range(len(gg) - 1)):
+            stamps.append("GAP-MONOTONE-IN-WD")
+        else:
+            stamps.append("GAP-NOT-MONOTONE-IN-WD")
+    if abs(M[SCALAR_OF["W1"]] - K01_CWD3) > MATCH_BAR:
+        stamps.append("ANCHOR-DIFFERS-FROM-CWD3")
+    for a in ARMS:
+        if any(nonfin[(a, s)] for s in SEEDS):
+            stamps.append("NONFINITE-%s" % a)
+    stamps.append(("HW-UNIFORM-%s" % hwset[0].replace(" ", "_")) if len(hwset) == 1 else "HW-MIXED")
+    agree = all((t > 0) == (p > 0) for p, t in CP.values() if abs(p) >= GAP_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals; NO other batch enters any cwd5 bar, state or contrast):")
+    for b_, v_ in R_BETWEEN.items():
+        print("  %-48s %.4f" % (b_, v_))
+    print("  cwd5 {%s}: %s" % (",".join(str(s) for s in SEEDS), "  ".join("%s %.4f" % (a, M[a]) for a in ARMS)))
+    print("  k01W1 - cwd3's k01 = %+.4f pp  (the anchor's in-batch replication of the mechanism cell)"
+          % (M[SCALAR_OF["W1"]] - K01_CWD3))
+
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        print("  " + ln)
+    print("\nTHE CARRIER HALF (rung %s only):" % CARRIER_RUNG)
+    print("  %s -- %s" % (cw, CARRIER_LICENSE[cw]))
+
+    print("\nWHAT IT DOES NOT LICENSE, UNCONDITIONALLY:")
+    print("  * DECOUPLED weight decay, in either direction.  The base optimiser has no decoupled path and no lambda")
+    print("    matches the coupled dose wd*a with `a` learned; the arm was DESCOPED WITH REASONS at 281.2, not run.")
+    print("  * Any weight-decay threshold finer than the bracketing PAIR of rungs: the ladder has FOUR points.")
+    print("  * Any other network (PlainNet / VGG / GroupNorm / ResNet10 / 34 / 50), dataset, meta step size, alpha0,")
+    print("    momentum, horizon beyond 100 epochs, or grouping other than scalar and layerwise.")
+    print("  * The carrier account at any rung other than %s, or the ROUTE the decay acts through (weight shrink vs" % CARRIER_RUNG)
+    print("    meta trace -- one flag changes both).")
+    print("  * Anything about the corpus's landed cells: every cwd5 reading is WITHIN this batch.  The 21 runs at a")
+    print("    non-standard weight decay are ARGS-value deviations and owe CORPUS-EXCLUSIONS rows of kind ARGS_WD_BASE")
+    print("    at the landing (CORRECTIONS 263's kind; corpus_exclusions.py is NOT edited).")
+    return 0, final
+
+
+# =============================================================================
+# SECTION E HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_ENV = ENV_EXPECTED.replace(" PROBE=100 ", " PROBE=100 PROBE_DIR=/x/probe ")
+# base scenario = THRESHOLD-W2-W3 (the collapse survives one decade and dies below it)
+_E_BASE = {"k01W1": 23.0, "kLW1": 69.5, "k01W2": 24.0, "kLW2": 70.0, "CARW2": 69.0,
+           "k01W3": 70.5, "kLW3": 71.0, "k01W4": 71.0, "kLW4": 71.5}
+
+
+def _e_curve(level):
+    return [level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0)) for e in range(EPOCHS)]
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, spec=None, wd=None, dm=None, extra=None,
+             gpu="NVIDIA L4, 23034 MiB"):
+    rn = "%s-%s-s%d" % (PREFIX, arm, s)
+    args = ("--optimizer HF --alg-base SGDm --momentum-param-base 0.99 --weight-decay-base %s "
+            "--alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 "
+            "--weight-decay-meta 0 --dataset CIFAR100 --NN-name %s --batch-size 100 "
+            "--max-time 999:00:00 --gamma 1 --meta-stepsize 1e-3 --alpha0 1e-6 "
+            "--num-epochs 100 --stepsize-groups %s --seed %d "
+            "--save-directory /cluster/account_b/metaopt/runs/cwd5 --run-name %s"
+            % (wd or B.WD[arm], NET, spec or SPEC[arm], s, rn))
+    lines = ["NODE=[HOST_45cba27b74] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + args, env, gpu]
+    lines += list(OFF_WITNESS.values()) + [B.WITNESS_DM[arm] if dm is None else dm,
+                                           "Files already downloaded and verified",
+                                           "PROBE_TENSOR: on every=100 type=%s tensors=%d meta_alg=Lion "
+                                           "momentum_param=0.99 Lion_beta2=0.9 dir=/x" % (PT_TYPE[arm], NTENS)]
+    lines += list(extra or [])
+    curve = _e_curve(level)
+    for e in range(n_ep):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.4f %%" % (e, min(99.9, curve[e] + 15.0), curve[e]))
+    if run_done:
+        lines += ["43  minutes", "RUN_DONE"]
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_records(arm, seed, ng=None, touch=False, add_bh=False, nodm=False, adddm=False, dmforge=None, n=N_RECORDS, k=None):
+    rnd = random.Random(7700 + seed + 17 * ARMS.index(arm))
+    ng = ng or NG[arm]
+    out = []
+    for kk in range(n):
+        s = 100 * kk
+        mom = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        z = [rnd.uniform(-1e-3, 1e-3) for _ in range(ng)]
+        bpre = [S9.f32(max(S9.LO, min(S9.HI, -13.8 + 0.3 * math.sin(kk / 30.0 + g) - 0.004 * kk))) for g in range(ng)]
+        beta = [S9.f32(lion_natural(bpre[g], mom[g], z[g])[0]) for g in range(ng)]
+        if touch:
+            beta[0] = S9.f32(beta[0] + 0.002)
+        rec = {"step": s, "pt_b2": 0.9, "pt_mp": 0.99, "beta": beta, "beta_pre": [bpre], "mom_pre": [mom], "z_agg": [z]}
+        if add_bh:
+            rec.update({"bh_n": s + 2, "bh_active": 0, "bh_nat": beta[0], "bh_held": beta[0]})
+        out.append(rec)
+    kk_ = K_MASKED[arm] if k is None else k
+    if (kk_ and not nodm) or adddm:
+        out = C.add_dm_keys(out, kk_ or 3, forge=dmforge)
+    return out
+
+
+def _e_probe_template(root):
+    for s in SEEDS:
+        for a in ARMS:
+            p = os.path.join(root, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(p, exist_ok=True)
+            with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                for r in _e_records(a, s):
+                    f.write(json.dumps(r) + "\n")
+
+
+def _e_prov(d, over=None):
+    kv = {"MODE": "submit", "BUILD_NETWORK_SHA256": B.BN_SHA, "HF_SHA256": B.HF_POST_SHA,
+          "HF_PRE_DECAYMASK_SHA256": B.HF_PARENT_SHA, "RUNNER_SHA256": B.RUNNER_SHA,
+          "SCORER_SHA256": file_sha(os.path.abspath(__file__)), "DESIGN_SHA256": file_sha(D.__file__),
+          "CWD_DESIGN_SHA256": file_sha(W.__file__), "COMMON_SHA256": file_sha(C.__file__)}
+    kv.update(over or {})
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+
+
+def _e_build(d, template, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, shadow=None, env_break=None,
+             spec_break=None, wd_break=None, dm_break=None, extra_break=None, manifest=None, prov=None,
+             probe_break=None, probe_drop=None, gpu=None):
+    lv = dict(_E_BASE, **(levels or {}))
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(manifest if manifest is not None else D.manifest_text(B))
+    _e_prov(d, prov)
+    jid = 9770000
+    pb = probe_break or {}
+    for i, s in enumerate(SEEDS):
+        for a in ARMS:
+            jid += 1
+            pname = "probe_%s-%s-s%d" % (PREFIX, a, s)
+            if (a, s) in pb:
+                p = os.path.join(d, PREFIX, pname)
+                os.makedirs(p)
+                with open(os.path.join(p, "probe.jsonl"), "w") as f:
+                    for r in pb[(a, s)]:
+                        f.write((json.dumps(r) if isinstance(r, dict) else r) + "\n")
+            elif probe_drop != (a, s):
+                os.symlink(os.path.join(template, pname), os.path.join(d, PREFIX, pname))
+            if drop == (a, s):
+                continue
+            L = (over or {}).get((a, s), lv[a] + jit[i])
+            env = _E_ENV.replace("AUGMENT=1", "AUGMENT=0") if env_break == (a, s) else _E_ENV
+            spec = ("layerwise" if SPEC[a] == "scalar" else "scalar") if spec_break == (a, s) else None
+            wd = wd_break[1] if wd_break and wd_break[0] == (a, s) else None
+            dm = dm_break[1] if dm_break and dm_break[0] == (a, s) else None
+            extra = extra_break[1] if extra_break and extra_break[0] == (a, s) else None
+            g = (gpu or {}).get((a, s), "NVIDIA L4, 23034 MiB")
+            _e_write(d, a, s, jid, L, env=env, spec=spec, wd=wd, dm=dm, extra=extra, gpu=g)
+            if shadow == (a, s):
+                _e_write(d, a, s, jid + 2000, L, n_ep=40, run_done=False)
+
+
+def _e_csv_variants(src, dst_dir):
+    out = {"no-corpus": os.path.join(dst_dir, "does_not_exist.csv")}
+    base = {"dataset": DSET, "base": "SGDm", "meta": "Lion", "meta_stepsize": MST, "alpha0": A0, "gamma": "1",
+            "augment": AUG, "beta_clip": CLIP, "batch_size": str(BATCH), "epochs_requested": str(EPOCHS), "hier": "none",
+            "lam": "na", "eta_ratio": "na", "superseded": "0", "collapsed": "0", "complete": "1"}
+    inv = []
+    for i, (gran, v) in enumerate([("scalar", 1.0), ("scalar", 70.0), ("scalar", 35.0), ("layerwise", 3.0),
+                                   ("layerwise", 95.0), ("layerwise", 40.0)]):
+        inv.append(dict(base, network=NET, granularity=gran, run="zstress-%d-s%d" % (i, 900 + i),
+                        job_id=str(9990000 + i), seed=str(900 + i), plateau5="%.4f" % v))
+    if src and os.path.exists(src):
+        rows = list(csv.DictReader(open(src)))
+        hdr = list(rows[0].keys())
+        out["real"] = src
+        p = os.path.join(dst_dir, "stress.csv")
+        w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+        for r in inv:
+            w.writerow(dict((k, r.get(k, "")) for k in hdr))
+        out["real+invented"] = p
+    hdr = ["run", "job_id", "seed", "superseded", "collapsed", "complete", "plateau5"] + S9.CELLKEYS
+    p = os.path.join(dst_dir, "minimal.csv")
+    w = csv.DictWriter(open(p, "w", newline=""), fieldnames=hdr, extrasaction="ignore")
+    w.writeheader()
+    for r in inv:
+        w.writerow(r)
+    out["minimal-invented"] = p
+    return out
+
+
+def _e_score(d, csvpath):
+    saved = GATE_FAIL[:]
+    del GATE_FAIL[:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc, fin = score(d, csvpath, "")
+    except Exception as ex:
+        return None, "EXCEPTION %s: %s" % (type(ex).__name__, ex), buf.getvalue()
+    finally:
+        GATE_FAIL[:] = saved
+    return rc, fin, buf.getvalue()
+
+
+def _mid(pl):
+    return (pl[0] + pl[1]) / 2.0
+
+
+# the corpus_exclusions KIND names as of THIS registration, as a LITERAL tuple (cSV1's pattern, 271.6 F2)
+KINDS_AT_REGISTRATION = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "COMP_HOLD", "REST_HOLD", "WINDOW_HOLD", "DECAY_MASK",
+                         "SHADOW_VOTE")
+ARGS_KINDS_AT_REGISTRATION = (("ARGS_MOMENTUM_BASE", "momentum-param-base", "0.99"),
+                              ("ARGS_WD_BASE", "weight-decay-base", "0.1"))
+
+
+# =============================================================================
+def selftest(csvpath, runsdir):
+    print("cWD5 --selftest: the ladder design and witnesses, G-BITE on REAL landed cwd1 / cwd3 records at BOTH grains")
+    print("and both nulls, the noise floor through corpus_exclusions.filter_rows, the account tables with exhaustive")
+    print("state reachability, the REAL score() on synthetic runs, the O2 invariance proof and the documented")
+    print("one-argument invocation.\n")
+
+    print("A. DESIGN, WITNESSES, ARITHMETIC")
+    chk(file_sha(S9.__file__) == W.S9_SHA, "A cvt9's registered scorer (Lion helper) is the file 249 registered")
+    chk(file_sha(W.__file__) == D.CWD_DESIGN_SHA and file_sha(C.__file__) == D.CWD_COMMON_SHA,
+        "A the REUSED cwd_design.py / cwd_common.py are cwd1's registered files, byte for byte (RULE 16)")
+    chk(file_sha(os.path.join(REPO, "patches", "patch_decaymask.py")) == D.PATCH_DECAYMASK_SHA,
+        "A patches/patch_decaymask.py is cwd1's registered file (RULE 16): NO NEW HARNESS CODE")
+    chk(ARMS == ("k01W1", "kLW1", "k01W2", "kLW2", "k01W3", "kLW3", "k01W4", "kLW4", "CARW2") and SEEDS == (146, 147, 148),
+        "A the 9 arms and the FRESH seed block {146,147,148}")
+    chk(RUNG_IDS == ("W1", "W2", "W3", "W4")
+        and [D.WD_TOKEN[r] for r in RUNG_IDS] == ["0.1", "1e-2", "1e-3", "5e-4"]
+        and [D.WD_VALUE[r] for r in RUNG_IDS] == [0.1, 0.01, 0.001, 0.0005],
+        "A THE LADDER: four coupled weight decays, the anchor 0.1 down to the standard CIFAR value 5e-4 (200x)")
+    chk(all(D.WD_VALUE[RUNG_IDS[i]] > D.WD_VALUE[RUNG_IDS[i + 1]] for i in range(3)),
+        "A the rungs are STRICTLY DECREASING, so the collapse prefix / threshold reading is well defined")
+    chk(D.WD_VALUE["W1"] == D.WD_ANCHOR == W.WD_BASE,
+        "A rung W1 IS the campaign's own weight decay, so the anchor replicates the mechanism cell in batch")
+    chk(all(SPEC[SCALAR_OF[r]] == "scalar" and SPEC[LAYER_OF[r]] == "layerwise" for r in RUNG_IDS),
+        "A BOTH GRAINS run at EVERY rung, so every gap is a WITHIN-rung contrast and never a cross-batch one")
+    chk(all(B.RUNG_OF[SCALAR_OF[r]] == B.RUNG_OF[LAYER_OF[r]] == r for r in RUNG_IDS)
+        and B.RUNG_OF[CAR] == CARRIER_RUNG,
+        "A each rung's two arms carry the SAME weight-decay token, and the carrier arm sits at rung %s" % CARRIER_RUNG)
+    chk(NG == dict((a, 1 if SPEC[a] == "scalar" else 62) for a in ARMS) and sorted(set(NG.values())) == [1, 62],
+        "A Lion is recomputed on each arm's OWN group count: 1 for scalar, 62 for layerwise")
+    chk(K_MASKED == dict([(a, 0) for a in LADDER_ARMS] + [(CAR, 3)]) and MASKED == (CAR,),
+        "A EXACTLY ONE arm is masked: the ladder's own reading uses NO patch, so a patch defect cannot forge a threshold")
+    T_ = B.TENSORS
+    idx = D.dm_indices(B.DMASK[CAR], T_)
+    chk(tuple(i + 1 for i in idx) == (50, 53, 59) and sum(T_[i][1] for i in idx) == 1536
+        and all(T_[i][2] == "BatchNorm2d" and T_[i][0].endswith(".weight") and T_[i][1] == 512
+                and T_[i][0].startswith("layer4.") for i in idx),
+        "A CARW2 = the three ctd1 carriers, idx 50/53/59, 1,536 params, all 512-wide layer4 BatchNorm SCALES (cwd3's set)")
+    chk(B.WITNESS_DM[CAR] == ("DECAY_MASK: on base=SGDm wd=0.01 spec=layer4.0.bn2.weight+layer4.0.shortcut.1.weight+"
+                              "layer4.1.bn2.weight masked=3 of=62 numel=1536 idx=50,53,59 names=layer4.0.bn2.weight,"
+                              "layer4.0.shortcut.1.weight,layer4.1.bn2.weight"),
+        "A CARW2's witness prints wd=0.01 -- a string PATCH_DECAYMASK has NEVER printed; the bite job proves it on GPU")
+    chk(all(B.WITNESS_DM[a] == "DECAY_MASK: off" for a in LADDER_ARMS) and len(set(B.WITNESS_DM.values())) == 2,
+        "A every ladder arm prints `DECAY_MASK: off`; only CARW2 carries a mask witness")
+    chk(B.ARGS_DEVIATING == ("k01W2", "kLW2", "k01W3", "kLW3", "k01W4", "kLW4", "CARW2")
+        and len(B.ARGS_DEVIATING) * len(SEEDS) == 21,
+        "A 21 of the 27 runs DEVIATE from the standard cell's weight decay and owe an ARGS_WD_BASE exclusion row each;"
+        " the 6 anchor runs owe none")
+    chk(ARGS_KINDS_AT_REGISTRATION[1] == ("ARGS_WD_BASE", "weight-decay-base", "0.1"),
+        "A the exclusion kind this batch needs ALREADY EXISTS (CORRECTIONS 263); corpus_exclusions.py is NOT edited")
+    chk(all(not "DECAY_MASK".startswith(k) and not k.startswith("DECAY_MASK") for k in KINDS_AT_REGISTRATION if k != "DECAY_MASK"),
+        "A prefix rule (245/251) over the LITERAL registration tuple: no other KIND prefixes or is prefixed by DECAY_MASK")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE_PRIOR) < 1e-6 and SIGMA_PRIOR == SIGMA_R18ALL,
+        "A SE_PRIOR = SIGMA_PRIOR*sqrt(2/3); SIGMA_PRIOR = SIGMA_R18ALL")
+    chk(all(compose_sigma(s)[1] == max(SIGMA_PRIOR, s) for s in (0.0, 0.3, SIGMA_PRIOR, 0.9, 3.0)),
+        "A SIGMA_USED == max(frozen floor, in-batch)")
+    src = open(os.path.abspath(__file__)).read()
+    sc_src = src[src.index("def score("):src.index("# SECTION E HELPERS")]
+    chk("pooled_sigma" not in sc_src and sc_src.count("read_corpus(") == 1 and "gpu_of(" in sc_src
+        and sc_src.index("gpu_of(") > sc_src.index("ladder_fail, carrier_fail = [], []"),
+        "A O2: score() calls no sigma routine and reads the corpus once (disclosure); G-HW is read only AFTER the gates")
+    chk("K01_CWD3" not in sc_src.split("stamps = ")[0] and "R_BETWEEN" not in sc_src.split("BETWEEN-BATCH")[0]
+        and "LANDED_DISCLOSURE" not in sc_src,
+        "A no landed level enters a LEVEL, a SIGMA, a CONTRAST or a STATE BAR -- only a non-gating stamp and the"
+        " disclosure block")
+    dec_src = src[src.index("def rung_state("):src.index("READING = (")]
+    chk("R50" in dec_src and "REF_MIN" in dec_src and "GAP_BAR" in dec_src and "corpus" not in dec_src
+        and "CWD3" not in dec_src,
+        "A decide() / rung_state() / carrier_state() read ONLY frozen literals and in-batch means")
+    mt = D.manifest_text(B)
+    chk(mt.count("\n") == 6 + 1 + 62 + 1 + 4 * 9 + 1
+        and "WD_LADDER W1=0.1,W2=1e-2,W3=1e-3,W4=5e-4" in mt
+        and "ARMWD k01W4 RUNG W4 WD 5e-4" in mt and "ARMWD kLW1 RUNG W1 WD 0.1" in mt
+        and "SET CARW2 idx=50,53,59 numel=1536 owners=BatchNorm2d,BatchNorm2d,BatchNorm2d widths=512,512,512"
+            " classes=scale,scale,scale" in mt,
+        "A the frozen manifest carries the ladder, one ARMWD line per arm and the carrier SET line", "%d lines" % mt.count("\n"))
+    chk(ENV_EXPECTED == S9.ENV_EXPECTED == W.ENV_EXPECTED, "A the ENV line is cvt9's (= cvt8's = cwd1's = cwd3's = cwd4's)")
+    chk("PROBE_DIR" not in ENV_EXPECTED.replace("PROBE_DIR=none", "") or "weight" not in ENV_EXPECTED,
+        "A the runner's ENV line carries NO weight decay -- which is WHY the rungs are discriminated by the ARGS half")
+    chk(B.HF_POST_SHA == W.CWD1.HF_POST_SHA and B.RUNNER_SHA == W.CWD1.RUNNER_SHA and B.BN_SHA == W.CWD1.BN_SHA,
+        "A the tree, the runner and build_network are cwd1's, UNCHANGED")
+
+    print("\nB. G-BITE ON REAL LANDED RECORDS (this host's runs directory)")
+    have1 = runsdir and all(C.load_probe(runsdir, "cwd1", a, s) is not None for a in ("k01", "kLNWD") for s in (128, 129, 130))
+    have3 = runsdir and all(C.load_probe(runsdir, "cwd3", "CARWD0", s) is not None for s in (140, 141, 142))
+    if not (have1 or have3):
+        skip("B landed cwd1 / cwd3 records not found under %s" % runsdir)
+    if have1:
+        pos0 = posL = strayL = 0
+        for s in (128, 129, 130):
+            r0 = C.load_probe(runsdir, "cwd1", "k01", s)
+            pos0 += bite_run("k01W1", r0)[0]
+            rL = C.load_probe(runsdir, "cwd1", "kLNWD", s)
+            okL, _dlL, ddL, _hkL = bite_run("kLW1", rL)
+            posL += ddL["keys_on_unmasked"] == N_RECORDS and not okL   # cwd1's kLNWD IS masked: it must FAIL as an
+            strayL += lion_check(rL, NTENS)[0]                          # UNMASKED cwd5 arm, while Lion on 62 groups passes
+        chk(pos0 == 3, "B the 3 landed cwd1 k01 runs PASS G-BITE read as cwd5's SCALAR ladder arm (Lion on 1 group, no"
+                       " hold key, no dm key)", "%d/3" % pos0)
+        chk(strayL == 3, "B the Lion recompute is exact on 62 GROUPS: the 3 landed cwd1 kLNWD (layerwise) runs pass it --"
+                         " the layerwise half of this ladder is readable by the same check", "%d/3" % strayL)
+        chk(posL == 3, "B THE STRAY-MASK NULL ON REAL RECORDS: those same layerwise runs, which ARE masked, FAIL cwd5's"
+                       " UNMASKED ladder audit on every record (a dm_* key on a ladder arm is a gate failure)", "%d/3" % posL)
+        r0 = C.load_probe(runsdir, "cwd1", "k01", 128)
+        broken = lion_check([dict(r, beta=[x + 0.01 for x in r["beta"]]) if isinstance(r, dict) and r.get("step") == 20000 else r
+                             for r in r0], 1)[0]
+        chk(not broken, "B ... and the Lion recompute FAILS when one real record's beta is moved by 0.01")
+    else:
+        skip("B landed cwd1 k01 / kLNWD records not found under %s" % runsdir)
+    if have3:
+        pos3 = nullc = 0
+        for s in (140, 141, 142):
+            rc_ = C.load_probe(runsdir, "cwd3", "CARWD0", s)
+            pos3 += bite_run(CAR, rc_)[0]                    # cwd3's CARWD0 is the SAME set, k = 3
+            r0 = C.load_probe(runsdir, "cwd1", "k01", 128) if have1 else None
+            if r0 is not None:
+                okn, dln, ddn, hkn = bite_run(CAR, r0)       # an UNMASKED run read as the carrier arm
+                nullc += (not okn) and dln["bad_lion"] == 0 and hkn == 0 and ddn["bad_types"] == N_RECORDS
+        chk(pos3 == 3, "B the 3 landed cwd3 CARWD0 runs PASS G-BITE read as cwd5's CARW2 (k = 3 on every record) -- the"
+                       " carrier arm's record contract is cwd3's, and only its wd VALUE is new", "%d/3" % pos3)
+        if have1:
+            chk(nullc == 3, "B THE CARRIER HALF'S DANGEROUS NULL ON REAL RECORDS: an UNMASKED run read as CARW2 FAILS the"
+                            " DECAY_MASK audit on every record.  Without this gate it would read as CAR-NULL, i.e. 'the"
+                            " carrier account fails at 1e-2'", "%d/3" % nullc)
+    else:
+        skip("B landed cwd3 CARWD0 records not found under %s" % runsdir)
+
+    print("\nC. THE NOISE FLOOR (OPERATIONS 36) AND FRESHNESS")
+    ce = _exclusions()
+    chk(("ARGS_WD_BASE", "weight-decay-base", "0.1") in [tuple(x) for x in ce.ARGS_KINDS],
+        "C the LIVE corpus_exclusions registry carries the ARGS_WD_BASE kind with standard 0.1 (263), UNEDITED")
+    if csvpath and os.path.exists(csvpath):
+        rows_all = [r for r in csv.DictReader(open(csvpath))]
+        filt = ce.filter_rows(rows_all)
+        sR, nR = S9.pooled_sigma(filt, S9.net_is(NET)), S9.pooled_sigma(rows_all, S9.net_is(NET))
+        if file_sha(csvpath) == REG_CORPUS_SHA256 and file_sha(ce.DEFAULT_TSV) == REG_EXCLUSIONS_SHA256:
+            chk(abs(sR[0] - SIGMA_R18ALL) < 1e-12 and sR[1] == 258,
+                "C SIGMA_R18ALL: the FROZEN literal %r IS the FILTERED value (df 258)" % SIGMA_R18ALL)
+            chk(abs(nR[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and nR[0] > 5 * SIGMA_R18ALL,
+                "C the NAIVE (unfiltered) value is the disclosed trap, not the literal")
+            chk(len(rows_all) == REG_CORPUS_ROWS, "C the registration corpus has %d rows" % REG_CORPUS_ROWS)
+        else:
+            note("C the corpus or exclusion list moved since registration: the literal stays frozen (O2); filtered now %.6f" % sR[0])
+        hit = [r["run"] for r in rows_all if r.get("seed") in set(str(s) for s in SEEDS) and not r["run"].startswith(PREFIX + "-")]
+        chk(not hit, "C ZERO corpus rows OUTSIDE cwd5 carry seed 146, 147 or 148", str(hit[:3]))
+        pre = [r["run"] for r in rows_all if r["run"].startswith(PREFIX + "-")]
+        if file_sha(csvpath) == REG_CORPUS_SHA256:
+            chk(not pre, "C ZERO corpus rows carry the cwd5- prefix (registration corpus)")
+        else:
+            note("C post-registration corpus: %d cwd5- rows (expected only after the landing's ingest)" % len(pre))
+    else:
+        skip("C no corpus at %s" % csvpath)
+
+    print("\nD. ACCOUNTS -> TOKENS, AND EXHAUSTIVE STATE REACHABILITY")
+    for name, lv in ACCOUNTS.items():
+        M = dict((a, _mid(pl)) for a, pl in lv.items())
+        got = decide(M)[0]
+        chk(got == name, "D account %s midpoints -> %s" % (name, name), "" if got == name else str(decide(M)))
+    chk(PART_PL[1] < FREE_PL[0] and K01_PL[1] < PART_PL[0], "D the K01 / PART / FREE bands are disjoint")
+    chk(_mid(K01_PL) <= R50 * _mid(FREE_PL) and _mid(PART_PL) > R50 * _mid(FREE_PL)
+        and _mid(FREE_PL) - _mid(PART_PL) >= GAP_BAR and _mid(FREE_PL) - _mid(FREE_PL) < GAP_BAR,
+        "D the three bands realise COLLAPSE / PARTIAL / NOGAP at a FREE layerwise arm, by construction")
+    # the dangerous null of the CARRIER half: a mask that never bit puts CARW2 at the scalar arm's level
+    Mn = dict((a, _mid(pl)) for a, pl in ACCOUNTS["THRESHOLD-W2-W3"].items())
+    Mn[CAR] = Mn[SCALAR_OF[CARRIER_RUNG]]
+    chk(decide(Mn)[1].endswith("+CAR-NULL") and decide(Mn)[0] == "THRESHOLD-W2-W3",
+        "D THE CARRIER HALF'S DANGEROUS NULL: a mask that never bit reads as CAR-NULL -- and does NOT move the ladder's"
+        " own token, because no ladder arm is masked.  Only G-BITE separates it from a real CAR-NULL")
+    chk(decide(Mn, carrier_ok=False)[1].endswith("+CAR-PATCH-NOT-VERIFIED")
+        and decide(Mn, carrier_ok=False)[0] == "THRESHOLD-W2-W3",
+        "D a failed CARRIER gate suppresses the carrier word and leaves the ladder's token untouched")
+    Mu = dict((a, _mid(pl)) for a, pl in ACCOUNTS["THRESHOLD-W1-W2"].items())
+    chk(decide(Mu)[1].endswith("+CAR-UNREADABLE"),
+        "D when rung %s is not COLLAPSE the carrier arm is UNREADABLE (cmo1's ISO-UNREADABLE at wd 0, 264)" % CARRIER_RUNG)
+    reach = set()
+    ST = ("COLLAPSE", "PARTIAL", "NOGAP")
+    for a_ in ST:
+        for b_ in ST:
+            for c_ in ST:
+                for d_ in ST:
+                    if a_ != "COLLAPSE":
+                        continue
+                    reach.add(account_of([a_, b_, c_, d_]))
+    chk(reach == set(ACCOUNT_TOKENS), "D every one of the %d registered accounts is reachable from the 27 admissible"
+        " state vectors and NOTHING ELSE is" % len(ACCOUNT_TOKENS), str(sorted(reach ^ set(ACCOUNT_TOKENS))))
+    chk(account_of(["COLLAPSE"] * 4) == "COLLAPSE-AT-ALL-VALUES"
+        and account_of(["COLLAPSE", "NOGAP", "NOGAP", "NOGAP"]) == "THRESHOLD-W1-W2"
+        and account_of(["COLLAPSE", "COLLAPSE", "NOGAP", "NOGAP"]) == "THRESHOLD-W2-W3"
+        and account_of(["COLLAPSE", "COLLAPSE", "COLLAPSE", "NOGAP"]) == "THRESHOLD-W3-W4"
+        and account_of(["COLLAPSE", "PARTIAL", "NOGAP", "NOGAP"]) == "GRADED-ABOVE-THRESHOLD-W1"
+        and account_of(["COLLAPSE", "NOGAP", "COLLAPSE", "NOGAP"]) == "NON-MONOTONE"
+        and account_of(["COLLAPSE", "NOGAP", "PARTIAL", "NOGAP"]) == "GRADED-ABOVE-THRESHOLD-W1",
+        "D the threshold is named by the BRACKETING PAIR, a PARTIAL tail is never called a threshold, and a COLLAPSE at"
+        " a LOWER weight decay than a non-collapsed rung is NON-MONOTONE")
+    Mr = dict((a, _mid(pl)) for a, pl in ACCOUNTS["COLLAPSE-AT-ALL-VALUES"].items())
+    Mr[LAYER_OF["W3"]] = REF_MIN - 0.01
+    chk(decide(Mr)[0] == "UNRESOLVED-REFERENCE" and "W3" in decide(Mr)[1],
+        "D a layerwise arm just below REF_MIN gates the WHOLE ladder and names the rung")
+    Ma = dict((a, _mid(pl)) for a, pl in ACCOUNTS["COLLAPSE-AT-ALL-VALUES"].items())
+    Ma[SCALAR_OF["W1"]] = K01_MAX + 0.01
+    chk(decide(Ma)[0] == "ANCHOR-NOT-COLLAPSED", "D a k01W1 just above K01_MAX gates the whole ladder")
+    Mb = dict((a, _mid(pl)) for a, pl in ACCOUNTS["COLLAPSE-AT-ALL-VALUES"].items())
+    Mb[SCALAR_OF["W1"]] = R50 * Mb[LAYER_OF["W1"]] + 0.01
+    chk(decide(Mb)[0] == "ANCHOR-NOT-COLLAPSED",
+        "D an anchor that is under K01_MAX but NOT at or below half its own layerwise arm still gates the ladder --"
+        " so the COLLAPSE prefix is never empty inside account_of()")
+
+    print("\nE. THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="cwd5_selftest_")
+    try:
+        tpl = os.path.join(tmp, "template")
+        _e_probe_template(tpl)
+        csvs = _e_csv_variants(csvpath, tmp)
+        n = [0]
+
+        def case(label, want_rc, want_prefix, **kw):
+            n[0] += 1
+            d = os.path.join(tmp, "b%03d" % n[0])
+            os.makedirs(d)
+            _e_build(d, tpl, **kw)
+            rc, fin, out = _e_score(d, csvs["real" if "real" in csvs else "minimal-invented"])
+            ok = rc == want_rc and fin.startswith("FINAL: " + want_prefix)
+            chk(ok, "E %s -> rc %d, %s" % (label, want_rc, want_prefix), "" if ok else "got rc %r %s" % (rc, fin[:200]))
+            return d, fin, out
+
+        _d0, fin0, out0 = case("base (THRESHOLD-W2-W3)", 0, "THRESHOLD-W2-W3 |")
+        chk("W1-COLLAPSE+W2-COLLAPSE+W3-NOGAP+W4-NOGAP+CAR-REC" in fin0 and "DECOUPLED-NOT-TESTED" in fin0
+            and "LADDER-IS-FOUR-POINTS" in fin0 and "LADDER-BITES" in fin0 and "MASK-UPDATE-AND-TRACE" in fin0
+            and "HW-UNIFORM-NVIDIA_L4" in fin0 and "BOTH-GRAINS-AT-EVERY-RUNG" in fin0
+            and "CARRIER-AGAINST-KLW2" in fin0 and "WD-IS-AN-ARGS-DEVIATION" in fin0
+            and "FLOOR-READINGS-ARE-BOUNDS" in fin0,
+            "E base stamps (the state word, the DESCOPE stamp, the four-point stamp, bite, HW and the scope stamps)")
+        chk("the granularity gap at the STANDARD CIFAR weight decay" in out0 and "G_W4" in out0,
+            "E the CO-PRIMARY G_W4 is printed with its meaning spelled out")
+        case("COLLAPSE-AT-ALL-VALUES", 0, "COLLAPSE-AT-ALL-VALUES",
+             levels={"k01W3": 23.5, "k01W4": 24.5})
+        _d, fr, _o = case("THRESHOLD-W1-W2 (the corner-case charge landing)", 0, "THRESHOLD-W1-W2",
+                          levels={"k01W2": 70.0})
+        chk("+CAR-UNREADABLE" in fr,
+            "E when rung W2 stops collapsing the carrier arm is UNREADABLE, exactly as registered")
+        case("THRESHOLD-W3-W4", 0, "THRESHOLD-W3-W4", levels={"k01W3": 23.5})
+        case("GRADED-ABOVE-THRESHOLD-W2", 0, "GRADED-ABOVE-THRESHOLD-W2", levels={"k01W3": 47.0})
+        case("GRADED-ABOVE-THRESHOLD-W1", 0, "GRADED-ABOVE-THRESHOLD-W1", levels={"k01W2": 47.0})
+        case("GRADED-ABOVE-THRESHOLD-W3", 0, "GRADED-ABOVE-THRESHOLD-W3", levels={"k01W3": 23.5, "k01W4": 47.0})
+        case("NON-MONOTONE (W2 healthy, W3 collapsed)", 0, "NON-MONOTONE", levels={"k01W2": 70.0, "k01W3": 23.5})
+        case("ANCHOR-NOT-COLLAPSED", 0, "ANCHOR-NOT-COLLAPSED", levels={"k01W1": 45.0})
+        case("UNRESOLVED-REFERENCE (kLW4 unhealthy)", 0, "UNRESOLVED-REFERENCE", levels={"kLW4": 40.0})
+        _d, fr, _o = case("near bar: scalar = 0.50 x layerwise - 0.05 at W3", 0, "THRESHOLD-W3-W4",
+                          levels={"k01W3": 0.5 * 71.0 - 0.05})
+        _d, fr, _o = case("near bar: scalar = 0.50 x layerwise + 0.05 at W3", 0, "GRADED-ABOVE-THRESHOLD-W2",
+                          levels={"k01W3": 0.5 * 71.0 + 0.05})
+        case("near bar: gap = GAP_BAR - 0.05 at W4 (NOGAP)", 0, "THRESHOLD-W2-W3",
+             levels={"k01W4": 71.5 + 0.2 - GAP_BAR + 0.05, "kLW4": 71.5})
+        _d, fr, _o = case("near bar: CARW2 = kLW2 - MATCH + 0.05", 0, "THRESHOLD-W2-W3",
+                          levels={"CARW2": 70.0 - MATCH_BAR + 0.05})
+        chk("+CAR-REC" in fr, "E a carrier arm just inside the MATCH bar is CAR-REC")
+        _d, fr, _o = case("near bar: CARW2 = kLW2 - MATCH - 0.05", 0, "THRESHOLD-W2-W3",
+                          levels={"CARW2": 70.0 - MATCH_BAR - 0.05})
+        chk("+CAR-PART" in fr, "E a carrier arm just outside the MATCH bar is CAR-PART")
+        _d, fr, _o = case("CARW2 at the floor (the ADVERSE carrier reading)", 0, "THRESHOLD-W2-W3",
+                          levels={"CARW2": 24.5})
+        chk("+CAR-NULL" in fr, "E a carrier mask that does not lift the run is CAR-NULL -- registered as adverse")
+        _d, fr, _o = case("mixed hardware (NON-GATING)", 0, "THRESHOLD-W2-W3",
+                          gpu={("kLW3", 147): "NVIDIA GeForce RTX 2080 Ti, 11264 MiB"})
+        chk("HW-MIXED" in fr, "E mixed hardware changes a STAMP only, never the account")
+        _d, fr, _o = case("anchor far from cwd3", 0, "THRESHOLD-W2-W3", levels={"k01W1": 16.0})
+        chk("ANCHOR-DIFFERS-FROM-CWD3" in fr, "E an anchor more than 5 pp from cwd3's k01 is stamped (non-gating)")
+        case("diverged arm", 0, "UNRESOLVED-DIVERGED", over={("k01W2", 147): 45.0})
+        case("floor: every arm under 15", 1, "HARNESS-UNSOUND", levels=dict((a, 5.0) for a in ARMS))
+        for lab, kw in (("ENV break", {"env_break": ("k01W2", 146)}),
+                        ("ARGS grain break (a scalar arm says layerwise)", {"spec_break": ("k01W3", 147)}),
+                        ("ARGS grain break (a layerwise arm says scalar)", {"spec_break": ("kLW1", 148)}),
+                        ("ARGS wd break: W4 arm carries the anchor's 0.1", {"wd_break": (("k01W4", 146), "0.1")}),
+                        ("ARGS wd break: W2 arm carries W3's 1e-3", {"wd_break": (("kLW2", 147), "1e-3")}),
+                        ("ARGS wd break: a fifth, unregistered wd value", {"wd_break": (("k01W3", 148), "3e-3")}),
+                        ("DECAY_MASK witness off on CARW2", {"dm_break": (("CARW2", 148), "DECAY_MASK: off")}),
+                        ("CARW2 carries the wd=0.1 witness (the WRONG-RUNG mask)",
+                         {"dm_break": (("CARW2", 146), B.WITNESS_DM[CAR].replace("wd=0.01", "wd=0.1"))}),
+                        ("DECAY_MASK on a ladder arm", {"dm_break": (("k01W2", 147), B.WITNESS_DM[CAR])}),
+                        ("a COMP_HOLD line", {"extra_break": (("k01W1", 146), ["COMP_HOLD: off"])}),
+                        ("manifest break (a rung's wd swapped)",
+                         {"manifest": D.manifest_text(B).replace("ARMWD k01W4 RUNG W4 WD 5e-4", "ARMWD k01W4 RUNG W4 WD 1e-3")}),
+                        ("prov HF = cvt8's", {"prov": {"HF_SHA256": B.HF_PARENT_SHA}}),
+                        ("prov scorer sha", {"prov": {"SCORER_SHA256": "0" * 64}}),
+                        ("prov design sha", {"prov": {"DESIGN_SHA256": "1" * 64}}),
+                        ("prov cwd_design sha", {"prov": {"CWD_DESIGN_SHA256": "3" * 64}}),
+                        ("prov common sha", {"prov": {"COMMON_SHA256": "2" * 64}}),
+                        ("prov runner = cvt8's", {"prov": {"RUNNER_SHA256": B.RUNNER_PARENT_SHA}}),
+                        ("prov MODE dry-run", {"prov": {"MODE": "dry-run"}})):
+            case("harness: %s" % lab, 1, "HARNESS-UNSOUND", **kw)
+        for lab, pb in (("k01W1 Lion broken", {("k01W1", 147): _e_records("k01W1", 147, touch=True)}),
+                        ("kLW4 Lion broken (62 groups)", {("kLW4", 146): _e_records("kLW4", 146, touch=True)}),
+                        ("a layerwise arm's records carry 1 group", {("kLW2", 148): _e_records("kLW2", 148, ng=1)}),
+                        ("a scalar arm's records carry 62 groups", {("k01W3", 146): _e_records("k01W3", 146, ng=62)}),
+                        ("dm keys on a ladder arm", {("k01W4", 147): _e_records("k01W4", 147, adddm=True)}),
+                        ("a hold key on kLW1", {("kLW1", 146): _e_records("kLW1", 146, add_bh=True)}),
+                        ("short probe file", {("k01W2", 148): _e_records("k01W2", 148)[:499]}),
+                        ("garbled record", {("kLW3", 146): _e_records("kLW3", 146)[:499] + ["{not json"]})):
+            case("G-BITE LADDER gate: %s" % lab, 1, "PATCH-NOT-VERIFIED", probe_break=pb)
+        case("G-BITE LADDER gate: missing probe file", 1, "PATCH-NOT-VERIFIED", probe_drop=("kLW2", 147))
+        for lab, pb in (("CARW2 without dm keys (THE DANGEROUS NULL)", {("CARW2", 146): _e_records("CARW2", 146, nodm=True)}),
+                        ("CARW2 records carry k = 2", {("CARW2", 147): _e_records("CARW2", 147, k=2)}),
+                        ("CARW2 dm_skipped forged", {("CARW2", 148): _e_records("CARW2", 148, dmforge="skipped")}),
+                        ("CARW2 dm_n off by one", {("CARW2", 146): _e_records("CARW2", 146, dmforge="n")}),
+                        ("CARW2 zero dm_wdterm", {("CARW2", 147): _e_records("CARW2", 147, dmforge="zero-wdterm")}),
+                        ("CARW2 dm_norm not a list", {("CARW2", 148): _e_records("CARW2", 148, dmforge="types")})):
+            _d, fr, _o = case("G-BITE CARRIER gate: %s" % lab, 0, "THRESHOLD-W2-W3", probe_break=pb)
+            chk("CARRIER-PATCH-NOT-VERIFIED" in fr and "+CAR-PATCH-NOT-VERIFIED" in fr and "MASK-UPDATE-AND-TRACE" not in fr,
+                "E ... and it suppresses ONLY the carrier word: the ladder's token survives, as registered")
+        _dn, fn_null, out_null = case("the carrier DANGEROUS NULL would otherwise read as CAR-NULL", 0, "THRESHOLD-W2-W3",
+                                      levels={"CARW2": 24.5})
+        chk("+CAR-NULL" in fn_null,
+            "E the level a non-biting mask produces IS a registered adverse reading -- which is why the carrier gate exists")
+        case("dropped run -> INCOMPLETE", 2, "INCOMPLETE", drop=("kLW3", 148))
+        case("truncated resubmission beside a complete run is ignored", 0, "THRESHOLD-W2-W3", shadow=("k01W2", 147))
+
+        print("\n   O2 INVARIANCE: FINAL identical across corpora (bars never read the corpus)")
+        for lab, kw in (("THRESH-23", {}), ("ALL-VALUES", {"levels": {"k01W3": 23.5, "k01W4": 24.5}}),
+                        ("ONLY-AT-0.1", {"levels": {"k01W2": 70.0}}),
+                        ("GRADED-W2", {"levels": {"k01W3": 47.0}})):
+            n[0] += 1
+            d = os.path.join(tmp, "o%03d" % n[0])
+            os.makedirs(d)
+            _e_build(d, tpl, **kw)
+            fins = dict((k, _e_score(d, v)[1]) for k, v in csvs.items())
+            chk(len(set(fins.values())) == 1 and "real+invented" in fins,
+                "O2 %-11s %s" % (lab, "real+invented " + " ".join(sorted(fins))),
+                "" if len(set(fins.values())) == 1 else str(fins)[:200])
+        if "real+invented" in csvs:
+            a1 = S9.pooled_sigma(ce.filter_rows(list(csv.DictReader(open(csvs["real"])))), S9.net_is(NET))[0]
+            a2 = S9.pooled_sigma(ce.filter_rows(list(csv.DictReader(open(csvs["real+invented"])))), S9.net_is(NET))[0]
+            chk(a1 is not None and a2 is not None and abs(a1 - a2) > 1e-3,
+                "O2 non-vacuity: the invented rows MOVE the filtered ResNet18_c100 sigma (%.4f -> %.4f), FINAL does not"
+                % (a1, a2))
+
+        print("\n   THE DOCUMENTED ONE-ARGUMENT INVOCATION")
+        d = os.path.join(tmp, "doc")
+        os.makedirs(d)
+        _e_build(d, tpl)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL: THRESHOLD-W2-W3 |" in p.stdout,
+            "`python3 cWD5_wdladder_score.py <runsdir>` exits 0 and prints FINAL")
+        os.remove([os.path.join(d, f) for f in os.listdir(d) if f.startswith("cwd5-kLW3-s147")][0])
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 2 and "FINAL: INCOMPLETE" in p.stdout, "... and on a dropped run exits 2 (INCOMPLETE)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nF. TOTALITY: decide() over 8,000 random draws returns a registered token")
+    rnd = random.Random(281)
+    bad = 0
+    for _ in range(8000):
+        M = dict((a, rnd.uniform(0, 85)) for a in ARMS)
+        t, w = decide(M, rnd.random() < 0.05, rnd.random() < 0.9)
+        bad += t not in TOKENS
+    chk(bad == 0, "F every draw's token is registered", "%d bad" % bad)
+    bad2 = 0
+    for _ in range(4000):
+        M = dict((a, rnd.uniform(0, 85)) for a in ARMS)
+        t, w = decide(M)
+        if t in ACCOUNT_TOKENS:
+            bad2 += not (w and w.count("+") == 4 and w.endswith(("+CAR-REC", "+CAR-PART", "+CAR-NULL", "+CAR-UNREADABLE")))
+    chk(bad2 == 0, "F every account draw prints a four-rung state word plus exactly one carrier word", "%d bad" % bad2)
+
+    print("\n%s" % ("SELFTEST PASS" if not GATE_FAIL else "SELFTEST FAIL: %d  %r" % (len(GATE_FAIL), GATE_FAIL[:10])))
+    return 0 if not GATE_FAIL else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--csv", default=S9.DEFAULT_CSV)
+    ap.add_argument("--manifest", default="")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt", default="")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir is required")
+    rc, _fin = score(a.runsdir, a.csv, a.manifest)
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()

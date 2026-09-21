@@ -295,6 +295,32 @@ ADDED_PHASES = [{
     # MECH5_FIRST_ROW / MECH5_LAST_ROW are both 236; they are defined further down the file, so the ID is written out.
     "experimentIds": ["MT236"],
     "source": "docs/CORRECTIONS.md 278 at 97eb049",
+}, {
+    # cwd4, the batch that decomposes cwd3's three-carrier mask: registered, proved and launched on 20 Sep (CORRECTIONS
+    # 280, campaign commits 5f16f40-edf3bfa), scored the same afternoon (5b5b372), ingested at 8b9fbd2 (corpus 3,268 ->
+    # 3,289) and written up at 26baf4a (CORRECTIONS 283). A separate phase from phase-12: that phase asked whether the
+    # three nominated carriers' own decay is enough; this one asks whether the rescue is a matter of WHICH tensors or of
+    # HOW MANY, with a class-pure matched pair at count two and a dose ladder of three single-carrier arms.
+    "id": "phase-13", "date": "2026-09-20", "period": "20 Sep", "title": "Which carriers, or how many",
+    "test": "The coupled weight decay removed from the carrier PAIR against a class-pure, count-, width-, depth- and numel-matched carrier-free pair, and from each of the three carriers alone, every arm scalar and the three-carrier mask re-run in batch as the recovery reference",
+    "observed_result": "At matched count two the carrier pair recovers and the matched non-carrier pair stays on the floor, and two of the three single carriers reach recovery alone, so the effect is not a function of count alone; but the third single lands far outside its registered band, the nearer of the two recovering singles clears its bar by 0.40 SE, and the term-magnitude and position-class rivals are both sharper than before",
+    "next_question": "Whether the ordering among the singles is identity, Kim's position class or term magnitude, none of which this network can separate",
+    # MECH6_FIRST_ROW / MECH6_STEP_ROW are both 237; they are defined further down the file, so the ID is written out.
+    "experimentIds": ["MT237"],
+    "source": "docs/CORRECTIONS.md 283 at 26baf4a",
+}, {
+    # cwd5, the coupled weight-decay ladder the area chair's corner-case charge made the gating experiment: registered,
+    # proved and launched on 20 Sep (CORRECTIONS 281, campaign commits 1d2a8b7-7ff4685), scored the same evening
+    # (bfda844), ingested at 91fcd57 (corpus 3,289 -> 3,316) and written up at 8554afa (CORRECTIONS 285), 20 Sep 22:41
+    # UTC. A separate phase from phase-13: that phase asks WHICH tensors inside the mechanism, this one asks whether the
+    # mechanism exists at all away from the campaign's own weight decay -- a scope question, not a decomposition.
+    "id": "phase-14", "date": "2026-09-20", "period": "20-21 Sep", "title": "Does the collapse exist at normal weight decays",
+    "test": "Four rungs of the base weight decay -- 0.1, 1e-2, 1e-3 and the standard CIFAR 5e-4 -- with BOTH grains run in batch at every rung, plus a carrier companion at the second rung",
+    "observed_result": "The collapse is present at the campaign's coupled 0.1 and absent at all three lower rungs, where the scalar arm is if anything slightly ahead of its own layerwise arm; four rungs bracket the change between 1e-2 and 0.1 and locate nothing inside that decade, and the carrier companion is unreadable because its rung did not collapse",
+    "next_question": "Where inside the unrun decade the configuration breaks, and whether decoupled weight decay behaves the same way",
+    # MECH6_LAST_ROW is 238; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT238"],
+    "source": "docs/CORRECTIONS.md 285 at 8554afa",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -427,7 +453,9 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     for commit, expected in [(LANDED_COMMIT, INTERVENTIONS_TSV_SHA256), (CVT23_COMMIT, CVT23_INTERVENTIONS_TSV_SHA256), (CVT45_COMMIT, CVT45_INTERVENTIONS_TSV_SHA256),
                              (CVT67_COMMIT, CVT67_INTERVENTIONS_TSV_SHA256), (CVT89_COMMIT, CVT89_INTERVENTIONS_TSV_SHA256),
                              (MUST_COMMIT, MUST_INTERVENTIONS_TSV_SHA256), (MECH4_COMMIT, MECH4_INTERVENTIONS_TSV_SHA256),
-                             (MECH5_COMMIT, MECH5_INTERVENTIONS_TSV_SHA256)]:
+                             (MECH5_COMMIT, MECH5_INTERVENTIONS_TSV_SHA256),
+                             (MECH6_CWD4_INGEST_COMMIT, MECH6_CWD4_INTERVENTIONS_TSV_SHA256),
+                             (MECH6_INGEST_COMMIT, MECH6_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -438,7 +466,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
     for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS,
-                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS}.items():
+                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS, **MECH6_INTERVENTIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as a patch intervention with an ARGS-value witness")
@@ -446,7 +474,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
             runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": False}
     # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
     # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
-    for eid, spec in MUST_ARGS_DEVIATIONS.items():
+    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if not is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
@@ -580,6 +608,28 @@ def is_args_deviation(witness: str) -> bool:
     return witness.split(":", 1)[0] in ARGS_KINDS
 
 
+# CORRECTIONS 284's TWO-AXIS row: a run that BOTH deviates on an ARGS value AND prints an ON "<KIND>:" line, which one
+# witness column cannot describe. The campaign writes both axes into the intervention cell, the ARGS flag first and each
+# patch clause after it, separated by " + "; the witness column carries the ARGS witness and the patch's own ON line is
+# read back from the run's own log. A patch spec may itself contain "+" (DECAY_MASK=a+b+c), so the axes split on the
+# spaced separator alone. cwd5's CARW2 is the corpus's first such row.
+ARGS_AXIS_SEPARATOR = " + "
+
+
+def args_axes(intervention: str) -> tuple[str, list[str]]:
+    """(the ARGS flag clause, [further patch clauses]) for a one- or two-axis ARGS-value exclusion row."""
+    parts = [part.strip() for part in intervention.split(ARGS_AXIS_SEPARATOR)]
+    if not parts[0] or any(not part for part in parts):
+        raise ValueError(f"Unreadable two-axis intervention in {INTERVENTIONS_TSV}: {intervention!r}")
+    return parts[0], parts[1:]
+
+
+def args_extra_kinds(intervention: str) -> list[tuple[str, str]]:
+    """[(patch, value), ...] for the PATCH axes of a two-axis ARGS-value row, in the order written; [] for one axis."""
+    _flag_clause, rest = args_axes(intervention)
+    return intervention_kinds(" ".join(rest)) if rest else []
+
+
 def args_deviation(intervention: str, witness: str) -> tuple[str, str, str, str]:
     """(kind, flag, value, standard value) for an ARGS-value exclusion row, or a ValueError."""
     kind, sep, rest = witness.partition(": ")
@@ -589,8 +639,11 @@ def args_deviation(intervention: str, witness: str) -> tuple[str, str, str, str]
     expected, standard, _name = ARGS_KINDS[kind]
     if not equals or not value or flag != expected or " " in rest:
         raise ValueError(f"Unreadable ARGS-value witness in {INTERVENTIONS_TSV}: {witness!r}")
-    if intervention != f"--{flag} {value}":
-        raise ValueError(f"The {kind} intervention cell must be the flag as written on the command line: {intervention!r}")
+    flag_clause, extra = args_axes(intervention)
+    if flag_clause != f"--{flag} {value}":
+        raise ValueError(f"The {kind} intervention cell must open with the flag as written on the command line: {intervention!r}")
+    if extra:
+        args_extra_kinds(intervention)  # every further axis must be a known patch kind with a value
     if args_equal(value, standard):
         raise ValueError(f"{kind} lists the standard value {standard} as a deviation")
     return kind, flag, value, standard
@@ -1960,6 +2013,141 @@ def mech5_rows(lines: list[str]) -> list[dict]:
     return with_interventions(appended_rows(lines, MECH5_ROWS, MECH5_FIRST_ROW, MECH5_LAST_ROW, MECH5_COMMIT), MECH5_INTERVENTIONS)
 
 
+# ---------------------------------------------------------------------------
+# 16. The cwd4 and cwd5 landings (CORRECTIONS 283 and 285): two appended rows, in two steps.
+# ---------------------------------------------------------------------------
+# Campaign commit 26baf4a (cycle 158, CORRECTIONS 283) appended the cwd4 landing as MASTER-TABLE line 237 and recounted
+# header line 3; campaign commit 8554afa (cycle 159, CORRECTIONS 285) appended the cwd5 landing as line 238 and recounted
+# header line 3 again. Neither step amended any earlier row, neither touched line 5, and no line moved. The two rows import
+# together because the cwd4 landing said so in its own commit message ("THE SITE IS NOT TOUCHED -- rows 237 and 238 import
+# together"), not because they answer one question: they get a phase each.
+#
+# BOTH ROWS ARE MIXED, and neither is Goal met by default. The MT218-MT236 precedent grants Goal met only when the fired
+# account returns its registered branch AND its registered state word in the registered direction, NO registered account
+# misses a band, and NO control fails (MT230's note). Each row fails a different half of that test:
+#   * MT237 (cwd4) answers its question and refutes the count / dose rival, but the fired account's OWN registered level
+#     band for ONE53 is K01 (18-28) and ONE53 landed at 58.5780. A registered expectation is defied, exactly as at MT231
+#     (cmg1), where ACCOUNT-A3-MERGE-HARMLESS was ruled "a BRANCH match only" because no account's levels were reproduced.
+#     The verdict's second token additionally turns on a near bar (ONE50's REC by +0.40 SE), which the row itself labels
+#     DESCRIPTIVE / UNSURE -- MT231's other reason for Mixed.
+#   * MT238 (cwd5) hits every registered band on the ladder (all four scalar rungs and all four layerwise references) and
+#     no control fails, but the batch's SECOND registered question -- whether the carrier account still holds wherever the
+#     collapse still exists (281.3) -- is unanswerable at this cell: CARW2 was pre-registered to be read ONLY if rung W2
+#     collapses, W2 is NOGAP, so CAR-UNREADABLE fires and nothing is read from 71.8327. That is MT228's (cmo1's)
+#     ISO-UNREADABLE at wd 0 repeating one rung higher, and the registered scorer says so in those words.
+# Neither row corrects an earlier PUBLISHED notebook claim, so neither carries a Corrected badge: every wording the two
+# refute passes fixed was the landing reports' own, fixed inside the same entries before any of it reached the register.
+MECH6_STEP_COMMIT = "26baf4a154bebd1332f2454cd67d700ec4af6e1a"
+MECH6_STEP_MASTER_TABLE_SHA256 = "a34406c0b0d4f414792186ab15d70bd49c8b8f22a05aeea69351aac4b3fcc674"
+MECH6_COMMIT = "8554afae4008a92f612d67f194db4ec186630fb9"
+MECH6_MASTER_TABLE_SHA256 = "eac919a3c4ef45c60c49c673eb8f6f3851fe26d3e33bf3e2b2ed141879e30f86"
+MECH6_FIRST_ROW, MECH6_STEP_ROW, MECH6_LAST_ROW = 237, 237, 238
+MECH6_EDITED_LINES = {3}  # each step recounted the run / GPU-hour header and nothing else; line 5 was left alone twice.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH6_ROWS = {
+    237: ("mixed", 9, ["cwd4"], ["page-19"], None, "ONE-SUFFICES-PARTIAL + TWO-REC+CTL2-NULL+ONE50-REC+ONE53-PART+ONE59-REC: the question is answered and 278's COUNT / DOSE rival is REFUTED at this cell -- at MATCHED count two P_2SPEC = TWOWD0 - CTL2WD0 = 67.0713 - 22.8547 = +44.2167 pp = +83.94 SE, the class-pure, count-, width-, depth- and numel-matched carrier-free pair {47, 56} stays on k01's floor while the carrier pair {50, 53} recovers, and one carrier alone reaches REC (ONE59 67.9567, P_ONE59 +45.1353 pp = +85.69 SE), so the effect is not a function of the number of masked scales alone and WRITEUP-mechanism's O-12 closes; at probe record 0 the removed decay dm_wdterm is a pure function of k and bit-identical across seeds, so TWOWD0 and CTL2WD0 remove NUMERICALLY IDENTICAL weight decay at initialisation and still differ by +44.2167 pp. Every gate passes, the registered scorer exits 0 UNEDITED on both hosts and again on the post-ingest corpus, an independent parser rebuilds all 359 printed lines with 0 mismatches and 0 violations, G-BITE passes 21/21 with a positive dm_wdterm on 9,000 of 9,000 masked records and a cross-read that refuses every wrong-k read, and the anchors replicate cwd3 in batch. BUT A REGISTERED EXPECTATION IS DEFIED: the fired account's own registered LEVEL BAND for ONE53 is K01 (18-28), and ONE53 landed at 58.5780 -- +35.7567 pp = +67.88 SE above k01, outside K01, outside PART (32-55) and outside FREE (62-78) -- so ONE-SUFFICES-PARTIAL is a BRANCH and STATE-WORD match whose level prediction for the non-sufficing carrier is missed by about 30 pp, as MT231's ACCOUNT-A3-MERGE-HARMLESS was a branch match only. The verdict's second token also turns on a NEAR BAR: ONE50's REC clears the in-batch 65.0100 bar by +0.2133 pp = +0.40 SE, far inside the 1.053511 pp half-width, so the ONE50-REC token and any 'two of the three singles suffice' phrasing are DESCRIPTIVE / UNSURE by the row's own words, while ONE59's REC, ONE53's PART and TWOWD0's REC are resolved. Bounded, and led with: CTL2WD0's NULL is a LOCATION at k01's floor and a BOUND, never a measured zero -- P_CTL2 +0.0333 pp = +0.06 SE with a +/-2 SE interval [-1.0202, +1.0868] that SPANS ZERO and per-seed signs that flip -- so the licensed form is 'leaves the run at k01's floor' and never 'does nothing'. The MAGNITUDE rival is NOT refuted and this batch makes it MORE attractive, not less: the three singles' levels are in exactly the mean-|L| rank order with both gaps resolved, re-derived IN BATCH on cwd4's own k01 pinned records at 140.1x between the smallest carrier and the largest admissible control, so MAGNITUDE-NOT-SEPARATED and CTL-NOT-MAGNITUDE-MATCHED stand unconditionally and no sentence may read the result as tensor identity. Position class now bites at count ONE -- the two REC singles {50, 59} are both Kim gamma_last and the PART single {53} is gamma_down -- and the dose ladder is NOT cleanly monotone at the point estimates, ONE59 exceeding the carrier pair by +0.8853 pp = +1.68 SE, not resolved. One switch changes the weight update and the meta trace together, so no route is isolated; one network, one cell, ONE weight-decay value (coupled 0.1), every arm scalar with no layerwise arm, one 100-epoch horizon, three seeds, and sigma is the frozen prior 0.645141, so every SE is conservative. A refute pass could not refute the verdict and produced six corrections and two hardenings, three of them floor-as-magnitude wording of the class 164.6 forbids; one RULE 16 defect is REPORTED and NOT fixed, a literal '100 %%' printed by two bare print() calls in the scorer's not-licensed block, read by no bar, level, contrast, branch or stamp."),
+    238: ("mixed", 9, ["cwd5"], ["page-19"], None, "THRESHOLD-W1-W2 + W1-COLLAPSE+W2-NOGAP+W3-NOGAP+W4-NOGAP+CAR-UNREADABLE: the ladder's own question is answered in a registered direction, adversely, and the answer was written out in advance as a reachable one -- the shared-step-size collapse is PRESENT at the campaign's coupled weight decay 0.1 and ABSENT at 1e-2, 1e-3 and 5e-4. CO-PRIMARY G_W4 = kLW4 - k01W4 = 67.8813 - 72.4080 = -4.5267 pp = -8.59 SE, +/-2 SE [-5.5802, -3.4732], negative on all three seeds: at the STANDARD CIFAR weight decay the layerwise arm is BELOW the scalar arm. G_W1 = +46.0700 pp = +87.46 SE, G_W2 = -1.0893 pp = -2.07 SE, G_W3 = -4.1607 pp = -7.90 SE. No state is near-bar (W1 collapses by 11.4230 pp; W2 / W3 / W4 sit 35.2203 / 38.3293 / 38.4673 pp above their own rungs' collapse bars), the account replicates on every individual seed, the anchor replicates cwd3's k01 in batch at +0.2387 pp so the threshold is not a failed-anchor artefact, both grains ran AT EVERY RUNG so no gap is cross-batch, and every registered LEVEL BAND is hit -- all four scalar rungs and all four layerwise references land where THRESHOLD-W1-W2 said they would. No control fails: every rung's layerwise reference is healthy, the mask bit on 1,500 of 1,500 masked records, and the CAR-NULL null is excluded by evidence. BUT THE BATCH'S SECOND REGISTERED QUESTION IS UNANSWERABLE AT THIS CELL: the carrier companion CARW2, registered to say whether the carrier account still holds wherever the collapse still exists, was pre-registered to be read ONLY if rung W2 collapses; W2 is NOGAP, so CAR-UNREADABLE fires, P_CARW2 and D_CARW2 were never computed, and 71.8327 is a LEVEL from which nothing is read -- not that the carrier account holds at 1e-2, not that it fails. That is MT228's ISO-UNREADABLE at weight decay 0 repeating one rung higher, named in those words by the registered scorer, and the risk was registered rather than hidden. Because the mask DID bite, it is a design-scope limit and not a patch failure. Bounded, and led with: FOUR rungs can only BRACKET a transition and never locate one, so the change lies somewhere in the UNRUN interval between 1e-2 and 0.1 and nothing inside that decade may be named -- neither a threshold value nor 'the collapse exists only at 0.1' (LADDER-IS-FOUR-POINTS). G_W1 is a floor LOCATION, so its SIZE is where the arm landed and not a measured effect; each NOGAP is a bound in the other direction, 'below the 10 pp bar', never 'the two grains are equal'. G_W2 is NOT resolved, its +/-2 SE interval [-2.1428, -0.0358] ending 0.04 pp from zero, and may not be pooled with W3 and W4. What is identified is the CONJUNCTION of scalar grouping with a coupled decay at or near 0.1, not grouping alone and not decay alone; DECOUPLED decay is untested in either direction and descoped with reasons, and which route the decay acts through is not separated. One network, one cell otherwise, one 100-epoch horizon, three seeds, sigma the frozen prior 0.645141. The consequence the registration wrote in advance: this is the area chair's CORNER-CASE charge LANDING, WRITEUP-mechanism's O-14 closes against the generality of the result, and the mechanism line must be written as a diagnostic of ONE extreme configuration -- a practitioner at 5e-4 will never meet this failure -- while wd 0.1 remains the parent paper's own value, so nothing is retracted and only the scope moves from assumed to measured. A refute pass could not refute the verdict; it refuted one supporting claim, the scorer stage's provenance, which touches no scored quantity, and applied eight further wording fixes. One RULE 16 defect is REPORTED and NOT fixed: the scorer's DESCRIPTIVE gap-monotonicity stamp is suppressed by an unintended substring match on CAR-UNREADABLE, so the monotonicity is re-derived from the four G values and no stamp is quoted for it."),
+}
+# Earlier records these rows bear on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH6_BEARS_ON = {
+    237: ["MT236", "MT233"],           # cwd3's three-carrier mask decomposed to a matched pair and three singles; cwd1's network-wide mask
+    238: ["MT236", "MT233", "MT228"],  # the wd-0.1 mechanism results whose SCOPE the ladder measures, and cmo1's wd-0 endpoint
+}
+# The 18 intervened rows of the cwd4 ingest, all under the single DECAY_MASK kind (CORRECTIONS 269): 6 masked arms x 3
+# seeds. The 3 k01 runs print DECAY_MASK: off and own no row.
+MECH6_CWD4_INGEST_COMMIT = "8b9fbd2d83304b419a4193d5cb4283478a0e3d5a"
+MECH6_CWD4_INTERVENTIONS_TSV_SHA256 = "29327a9622170513214d2fcadd80b413575a047f6b440c483b1019eaa5a1ce55"
+MECH6_INTERVENTIONS = {
+    "MT237": {
+        "batch": "cwd4", "arms": {"CARWD0": 3, "TWOWD0": 3, "CTL2WD0": 3, "ONE50": 3, "ONE53": 3, "ONE59": 3},
+        "title": "cwd4's six masked arms run with the coupled weight decay switched off on a named set of BatchNorm scales",
+        "source": f"{INTERVENTIONS_TSV} at {MECH6_CWD4_INGEST_COMMIT[:7]}; CORRECTIONS 269, 280 and 283",
+        "note": "CARWD0, TWOWD0, CTL2WD0, ONE50, ONE53 and ONE59 ran PATCH_DECAYMASK, which sets the BASE optimiser's coupled weight decay to 0 on a named tensor set -- in the weight update AND in the meta trace. The batch needed NO new harness code: it runs from cwd1's tree and cwd1's runner unchanged, with the patch's registered name-list grammar used at new places, and a proof job on the real GPU path checked every name-list string against the live model before any arm was launched. CARWD0 masks the three ctd1 carriers (indices 50, 53 and 59, 1,536 parameters) and is the batch's IN-BATCH recovery reference, so no cwd3 level enters any bar; TWOWD0 masks the carrier pair {50, 53} and CTL2WD0 the class-pure, count-, width-, depth- and numel-matched carrier-FREE pair {47, 56}, both 1,024 parameters, which is the matched-count-two contrast cwd3 could not build; ONE50, ONE53 and ONE59 mask one carrier each, 512 parameters, turning the contrast into a dose ladder 1 / 2 / 3 on the carrier side. No CSV column records a weight-decay mask, so the run inventory writes all six arms with the plain scalar cell key: they are NOT plain measurements of that cell. The 18 rows are listed in results/CORPUS-EXCLUSIONS.tsv under the DECAY_MASK witness kind added at CORRECTIONS 269 -- one kind only, no run of this batch carries a second -- and every witness was generated from the run's own log rather than typed, then cross-checked against the run tree's own PARTITION-MANIFEST.txt with 0 mismatches. Drop them before pooling runs by cell. The three k01 runs print DECAY_MASK: off and are ordinary measurements of their cell.",
+    },
+}
+# The 21 ARGS-deviating rows of the cwd5 ingest: 7 non-anchor arms x 3 seeds under the ARGS_WD_BASE kind (CORRECTIONS 263).
+# CARW2's three rows are the corpus's first TWO-AXIS rows (CORRECTIONS 284): a run that BOTH deviates on an ARGS value and
+# prints an ON <KIND> line. They are listed with the ARGS witness, and their DECAY_MASK line is held in the intervention
+# cell's second clause and read back from the run's own log.
+MECH6_INGEST_COMMIT = "91fcd57b700962e7b5aaa75508f102dad430bd89"
+MECH6_INTERVENTIONS_TSV_SHA256 = "4e6d938745fade2eb02dbbda79bc1bc096d5f077c9092b5dd4ef2b10cfbfc7db"
+MECH6_ARGS_DEVIATIONS = {
+    "MT238": {
+        "batch": "cwd5", "arms": {"k01W2": 3, "kLW2": 3, "k01W3": 3, "kLW3": 3, "k01W4": 3, "kLW4": 3, "CARW2": 3},
+        "title": "cwd5's three lower rungs differ from the standard cell in the base weight-decay flag, and its carrier companion deviates on TWO axes at once",
+        "source": f"{INTERVENTIONS_TSV} at {MECH6_INGEST_COMMIT[:7]}; CORRECTIONS 263, 281, 284 and 285",
+        "note": "cwd5 varies ONE axis, --weight-decay-base, across four rungs: 0.1 (the campaign's own value, the anchor), 1e-2, 1e-3 and 5e-4, with BOTH grains run in batch at every rung. results/all_runs.csv has no column for a base-optimiser CLI flag, so the 18 runs of the three lower rungs carry the plain 0.1 cell key of their own grain: seed for seed they differ from their anchor arm only in run, job_id, node, wallclock_min and the accuracy columns. They are NOT measurements of the standard cell. There is no PATCH ON line to read for them, because no patch ran: the witness is the run's OWN ARGS: line, the one prefix every run prints, read with argparse last-wins semantics, and each row is listed under the ARGS-value witness kind ARGS_WD_BASE added at CORRECTIONS 263. The three CARW2 runs are different and are the corpus's FIRST TWO-AXIS rows: they deviate on --weight-decay-base 1e-2 AND run PATCH_DECAYMASK on the three ctd1 carriers, so a single witness column cannot describe them. CORRECTIONS 284 registered the shape they use -- listed with the ARGS witness, the DECAY_MASK: on line held beside it and checked against the run's own log -- and the campaign's checker verifies both axes. The six anchor runs at the standard 0.1 deviate on nothing and own no row. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md is append-only across the whole cycle: only the closing "Next free number" trailer is ever replaced.
+# 279-282 were appended between the cwd3 landing and the cwd4 registration (7ff4685), 283 by the cwd4 landing itself
+# (26baf4a), 284 by the two-axis code gap (5045875), 285 by the cwd5 landing (8554afa) and 286 by the post-landing
+# verification (72c4902). The two ingest commits 8b9fbd2 and 91fcd57 touched results/ alone and no entry at all.
+MECH6_PREVIOUS_COMMIT = "7ff46858ad4dfd5bcbac604706c4108b9426f085"
+MECH6_PREVIOUS_CORRECTIONS_SHA256 = "c8226da5aef49f88d4af1214870d62ce77489fb7e99f27aba0bee0afe44b79a6"
+MECH6_STEP_CORRECTIONS_SHA256 = "c0b243624a18eb41ec44e24d1c30fb366ed8c540e479db94096adff175032380"
+MECH6_GAP_COMMIT = "504587580f2343e7003b012ae9fff22afb94d584"
+MECH6_GAP_CORRECTIONS_SHA256 = "06dea902b5bcf1f3356a7e6c2c89f18a952a619189fac97def6e9dd81ea79c01"
+MECH6_CORRECTIONS_SHA256 = "c5cb62e4036f2b9b9dc22b429a226ff5a46509a906dc4f27762d88011e7eef12"
+MECH6_PREVIOUS_ENTRIES = (279, 280, 281, 282)
+MECH6_STEP_ENTRIES = (283,)
+MECH6_GAP_ENTRIES = (284,)
+MECH6_ENTRIES = (285,)
+
+
+def mech6_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cwd4 and cwd5 landings; each step may edit header line 3 and append ONE row, and nothing else."""
+    before = mech5_master_table(repo)
+    for commit, expected, last in [(MECH6_STEP_COMMIT, MECH6_STEP_MASTER_TABLE_SHA256, MECH6_STEP_ROW),
+                                   (MECH6_COMMIT, MECH6_MASTER_TABLE_SHA256, MECH6_LAST_ROW)]:
+        raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{MASTER_TABLE}"])
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError(f"{MASTER_TABLE} at {commit[:12]} does not match the pinned cwd4/cwd5-landing bytes")
+        lines = raw.decode("utf-8").splitlines()
+        changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+        if len(lines) != last or len(before) != last - 1 or changed != MECH6_EDITED_LINES:
+            raise ValueError(f"MASTER-TABLE at {commit[:7]} moved a line or edited lines other than {sorted(MECH6_EDITED_LINES)}: {sorted(changed)}")
+        before = lines
+    mech6_corrections(repo)  # neither landing amends a row, so the append-only CORRECTIONS check rides here
+    return before
+
+
+def mech6_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at each step of the cwd4 / cwd5 cycle; append-only from the cwd3 landing through all four."""
+    steps = [(MECH6_PREVIOUS_COMMIT, MECH6_PREVIOUS_CORRECTIONS_SHA256, MECH6_PREVIOUS_ENTRIES),
+             (MECH6_STEP_COMMIT, MECH6_STEP_CORRECTIONS_SHA256, MECH6_STEP_ENTRIES),
+             (MECH6_GAP_COMMIT, MECH6_GAP_CORRECTIONS_SHA256, MECH6_GAP_ENTRIES),
+             (MECH6_COMMIT, MECH6_CORRECTIONS_SHA256, MECH6_ENTRIES)]
+    older = mech5_corrections(repo)[0]
+    previous = None
+    for commit, expected, entries in steps:
+        raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{CORRECTIONS_DOC}"])
+        if hashlib.sha256(raw).hexdigest() != expected:
+            raise ValueError(f"{CORRECTIONS_DOC} at {commit[:12]} does not match the pinned bytes")
+        later = raw.decode("utf-8").splitlines()
+        if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MUST_TRAILER):
+            raise ValueError(f"{CORRECTIONS_DOC} at {commit[:7]} does not append entries below the previous closing trailer")
+        if later[:len(older) - 1] != older[:-1]:
+            changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+            raise ValueError(f"{CORRECTIONS_DOC} at {commit[:7]} changed an earlier line: {changed[:8]}")
+        appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+        if [line.split(".")[0] for line in appended] != [f"## {number}" for number in entries]:
+            raise ValueError(f"{CORRECTIONS_DOC} at {commit[:7]} does not append exactly entries {entries}: {appended[:4]}")
+        previous, older = older, later
+    return older, previous
+
+
+def mech6_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 237-238 (cwd4, cwd5) and attach their exclusion notes.  Neither landing amends a row."""
+    rows = with_interventions(appended_rows(lines, MECH6_ROWS, MECH6_FIRST_ROW, MECH6_LAST_ROW, MECH6_COMMIT), MECH6_INTERVENTIONS)
+    for row in rows:
+        spec = MECH6_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
     """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
     lines, before = mech4_master_table(repo), must_master_table(repo)
@@ -2289,7 +2477,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + cvt23_rows(cvt23_master_table(Path(repo))) + cvt45_rows(cvt45_master_table(Path(repo)))
              + cvt67_rows(cvt67_master_table(Path(repo))) + cvt89_rows(cvt89_master_table(Path(repo)))
              + must_rows(must_master_table(Path(repo))) + mech4_rows(mech4_master_table(Path(repo)))
-             + mech5_rows(mech5_master_table(Path(repo))))
+             + mech5_rows(mech5_master_table(Path(repo)))
+             + mech6_rows(mech6_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)
