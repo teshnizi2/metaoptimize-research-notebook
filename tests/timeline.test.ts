@@ -21,14 +21,14 @@ test('newest-first timeline retains documented windows and every original CSV ob
   const { researchTimeline } = await helpers();
   const rows = researchTimeline(data.activity, data.experiments);
   const csv = Papa.parse<Record<string, string>>(readFileSync(new URL('../public/assets/tables/research_timeline.csv', import.meta.url), 'utf8'), { header: true, skipEmptyLines: true }).data;
-  assert.equal(rows.length, 19);
+  assert.equal(rows.length, 20);
   // phase-13 and phase-14 share a date (the cwd5 landing is 2026-09-20 22:41 UTC), and so do phase-15 and phase-16 (caw2 and
-  // cgw1, both landed on 2026-09-22), phase-17 and phase-18 (crt1 and csh1, the same day) and phase-19 (cvl1, the same day), so
+  // cgw1, both landed on 2026-09-22), phase-17 and phase-18 (crt1 and csh1, the same day), phase-19 (cvl1, the same day) and phase-20 (g3b, the same day), so
   // the newest-first sort keeps each same-date group in register order.
-  assert.deepEqual(rows.map(row => row.id), ['phase-15', 'phase-16', 'phase-17', 'phase-18', 'phase-19', 'phase-13', 'phase-14', 'phase-12', 'phase-11', 'phase-10', ...Array.from({ length: 9 }, (_, i) => `phase-0${9 - i}`)]);
+  assert.deepEqual(rows.map(row => row.id), ['phase-15', 'phase-16', 'phase-17', 'phase-18', 'phase-19', 'phase-20', 'phase-13', 'phase-14', 'phase-12', 'phase-11', 'phase-10', ...Array.from({ length: 9 }, (_, i) => `phase-0${9 - i}`)]);
   assert.equal(csv.length, 8, 'the campaign timeline CSV is published unchanged');
-  // phase-09 through phase-19 are added by the notebook register (scripts/register_model.py ADDED_PHASES), not by the CSV.
-  rows.filter(row => !['phase-09', 'phase-10', 'phase-11', 'phase-12', 'phase-13', 'phase-14', 'phase-15', 'phase-16', 'phase-17', 'phase-18', 'phase-19'].includes(row.id)).forEach(row => {
+  // phase-09 through phase-20 are added by the notebook register (scripts/register_model.py ADDED_PHASES), not by the CSV.
+  rows.filter(row => !['phase-09', 'phase-10', 'phase-11', 'phase-12', 'phase-13', 'phase-14', 'phase-15', 'phase-16', 'phase-17', 'phase-18', 'phase-19', 'phase-20'].includes(row.id)).forEach(row => {
     const original = csv.find(entry => entry.phase.split('\n')[1] === row.title)!;
     assert.ok(original, `${row.title} must preserve a recorded CSV phase`);
     const [period, title] = original.phase.split('\n');
@@ -45,8 +45,8 @@ test('coverage deduplicates overlaps without dating unlinked records from the sn
   const rows = researchTimeline(data.activity, data.experiments);
   const phaseIds = new Set(rows.flatMap(row => row.experiments.map(entry => entry.id)));
   const unlinked = filterByResearchPhase(data.experiments, data.activity, 'unlinked');
-  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 101);
-  assert.equal(phaseIds.size, 100);
+  assert.equal(rows.reduce((sum, row) => sum + row.experiments.length, 0), 102);
+  assert.equal(phaseIds.size, 101);
   assert.equal(unlinked.length, 80);
   assert.ok(unlinked.every(entry => !phaseIds.has(entry.id)));
   assert.equal(phaseIds.size + unlinked.length, data.experiments.length);

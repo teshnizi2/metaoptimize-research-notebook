@@ -41,7 +41,7 @@ test('the record text makes the MUTE, DOSE and INJECT interventions visible', ()
 });
 
 test('the 15 cvt1 runs link to MT218, and exactly the 9 intervened runs are marked with their VOTE_W witness', () => {
-  assert.equal(runs.length, 3469);
+  assert.equal(runs.length, 3501);
   const cvt1 = runs.filter(run => run.batch === 'cvt1');
   assert.equal(cvt1.length, 15);
   assert.deepEqual([...record.runIds].sort(), cvt1.map(run => run.id).sort());

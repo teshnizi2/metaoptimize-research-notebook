@@ -1,0 +1,51 @@
+#!/bin/bash
+# cG3B_rule20.sh -- CORRECTIONS 299: RULE 20 at current coverage for `g3b` (a copy of cGW1_rule20.sh with g3b's
+# table; the ENV half is analysis/g3b_rule20_envaudit.py).  READ-ONLY: no accuracy number is opened.
+# analysis/argsline_guard.py is used UNEDITED from the stage.
+#   * `weight-decay-base` and `stepsize-groups` VARY BY ARM, so the batch-consistency half is given
+#     `--vary weight-decay-base --vary stepsize-groups` as well as `--vary seed --vary run-name`; the per-run half then
+#     pins BOTH to the arm's own registered value, so a run carrying another rung's decay is a PER-RUN VIOLATION.
+#   * the ENV line carries neither axis; the ENV half checks the single registered ENV line and the OFF witnesses.
+#   bash bin/cG3B_rule20.sh            (run from ~/stage_g3b on cluster_b)
+set +u
+source /etc/profile >/dev/null 2>&1
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+source /cluster/account_b/metaopt/envs/mo/bin/activate
+export METAOPT_WS=/cluster/account_b/metaopt
+WS=$METAOPT_WS; R=$WS/runs; P=g3b
+S="$(cd "$(dirname "$0")/.." && pwd)"
+G=$S/analysis/argsline_guard.py
+echo "RULE20 run utc=$(date -u +%FT%TZ) host=$(hostname) batch=$P guard_sha=$(sha256sum $G | cut -c1-16)"
+HF="--expect optimizer=HF --expect alg-base=SGDm --expect momentum-param-base=0.99 --expect alg-meta=Lion --expect momentum-param-meta=0.99 --expect Lion-beta2-meta=0.9 --expect weight-decay-meta=0 --expect dataset=CIFAR100 --expect batch-size=100 --expect max-time=999:00:00 --expect gamma=1"
+NET=ResNet18_c100
+echo "  .out files: $(ls $R/$P-*.out 2>/dev/null | wc -l)   with ARGS: $(grep -l -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | wc -l)   squeue: $(squeue -h -u account_b -o '%j %T' | awk -v p="^$P-" '$1 ~ p {print $2}' | sort | uniq -c | tr '\n' ' ')"
+OUT=$(python3 $G $R --name $P- --batch-consistency --strict --vary seed --vary run-name --vary weight-decay-base --vary stepsize-groups 2>&1); RC=$?
+echo "  BATCH-CONSISTENCY --name $P- --vary seed --vary run-name --vary weight-decay-base --vary stepsize-groups -> rc=$RC  $(echo "$OUT" | grep -E '^argsline_guard:|^VERDICT|no candidate|NONE carried|ACROSS-RUN|^    --' | tr '\n' ' ')"
+n=0; bad=0; noargs=0
+for f in $(ls $R/$P-*.out 2>/dev/null); do
+  b=$(basename $f .out); rn=${b%-*}; rest=${rn#$P-}; arm=${rest%-s*}; seed=${rest##*-s}
+  grep -q -m1 '^ARGS:' "$f" || { noargs=$((noargs+1)); continue; }
+  n=$((n+1))
+  case $arm in
+    *W1) WD=0.1;  SOK="170 171 172 173" ;;
+    *W4) WD=5e-4; SOK="170 171 172 173" ;;
+    *) bad=$((bad+1)); echo "  PER-RUN VIOLATION $b: UNKNOWN RUNG"; continue ;;
+  esac
+  case $arm in
+    ch*) GR=chunk771 ;; nd*) GR=nodewise ;; k01*) GR=scalar ;; kL*) GR=layerwise ;;
+    *) bad=$((bad+1)); echo "  PER-RUN VIOLATION $b: UNKNOWN GRAIN"; continue ;;
+  esac
+  case " $SOK " in *" $seed "*) ;; *) bad=$((bad+1)); echo "  PER-RUN VIOLATION $b: seed $seed is not registered at this rung"; continue ;; esac
+  E="$HF --expect meta-stepsize=1e-4 --expect alpha0=1e-3 --expect NN-name=$NET --expect num-epochs=100 --expect stepsize-groups=$GR --expect weight-decay-base=$WD"
+  O=$(python3 $G "$f" $E --expect seed=$seed --expect save-directory=$R/$P --expect run-name=$rn 2>&1); RCX=$?
+  NFG=$(echo "$O" | grep -o 'no repeated flag ([0-9]* flags)' | grep -o '[0-9]*')
+  if [ $RCX != 0 ] || [ "$NFG" != 20 ]; then bad=$((bad+1)); echo "  PER-RUN VIOLATION $b rc=$RCX flags=$NFG want 20 (wd=$WD grain=$GR)"; echo "$O" | grep -E '!!!|DESIGN|declared' | sed 's/^/      /'; fi
+done
+echo "  PER-RUN --expect ($P, each run pinned to its OWN rung's weight decay and its OWN grain): $n runs with an ARGS line checked, $bad violations, $noargs .out without ARGS yet"
+echo "  WD COVERAGE across the started runs (read from the runs' ARGS lines; the registered counts are on the next line):"
+echo "    registered: 0.1 x16, 5e-4 x16"
+grep -h -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | grep -o -- '--weight-decay-base [^ ]*' | sort | uniq -c | sed 's/^/    /'
+echo "  GRAIN COVERAGE (registered: 8 each):"
+grep -h -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | grep -o -- '--stepsize-groups [^ ]*' | sort | uniq -c | sed 's/^/    /'
+python3 $S/analysis/g3b_rule20_envaudit.py $R | sed 's/^/  /'
+echo "RULE20 end utc=$(date -u +%FT%TZ)"

@@ -35,11 +35,11 @@ test('MT219 is the cgn3 row, Goal met under the documented rules, with all 25 FI
   const master = data.sources.find(s => s.path === 'docs/MASTER-TABLE.md')!;
   assert.ok(record.sourceRefs.some(ref => ref.sourceId === master.id && ref.line === 219));
   assert.deepEqual(warningsOf('MT219').map(w => w.id), ['warning-MT219-verdict']);
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.runs], [180, 162, 3469]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.runs], [181, 163, 3501]);
 });
 
 test('the 12 cgn3 runs link to MT219 as 430-epoch GroupNorm runs with sanitized raw logs', () => {
-  assert.equal(runs.length, 3469);
+  assert.equal(runs.length, 3501);
   const cgn3 = runs.filter(run => run.batch === 'cgn3');
   assert.equal(cgn3.length, 12);
   assert.deepEqual([...record.runIds].sort(), cgn3.map(run => run.id).sort());

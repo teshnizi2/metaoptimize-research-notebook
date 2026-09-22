@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+# =============================================================================
+# g3b_attack_indep.py -- THE INDEPENDENT PARSER OF `g3b` (CORRECTIONS 299: the audit's CIFAR-100 cell -- ResNet18_c100,
+# SGDm 0.99 + Lion, ms 1e-4, alpha0 1e-3 -- at alpha-scaled weight decay 0.1 (W1, the in-batch anchor) and 5e-4 (W4,
+# PRIMARY) x {chunk771, nodewise, scalar, layerwise} x seeds {170..173}, 32 runs, jobs 5080798-5080829)
+#
+# It re-derives, FROM THE RAW RUN FILES ALONE (each run's `Epoch e, ... Test Accuracy` lines and its probe.jsonl), every
+# line the REGISTERED scorer analysis/cG3B_c100wd_score.py (sha f21f57bd...) prints, and compares that rebuild with one or
+# more committed scorer logs, line by line, in order.
+#
+#   python3 analysis/g3b_attack_indep.py <runsdir> <scorer-log> [<scorer-log> ...] --stage DIR --rows P
+#
+#   <runsdir>  $WS/runs on cluster_b or cluster_a-backup/runs_cluster_b on the Mac: the 32 `g3b-*.out` files at its top level (or
+#              under g3b/), the probe directories and PROVENANCE.txt under <runsdir>/g3b/.
+#   --stage    a `git archive 31792c4 -- analysis bin results ':!paper'` extraction: its scorer and design are HASHED
+#              (never imported) and its results/all_runs.csv + results/CORPUS-EXCLUSIONS.tsv give the disclosure count.
+#   --rows     results/g3b_exclusion_rows_PROPOSED.tsv: the 16 rows this landing owes (299.9), checked row for row
+#              against a rebuild from the runs' own file names and ARGS lines.
+#
+# INDEPENDENCE, deliberately (the cwd2 ... crt1 / cvl1 pattern):
+#   * it imports NOTHING from the repo: not cG3B_c100wd_score.py, g3b_design.py, corpus_exclusions.py, argsline_guard.py
+#     or any other module.  Stdlib only: hashlib, json, math, os, sys.
+#   * NO regular expressions and no shlex: `.out` lines are split on commas / colons / whitespace, file names on
+#     hyphens, the TSV on tabs, the CSV by a hand-written quote-aware splitter.
+#   * every bar, literal, sha, token, licence sentence and stamp name below is RE-TYPED from CORRECTIONS 299 and the
+#     registered scorer's docstring; the ARGS line and the ENV line are rebuilt from the design as written in 299.3.
+#
+# HOST INDEPENDENCE.  THIS parser's stdout names no path, host, time or Python version, so it is byte-identical on both
+# hosts when the run files are.  Two scorer lines are host-dependent and are MATCHED, not rebuilt byte for byte:
+# (1) `runsdir <path>`, matched by its prefix; (2) the G-PROV line, whose PROVENANCE path is host-dependent -- everything
+# after the path is rebuilt.
+#
+# WHAT IT ADDS BEYOND A REPLAY:
+#   [0] sync integrity: one digest over every run file's name and bytes (equal on both hosts <=> the sync is exact);
+#       PROVENANCE keys.
+#   [1] the design rebuilt from 299.3: 8 arms, 32 runs, the group counts, the job-id order.
+#   [2] every run's ARGS line rebuilt flag by flag and compared BYTE FOR BYTE, its ENV line byte for byte; G-ONCE (one
+#       ARGS / ENV line, each epoch once); no ON witness; RUN_DONE; every `Test Accuracy` line is a well-formed epoch line.
+#   [3] the probe structure (10,000 records at steps 0,5,..,49995; n_beta == m; beta list length 1 or 62; first record at
+#       ln(alpha0)) and box occupancy per SEED from the raw records.
+#   [4] every level, sigma, contrast, state, token, stamp and the FINAL recomputed.
+#   [5] line-by-line agreement with each committed log.
+#   [6] THE THREE QUESTIONS OF 299 answered from the numbers, bounds first.
+#   [7] what bounds the verdict: which seeds make W4 box-bound, the counterfactual rung state if the box gate were
+#       absent (DESCRIPTIVE, no token), leave-one-seed-out, sigma sensitivity, the realised shrink per arm.
+#   [8] the 16 exclusion rows owed at ingest, rebuilt and compared with the PROPOSED file.
+# =============================================================================
+
+import hashlib
+import json
+import math
+import os
+import sys
+
+# ---------------------------------------------------------------------------------------------------------------------
+# RE-TYPED LITERALS (CORRECTIONS 299.3-299.12 and the registered scorer's docstring / module constants)
+# ---------------------------------------------------------------------------------------------------------------------
+BATCH = "g3b"
+SCORER_SHA = "f21f57bdcceea3a3873b8399d09c38b98cb4c9270eda8892872cac0f260c9589"
+DESIGN_SHA = "f31f4ee407880a92688491ec5cb2563b66f941a56810210a4d958a9ba994d83e"
+HF_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+REG_COMMIT = "31792c4601863e47d8fc1eb7272db8272465ddbe"
+RUNNER_SHA = "a478739882d9cd158dd12922336d716ca23fe624d6dfee67e225e97fed118003"
+ENV_PRE = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default COS_WARMUP=default "
+           "SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=5 PROBE_DIR=")
+ENV_POST = " EB_RHO=na EB_LOG=0"
+
+RUNGS = ("W1", "W4")
+WD_TOK = {"W1": "0.1", "W4": "5e-4"}
+WD_VAL = {"W1": 0.1, "W4": 0.0005}
+GRAINS = ("ch", "nd", "k01", "kL")
+SPEC_OF = {"ch": "chunk771", "nd": "nodewise", "k01": "scalar", "kL": "layerwise"}
+M_OF = {"ch": 14595, "nd": 14600, "k01": 1, "kL": 62}
+SEEDS = (170, 171, 172, 173)
+ARMS = tuple(g + r for r in RUNGS for g in GRAINS)
+JOB0 = 5080798                       # 299.12: W1 798-813, W4 814-829; within each seed ch / nd / k01 / kL
+NEPOCH = 100
+STEPS_PER_EPOCH = 500
+PROBE = 5
+NREC = 10000
+LO, HI = -15.0, -2.3026
+ALPHA0 = 1e-3
+NTENS = 62
+
+SIGMA_PRIOR = 0.2734275099082097
+SIGMA_PRIOR_DF = 21
+SIGMA_DEMO = 0.636565585885168
+SIGMA_DEMO_DF = 274
+SURV = 0.30
+NULLBAR = 0.15
+POOL = 1.5602
+RES = 2.0
+HEALTH_MIN = 55.0
+DIVERGED = 2.5
+BOXFREE_MAX = 0.05
+BOX_EPS = 1e-3
+MATCH = 0.50
+DENOM_BAR = 1.0
+PL_LO, PL_HI = 95, 99
+WIN_STEP = 95 * 500
+LRWD_REF = 5e-5
+STD_RECIPE_REF = 5e-4
+SGD = 77.5927
+SGD_SD = 0.4259
+SGD_N = 3
+CDN1_GAP_IN = 5.6993
+LANDED_W1 = {"ch": 71.9648, "nd": 70.4220, "k01": 35.7920, "kL": 71.0827}
+CGW1_D = {"W1": 0.3693, "W4": 0.2410}
+CGW1_T4 = {"ch": 2.5590, "nd": 2.8000}
+BOUNDS = ("ONE-CELL-C100", "TWO-RUNGS", "ALPHA-INDEPENDENT-DECAY-NOT-TESTED", "W4-IS-A-NOMINAL-VALUE",
+          "DENOM-IS-CROSS-BATCH", "FLOOR-READINGS-ARE-BOUNDS")
+
+LICENCE = {
+    "AUDIT-SURVIVES": "at this ONE CIFAR-100 cell the uniform partition still beats the architecture-aligned one at "
+                      "matched count at alpha-scaled weight decay 5e-4 by at least the audit's own +0.30 pp bar, resolved "
+                      "at 2 SE.  TMLR: the count-matched sign is a finding at 5e-4 on the audit's second dataset; quote "
+                      "with the W4 bound (a nominal value, applied alpha-scaled).",
+    "AUDIT-VANISHES": "at 5e-4 the count-matched gap on this CIFAR-100 cell is at or below +0.15 pp -- a BOUND, not a "
+                      "measured zero -- while the in-batch anchor is above +0.15 at 0.1.  TMLR: the CIFAR-100 headline "
+                      "must be written as a finding AT alpha-scaled decay 0.1, this row beside it.",
+    "AUDIT-REVERSES": "at 5e-4 the ALIGNED partition beats the uniform one on this CIFAR-100 cell, resolved.  TMLR: the "
+                      "count-matched sign does not hold at the standard value on the second dataset; the headline "
+                      "must be reframed around its decay-dependence.",
+    "AUDIT-UNDECIDED": "D4 lies between the bars or is not resolved: report the interval; no seeds may be added after "
+                       "seeing it (108.6a); no survive / vanish sentence.",
+    "ANCHOR-UNREADABLE": "the in-batch anchor is diverged, unhealthy or box-bound; no rung is read.",
+    "ANCHOR-NOT-REPRODUCED": "the batch does not reproduce the audit effect at 0.1 on CIFAR-100, so nothing it measures "
+                             "at 5e-4 is about that effect; report the levels only.",
+    "UNRESOLVED-DIVERGED-W4": "a primary-rung partition arm is bimodal; no reading at 5e-4.",
+    "UNRESOLVED-UNHEALTHY-W4": "a primary-rung partition arm failed as a run; itself a fact about 5e-4 in this cell.",
+    "UNRESOLVED-BOXBOUND-W4": "a primary-rung partition arm is box-bound; the contrast is not an audit replication.  "
+                              "Itself a fact: at 5e-4 the step sizes reach the box.",
+    "SCALAR-BEATS-BEST": "plain scalar is ABOVE both audit partitions at 5e-4 by >= 0.30 pp, resolved: at the decay VALUE "
+                         "5e-4 applied alpha-scaled, on this CIFAR-100 cell, no audited partition beats a single shared "
+                         "step size -- cgw1's reading holds on the audit's second dataset.",
+    "SCALAR-TIES-BEST": "plain scalar is at most 0.30 pp below the better audit partition at the 2 SE lower edge -- a "
+                        "BOUND: at 5e-4 on this CIFAR-100 cell the partition buys nothing a single shared step size does "
+                        "not already get; the audit's practical significance must be qualified.",
+    "SCALAR-BELOW-BEST": "plain scalar is resolved below an audit partition by >= 0.30 pp at 5e-4 on this CIFAR-100 cell: "
+                         "partitioning still pays here, and cgw1's SCALAR-BEATS-BEST does NOT generalise to the second "
+                         "dataset; the TMLR draft must say so beside cgw1's row.",
+    "SCALAR-UNRESOLVED": "the scalar comparison is not resolved against the 0.30 pp bar; report the interval.",
+    "SCALAR-DIVERGED": "the scalar arm at 5e-4 is bimodal; no scalar reading.",
+    "SCALAR-COLLAPSED": "plain scalar FAILS at 5e-4 on this CIFAR-100 cell (< 55 %); the collapse is not confined to "
+                        "decay near 0.1 here; report it.",
+    "SCALAR-UNREADABLE": "a comparator partition arm at 5e-4 is unhealthy or diverged; no scalar reading.",
+    "DENOM-HOLDS": "the audit's CIFAR-100 MetaOptimize arm (chunk771, cdn1-m's configuration) run at the decay VALUE 5e-4 "
+                   "is still below the landed tuned SGD + cosine (cdn1, lr 0.1, wd 5e-4) by >= 1.0 pp, resolved: the "
+                   "denominator deficit is not an artefact of running the MetaOptimize arm at 0.1 (ICML-PLAN 1.16), at "
+                   "this cell, between batches, with the SGD arm's lr chosen on the test set (1.14).",
+    "DENOM-REVERSES": "at 5e-4 the chunk771 MetaOptimize arm is resolved ABOVE the landed tuned SGD by >= 0.30 pp: the "
+                      "denominator result was an artefact of the 0.1 decay at this cell; the TMLR denominator section "
+                      "must be rewritten.",
+    "DENOM-CLOSES": "at 5e-4 the chunk771 arm's deficit to the landed tuned SGD is below 1.0 pp at the +2 SE edge -- a "
+                    "BOUND: most of cdn1's +5.7 pp gap was the 0.1 decay; the denominator sentence may not be quoted "
+                    "without this row.",
+    "DENOM-UNRESOLVED": "the chunk771 arm's gap to the landed tuned SGD at 5e-4 is not resolved against the 1.0 pp bar; "
+                        "report the interval.",
+    "DENOM-UNREADABLE": "the chunk771 arm at 5e-4 is unhealthy or diverged; no denominator reading.",
+}
+
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DIGITS = "0123456789"
+
+OUT = []
+NPASS = [0]
+NFAIL = [0]
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def check(cond, label):
+    if cond:
+        NPASS[0] += 1
+    else:
+        NFAIL[0] += 1
+    P("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def sha_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        while True:
+            b = fh.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def amean(v):
+    t = 0.0
+    for x in v:
+        t += x
+    return t / float(len(v))
+
+
+def asd(v):
+    m = amean(v)
+    t = 0.0
+    for x in v:
+        t += (x - m) ** 2
+    return math.sqrt(t / (len(v) - 1))
+
+
+def amed(v):
+    w = sorted(v)
+    n = len(w)
+    if n == 0:
+        return float("nan")
+    if n % 2:
+        return w[n // 2]
+    return 0.5 * (w[n // 2 - 1] + w[n // 2])
+
+
+def run_name(arm, seed):
+    return "%s-%s-s%d" % (BATCH, arm, seed)
+
+
+def grain_of(arm):
+    return arm[:-2]
+
+
+def rung_of(arm):
+    return arm[-2:]
+
+
+def job_of(arm, seed):
+    r = RUNGS.index(rung_of(arm))
+    return JOB0 + r * 16 + SEEDS.index(seed) * 4 + GRAINS.index(grain_of(arm))
+
+
+def design_args(arm, seed, save_dir):
+    g, r = grain_of(arm), rung_of(arm)
+    flags = [("optimizer", "HF"), ("alg-base", "SGDm"), ("momentum-param-base", "0.99"),
+             ("weight-decay-base", WD_TOK[r]), ("alg-meta", "Lion"), ("momentum-param-meta", "0.99"),
+             ("Lion-beta2-meta", "0.9"), ("weight-decay-meta", "0"), ("dataset", "CIFAR100"),
+             ("NN-name", "ResNet18_c100"), ("batch-size", "100"), ("max-time", "999:00:00"), ("gamma", "1"),
+             ("meta-stepsize", "1e-4"), ("alpha0", "1e-3"), ("num-epochs", "100"), ("stepsize-groups", SPEC_OF[g]),
+             ("seed", str(seed)), ("save-directory", save_dir), ("run-name", run_name(arm, seed))]
+    return "ARGS: " + " ".join("--%s %s" % kv for kv in flags)
+
+
+def is_kind_on(line):
+    """a `<KIND>: on` witness: uppercase letter, then uppercase / underscore, then ': on' at a word end."""
+    k = line.find(": on")
+    if k < 2:
+        return False
+    head = line[:k]
+    if head[0] not in UPPER or any(c not in UPPER + "_" for c in head):
+        return False
+    rest = line[k + 4:k + 5]
+    return rest == "" or not (rest.isalnum() or rest == "_")
+
+
+def parse_epoch(line):
+    """'Epoch 98, Train Accuracy: 95.62 %, Test Accuracy: 64.00 %' -> (98, 95.62, 64.00) or None."""
+    if not line.startswith("Epoch "):
+        return None
+    parts = line.split(",")
+    if len(parts) != 3:
+        return None
+    e = parts[0][len("Epoch "):].strip()
+    if not e or any(c not in DIGITS for c in e):
+        return None
+    tr = parts[1].strip()
+    te = parts[2].strip()
+    if not (tr.startswith("Train Accuracy:") and tr.endswith("%") and te.startswith("Test Accuracy:") and te.endswith("%")):
+        return None
+    try:
+        a = float(tr[len("Train Accuracy:"):-1].strip())
+        b = float(te[len("Test Accuracy:"):-1].strip())
+    except ValueError:
+        return None
+    return int(e), a, b
+
+
+def read_out(path):
+    L = open(path, errors="replace").read().split("\n")
+    r = dict(args=[], env=[], eps={}, dup=[], done=0, gpu=None, node=None, kinds=[], pt=0, bad_acc=0, minutes=None)
+    for ln in L:
+        if ln.startswith("ARGS:"):
+            r["args"].append(ln)
+        elif ln.startswith("ENV:"):
+            r["env"].append(ln)
+        elif ln.startswith("NODE=") and r["node"] is None:
+            r["node"] = ln.split("|")[0].strip()
+        elif ln.startswith("NVIDIA") and r["gpu"] is None:
+            r["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            r["done"] += 1
+        elif ln.startswith("PROBE_TENSOR:"):
+            r["pt"] += 1
+        else:
+            ep = parse_epoch(ln)
+            if ep is not None:
+                if ep[0] in r["eps"]:
+                    r["dup"].append(ep[0])
+                r["eps"][ep[0]] = (ep[1], ep[2])
+            elif "Test Accuracy" in ln:
+                r["bad_acc"] += 1
+            if is_kind_on(ln.strip()):
+                r["kinds"].append(ln.strip())
+            w = ln.split()
+            if len(w) == 2 and w[1] == "minutes" and all(c in DIGITS for c in w[0]):
+                r["minutes"] = int(w[0])
+    return r
+
+
+def read_probe(path):
+    recs = []
+    with open(path, errors="replace") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln:
+                continue
+            d = json.loads(ln)
+            b = d["beta"]
+            u = amed([math.exp(v) for v in b])
+            recs.append((d["step"], d["n_beta"], len(b), d["beta_true_min"], d["beta_true_max"], d["n_at_lo"],
+                         d["n_at_hi"], u, b[0] if len(b) else None))
+    return recs
+
+
+def csv_split(line):
+    out, cur, q, i = [], [], False, 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    q = False
+            else:
+                cur.append(c)
+        else:
+            if c == '"':
+                q = True
+            elif c == ",":
+                out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
+def corpus_count(csvp, tsvp):
+    lines = [ln for ln in open(csvp).read().split("\n") if ln != ""]
+    head = csv_split(lines[0])
+    ir, ij = head.index("run"), head.index("job_id")
+    t = [ln for ln in open(tsvp).read().split("\n") if ln.strip() and not ln.startswith("#")]
+    th = t[0].split("\t")
+    kr, kj = th.index("run"), th.index("job_id")
+    ex = set()
+    for ln in t[1:]:
+        f = ln.split("\t")
+        ex.add((f[kr], f[kj]))
+    n = 0
+    for ln in lines[1:]:
+        f = csv_split(ln)
+        if f[ir].startswith(BATCH + "-"):
+            continue
+        if (f[ir], f[ij]) in ex:
+            continue
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# THE REGISTERED DECISION, re-typed from 299.6
+# ---------------------------------------------------------------------------------------------------------------------
+def state_of(d, se, div, healthy, boxfree):
+    if div:
+        return "DIVERGED"
+    if not healthy:
+        return "UNHEALTHY"
+    if not boxfree:
+        return "BOXBOUND"
+    if d <= -NULLBAR and d < -RES * se:
+        return "REVERSES"
+    if d <= NULLBAR and d + RES * se < POOL:
+        return "VANISHES"
+    if d >= SURV and d > RES * se:
+        return "SURVIVES"
+    return "UNDECIDED"
+
+
+def primary_token(s1, s4):
+    if s1 in ("DIVERGED", "UNHEALTHY", "BOXBOUND"):
+        return "ANCHOR-UNREADABLE"
+    if s1 in ("VANISHES", "REVERSES"):
+        return "ANCHOR-NOT-REPRODUCED"
+    if s4 in ("DIVERGED", "UNHEALTHY", "BOXBOUND"):
+        return "UNRESOLVED-" + s4 + "-W4"
+    return "AUDIT-" + s4
+
+
+def scalar_token(k, kdiv, cmp_ok, tch, tnd, se):
+    if kdiv:
+        return "SCALAR-DIVERGED"
+    if k < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not cmp_ok:
+        return "SCALAR-UNREADABLE"
+    if tch >= SURV and tnd >= SURV and tch > RES * se and tnd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    tmin = min(tch, tnd)
+    if tmin - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "SCALAR-BELOW-BEST"
+    return "SCALAR-UNRESOLVED"
+
+
+def denom_token(ok, gap, se):
+    if not ok:
+        return "DENOM-UNREADABLE"
+    if gap >= DENOM_BAR and gap > RES * se:
+        return "DENOM-HOLDS"
+    if gap <= -SURV and gap < -RES * se:
+        return "DENOM-REVERSES"
+    if gap + RES * se < DENOM_BAR:
+        return "DENOM-CLOSES"
+    return "DENOM-UNRESOLVED"
+
+
+def contrasts(A, sig, box_override=None):
+    st, K = {}, {}
+    for r in RUNGS:
+        c, n = A["ch" + r], A["nd" + r]
+        d = c["level"] - n["level"]
+        se = sig * math.sqrt(1.0 / c["n"] + 1.0 / n["n"])
+        bf = (c["boxfree"] and n["boxfree"]) if box_override is None else box_override
+        st[r] = state_of(d, se, c["range"] > DIVERGED or n["range"] > DIVERGED,
+                         c["level"] >= HEALTH_MIN and n["level"] >= HEALTH_MIN, bf)
+        K["D" + r] = (d, se)
+        K["DTR" + r] = c["train"] - n["train"]
+        k, L = A["k01" + r], A["kL" + r]
+        for g in ("ch", "nd"):
+            K["T" + g + r] = (k["level"] - A[g + r]["level"], sig * math.sqrt(1.0 / k["n"] + 1.0 / A[g + r]["n"]))
+        K["G" + r] = (L["level"] - k["level"], sig * math.sqrt(1.0 / k["n"] + 1.0 / L["n"]))
+        for g in GRAINS:
+            K["GAP" + g + r] = (SGD - A[g + r]["level"], math.sqrt(sig ** 2 / A[g + r]["n"] + SGD_SD ** 2 / SGD_N))
+    return st, K
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+def main(argv):
+    runsdir, logs, stage, rowsp = None, [], None, None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--stage":
+            stage = argv[i + 1]
+            i += 2
+        elif a == "--rows":
+            rowsp = argv[i + 1]
+            i += 2
+        elif runsdir is None:
+            runsdir = a
+            i += 1
+        else:
+            logs.append(a)
+            i += 1
+    if runsdir is None or not logs or stage is None or rowsp is None:
+        sys.stderr.write("usage: g3b_attack_indep.py <runsdir> <scorer-log> [...] --stage DIR --rows P\n")
+        return 2
+
+    P("=" * 110)
+    P("g3b_attack_indep.py -- an INDEPENDENT re-derivation of g3b (CORRECTIONS 299) from the raw run files")
+    P("  stdlib only, no repo import, no regex, no shlex; every literal re-typed.  Scorer under attack: sha %s" % SCORER_SHA[:16])
+    P("=" * 110)
+
+    # ---- [0] files ---------------------------------------------------------------------------------------------------
+    P("")
+    P("[0] RUN FILES, SYNC INTEGRITY, PROVENANCE, STAGE")
+    found = {}
+    for base in (runsdir, os.path.join(runsdir, BATCH)):
+        if not os.path.isdir(base):
+            continue
+        for fn in sorted(os.listdir(base)):
+            if fn.startswith(BATCH + "-") and fn.endswith(".out"):
+                found.setdefault(fn, []).append(os.path.join(base, fn))
+    check(all(len(v) == 1 for v in found.values()), "each g3b-*.out file name occurs once across <runsdir> and <runsdir>/g3b")
+    check(len(found) == 32, "32 g3b-*.out files found (found %d)" % len(found))
+    runs = {}
+    ok_names = True
+    for fn, ps in sorted(found.items()):
+        parts = fn[:-4].split("-")
+        if len(parts) != 4 or parts[0] != BATCH or parts[1] not in ARMS or not parts[2].startswith("s"):
+            ok_names = False
+            continue
+        seed, jid = int(parts[2][1:]), int(parts[3])
+        if seed not in SEEDS or (parts[1], seed) in runs:
+            ok_names = False
+            continue
+        runs[(parts[1], seed)] = (jid, ps[0])
+    check(ok_names and len(runs) == 32, "the 32 file names are exactly the design's (arm, seed) set, 8 arms x seeds 170-173")
+    pdir = os.path.join(runsdir, BATCH)
+    files = []
+    for (arm, seed), (jid, p) in sorted(runs.items()):
+        files.append(("%s-%d.out" % (run_name(arm, seed), jid), p))
+        files.append(("probe_%s/probe.jsonl" % run_name(arm, seed), os.path.join(pdir, "probe_" + run_name(arm, seed), "probe.jsonl")))
+    have = all(os.path.exists(p) for _n, p in files)
+    check(have, "all 64 run files present (32 .out + 32 probe.jsonl)")
+    if not have:
+        print("\n".join(OUT))
+        return 1
+    dig = hashlib.sha256()
+    nbytes = 0
+    for n, p in sorted(files):
+        dig.update(n.encode() + b"\0" + sha_file(p).encode() + b"\n")
+        nbytes += os.path.getsize(p)
+    P("  DIGEST over the 64 run files' names and sha256: %s  (%d bytes)" % (dig.hexdigest(), nbytes))
+    check(all(runs[(a, s)][0] == job_of(a, s) for a in ARMS for s in SEEDS),
+          "job ids are 5080798-5080829, contiguous, W1 then W4, per seed ch / nd / k01 / kL (299.12)")
+    prov = os.path.join(pdir, "PROVENANCE.txt")
+    kv = {}
+    for ln in open(prov).read().split("\n"):
+        if " " in ln:
+            k, v = ln.split(" ", 1)
+            kv[k] = v.strip()
+    for k, v in (("MODE", "submit"), ("SCORER_SHA256", SCORER_SHA), ("DESIGN_SHA256", DESIGN_SHA), ("HF_SHA256", HF_SHA),
+                 ("RUNNER_SHA256", RUNNER_SHA), ("REGISTERED_COMMIT", REG_COMMIT), ("WD_LADDER", "W1=0.1 W4=5e-4"),
+                 ("SEEDS", "W1=170 171 172 173 W4=170 171 172 173"),
+                 ("GRAINS", "ch=chunk771 nd=nodewise k01=scalar kL=layerwise")):
+        check(kv.get(k) == v, "PROVENANCE %s = %s" % (k, v[:16] if len(v) == 64 or len(v) == 40 else v))
+    sc = os.path.join(stage, "analysis", "cG3B_c100wd_score.py")
+    ds = os.path.join(stage, "analysis", "g3b_design.py")
+    check(os.path.exists(sc) and sha_file(sc) == SCORER_SHA, "stage scorer sha256 = %s (the registered bytes)" % SCORER_SHA[:16])
+    check(os.path.exists(ds) and sha_file(ds) == DESIGN_SHA, "stage design sha256 = %s" % DESIGN_SHA[:16])
+
+    # ---- [1]-[3] per run --------------------------------------------------------------------------------------------
+    P("")
+    P("[1]-[3] PER RUN: ARGS rebuilt flag by flag, ENV, epoch lines, probe structure, box occupancy per seed")
+    per = {}
+    fails = {"args": [], "env": [], "kind": [], "done": [], "eps": [], "bad": [], "probe": [], "first": [], "gpu": []}
+    save_dirs = set()
+    gpus = {}
+    for (arm, seed), (jid, p) in sorted(runs.items(), key=lambda kv: kv[1][0]):
+        rn = run_name(arm, seed)
+        o = read_out(p)
+        sd_ = None
+        if len(o["args"]) == 1:
+            toks = o["args"][0].split(" ")
+            if "--save-directory" in toks:
+                sd_ = toks[toks.index("--save-directory") + 1]
+        save_dirs.add(sd_)
+        if len(o["args"]) != 1 or sd_ is None or o["args"][0] != design_args(arm, seed, sd_):
+            fails["args"].append(rn)
+        envw = ENV_PRE + (sd_ or "?") + "/probe_" + rn + ENV_POST
+        if len(o["env"]) != 1 or o["env"][0] != envw:
+            fails["env"].append(rn)
+        if o["kinds"] or o["pt"]:
+            fails["kind"].append(rn)
+        if o["done"] != 1:
+            fails["done"].append(rn)
+        if o["dup"] or sorted(o["eps"]) != list(range(NEPOCH)):
+            fails["eps"].append(rn)
+        if o["bad_acc"]:
+            fails["bad"].append(rn)
+        if o["gpu"] != "NVIDIA L4":
+            fails["gpu"].append(rn)
+        gpus[o["gpu"]] = gpus.get(o["gpu"], 0) + 1
+        recs = read_probe(os.path.join(pdir, "probe_" + rn, "probe.jsonl"))
+        m = M_OF[grain_of(arm)]
+        blen = 1 if m == 1 else NTENS
+        good = (len(recs) == NREC and [x[0] for x in recs] == list(range(0, NREC * PROBE, PROBE))
+                and all(x[1] == m for x in recs) and all(x[2] == blen for x in recs)
+                and max(x[4] for x in recs) - min(x[3] for x in recs) > 1e-9)
+        if not good:
+            fails["probe"].append(rn)
+        if abs(recs[0][8] - math.log(ALPHA0)) > 1e-3:
+            fails["first"].append(rn)
+        T = float(len(recs))
+        rec_lo = sum(1 for x in recs if x[3] <= LO + BOX_EPS) / T
+        rec_hi = sum(1 for x in recs if x[4] >= HI - BOX_EPS) / T
+        win = [x for x in recs if x[0] >= WIN_STEP]
+        tot = float(sum(x[1] for x in win))
+        clo = sum(x[5] for x in win) / tot
+        chi = sum(x[6] for x in win) / tot
+        wd = WD_VAL[rung_of(arm)]
+        allv = [x[7] * wd for x in recs]
+        winv = [x[7] * wd for x in win]
+        # first record at which the true max touches the box edge (for [7])
+        first_hi = None
+        for x in recs:
+            if x[4] >= HI - BOX_EPS:
+                first_hi = x[0]
+                break
+        eps = o["eps"]
+        per[(arm, seed)] = dict(
+            level=amean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+            train=amean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]),
+            last=eps[99][1], rec_lo=rec_lo, rec_hi=rec_hi, clo=clo, chi=chi,
+            boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX),
+            dose=(amed(winv), max(allv)), jid=jid, minutes=o["minutes"], first_hi=first_hi)
+    check(not fails["args"], "ARGS: exactly ONE line per run, equal to the design's 20 flags in order, value for value, byte for byte (%d of 32 fail; %s)" % (len(fails["args"]), fails["args"][:3]))
+    check(len(save_dirs) == 1, "ONE save directory across the 32 runs")
+    check(not fails["env"], "ENV: exactly ONE line per run, the registered one with the run's own PROBE_DIR (%d fail)" % len(fails["env"]))
+    check(not fails["kind"], "no `<KIND>: on` witness and no PROBE_TENSOR line (%d fail)" % len(fails["kind"]))
+    check(not fails["done"], "RUN_DONE exactly once on every run (%d fail)" % len(fails["done"]))
+    check(not fails["eps"], "Epoch lines: epochs 0..99 once each, 100 lines (%d fail)" % len(fails["eps"]))
+    check(not fails["bad"], "every line carrying `Test Accuracy` parses as an epoch line (%d fail)" % len(fails["bad"]))
+    check(not fails["gpu"], "every run's nvidia-smi line names an NVIDIA L4 (%d fail)" % len(fails["gpu"]))
+    check(not fails["probe"], "probe.jsonl: 10,000 records at steps 0,5,...,49995, n_beta == the arm's m, beta list 1 (scalar) or 62 entries, beta moved (%d fail)" % len(fails["probe"]))
+    check(not fails["first"], "every run's first probe record sits at ln(alpha0 1e-3) = -6.9078 (+/-1e-3) (%d fail)" % len(fails["first"]))
+    P("")
+    P("  PER RUN (plateau5 = mean TEST of epochs 95-99; box occupancy from the raw probe records; minutes from the run's own line)")
+    P("  %-15s %8s %9s %9s %8s %8s %8s %8s %11s %7s" % ("run", "job", "plateau5", "train5", "TEST99", "rec_lo", "rec_hi",
+      "coordhi", "first@HI", "minutes"))
+    for (arm, seed), x in sorted(per.items(), key=lambda kv: kv[1]["jid"]):
+        P("  %-15s %8d %9.4f %9.4f %8.2f %8.4f %8.4f %8.6f %11s %7s" % (
+            run_name(arm, seed), x["jid"], x["level"], x["train"], x["last"], x["rec_lo"], x["rec_hi"], x["chi"],
+            "-" if x["first_hi"] is None else str(x["first_hi"]), x["minutes"]))
+    mins = sum(x["minutes"] for x in per.values())
+    P("  GPU time by the runs' own `minutes` lines: %d min = %.4f GPU-h (registered expectation 24.4, hard bound 64)" % (mins, mins / 60.0))
+
+    # ---- [4] levels, sigma, contrasts --------------------------------------------------------------------------------
+    A = {}
+    ss, df, pooled = 0.0, 0, []
+    for a in ARMS:
+        xs = [per[(a, s)]["level"] for s in SEEDS]
+        m = amean(xs)
+        if m >= HEALTH_MIN:
+            for x in xs:
+                ss += (x - m) ** 2
+            df += len(xs) - 1
+            pooled.append(a)
+        A[a] = dict(level=m, train=amean([per[(a, s)]["train"] for s in SEEDS]), range=max(xs) - min(xs), n=len(xs),
+                    boxfree=all(per[(a, s)]["boxfree"] for s in SEEDS), sd=asd(xs), seeds=xs)
+    sig_in = math.sqrt(ss / df)
+    sig, which = (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sig_in else (sig_in, "SIGMA_INBATCH")
+    st, K = contrasts(A, sig)
+    primary = primary_token(st["W1"], st["W4"])
+    c4, n4, k4 = A["chW4"], A["ndW4"], A["k01W4"]
+    cmp_ok = c4["level"] >= HEALTH_MIN and n4["level"] >= HEALTH_MIN and c4["range"] <= DIVERGED and n4["range"] <= DIVERGED
+    scal = scalar_token(k4["level"], k4["range"] > DIVERGED, cmp_ok, K["TchW4"][0], K["TndW4"][0], K["TchW4"][1])
+    den = denom_token(c4["level"] >= HEALTH_MIN and c4["range"] <= DIVERGED, K["GAPchW4"][0], K["GAPchW4"][1])
+    d1, se1 = K["DW1"]
+    d4, se4 = K["DW4"]
+    dd = (d4 - d1, math.sqrt(se1 ** 2 + se4 ** 2))
+
+    # ---- rebuild the scorer's stdout ---------------------------------------------------------------------------------
+    R = []
+    R.append("=" * 110)
+    R.append("g3b -- THE COUNT-MATCHED AUDIT, SCALAR, AND THE DENOMINATOR ON CIFAR-100 AT 0.1 AND 5e-4  (CORRECTIONS 299; G3b)")
+    R.append("scorer sha256 %s   design sha256 %s" % (SCORER_SHA, DESIGN_SHA))
+    R.append("@RUNSDIR")
+    R.append("=" * 110)
+    R.append("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(per), 32))
+    R.append("@GPROV  MODE %s  SCORER %s  DESIGN %s  HF %s" % (kv.get("MODE"), kv.get("SCORER_SHA256", "")[:16],
+             kv.get("DESIGN_SHA256", "")[:16], kv.get("HF_SHA256", "")[:16]))
+    R.append("G-ARGS / G-ENV / G-KIND / G-STRUCT  %d of %d complete runs pass (20 flags each, ONE ARGS and ONE ENV line, the "
+             "registered ENV line, no patch witness, no epoch printed twice, 10,000 probe records with n_beta == the arm's m "
+             "and a beta list of the grain's length)" % (len(per), len(per)))
+    R.append("G-HW (DISCLOSURE ONLY, never a gate): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    ncorp = corpus_count(os.path.join(stage, "results", "all_runs.csv"), os.path.join(stage, "results", "CORPUS-EXCLUSIONS.tsv"))
+    R.append("corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- enters no bar, sigma, "
+             "level, state, contrast or stamp)" % (ncorp, BATCH))
+    R.append("")
+    R.append("ARMS  plateau5 = mean TEST over epochs %d-%d from each run's OWN .out; box occupancy from its OWN probe.jsonl" % (PL_LO, PL_HI))
+    R.append("  %-6s %-4s %-5s %-9s %2s %9s %7s %7s %9s  %-6s %8s %8s %11s %11s" % ("arm", "rung", "wd", "grain", "n",
+             "plateau5", "sd", "range", "train5", "box", "rec_lo", "rec_hi", "coordlo_win", "coordhi_win"))
+    for a in ARMS:
+        x = A[a]
+        pr = [per[(a, s)] for s in SEEDS]
+        R.append("  %-6s %-4s %-5s %-9s %2d %9.4f %7.3f %7.3f %9.4f  %-6s %8.4f %8.4f %11s %11s" % (
+            a, rung_of(a), WD_TOK[rung_of(a)], SPEC_OF[grain_of(a)], x["n"], x["level"], x["sd"], x["range"], x["train"],
+            "free" if x["boxfree"] else "BOUND", max(q["rec_lo"] for q in pr), max(q["rec_hi"] for q in pr),
+            "%.6f" % max(q["clo"] for q in pr), "%.6f" % max(q["chi"] for q in pr)))
+        R.append("         seeds: %s" % ", ".join("s%d %.4f" % (s, v) for s, v in zip(SEEDS, x["seeds"])))
+    R.append("")
+    R.append("SIGMA  O2: max(frozen cell floor, in-batch) -- nothing from the corpus")
+    R.append("  SIGMA_PRIOR_frozen   %.6f  (df %d, filtered, literal; this cell)" % (SIGMA_PRIOR, SIGMA_PRIOR_DF))
+    R.append("  SIGMA_INBATCH        %.6f  (df %d, pooled within the %d arms with mean >= %.0f: %s)" % (
+        sig_in, df, len(pooled), HEALTH_MIN, " ".join(pooled)))
+    R.append("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+    R.append("  SIGMA_DEMO (quoted)  %.6f  (df %d; corpus_exclusions --check SIGMA_R18ALL, the mechanism cell; DESCRIPTIVE)"
+             % (SIGMA_DEMO, SIGMA_DEMO_DF))
+    R.append("")
+    R.append("CONTRASTS (every one WITHIN a rung, IN BATCH unless marked; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    for r in RUNGS:
+        d, se = K["D" + r]
+        R.append("  D_%s  = ch%s - nd%s = %+.4f pp = %+.2f SE (SE %.6f)  [%+.4f, %+.4f]  TRAIN %+.4f   state %s"
+                 % (r, r, r, d, d / se, se, d - RES * se, d + RES * se, K["DTR" + r], st[r]))
+    R.append("  DD_W4 = D_W4 - D_W1 = %+.4f pp = %+.2f SE (SE %.6f)   DESCRIPTIVE" % (dd[0], dd[0] / dd[1], dd[1]))
+    for r in RUNGS:
+        for g in ("ch", "nd"):
+            v, se = K["T" + g + r]
+            R.append("  T%s_%s = k01%s - %s%s = %+.4f pp = %+.2f SE%s" % (g, r, r, g, r, v, v / se,
+                     "" if r == "W4" else "   DESCRIPTIVE (k01W1 is predicted collapsed)"))
+    for r in RUNGS:
+        v, se = K["G" + r]
+        R.append("  G_%s  = kL%s - k01%s = %+.4f pp = %+.2f SE   DESCRIPTIVE (layerwise vs scalar in this cell)" % (r, r, r, v, v / se))
+    R.append("")
+    R.append("DENOMINATOR (BETWEEN-BATCH: tuned SGD + cosine = the landed cdn1 lr 0.1 literal %.4f, n %d, sd %.4f, wd 5e-4)"
+             % (SGD, SGD_N, SGD_SD))
+    for r in RUNGS:
+        for g in GRAINS:
+            v, se = K["GAP" + g + r]
+            R.append("  GAP%s_%s = SGD - %s%s = %+.4f pp = %+.2f SE (SE %.6f)  [%+.4f, %+.4f]%s" % (
+                g, r, g, r, v, v / se, se, v - RES * se, v + RES * se,
+                "   GATED (the cdn1-m arm)" if (g, r) == ("ch", "W4") else "   DESCRIPTIVE"))
+    best = GRAINS[0]
+    for g in GRAINS:
+        if A[g + "W4"]["level"] > A[best + "W4"]["level"]:
+            best = g
+    R.append("  best grain at W4 = %s (%.4f): GAP %+.4f -- DESCRIPTIVE, a max over four arms is biased UP, so this gap is biased DOWN"
+             % (SPEC_OF[best], A[best + "W4"]["level"], K["GAP" + best + "W4"][0]))
+    R.append("  landed cdn1 GAP_in (cdn1-m at 0.1, in cdn1's batch) %+.4f; GAPch_W1 here %+.4f (DESCRIPTIVE replication)"
+             % (CDN1_GAP_IN, K["GAPchW1"][0]))
+    R.append("")
+    R.append("THE DOSE (DESCRIPTIVE): realised per-step shrink a*wd = median over the arm's step sizes of exp(beta)*wd per record;"
+             " plateau = median over records with step >= %d; arm = median over its seeds.  ch / nd are APPROXIMATE (62"
+             " per-tensor mean log step sizes per record)." % WIN_STEP)
+    dose = {}
+    for a in ARMS:
+        pl = amed([per[(a, s)]["dose"][0] for s in SEEDS])
+        pk = amed([per[(a, s)]["dose"][1] for s in SEEDS])
+        dose[a] = (pl, pk)
+        extra = ""
+        if rung_of(a) == "W4":
+            extra = "   = 1/%.0f of lr*wd %.0e, 1/%.0f of a standard recipe's ~%.0e" % (LRWD_REF / pl, LRWD_REF, STD_RECIPE_REF / pl, STD_RECIPE_REF)
+        R.append("  %-6s %-9s wd %-5s plateau %.4e  peak %.4e%s%s" % (a, SPEC_OF[grain_of(a)], WD_TOK[rung_of(a)], pl, pk,
+                 "  (approx)" if grain_of(a) in ("ch", "nd") else "", extra))
+    R.append("")
+    R.append("SENSITIVITY (DESCRIPTIVE, no token): the primary states re-read at the quoted SIGMA_DEMO %.6f instead of SIGMA_USED:" % SIGMA_DEMO)
+    st2, _k2 = contrasts(A, max(sig, SIGMA_DEMO))
+    R.append("  %s" % " ".join("%s-%s" % (r, st2[r]) for r in RUNGS))
+    R.append("")
+    R.append("LADDERS (LEVELS, not effects; this cell only)")
+    for g in GRAINS:
+        R.append("  %-9s %s" % (SPEC_OF[g], " | ".join("%s %.4f" % (WD_TOK[r], A[g + r]["level"]) for r in RUNGS)))
+    R.append("  cgw1 side by side (CIFAR-10, DESCRIPTIVE, cross-batch): D_W1 %+.4f, D_W4 %+.4f, Tch_W4 %+.4f, Tnd_W4 %+.4f"
+             % (CGW1_D["W1"], CGW1_D["W4"], CGW1_T4["ch"], CGW1_T4["nd"]))
+    stamps = list(BOUNDS)
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    stamps.append("ANCHOR-MATCHES-POOL" if abs(d1 - POOL) <= MATCH else "ANCHOR-DIFFERS-FROM-POOL")
+    for g in GRAINS:
+        if abs(A[g + "W1"]["level"] - LANDED_W1[g]) > MATCH:
+            stamps.append("W1-LEVEL-DIFFERS-" + g)
+    stamps.append("K01W1-COLLAPSED" if A["k01W1"]["level"] < HEALTH_MIN else "K01W1-HEALTHY")
+    if primary in ("AUDIT-SURVIVES", "AUDIT-REVERSES"):
+        stamps.append("TRAIN-AGREES" if (K["DTRW4"] > 0) == (d4 > 0) else "TRAIN-DISAGREES")
+    g4, gse = K["GW4"]
+    if g4 <= -SURV and g4 < -RES * gse:
+        stamps.append("LAYERWISE-BELOW-SCALAR-W4")
+    elif g4 >= SURV and g4 > RES * gse:
+        stamps.append("LAYERWISE-ABOVE-SCALAR-W4")
+    if not A["k01W4"]["boxfree"]:
+        stamps.append("SCALAR-W4-BOX-BOUND")
+    for a in ARMS:
+        if A[a]["range"] > DIVERGED:
+            stamps.append("DIVERGED-" + a)
+    R.append("")
+    R.append("LICENCE (primary)  %s" % LICENCE[primary])
+    R.append("LICENCE (scalar)   %s" % LICENCE[scal])
+    R.append("LICENCE (denom)    %s" % LICENCE[den])
+    R.append("")
+    final = "FINAL %s | %s | %s | %s | %s" % (primary, scal, den, "+".join("%s-%s" % (r, st[r]) for r in RUNGS), " ".join(stamps))
+    R.append(final)
+
+    # ---- [5] compare with each committed log -------------------------------------------------------------------------
+    P("")
+    P("[4]-[5] THE SCORER'S STDOUT REBUILT (%d lines) AND COMPARED LINE BY LINE WITH EACH COMMITTED LOG" % len(R))
+    rebuilt = hashlib.sha256("\n".join(R).encode()).hexdigest()
+    P("  rebuild digest (host-dependent lines as their @ placeholders): %s" % rebuilt)
+    for li, lp in enumerate(logs):
+        L = open(lp).read().split("\n")
+        while L and L[-1] == "":
+            L.pop()
+        bad = []
+        if len(L) != len(R):
+            bad.append("length %d != %d" % (len(L), len(R)))
+        for j in range(min(len(L), len(R))):
+            want = R[j]
+            got = L[j]
+            if want == "@RUNSDIR":
+                okj = got.startswith("runsdir ") and len(got) > len("runsdir ")
+            elif want.startswith("@GPROV"):
+                tail = want[len("@GPROV"):]
+                okj = (got.startswith("G-PROV  ") and got.endswith(tail)
+                       and got[len("G-PROV  "):-len(tail)].endswith("/g3b/PROVENANCE.txt"))
+            else:
+                okj = (got == want)
+            if not okj:
+                bad.append("line %d" % (j + 1))
+        check(not bad, "committed log #%d: %d lines, every line equal to the rebuild (%d byte for byte, 2 host lines by form) %s"
+              % (li + 1, len(L), len(R) - 2, bad[:4]))
+        check(L and L[-1] == final, "committed log #%d: its LAST line is the rebuilt FINAL" % (li + 1))
+
+    # ---- [6] the three questions -------------------------------------------------------------------------------------
+    P("")
+    P("[6] THE THREE QUESTIONS OF 299, FROM THE NUMBERS (bounds first)")
+    P("  BOUNDS on every reading: %s" % " ".join(BOUNDS))
+    P("  FINAL %s" % final[len("FINAL "):])
+    P("  sigma_used %.6f (%s; in-batch %.6f df %d is %.1f %% above the frozen floor %.6f)" % (
+        sig, which, sig_in, df, 100.0 * (sig_in / SIGMA_PRIOR - 1.0), SIGMA_PRIOR))
+    P("  PRIMARY  D_W1 %+.4f (SE %.4f, state %s) | D_W4 %+.4f [%+.4f, %+.4f] state %s -> %s" % (
+        d1, se1, st["W1"], d4, d4 - RES * se4, d4 + RES * se4, st["W4"], primary))
+    P("  SCALAR   Tch_W4 %+.4f, Tnd_W4 %+.4f (2 SE %.4f); min T - 2 SE %+.4f -> %s" % (
+        K["TchW4"][0], K["TndW4"][0], RES * K["TchW4"][1], min(K["TchW4"][0], K["TndW4"][0]) - RES * K["TchW4"][1], scal))
+    P("  DENOM    GAP4 %+.4f [%+.4f, %+.4f] (SE %.6f) -> %s   (between-batch; the SGD lr was chosen on TEST, 1.14)" % (
+        K["GAPchW4"][0], K["GAPchW4"][0] - RES * K["GAPchW4"][1], K["GAPchW4"][0] + RES * K["GAPchW4"][1], K["GAPchW4"][1], den))
+
+    # ---- [7] what bounds the verdict ---------------------------------------------------------------------------------
+    P("")
+    P("[7] WHAT BOUNDS THE VERDICT (DESCRIPTIVE unless it restates a registered gate)")
+    for a in ARMS:
+        bs = [s for s in SEEDS if not per[(a, s)]["boxfree"]]
+        if bs:
+            P("  BOX: %s is BOUND on seed(s) %s: rec_hi %s (gate 0.05); first record at the top edge -2.3026 at meta step %s"
+              % (a, " ".join(str(s) for s in bs), " ".join("%.4f" % per[(a, s)]["rec_hi"] for s in bs),
+                 " ".join(str(per[(a, s)]["first_hi"]) for s in bs)))
+    stx, _kx = contrasts(A, sig, box_override=True)
+    P("  COUNTERFACTUAL (no token, not a licence): with the 5 %% box gate removed the rung states would read W1-%s W4-%s,"
+      " i.e. %s" % (stx["W1"], stx["W4"], primary_token(stx["W1"], stx["W4"])))
+    stf, kf = contrasts(A, SIGMA_PRIOR, box_override=True)
+    P("  COUNTERFACTUAL at the frozen floor sigma %.6f and no box gate: W1-%s W4-%s (D_W4 %+.4f, 2 SE %.4f)" % (
+        SIGMA_PRIOR, stf["W1"], stf["W4"], kf["DW4"][0], RES * kf["DW4"][1]))
+    P("  VANISHES needs D_W4 <= +0.15 (D_W4 %+.4f is %.4f inside that bar) and D_W4 + 2 SE < 1.5602 (%+.4f); SURVIVES would need"
+      " D_W4 >= 0.30 and > 2 SE %.4f (D_W4 is %.4f short of the 0.30 bar)" % (d4, NULLBAR - d4, d4 + RES * se4, RES * se4, SURV - d4))
+    P("  BOX-GATE CAVEAT: the box gate applies to BOTH ch and nd arms of a rung; only chW4 is bound (ndW4 free), and its bound"
+      " coordinates are a small share of its groups in the plateau window (coordhi_win max %.6f)" % max(per[("chW4", s)]["chi"] for s in SEEDS))
+    P("  leave-one-seed-out D_W4 (drop the same seed from ch and nd):")
+    for s in SEEDS:
+        c = amean([per[("chW4", t)]["level"] for t in SEEDS if t != s])
+        n = amean([per[("ndW4", t)]["level"] for t in SEEDS if t != s])
+        P("    drop s%d: D_W4 %+.4f" % (s, c - n))
+    P("  same-seed paired chW4 - ndW4: %s" % ", ".join("s%d %+.4f" % (s, per[("chW4", s)]["level"] - per[("ndW4", s)]["level"]) for s in SEEDS))
+    P("  SCALAR: min T - 2 SE %+.4f clears the BEATS bar by %.4f (T >= 0.30 and > 2 SE %.4f); at SIGMA_DEMO 2 SE is %.4f" % (
+        min(K["TchW4"][0], K["TndW4"][0]) - RES * K["TchW4"][1], min(K["TchW4"][0], K["TndW4"][0]) - max(SURV, RES * K["TchW4"][1]),
+        RES * K["TchW4"][1], RES * max(sig, SIGMA_DEMO) * math.sqrt(0.5)))
+    P("  SCALAR per seed k01W4 - max(chW4, ndW4): %s" % ", ".join(
+        "s%d %+.4f" % (s, per[("k01W4", s)]["level"] - max(per[("chW4", s)]["level"], per[("ndW4", s)]["level"])) for s in SEEDS))
+    P("  DENOM: GAP4 - 2 SE %+.4f clears the 1.0 pp bar by %.4f" % (K["GAPchW4"][0] - RES * K["GAPchW4"][1],
+      K["GAPchW4"][0] - RES * K["GAPchW4"][1] - DENOM_BAR))
+    P("  FLOOR GATE (164.6): every W4 level vs HEALTH_MIN 55 and 100: %s" % ", ".join(
+        "%s %+.2f / %.2f" % (a, A[a]["level"] - HEALTH_MIN, 100.0 - A[a]["level"]) for a in ARMS if rung_of(a) == "W4"))
+    P("  predicted (299.5) vs measured W4 levels, SURVIVES account: %s" % ", ".join(
+        "%s %.4f" % (g, A[g + "W4"]["level"]) for g in GRAINS) + "  (ch 66.5-71.5, nd 65.0-70.5, k01 68.0-73.5, kL 66.0-70.5)")
+    P("  level drop 0.1 -> 5e-4 per grain: %s" % ", ".join("%s %+.4f" % (g, A[g + "W4"]["level"] - A[g + "W1"]["level"]) for g in GRAINS))
+    P("  REALISED SHRINK per arm (plateau median a*wd; W4 beside lr*wd 5e-5 and a standard recipe's ~5e-4):")
+    for a in ARMS:
+        pl, pk = dose[a]
+        if rung_of(a) == "W4":
+            P("    %-6s plateau %.4e  peak %.4e  = %.1fx below lr*wd, %.1fx below a standard recipe%s" % (
+                a, pl, pk, LRWD_REF / pl, STD_RECIPE_REF / pl, "  (approx)" if grain_of(a) in ("ch", "nd") else ""))
+        else:
+            P("    %-6s plateau %.4e  peak %.4e%s" % (a, pl, pk, "  (approx)" if grain_of(a) in ("ch", "nd") else ""))
+
+    # ---- [8] exclusion rows ------------------------------------------------------------------------------------------
+    P("")
+    P("[8] THE 16 EXCLUSION ROWS OWED AT INGEST (299.9), REBUILT FROM THE RUNS' OWN FILE NAMES AND ARGS LINES")
+    want = []
+    for (arm, seed), x in sorted(per.items(), key=lambda kv: kv[1]["jid"]):
+        o = read_out(runs[(arm, seed)][1])
+        toks = o["args"][0].split(" ")
+        wdv = toks[toks.index("--weight-decay-base") + 1]
+        mom = toks[toks.index("--momentum-param-base") + 1]
+        if float(mom) != 0.99:
+            want.append("UNEXPECTED momentum deviation %s" % run_name(arm, seed))
+        if float(wdv) == 0.1:
+            continue
+        g = grain_of(arm)
+        want.append("\t".join([run_name(arm, seed), str(x["jid"]), BATCH, arm, "%s (granularity %s)" % (g, SPEC_OF[g]),
+                               "--weight-decay-base " + wdv, "ARGS_WD_BASE: weight-decay-base=" + wdv, "CORRECTIONS 315",
+                               "base-optimiser CLI flag not carried by any CSV column (ARGS-value kind, CORRECTIONS 263)"]))
+    got = [ln for ln in open(rowsp).read().split("\n") if ln.strip() and not ln.startswith("#")]
+    check(got and got[0] == "run\tjob_id\tbatch\tarm\tlooks_like\tintervention\twitness\tregistered_at\treason",
+          "PROPOSED file header is CORPUS-EXCLUSIONS.tsv's 9-column header")
+    check(len(want) == 16 and all(w.split("\t")[3].endswith("W4") for w in want),
+          "exactly the 16 W4 runs deviate (wd 5e-4 != 0.1); no W1 run and no momentum deviation")
+    check(got[1:] == want, "the PROPOSED rows equal the rebuild byte for byte, in job order (%d rows)" % (len(got) - 1))
+    P("  rows digest %s" % hashlib.sha256("\n".join(want).encode()).hexdigest())
+    for w in want:
+        P("  " + w)
+
+    P("")
+    P("SUMMARY %d PASS / %d FAIL" % (NPASS[0], NFAIL[0]))
+    print("\n".join(OUT))
+    return 0 if NFAIL[0] == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

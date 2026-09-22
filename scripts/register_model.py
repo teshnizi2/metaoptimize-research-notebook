@@ -381,6 +381,18 @@ ADDED_PHASES = [{
     # MECH9_FIRST_ROW is 243; it is defined further down the file, so the ID is written out.
     "experimentIds": ["MT243"],
     "source": "docs/CORRECTIONS.md 312 at a3d422a",
+}, {
+    # g3b, the ICML plan's 4a rank 1 (the audit's CIFAR-100 cell at weight decay 5e-4; it also re-runs row 1.16's denominator
+    # arm): registered at 31792c4 (CORRECTIONS 299), submitted at 08:23 UTC, scored at 7e348a3, ingested at 4f7e191 and written
+    # up at 12a4c5d (CORRECTIONS 315). A separate phase from phase-16: that phase asked the question on CIFAR-10; this one asks
+    # it on the audit's second dataset.
+    "id": "phase-20", "date": "2026-09-22", "period": "22 Sep", "title": "Does the audit's weight-decay reading hold on CIFAR-100",
+    "test": "The audit's CIFAR-100 cell at weight decay 0.1 and 5e-4 with all four grains, four fresh seeds each, with the aligned-partition arm at 5e-4 also read against the tuned plain-SGD baseline",
+    "observed_result": "At 0.1 the uniform partition again beats the aligned one; at 5e-4 the uniform partition's step sizes reach the harness's upper limit, so the partition comparison cannot be read there; plain scalar is about six points above both partitions at 5e-4 with the tuning chosen at 0.1; and the MetaOptimize arm run at 5e-4 is still well below tuned SGD, further below than at 0.1",
+    "next_question": "Whether re-tuning at 5e-4 on CIFAR-100 changes the scalar reading, and whether the partition comparison can be read there without the step-size limit binding",
+    # MECH10_FIRST_ROW is 244; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT244"],
+    "source": "docs/CORRECTIONS.md 315 at 12a4c5d",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -518,7 +530,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
                              (MECH6_INGEST_COMMIT, MECH6_INTERVENTIONS_TSV_SHA256),
                              (MECH7_INGEST_COMMIT, MECH7_INTERVENTIONS_TSV_SHA256),
                              (MECH8_INGEST_COMMIT, MECH8_INTERVENTIONS_TSV_SHA256),
-                             (MECH9_INGEST_COMMIT, MECH9_INTERVENTIONS_TSV_SHA256)]:
+                             (MECH9_INGEST_COMMIT, MECH9_INTERVENTIONS_TSV_SHA256),
+                             (MECH10_INGEST_COMMIT, MECH10_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -537,7 +550,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
             runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": False}
     # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
     # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
-    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS, **MECH9_ARGS_DEVIATIONS}.items():
+    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS, **MECH9_ARGS_DEVIATIONS,
+                      **MECH10_ARGS_DEVIATIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if not is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
@@ -2599,6 +2613,111 @@ def mech9_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 20. The g3b landing (CORRECTIONS 315): one appended row.
+# ---------------------------------------------------------------------------
+# Campaign commit 12a4c5d (cycle 165; CORRECTIONS 315, the g3b landing) appended the g3b landing as MASTER-TABLE line 244 and
+# recounted header line 3 (which also corrected, in a bracket, a stale count of rows carrying a wallclock_min). It amended no
+# earlier row, did not touch line 5, and no line moved. The ingest 4f7e191 touched results/ and bin/PROTECTED.txt alone.
+# Between the cvl1 pin a3d422a and this one, CORRECTIONS 313 (the crt2 registration, which owns no row) gained its verifier's
+# subsection 313.12 and a heading tag at c7a8016; CORRECTIONS 314 (an audit addendum) owns no row.
+#
+# MT244 (g3b) is OPEN, as MT240 (cgw1) and MT243 (cvl1). Its PRIMARY returned UNRESOLVED-BOXBOUND-W4: at 5e-4 the chunk771
+# arm's step sizes reach the harness's box on all four seeds, the registered 5 % box gate makes the rung unreadable, and the
+# registered licence is "a primary-rung partition arm is box-bound; the contrast is not an audit replication". The
+# co-reported scalar (SCALAR-BEATS-BEST) and denominator (DENOM-HOLDS) readings ARE resolved and are carried in the reason,
+# as MT240 carries its scalar reading. The row does not correct an earlier PUBLISHED notebook claim, so it carries no
+# Corrected badge.
+MECH10_COMMIT = "12a4c5d56a8d47fe63572c3154079e267837acdc"
+MECH10_MASTER_TABLE_SHA256 = "b6f204e9876b29813a396d8b6bc912360d5e2551609193fd6671b1b4ea141d00"
+MECH10_FIRST_ROW, MECH10_LAST_ROW = 244, 244
+MECH10_EDITED_LINES = {3}  # the run / GPU-hour header and the tally, recounted in place; no row amended, line 5 untouched.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH10_ROWS = {
+    244: ("open", 10, ["g3b"], ["page-8"], None, "UNRESOLVED-BOXBOUND-W4: the primary is unreadable -- the audit's CIFAR-100 cell (ResNet18_c100, SGDm 0.99 + Lion, ms 1e-4, alpha0 1e-3) at alpha-scaled weight decay 0.1 (W1, the in-batch anchor) and 5e-4 (W4), four grains, four fresh seeds. At 0.1 the audit's sign reproduces in batch: D = chunk771 - nodewise is +1.2170 pp (+3.99 SE) SURVIVES, within 0.35 pp of the landed CIFAR-100 pool (ANCHOR-MATCHES-POOL). At 5e-4 the chunk771 arm is box-bound on all four seeds (its top coordinate at the box's upper edge from about epoch 92, on at most 0.027 % of its groups), so the registered box gate makes the rung BOXBOUND and D_W4 (+0.0645 pp, +/-2 SE [-0.5451, +0.6741]) is not a registered survive, vanish or reverse reading; the registered licence: a primary-rung partition arm is box-bound; the contrast is not an audit replication; itself a fact: at 5e-4 the step sizes reach the box. The co-reported readings ARE resolved: plain scalar is above both audited partitions at 5e-4 by +6.0345 / +6.0990 pp (19.8 / 20.0 SE, SCALAR-BEATS-BEST), an UNTUNED reading at crt1's M2 configuration (robustness to tuning untested here, not refuted), and the chunk771 MetaOptimize arm run at 5e-4 is still +14.5857 pp (+44.61 SE) below the landed tuned SGD + cosine (DENOM-HOLDS, between batches, the SGD learning rate chosen on the test set), so ICML-PLAN 1.16's decay confound is not supported in its nominal-value form at this cell. Every gate passes, RULE 20 passes at full coverage, the registered scorer exits 0 UNEDITED on both hosts and again post-ingest, and an independent parser passes 33 of 33 checks, byte-identical on both hosts. Bounded, and led with: one CIFAR-100 cell, two rungs, never pooled with cgw1; alpha-scaled decay only; 5e-4 is a nominal value (every W4 arm 38.9-709.8x less decayed than a standard SGD recipe, and up to 18.2x apart among the arms); the denominator is between batches; the scalar and denominator rules do not gate on the box, and both readings hold descriptively against the box-free nodewise arm; the layerwise arm is box-bound too; the in-batch sigma is 57.6 % above the frozen floor; the partitions' 5e-4 levels fell below every registered prediction band. A refute pass could not refute the verdict and applied six wording and disclosure fixes; no RULE 16 defect."),
+}
+# Earlier records this row bears on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH10_BEARS_ON = {
+    244: ["MT240", "MT175", "MT191", "MT199", "MT155", "MT241"],  # cgw1's question on CIFAR-100; the audit headline; gc1 and gm2 (the CIFAR-100 pool); cdn1's denominator; crt1's untuned M2
+}
+MECH10_INTERVENTIONS: dict[str, dict] = {}  # no patch ran; every exclusion row of the ingest is an ARGS-value row
+# The 16 ARGS-deviating rows of the ingest 4f7e191 (CORRECTIONS 315.9): g3b's W4 runs, every one ARGS_WD_BASE at 5e-4, one kind
+# per run (base momentum is 0.99 on every run, so no row is two-ARGS; no ON line, so no row is two-axis). The 16 W1 runs sit at
+# the standard 0.1 and own none. The landing commit left the list byte-identical.
+MECH10_INGEST_COMMIT = "4f7e191847ea650b1f7184118f6f996f8ba34d28"
+MECH10_INTERVENTIONS_TSV_SHA256 = "2cc93207076333bb6b245a4d6ba954267cc01aa4dee39dcd9971451672b7d5bc"
+MECH10_ARGS_DEVIATIONS = {
+    "MT244": {
+        "batch": "g3b", "arms": {f"{grain}W4": 4 for grain in ("ch", "nd", "k01", "kL")},
+        "title": "g3b's 5e-4 rung differs from the audit's CIFAR-100 cell in the base weight-decay flag",
+        "source": f"{INTERVENTIONS_TSV} at {MECH10_INGEST_COMMIT[:7]}; CORRECTIONS 263, 299 and 315",
+        "note": "g3b runs the audit's CIFAR-100 cell at two weight decays: 0.1 and 5e-4. The corpus has no column for a base-optimiser CLI flag, so the 16 runs at --weight-decay-base 5e-4 carry the plain 0.1 cell key of their grain and are NOT measurements of that cell. No patch ran: the witness is the run's OWN ARGS: line, read with argparse last-wins semantics, and each row is listed under the ARGS-value witness kind ARGS_WD_BASE added at CORRECTIONS 263. No run deviates on a second ARGS kind. The 16 runs at 0.1 are the standard cell and are not listed. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md at the landing is the cvl1 landing's file with two registered in-place changes to entry 313 (the crt2
+# registration, which owns no row) and entries 314-315 appended: 313.12 (its verifier's subsection) inserted directly above
+# the cvl1 pin's closing trailer, and 313's heading tag "REGISTERED, NOT SUBMITTED:" rewritten to the submitted form. The
+# cvl1 pin's trailer is kept in place below 313.12; 314 and 315 follow, closed by a fresh "Next free number: " trailer.
+MECH10_CORRECTIONS_SHA256 = "230bd15a194b13b7ee3a4568ec7ca8b52249572167838aa320bcd0bc8dec494b"
+MECH10_ENTRIES = (314, 315)
+MECH10_313_TAG = ("REGISTERED, NOT SUBMITTED:", "REGISTERED; VERIFIED AND SUBMITTED 2026-09-22 (313.12: 45 jobs 5083795–5083839, RULE 21 +20 min 07 s):")
+MECH10_INSERTED_SUBSECTION = "### 313.12 "
+
+
+def mech10_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the g3b landing; ONE step that edits header line 3 and appends ONE row, and nothing else."""
+    before = mech9_master_table(repo)
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH10_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH10_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH10_COMMIT[:12]} does not match the pinned g3b-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH10_LAST_ROW or len(before) != MECH10_FIRST_ROW - 1 or changed != MECH10_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH10_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH10_EDITED_LINES)}: {sorted(changed)}")
+    mech10_corrections(repo)  # the landing amends no row, so the CORRECTIONS check rides here
+    return lines
+
+
+def mech10_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the g3b landing: the cvl1 pin's file, 313.12 inserted above its trailer, 313's heading tag
+    rewritten, and entries 314-315 appended below that trailer."""
+    older = mech9_corrections(repo)[0]
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH10_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH10_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:12]} does not match the pinned bytes")
+    later = raw.decode("utf-8").splitlines()
+    trailer = older[-1]
+    if not trailer.startswith(MECH9_TRAILER) or later.count(trailer) != 1 or not later[-1].startswith(MUST_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:7]} does not keep the cvl1 pin's trailer once and close with a fresh one")
+    k = later.index(trailer)
+    body = len(older) - 1
+    changed = [n for n in range(1, body + 1) if later[n - 1] != older[n - 1]]
+    if len(changed) != 1 or not older[changed[0] - 1].startswith("## 313. ") \
+            or older[changed[0] - 1].count(MECH10_313_TAG[0]) != 1 \
+            or older[changed[0] - 1].replace(MECH10_313_TAG[0], MECH10_313_TAG[1]) != later[changed[0] - 1]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:7]} changed an earlier line other than 313's heading tag: {changed[:8]}")
+    inserted = later[body:k]
+    if not inserted or not inserted[0].startswith(MECH10_INSERTED_SUBSECTION) or any(line.startswith("## ") for line in inserted):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:7]} inserts something other than subsection 313.12 above the trailer")
+    appended = [line for line in later[k + 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MECH10_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:7]} does not append exactly entries {MECH10_ENTRIES}: {appended[:4]}")
+    if any(".  RESERVED" in line or line.split(" — ")[0].endswith("RESERVED") for line in appended):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH10_COMMIT[:7]} still carries a reserved stub")
+    return later, older
+
+
+def mech10_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE line 244 (g3b) and attach its ARGS-value note (the 16 W4 runs)."""
+    rows = with_interventions(appended_rows(lines, MECH10_ROWS, MECH10_FIRST_ROW, MECH10_LAST_ROW, MECH10_COMMIT), MECH10_INTERVENTIONS)
+    for row in rows:
+        spec = MECH10_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
     """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
     lines, before = mech4_master_table(repo), must_master_table(repo)
@@ -2932,7 +3051,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + mech6_rows(mech6_master_table(Path(repo)))
              + mech7_rows(mech7_master_table(Path(repo)))
              + mech8_rows(mech8_master_table(Path(repo)))
-             + mech9_rows(mech9_master_table(Path(repo))))
+             + mech9_rows(mech9_master_table(Path(repo)))
+             + mech10_rows(mech10_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

@@ -24,8 +24,8 @@ const CVL1_FINAL = ['VAL-DIFFERS-UNRESOLVED', 'SELECT-SAME', 'W1-TUNDECIDED/VSUR
   'TEST-LEVEL-DIFFERS-FROM-CGW1-kLW4 (primary', 'selection', 'per-claim states', '11 stamps; the 7 registered bounds in the next column)'];
 
 test('MT243 carries the outcome the documented rules give it, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-1).map(e => e.id), ['MT243'], 'appended after every existing record');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [180, 162, 18, 3469]);
+  assert.deepEqual(data.experiments.slice(-2, -1).map(e => e.id), ['MT243'], 'appended in line order, before the later g3b row');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [181, 163, 18, 3501]);
   // cvl1 belongs to the count-matched partition audit; Open, as MT240, and it corrects no earlier published claim.
   assert.deepEqual([cvl1.section, cvl1.area, cvl1.kind, cvl1.outcome, cvl1.corrected, cvl1.batches],
     [10, 'Count-matched partition audit', 'research', 'unresolved', false, ['cvl1']]);
@@ -69,7 +69,7 @@ test('the two warnings name their kinds, and every row of the batch is listed on
 });
 
 test('the 32 runs link to MT243 with sanitized logs; W1 runs carry the VAL_SPLIT mark, W4 runs the two-axis mark', () => {
-  assert.equal(runs.length, 3469);
+  assert.equal(runs.length, 3501);
   const linked = runs.filter(run => run.batch === 'cvl1');
   assert.equal(linked.length, 32);
   assert.deepEqual([...cvl1.runIds].sort(), linked.map(run => run.id).sort());
@@ -99,7 +99,7 @@ test('the 32 runs link to MT243 with sanitized logs; W1 runs carry the VAL_SPLIT
     }
   }
   assert.equal(runs.filter(run => run.parameters.intervention).length, 199, "183 before, plus cvl1's 16 VAL_SPLIT rows");
-  assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 155, "139 before, plus cvl1's 16 two-axis rows");
+  assert.equal(runs.filter(run => run.batch !== 'g3b' && run.parameters.argsDeviation).length, 155, "139 before, plus cvl1's 16 two-axis rows");
 });
 
 test('the published arm means reproduce every TEST level the row reads', () => {
@@ -118,7 +118,8 @@ test('phase-19 is its own documented phase and carries one record', () => {
   const phase19 = data.activity.find(e => e.id === 'phase-19')!;
   assert.deepEqual([phase19.experimentIds, phase19.kind, phase19.date], [['MT243'], 'research-phase', '2026-09-22']);
   assert.match(phase19.title, /Do the audit's rankings hold on a held-out validation split/);
-  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 19);
+  // phase-20 was added later with g3b (tests/mech10-landing.test.ts).
+  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 20);
 });
 
 test('the landing links the scorer, parser, design and audit tools it cites', () => {
