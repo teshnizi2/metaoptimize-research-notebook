@@ -1,0 +1,1137 @@
+#!/usr/bin/env python3
+"""cRT1_retune_score.py -- THE REGISTERED SCORER OF `crt1` (CORRECTIONS 300; ICML-PLAN section 4a rank 2 / row 1.18).
+
+QUESTION.  `cgw1` (296) landed SCALAR-BEATS-BEST at alpha-scaled weight decay 5e-4 on the audit's core cell: plain scalar
+above chunk777 by +2.5590 pp and above nodewise by +2.8000 pp, with ms 1e-4 / alpha0 1e-3 -- hyperparameters chosen at
+weight decay 0.1.  Is that a TUNING ARTEFACT?  Re-tune every grain at 5e-4 over the same grid and read the gap again.
+
+DESIGN (analysis/crt1_design.py).  cgw1's W4 cell verbatim (ResNet18 / CIFAR-10 / SGDm 0.99 + Lion 0.99/0.9 / wd 5e-4 /
+box -15:-2.3026 / 100 ep / AUGMENT=1 / PROBE=5) with THREE grains -- `ch` chunk777, `nd` nodewise, `k01` scalar -- at
+FOUR tuning configs: M2 (ms 1e-4, alpha0 1e-3: the incumbent, cgw1's cell, the IN-BATCH replicate), A2 (ms 1e-4,
+alpha0 1e-2), M3 (ms 3e-4, alpha0 1e-3), M1 (ms 3e-5, alpha0 1e-3).  Seeds {176, 177, 178} on every arm.  36 runs.
+
+DOCUMENTED INVOCATION
+    python3 analysis/cRT1_retune_score.py <runsdir>          # runsdir = $WS/runs (or its crt1/ subdirectory)
+    python3 analysis/cRT1_retune_score.py --selftest [--runsdir <dir>] [--csv <all_runs.csv>]
+EXIT  0 FINAL printed | 2 INCOMPLETE | 3 HARNESS-FAIL (a registered run is not the run the design says it is)
+
+EVERY READING IS WITHIN THIS BATCH.  Levels are plateau5 = mean TEST accuracy over epochs 95-99; the SELECTOR is train5
+= mean TRAIN accuracy over the same epochs; both from each run's OWN raw `.out` epoch lines (never the CSV).
+SIGMA_USED = max(the FROZEN prior, the in-batch pooled within-arm sd) (O2).  The prior was read ONCE through
+corpus_exclusions.filter_rows on the 3,383-row corpus and is a literal here; the corpus line printed at run time is
+DISCLOSURE ONLY.  cgw1's landed W4 levels (crt1_design.CGW1_W4) feed ONE non-gating replicate stamp and one descriptive
+line, and are NEVER pooled with this batch.
+
+THE REGISTERED DECISION (300.2).
+ SELECTION, per grain g, over the configs whose arm g_c is not DIVERGED (seed range <= 2.0 pp):
+   TUNED  = argmax over c of train5(g_c)  -- selection on TRAIN, never on the test set (the PRIMARY reading);
+   ORACLE = argmax over c of plateau5(g_c) -- the best-of-grid reading ON THE TEST SET, co-reported;
+   an exact tie goes to the earlier config in crt1_design.CONFIG_IDS (M2, A2, M3, M1).
+ SELECTION-BIAS BOUND.  A selected arm's level is optimistic by at most, IN EXPECTATION, the expected maximum of the 4
+   candidates' noises: for iid Gaussian arm-mean noise of sd SIGMA_USED/sqrt(3) this is B = EMAX4 * SIGMA_USED / sqrt(3),
+   EMAX4 = E[max of 4 iid N(0,1)] = 1.0293753730 (the equal-means worst case; with train-selection it is reached only if
+   train and test noise are perfectly correlated).  Both sides of T = k01_sel - x_sel are selected, so T is biased by at
+   most B in EITHER direction; every scalar-favouring reading is taken on T - B, every partition-favouring one on T + B.
+   B is a bound on the EXPECTED bias, not a high-probability bound; the 2 SE half-width is added on top of it.
+ READING (TUNED and ORACLE alike), with T_ch = k01 - ch, T_nd = k01 - nd, SE = SIGMA_USED * sqrt(1/3 + 1/3), first match:
+   <X>-SCALAR-DIVERGED (every scalar config diverged) | <X>-SCALAR-COLLAPSED (the selected scalar arm < 80) |
+   <X>-UNREADABLE (a partition has no candidate, or its selected arm < 80) |
+   <X>-SCALAR-BEATS-BEST     both T - B >= +0.30 and T - B > 2 SE
+   <X>-SCALAR-TIES-BEST      min T - B - 2 SE >= -0.30                       (a BOUND)
+   <X>-PARTITION-ABOVE-SCALAR min T + B <= -0.30 and min T + B < -2 SE
+   <X>-UNRESOLVED
+ BRANCH (the answer), from (TUNED, ORACLE), first match:
+   BRANCH-UNREADABLE            TUNED is a gate token
+   HEADLINE-REFUTED-BY-RETUNE   TUNED-PARTITION-ABOVE-SCALAR
+   NOT-A-TUNING-ARTEFACT        TUNED-SCALAR-BEATS-BEST and ORACLE-SCALAR-BEATS-BEST
+   SELECTION-DEPENDENT          TUNED-SCALAR-BEATS-BEST and ORACLE anything else
+   WEAKENED-TO-TIE              TUNED-SCALAR-TIES-BEST
+   RETUNE-UNDECIDED             TUNED-UNRESOLVED
+ EVERY-CONFIG READING (co-reported, NO selection so NO bias term): at each config c, cgw1's scalar ladder on
+   (k01_c - ch_c, k01_c - nd_c): BEATS | TIES | BELOW | UNRESOLVED | DIVERGED | COLLAPSED | UNREADABLE.
+ DESCRIPTIVE ONLY (license nothing): D = ch - nd per config and at the tuned selection; the gap change T_tuned - T_M2;
+   M2 against cgw1's W4 (cross-batch, NOT pooled); the realised per-step shrink a*wd per arm; the plateau beta.
+
+BOUNDS PRINTED ON EVERY FINAL: ONE-CELL, ONE-DECAY-5e-4, FOUR-POINT-GRID, ALPHA0-TWO-POINTS, SELBIAS-B=<value>,
+NO-VALIDATION-SPLIT (1.14), ALPHA-SCALED-DECAY-ONLY, UNDER-DECAYED-VS-STANDARD-RECIPE (296.4's W4 caveat), TIES-ARE-BOUNDS,
+CGW1-COMPARISON-DESCRIPTIVE.
+"""
+import argparse
+import csv
+import glob
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("crt1_design", os.path.join(HERE, "crt1_design.py"))
+PREFIX = D.PREFIX
+
+# ---- FROZEN noise floor (O2).  corpus_exclusions.filter_rows on results/all_runs.csv @ 3,383 rows (268 exclusion rows
+# ---- -> 3,115 kept); cgw1's cell filter verbatim (ResNet18 / CIFAR10 / 100 ep / aug 1 / clip -15:-2.3026 / ms 1e-4 /
+# ---- alpha0 1e-3 / bs 100), pooled within the 15-key cells.  The UNFILTERED value is 1.034333 (df 218): cgw1's W2 / W4
+# ---- rows share the 15-key cell with its W1 rows (weight decay is not a key), and the exclusion list removes them.
+SIGMA_PRIOR = 0.17818264951145454     # FILTERED; df 190, 34 cells, 224 rows
+SIGMA_PRIOR_DF = 190
+SIGMA_PRIOR_NAIVE = 1.034332721154537  # UNFILTERED (the trap) -- disclosure
+CORPUS_ROWS_AT_REG = 3383
+EXCL_ROWS_AT_REG = 268
+NOISE_FLOOR_DEMO = 0.636566           # corpus_exclusions --check SIGMA_R18ALL at registration (df 274); quoted, not read
+EMAX4 = 1.0293753730039641            # E[max of 4 iid N(0,1)]; selftest H re-derives it by quadrature
+SE3 = 0.145486                        # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+B_PRIOR = 0.105896                    # EMAX4 * SIGMA_PRIOR / sqrt(3), 6 d.p.
+
+# ---- FROZEN bars (O2).  pp unless stated. ----------------------------------------------------------------------------
+SURV = 0.30          # cgw1's scalar bar (both BEATS and the TIES edge), unchanged
+RES = 2.0            # resolved at |x| > 2 SE; 2 SE is a HALF-WIDTH, never a bound on an effect
+HEALTH_MIN = 80.0    # a ResNet18 / CIFAR-10 arm below this has failed as a run (cgw1's W4 partitions sat at 87.7-87.9,
+                     # 2.7 pp above cgw1's 85; 80 keeps every predicted level >= 6.5 pp clear, 300.6)
+DIVERGED = 2.0       # a seed range above this is bimodal, not noise (cgw1's)
+BOXFREE_MAX = 0.05   # the audit's published rec-based 5 % box gate -- a STAMP here, never a gate
+BOX_EPS = 1e-3
+MATCH = 0.50         # non-gating replicate stamp: |M2 level - cgw1 W4 level| <= MATCH on every grain
+PL_LO, PL_HI = 95, 99
+WIN_STEP = PL_LO * D.STEPS_PER_EPOCH      # 47,500: the plateau window's first meta step
+
+READINGS = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST", "PARTITION-ABOVE-SCALAR", "UNRESOLVED",
+            "SCALAR-DIVERGED", "SCALAR-COLLAPSED", "UNREADABLE")
+GATE_READINGS = ("SCALAR-DIVERGED", "SCALAR-COLLAPSED", "UNREADABLE")
+TUNED_TOKENS = tuple("TUNED-" + r for r in READINGS)
+ORACLE_TOKENS = tuple("ORACLE-" + r for r in READINGS)
+CFG_STATES = ("BEATS", "TIES", "BELOW", "UNRESOLVED", "DIVERGED", "COLLAPSED", "UNREADABLE")
+BRANCHES = D.BRANCHES
+BOUNDS = ("ONE-CELL", "ONE-DECAY-5e-4", "FOUR-POINT-GRID", "ALPHA0-TWO-POINTS", "NO-VALIDATION-SPLIT",
+          "ALPHA-SCALED-DECAY-ONLY", "UNDER-DECAYED-VS-STANDARD-RECIPE", "TIES-ARE-BOUNDS", "CGW1-COMPARISON-DESCRIPTIVE")
+
+LICENCE = {
+    "NOT-A-TUNING-ARTEFACT": "after re-tuning every grain at alpha-scaled 5e-4 over this four-point grid (ms 3e-5 / 1e-4 / 3e-4 "
+                             "at alpha0 1e-3, and alpha0 1e-2 at ms 1e-4), plain scalar is still above BOTH audited "
+                             "partitions by >= 0.30 pp net of the selection-bias bound, resolved, under train-selection "
+                             "AND best-of-grid selection: at this cell cgw1's scalar-beats-both row is not an artefact of "
+                             "hyperparameters chosen at 0.1, over this grid.  TMLR: the row may say 'robust to re-tuning "
+                             "the meta step size and alpha0 over a four-point grid', at this cell only.",
+    "WEAKENED-TO-TIE": "after re-tuning, scalar is at most 0.30 pp below the better audited partition at the lower edge (2 SE "
+                       "plus the selection bound) and no longer resolved above both by the bar -- a BOUND: at this cell "
+                       "cgw1's +2.6-2.8 pp was, at least in part, a tuning artefact.  TMLR: the row must be rewritten from "
+                       "'beats' to 'ties (a bound) after re-tuning'.",
+    "HEADLINE-REFUTED-BY-RETUNE": "after re-tuning with TRAIN selection, an audited partition is above plain scalar by >= "
+                                  "0.30 pp net of the selection bound, resolved: cgw1's scalar-beats-both row IS a tuning "
+                                  "artefact at this cell.  TMLR: the row must be withdrawn and replaced by this reading.",
+    "SELECTION-DEPENDENT": "train-selected scalar beats both partitions, but the best-of-grid (test-selected) reading does not: "
+                           "the answer depends on the selection rule.  TMLR: report both readings; no robustness sentence.",
+    "RETUNE-UNDECIDED": "the tuned comparison is not resolved against the 0.30 pp bar; report the interval and the grid.",
+    "BRANCH-UNREADABLE": "a tuned arm diverged or failed as a run; report the grid levels only.",
+}
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^%s-([A-Za-z0-9]+)-s(\d+)-(\d+)\.out$" % PREFIX)
+KIND_ON_RE = re.compile(r"^([A-Z][A-Z_]+): on\b")
+
+
+def mean(v):
+    return sum(v) / float(len(v))
+
+
+def sd(v):
+    if len(v) < 2:
+        return 0.0
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def median(v):
+    s = sorted(v)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =====================================================================================================================
+# THE DECISION (pure functions of numbers; the selftest drives them exhaustively)
+# =====================================================================================================================
+def select(cands, key):
+    """cands = [(config, dict)] in CONFIG_IDS order, already filtered to non-diverged; -> config or None.
+    argmax of dict[key]; an exact tie keeps the EARLIER config (the incumbent first)."""
+    best = None
+    for c, x in cands:
+        if best is None or x[key] > best[1][key]:
+            best = (c, x)
+    return best[0] if best else None
+
+
+def reading_of(k_ok, k_level, p_ok, p_levels_ok, t_ch, t_nd, se, b):
+    """k_ok: a scalar candidate exists; p_ok: both partitions have a candidate; p_levels_ok: both selected partitions >= 80."""
+    if not k_ok:
+        return "SCALAR-DIVERGED"
+    if k_level < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not (p_ok and p_levels_ok):
+        return "UNREADABLE"
+    lo_ch, lo_nd = t_ch - b, t_nd - b
+    if lo_ch >= SURV and lo_nd >= SURV and lo_ch > RES * se and lo_nd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    tmin = min(t_ch, t_nd)
+    if tmin - b - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin + b <= -SURV and tmin + b < -RES * se:
+        return "PARTITION-ABOVE-SCALAR"
+    return "UNRESOLVED"
+
+
+def cfg_state(k_level, k_div, cmp_ok, t_ch, t_nd, se):
+    """cgw1's scalar ladder at ONE config (no selection, so no bias term)."""
+    if k_div:
+        return "DIVERGED"
+    if k_level < HEALTH_MIN:
+        return "COLLAPSED"
+    if not cmp_ok:
+        return "UNREADABLE"
+    tmin = min(t_ch, t_nd)
+    if t_ch >= SURV and t_nd >= SURV and t_ch > RES * se and t_nd > RES * se:
+        return "BEATS"
+    if tmin - RES * se >= -SURV:
+        return "TIES"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "BELOW"
+    return "UNRESOLVED"
+
+
+def branch_of(tuned, oracle):
+    t = tuned[len("TUNED-"):]
+    o = oracle[len("ORACLE-"):]
+    if t in GATE_READINGS:
+        return "BRANCH-UNREADABLE"
+    if t == "PARTITION-ABOVE-SCALAR":
+        return "HEADLINE-REFUTED-BY-RETUNE"
+    if t == "SCALAR-BEATS-BEST":
+        return "NOT-A-TUNING-ARTEFACT" if o == "SCALAR-BEATS-BEST" else "SELECTION-DEPENDENT"
+    if t == "SCALAR-TIES-BEST":
+        return "WEAKENED-TO-TIE"
+    return "RETUNE-UNDECIDED"
+
+
+def compose_sigma(sigma_in):
+    return (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sigma_in else (sigma_in, "SIGMA_INBATCH")
+
+
+def bias_bound(sigma_used):
+    return EMAX4 * sigma_used / math.sqrt(len(D.SEEDS_ALL))
+
+
+def _selected_reading(A, sel, sigma_used, b):
+    k = sel["k01"]
+    p_ok = sel["ch"] is not None and sel["nd"] is not None
+    if k is None:
+        return "SCALAR-DIVERGED", None, None, None
+    kx = A[D.arm_of("k01", k)]
+    if not p_ok:
+        return reading_of(True, kx["level"], False, False, 0, 0, 1, b), None, None, None
+    cx, nx = A[D.arm_of("ch", sel["ch"])], A[D.arm_of("nd", sel["nd"])]
+    t_ch, t_nd = kx["level"] - cx["level"], kx["level"] - nx["level"]
+    se = sigma_used * math.sqrt(1.0 / kx["n"] + 1.0 / cx["n"])
+    r = reading_of(True, kx["level"], True, cx["level"] >= HEALTH_MIN and nx["level"] >= HEALTH_MIN, t_ch, t_nd, se, b)
+    return r, t_ch, t_nd, se
+
+
+def decide(A, sigma_used):
+    """A[arm] = dict(level, train, range, n, boxfree).  -> (branch, tuned, oracle, cfg_states, K)."""
+    b = bias_bound(sigma_used)
+    K = {"B": b}
+    sel_t, sel_o = {}, {}
+    for g in D.GRAIN_IDS:
+        cands = [(c, A[D.arm_of(g, c)]) for c in D.CONFIG_IDS if A[D.arm_of(g, c)]["range"] <= DIVERGED]
+        sel_t[g] = select(cands, "train")
+        sel_o[g] = select(cands, "level")
+    K["SEL_TUNED"], K["SEL_ORACLE"] = sel_t, sel_o
+    rt, tch, tnd, se = _selected_reading(A, sel_t, sigma_used, b)
+    ro, och, ond, ose = _selected_reading(A, sel_o, sigma_used, b)
+    K["T_TUNED"] = (tch, tnd, se)
+    K["T_ORACLE"] = (och, ond, ose)
+    tuned, oracle = "TUNED-" + rt, "ORACLE-" + ro
+    cfg = {}
+    for c in D.CONFIG_IDS:
+        k, ch, nd = (A[D.arm_of(g, c)] for g in ("k01", "ch", "nd"))
+        t_ch, t_nd = k["level"] - ch["level"], k["level"] - nd["level"]
+        se_c = sigma_used * math.sqrt(1.0 / k["n"] + 1.0 / ch["n"])
+        cmp_ok = (ch["level"] >= HEALTH_MIN and nd["level"] >= HEALTH_MIN and ch["range"] <= DIVERGED
+                  and nd["range"] <= DIVERGED)
+        cfg[c] = cfg_state(k["level"], k["range"] > DIVERGED, cmp_ok, t_ch, t_nd, se_c)
+        K["T_" + c] = (t_ch, t_nd, se_c)
+        K["D_" + c] = (ch["level"] - nd["level"], se_c)
+    return branch_of(tuned, oracle), tuned, oracle, cfg, K
+
+
+# =====================================================================================================================
+# READING THE RUNS
+# =====================================================================================================================
+def parse_args_line(line):
+    """-> (pairs in order, repeated flags).  argparse semantics for this harness: every value is ONE token."""
+    toks = shlex.split(line[len("ARGS:"):])
+    pairs, seen, rep, i = [], set(), [], 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("--"):
+            return None, ["stray token %r" % t]
+        if i + 1 >= len(toks) or toks[i + 1].startswith("--"):
+            return None, ["flag %s has no value" % t]
+        f = t[2:]
+        if f in seen:
+            rep.append(f)
+        seen.add(f)
+        pairs.append((f, toks[i + 1]))
+        i += 2
+    return pairs, rep
+
+
+def read_out(path):
+    """Unlike cgw1's reader (its latent RULE 16 defect F1, 296.6), a REPEATED epoch line, ARGS line or ENV line is recorded
+    and becomes a harness failure; nothing is silently overwritten."""
+    L = open(path, errors="replace").read().splitlines()
+    info = dict(path=path, args=None, env=None, gpu=None, done=False, eps={}, kinds_on=[], node=None, pt=False,
+                dup_ep=[], n_args=0, n_env=0)
+    for ln in L:
+        if ln.startswith("ARGS:"):
+            info["n_args"] += 1
+            if info["args"] is None:
+                info["args"] = ln
+        elif ln.startswith("ENV:"):
+            info["n_env"] += 1
+            if info["env"] is None:
+                info["env"] = ln
+        elif ln.startswith("NODE=") and info["node"] is None:
+            info["node"] = ln.split("|")[0].strip()
+        elif ln.startswith("NVIDIA") and info["gpu"] is None:
+            info["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            info["done"] = True
+        elif ln.startswith("PROBE_TENSOR:"):
+            info["pt"] = True
+        else:
+            m = EPTR_RE.search(ln)
+            if m:
+                e = int(m.group(1))
+                if e in info["eps"]:
+                    info["dup_ep"].append(e)
+                else:
+                    info["eps"][e] = (float(m.group(2)), float(m.group(3)))
+            k = KIND_ON_RE.match(ln)
+            if k:
+                info["kinds_on"].append(ln.strip())
+    info["complete"] = info["done"] and all(e in info["eps"] for e in range(D.EPOCHS))
+    return info
+
+
+def find_outs(runsdir):
+    out = []
+    for base in (runsdir, os.path.join(runsdir, PREFIX)):
+        out += glob.glob(os.path.join(base, "%s-*.out" % PREFIX))
+    return sorted(set(os.path.realpath(p) for p in out))
+
+
+def probe_path(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, D.probe_dir_name(arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def read_probe(path):
+    recs = []
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            recs.append(None)
+            continue
+        recs.append({k: r.get(k) for k in ("step", "n_beta", "beta_true_min", "beta_true_max", "n_at_lo", "n_at_hi", "beta")}
+                    if isinstance(r, dict) else None)
+    return recs
+
+
+def probe_audit(recs, m_want):
+    """-> (ok, why, occupancy dict).  G-STRUCT: 10,000 records at steps 0,5,..; n_beta == the arm's m on EVERY record."""
+    if recs is None:
+        return False, "no probe.jsonl", None
+    if len(recs) != D.N_RECORDS:
+        return False, "%d records, want %d" % (len(recs), D.N_RECORDS), None
+    if any(r is None for r in recs):
+        return False, "an unreadable record", None
+    steps = [r["step"] for r in recs]
+    if steps != list(range(0, D.N_RECORDS * D.PROBE, D.PROBE)):
+        return False, "record steps are not 0,5,...,%d" % ((D.N_RECORDS - 1) * D.PROBE), None
+    nb = set(r["n_beta"] for r in recs)
+    if nb != {m_want}:
+        return False, "n_beta %s != the arm's registered m %d (the grain is not what ARGS says)" % (sorted(nb)[:3], m_want), None
+    mins = [r["beta_true_min"] for r in recs]
+    maxs = [r["beta_true_max"] for r in recs]
+    if not (max(maxs) - min(mins) > 1e-9):
+        return False, "beta never moved", None
+    if any(not isinstance(r.get("beta"), list) or not r["beta"] for r in recs):
+        return False, "a record without a beta list", None
+    T = len(recs)
+    rec_lo = sum(1 for x in mins if x <= D.LO + BOX_EPS) / float(T)
+    rec_hi = sum(1 for x in maxs if x >= D.HI - BOX_EPS) / float(T)
+    win = [r for r in recs if r["step"] >= WIN_STEP]
+    occ = dict(rec_lo=rec_lo, rec_hi=rec_hi, boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX),
+               beta_min_win=min(r["beta_true_min"] for r in win), beta_max_win=max(r["beta_true_max"] for r in win))
+    occ.update(shrink_of(recs, D.WD_VALUE))
+    return True, "", occ
+
+
+def rec_shrink(r, wd):
+    """caw2's registered definition (290): per record, the median over the record's step sizes of exp(beta) * wd.
+    For the partitions the probe stores 62 per-tensor MEAN log step sizes, so their figure is APPROXIMATE (296.4)."""
+    return median([math.exp(x) for x in r["beta"]]) * wd
+
+
+def shrink_of(recs, wd):
+    """-> plateau (median over window records), peak (max over all records), plateau median log step size, peak beta."""
+    allv = [rec_shrink(r, wd) for r in recs]
+    win = [(rec_shrink(r, wd), median(r["beta"])) for r in recs if r["step"] >= WIN_STEP]
+    return dict(shrink_plateau=median([w[0] for w in win]), shrink_peak=max(allv),
+                beta_plateau=median([w[1] for w in win]), beta_peak=max(r["beta_true_max"] for r in recs))
+
+
+def read_corpus_disclosure(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions as ce
+    finally:
+        sys.path.pop(0)
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return len(ce.filter_rows(rows))
+
+
+def resolve_prov(runsdir):
+    for p in (os.path.join(runsdir, PREFIX, "PROVENANCE.txt"), os.path.join(runsdir, "PROVENANCE.txt")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# =====================================================================================================================
+# SCORE
+# =====================================================================================================================
+def score(runsdir, csvpath=DEFAULT_CSV, out=print):
+    P = out
+    P("=" * 110)
+    P("crt1 -- IS cgw1's SCALAR-BEATS-BEST AT WEIGHT DECAY 5e-4 A TUNING ARTEFACT?  (CORRECTIONS 300; ICML-PLAN 4a rank 2)")
+    P("scorer sha256 %s   design sha256 %s" % (file_sha(os.path.abspath(__file__)), file_sha(os.path.join(HERE, "crt1_design.py"))))
+    P("runsdir %s" % runsdir)
+    P("=" * 110)
+    harness = []
+
+    def hfail(msg):
+        harness.append(msg)
+        P("  !!! HARNESS %s" % msg)
+
+    found = {}
+    for p in find_outs(runsdir):
+        m = OUT_RE.match(os.path.basename(p))
+        if not m:
+            hfail("unparseable file name %s" % os.path.basename(p))
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        if arm not in D.ARMS or seed not in D.SEEDS[arm]:
+            hfail("a %s .out that is not a registered run: %s" % (PREFIX, os.path.basename(p)))
+            continue
+        found.setdefault((arm, seed), []).append((jid, p))
+    runs, missing, ignored = {}, [], []
+    for (arm, seed) in D.RUNS:
+        cands = [(jid, p, read_out(p)) for jid, p in sorted(found.get((arm, seed), []))]
+        comp = [c for c in cands if c[2]["complete"]]
+        ignored += [os.path.basename(c[1]) for c in cands if not c[2]["complete"]]
+        if not comp:
+            missing.append(D.run_name(arm, seed))
+        elif len(comp) > 1:
+            hfail("%s has %d COMPLETE .out files (%s) -- ambiguous" % (D.run_name(arm, seed), len(comp),
+                  ", ".join(os.path.basename(c[1]) for c in comp)))
+        else:
+            runs[(arm, seed)] = comp[0]
+    P("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(runs), D.NJOBS))
+    if ignored:
+        P("  ignored (incomplete, a complete twin or none): %s" % ", ".join(sorted(ignored)))
+    if missing:
+        P("  MISSING / INCOMPLETE: %s" % ", ".join(missing))
+
+    prov = resolve_prov(runsdir)
+    if prov is None:
+        hfail("G-PROV: no PROVENANCE.txt under %s/%s" % (runsdir, PREFIX))
+    else:
+        kv = dict(ln.split(" ", 1) for ln in open(prov).read().splitlines() if " " in ln)
+        want = {"SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+                "DESIGN_SHA256": file_sha(os.path.join(HERE, "crt1_design.py"))}
+        for k, v in sorted(want.items()):
+            if kv.get(k, "").strip() != v:
+                hfail("G-PROV: %s in %s is %r, the file that is running is %s" % (k, prov, kv.get(k), v[:16]))
+        P("G-PROV  %s  MODE %s  SCORER %s  DESIGN %s  HF %s" % (prov, kv.get("MODE", "?"), kv.get("SCORER_SHA256", "?")[:16],
+          kv.get("DESIGN_SHA256", "?")[:16], kv.get("HF_SHA256", "?")[:16]))
+        if kv.get("HF_SHA256", D.HF_LIVE_SHA).strip() != D.HF_LIVE_SHA:
+            hfail("G-PROV: HF_SHA256 is not the registered live HF %s" % D.HF_LIVE_SHA[:16])
+
+    per, gpus, save_dirs = {}, {}, set()
+    for (arm, seed), (jid, path, info) in sorted(runs.items()):
+        rn = D.run_name(arm, seed)
+        if info["n_args"] != 1 or info["n_env"] != 1 or info["dup_ep"]:
+            hfail("G-ONCE %s: %d ARGS lines, %d ENV lines, repeated epoch lines %s (each must appear exactly once)"
+                  % (rn, info["n_args"], info["n_env"], info["dup_ep"][:5]))
+            continue
+        pairs, rep = parse_args_line(info["args"])
+        if pairs is None or rep:
+            hfail("G-ARGS %s: %s" % (rn, rep))
+            continue
+        sd_ = dict(pairs).get("save-directory", "")
+        save_dirs.add(sd_)
+        want = D.expected_args(arm, seed, sd_)
+        if pairs != want:
+            diff = [(f, v, dict(want).get(f)) for f, v in pairs if dict(want).get(f) != v]
+            miss = [f for f, _v in want if f not in dict(pairs)]
+            hfail("G-ARGS %s: %d flags differ from the registered line %s missing %s" % (rn, len(diff), diff[:4], miss[:4]))
+            continue
+        want_env = D.ENV_TEMPLATE.replace("<P>", os.path.join(sd_, D.probe_dir_name(arm, seed)))
+        if info["env"] != want_env:
+            hfail("G-ENV %s: ENV line is not the registered one (%r)" % (rn, (info["env"] or "")[:160]))
+            continue
+        if info["kinds_on"] or info["pt"]:
+            hfail("G-KIND %s: prints a patch witness %s" % (rn, (info["kinds_on"] or ["PROBE_TENSOR"])[:2]))
+            continue
+        pp = probe_path(runsdir, arm, seed)
+        ok, why, occ = probe_audit(read_probe(pp) if pp else None, D.M_OF_ARM[arm])
+        if not ok:
+            hfail("G-STRUCT %s: %s" % (rn, why))
+            continue
+        eps = info["eps"]
+        per[(arm, seed)] = dict(level=mean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+                                train=mean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]), occ=occ, jid=jid)
+        gpus[info["gpu"]] = gpus.get(info["gpu"], 0) + 1
+    if len(save_dirs) > 1:
+        hfail("G-ARGS: the runs name %d different save directories %s" % (len(save_dirs), sorted(save_dirs)))
+    P("G-ONCE / G-ARGS / G-ENV / G-KIND / G-STRUCT  %d of %d complete runs pass (one ARGS / ENV line and each epoch once, "
+      "20 flags, the registered ENV line, no patch witness, 10,000 probe records with n_beta == the arm's m)" % (len(per), len(runs)))
+    P("G-HW (DISCLOSURE ONLY, never a gate): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    n_corp = read_corpus_disclosure(csvpath)
+    P("corpus: %s  (DISCLOSURE ONLY -- enters no bar, sigma, level, selection, reading or stamp)"
+      % ("not readable" if n_corp is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (n_corp, PREFIX)))
+    if harness:
+        P("\nFINAL HARNESS-FAIL | %d harness failure(s); nothing is read" % len(harness))
+        return 3
+    if missing:
+        P("\nFINAL INCOMPLETE | %d of %d runs missing or incomplete; nothing is read" % (len(missing), D.NJOBS))
+        return 2
+
+    A = {}
+    ss, df = 0.0, 0
+    P("\nARMS  plateau5 = mean TEST, train5 = mean TRAIN (the SELECTOR), epochs %d-%d, from each run's OWN .out" % (PL_LO, PL_HI))
+    P("  %-6s %-3s %-5s %-5s %-9s %2s %9s %7s %7s %9s  %-5s %8s %8s %11s %11s %9s %9s" % (
+        "arm", "cfg", "ms", "a0", "grain", "n", "plateau5", "sd", "range", "train5", "box", "rec_lo", "rec_hi",
+        "shrink_pl", "shrink_pk", "beta_pl", "beta_pk"))
+    for a in D.ARMS:
+        xs = [per[(a, s)]["level"] for s in D.SEEDS[a]]
+        tr = [per[(a, s)]["train"] for s in D.SEEDS[a]]
+        occs = [per[(a, s)]["occ"] for s in D.SEEDS[a]]
+        m_ = mean(xs)
+        ss += sum((x - m_) ** 2 for x in xs)
+        df += len(xs) - 1
+        A[a] = dict(level=m_, train=mean(tr), range=max(xs) - min(xs), n=len(xs), sd=sd(xs),
+                    boxfree=all(o["boxfree"] for o in occs),
+                    shrink_pl=median([o["shrink_plateau"] for o in occs]), shrink_pk=median([o["shrink_peak"] for o in occs]),
+                    beta_pl=median([o["beta_plateau"] for o in occs]), beta_pk=max(o["beta_peak"] for o in occs))
+        P("  %-6s %-3s %-5s %-5s %-9s %2d %9.4f %7.3f %7.3f %9.4f  %-5s %8.4f %8.4f %11.4e %11.4e %9.4f %9.4f" % (
+            a, D.CONFIG_OF[a], D.MS[a], D.A0[a], D.SPEC[a], len(xs), m_, A[a]["sd"], A[a]["range"], A[a]["train"],
+            "free" if A[a]["boxfree"] else "BOUND", max(o["rec_lo"] for o in occs), max(o["rec_hi"] for o in occs),
+            A[a]["shrink_pl"], A[a]["shrink_pk"], A[a]["beta_pl"], A[a]["beta_pk"]))
+    P("  shrink = realised per-step shrink a*wd (caw2's definition: per record the median over the step sizes of exp(beta)*wd;"
+      " plateau = median over records at step >= %d; median over seeds); partitions APPROXIMATE (62 per-tensor means);" % WIN_STEP)
+    P("  DESCRIPTIVE.  A standard SGD recipe's steady-state shrink is ~%.0e (296.4)." % D.STANDARD_RECIPE_SHRINK)
+    sig_in = math.sqrt(ss / df) if df else 0.0
+    sig, which = compose_sigma(sig_in)
+    P("\nSIGMA  O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    P("  SIGMA_PRIOR_frozen   %.6f  (df %d, filtered, literal)" % (SIGMA_PRIOR, SIGMA_PRIOR_DF))
+    P("  SIGMA_INBATCH        %.6f  (df %d, pooled within the 12 arms)" % (sig_in, df))
+    P("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+
+    branch, tuned, oracle, cfg, K = decide(A, sig)
+    b = K["B"]
+    P("\nSELECTION  (per grain over its non-diverged configs; exact ties to the earlier of %s)" % ",".join(D.CONFIG_IDS))
+    P("  selection-bias bound B = EMAX4 x SIGMA_USED / sqrt(3) = %.4f x %.6f / %.4f = %.6f pp (EXPECTED bias, max over 4)"
+      % (EMAX4, sig, math.sqrt(3), b))
+    for g in D.GRAIN_IDS:
+        P("  %-9s TRAIN-selected %-3s (train5 %s)   TEST-selected %-3s (plateau5 %s)" % (
+            D.SPEC_OF_GRAIN[g], K["SEL_TUNED"][g] or "-", " ".join("%s %.4f" % (c, A[D.arm_of(g, c)]["train"]) for c in D.CONFIG_IDS),
+            K["SEL_ORACLE"][g] or "-", " ".join("%s %.4f" % (c, A[D.arm_of(g, c)]["level"]) for c in D.CONFIG_IDS)))
+    P("\nCONTRASTS (IN BATCH; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    for lab, key in (("TUNED ", "T_TUNED"), ("ORACLE", "T_ORACLE")):
+        t_ch, t_nd, se = K[key]
+        if t_ch is None:
+            P("  %s  unreadable" % lab)
+            continue
+        P("  %s  T_ch = %+.4f pp (T-B %+.4f, T+B %+.4f)   T_nd = %+.4f pp (T-B %+.4f, T+B %+.4f)   SE %.6f   2 SE %.4f"
+          % (lab, t_ch, t_ch - b, t_ch + b, t_nd, t_nd - b, t_nd + b, se, RES * se))
+    for c in D.CONFIG_IDS:
+        t_ch, t_nd, se = K["T_" + c]
+        d, _se = K["D_" + c]
+        P("  %s (ms %s, a0 %s)  T_ch %+.4f (%+.2f SE)  T_nd %+.4f (%+.2f SE)  -> %-10s   D = ch - nd %+.4f (%+.2f SE) DESCRIPTIVE"
+          % (c, D.MS_TOKEN[c], D.A0_TOKEN[c], t_ch, t_ch / se, t_nd, t_nd / se, cfg[c], d, d / se))
+    t_ch, t_nd, _se = K["T_TUNED"]
+    if t_ch is not None:
+        m2c, m2n, _s = K["T_M2"]
+        dsel = A[D.arm_of("ch", K["SEL_TUNED"]["ch"])]["level"] - A[D.arm_of("nd", K["SEL_TUNED"]["nd"])]["level"]
+        P("  GAP CHANGE (DESCRIPTIVE): T_tuned - T_M2 = ch %+.4f, nd %+.4f pp;  D at the tuned selections = %+.4f pp (+/- B)"
+          % (t_ch - m2c, t_nd - m2n, dsel))
+    P("\nREPLICATE (DESCRIPTIVE, CROSS-BATCH, NOT POOLED): M2 is cgw1's W4 cell with fresh seeds")
+    se_x = sig * math.sqrt(1.0 / 3 + 1.0 / D.CGW1_W4_N)
+    for g in D.GRAIN_IDS:
+        x = A[D.arm_of(g, "M2")]["level"]
+        P("  %-9s crt1 M2 %.4f   cgw1 W4 %.4f   diff %+.4f (%+.2f x cross-batch SE %.4f)" % (
+            D.SPEC_OF_GRAIN[g], x, D.CGW1_W4[g], x - D.CGW1_W4[g], (x - D.CGW1_W4[g]) / se_x, se_x))
+    m2c, m2n, _s = K["T_M2"]
+    P("  T at M2: ch %+.4f (cgw1 %+.4f), nd %+.4f (cgw1 %+.4f)" % (m2c, D.CGW1_T["ch"], m2n, D.CGW1_T["nd"]))
+
+    stamps = list(BOUNDS)
+    stamps.insert(4, "SELBIAS-B=%.4f" % b)
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    diffs = [g for g in D.GRAIN_IDS if abs(A[D.arm_of(g, "M2")]["level"] - D.CGW1_W4[g]) > MATCH]
+    stamps += ["REPLICATE-MATCHES-CGW1"] if not diffs else ["REPLICATE-DIFFERS-%s" % g for g in diffs]
+    for g in D.GRAIN_IDS:
+        st_, so_ = K["SEL_TUNED"][g], K["SEL_ORACLE"][g]
+        if st_ in D.GRID_EDGE:
+            stamps.append("GRID-EDGE-%s-%s" % (g, st_))
+        if st_ is not None and so_ is not None:
+            stamps.append("SEL-AGREE-%s" % g if st_ == so_ else "SEL-DISAGREE-%s" % g)
+        if st_ is not None and not A[D.arm_of(g, st_)]["boxfree"]:
+            stamps.append("SELECTED-BOX-BOUND-%s" % g)
+    if oracle == "ORACLE-PARTITION-ABOVE-SCALAR":
+        stamps.append("ORACLE-PARTITION-ABOVE")
+    for a in D.ARMS:
+        if not A[a]["boxfree"]:
+            stamps.append("BOX-BOUND-%s" % a)
+        if A[a]["range"] > DIVERGED:
+            stamps.append("DIVERGED-%s" % a)
+    cfgword = "+".join("%s-%s" % (c, cfg[c]) for c in D.CONFIG_IDS)
+    selword = "SEL-TRAIN:%s SEL-TEST:%s" % (",".join("%s=%s" % (g, K["SEL_TUNED"][g] or "-") for g in D.GRAIN_IDS),
+                                            ",".join("%s=%s" % (g, K["SEL_ORACLE"][g] or "-") for g in D.GRAIN_IDS))
+    P("\nLICENCE  %s" % LICENCE[branch])
+    P("\nFINAL %s | %s | %s | %s | %s | %s" % (branch, tuned, oracle, cfgword, selword, " ".join(stamps)))
+    return 0
+
+
+# =====================================================================================================================
+# SELFTEST
+# =====================================================================================================================
+RESULTS = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label):
+    RESULTS["PASS" if cond else "FAIL"] += 1
+    print("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def skip(label):
+    RESULTS["SKIP"] += 1
+    print("  SKIP %s" % label)
+
+
+def _write_out(d, arm, seed, jid, level, train, save_dir, args_over=None, env_over=None, extra_line=None, done=True,
+               n_ep=D.EPOCHS, gpu="NVIDIA L4, 23034 MiB", dup_epoch=None):
+    rn = D.run_name(arm, seed)
+    pairs = D.expected_args(arm, seed, save_dir)
+    if args_over:
+        pairs = args_over(pairs)
+    args = "ARGS: " + " ".join("--%s %s" % kv for kv in pairs)
+    env = D.ENV_TEMPLATE.replace("<P>", os.path.join(save_dir, D.probe_dir_name(arm, seed)))
+    if env_over:
+        env = env_over(env)
+    L = ["NODE=[HOST_2f2f29d9e1] | JOB=%s %d | AUGMENT=1" % (rn, jid), args, env, gpu, ""]
+    if extra_line:
+        L.append(extra_line)
+    for e in range(n_ep):
+        te = level if e >= PL_LO - 5 else level * (1 - math.exp(-(e + 1) / 12.0))
+        tr = train if e >= PL_LO - 5 else train * (1 - math.exp(-(e + 1) / 12.0))
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.99, tr), te))
+        if dup_epoch is not None and e == dup_epoch:
+            L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.99, tr), 10.0))
+    L.append("%d  minutes" % 55)
+    if done:
+        L.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(L) + "\n")
+
+
+def _write_probe(pdir, m, lo=-8.0, hi=-5.0, n=D.N_RECORDS, nb=None, hi_frac=0.0, no_beta=False):
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "probe.jsonl"), "w") as fh:
+        for i in range(n):
+            bmax = D.HI if i >= n * (1 - hi_frac) else hi + 1e-4 * (i % 7)
+            beta = "" if no_beta else ', "beta": [%.6f%s]' % (lo + 1.0, "" if m == 1 else ", %.6f" % (lo + 2.0))
+            fh.write('{"step": %d, "beta_true_min": %.6f, "beta_true_max": %.6f, "n_beta": %d, "n_at_lo": 0, '
+                     '"n_at_hi": %d%s}\n' % (i * D.PROBE, lo - 1e-4 * (i % 5), bmax, nb if nb is not None else m,
+                                             1 if bmax >= D.HI else 0, beta))
+
+
+JIT = (0.0, 0.03, -0.03)       # zero-mean over the 3 seeds
+
+
+def _build(root, template, levels, trains=None, save_dir="/SAVE/runs/crt1", over=None, drop=(), extra=None,
+           probe_over=None, prov_over=None, jit=None):
+    os.makedirs(os.path.join(root, PREFIX), exist_ok=True)
+    jid = 7100000
+    for (arm, seed) in D.RUNS:
+        jid += 1
+        if (arm, seed) in drop:
+            continue
+        i = D.SEEDS[arm].index(seed)
+        lv = levels[arm] + (JIT[i] if jit is None else jit(arm, i))
+        tr = (trains or {}).get(arm, levels[arm] + 9.0)
+        kw = dict((over or {}).get((arm, seed), {}))
+        _write_out(os.path.join(root, PREFIX), arm, seed, jid, lv, tr, save_dir, **kw)
+        dst = os.path.join(root, PREFIX, D.probe_dir_name(arm, seed))
+        if probe_over and (arm, seed) in probe_over:
+            _write_probe(dst, D.M_OF_ARM[arm], **probe_over[(arm, seed)])
+        else:
+            os.symlink(os.path.join(template, D.probe_dir_name(arm, seed)), dst)
+    for f in (extra or []):
+        f(os.path.join(root, PREFIX))
+    kv = {"MODE": "submit", "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+          "DESIGN_SHA256": file_sha(os.path.join(HERE, "crt1_design.py")), "HF_SHA256": D.HF_LIVE_SHA}
+    kv.update(prov_over or {})
+    open(os.path.join(root, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+    return root
+
+
+def _run(root, csvpath=None):
+    lines = []
+    rc = score(root, csvpath, out=lines.append)
+    lines = [x for ln in lines for x in ln.split("\n")]
+    fin = [ln for ln in lines if ln.startswith("FINAL ")]
+    return rc, (fin[0] if fin else ""), lines
+
+
+def _levels(**over):
+    """Default grid: scalar far above both partitions at every config (a NOT-A-TUNING-ARTEFACT world)."""
+    L = {"chM2": 87.9, "ndM2": 87.7, "k01M2": 90.5, "chA2": 88.4, "ndA2": 88.0, "k01A2": 90.6,
+         "chM3": 88.6, "ndM3": 88.2, "k01M3": 90.0, "chM1": 87.2, "ndM1": 87.4, "k01M1": 89.5}
+    L.update(over)
+    return L
+
+
+def _A(levels, trains=None, rng_=None, n=3):
+    return dict((a, dict(level=levels[a], train=(trains or {}).get(a, levels[a] + 9.0), range=(rng_ or {}).get(a, 0.1),
+                         n=n, boxfree=True)) for a in D.ARMS)
+
+
+def _emax(k, steps=200000, lo=-10.0, hi=10.0):
+    """E[max of k iid N(0,1)] = integral x * k * phi(x) * Phi(x)^(k-1) dx, by the midpoint rule."""
+    h = (hi - lo) / steps
+    s = 0.0
+    for i in range(steps):
+        x = lo + (i + 0.5) * h
+        phi = math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+        Phi = 0.5 * (1 + math.erf(x / math.sqrt(2)))
+        s += x * k * phi * Phi ** (k - 1)
+    return s * h
+
+
+def selftest(csvpath, runsdir):
+    print("crt1 SELFTEST -- the design, the frozen floor, the selection-bias constant, the decision tables with exhaustive")
+    print("reachability, the realised-shrink function on REAL landed cgw1 W4 records, and the REAL score() on synthetic runs.")
+    src = open(os.path.abspath(__file__)).read()
+    # ---- A: design ----------------------------------------------------------------------------------------------
+    print("\nA  DESIGN")
+    chk(D.NJOBS == 36 and len(D.ARMS) == 12, "A 12 arms (3 grains x 4 configs), 36 runs")
+    chk(all(D.SEEDS[a] == (176, 177, 178) for a in D.ARMS) and D.SEED_BLOCK == (176, 177, 178),
+        "A every arm runs seeds {176, 177, 178} -- Track B's block, and nothing else")
+    chk(D.CONFIG_IDS == ("M2", "A2", "M3", "M1") and D.REPLICATE == "M2", "A the grid order (the tie-break order) is M2, A2, M3, M1")
+    chk([(D.MS_TOKEN[c], D.A0_TOKEN[c]) for c in D.CONFIG_IDS] == [("1e-4", "1e-3"), ("1e-4", "1e-2"), ("3e-4", "1e-3"), ("3e-5", "1e-3")],
+        "A the configs: M2 1e-4/1e-3 (cgw1's cell), A2 1e-4/1e-2, M3 3e-4/1e-3, M1 3e-5/1e-3")
+    chk(all(abs(float(D.MS_TOKEN[c]) - D.MS_VALUE[c]) == 0 and abs(float(D.A0_TOKEN[c]) - D.A0_VALUE[c]) == 0 for c in D.CONFIG_IDS),
+        "A every token parses to its registered value")
+    chk(D.M_OF_GRAIN == {"ch": 14421, "nd": 14420, "k01": 1}, "A registered group counts 14421 / 14420 / 1 (cgw1's)")
+    chk(all(dict(D.expected_args(a, s, "/x"))["weight-decay-base"] == "5e-4" for a, s in D.RUNS), "A every run is at wd 5e-4")
+    chk(all(len(D.expected_args(a, s, "/x")) == 20 for a, s in D.RUNS), "A every expected ARGS line has 20 flags")
+    chk(all(" " not in v for a, s in D.RUNS for _f, v in D.expected_args(a, s, "/x")), "A every ARGS value is one token")
+    cg = _load("cgw1_design", os.path.join(HERE, "cgw1_design.py")) if os.path.exists(os.path.join(HERE, "cgw1_design.py")) else None
+    if cg is not None:
+        same = ([(f, v) for f, v in D.expected_args("chM2", 176, "/x") if f not in ("seed", "run-name")]
+                == [(f, v) for f, v in cg.expected_args("chW4", 176, "/x") if f not in ("seed", "run-name")])
+        chk(same and D.ENV_TEMPLATE == cg.ENV_TEMPLATE and D.HF_LIVE_SHA == cg.HF_LIVE_SHA and D.TRAIN_SHA == cg.TRAIN_SHA
+            and D.BN_SHA == cg.BN_SHA and D.RUNNER_SRC_SHA == cg.RUNNER_SRC_SHA,
+            "A M2's ARGS line (seed / name aside) == cgw1's W4 chunk777 line; ENV template and the tree / runner shas == cgw1's")
+        chk(all(abs(D.CGW1_W4[g] - v) < 1e-9 for g, v in (("ch", 87.9060), ("nd", 87.6650), ("k01", 90.4650))),
+            "A the cgw1 W4 replicate literals are 296.3's levels")
+    else:
+        skip("A cgw1_design.py absent")
+    chk(D.N_EXCLUSION_ROWS == 36, "A every one of the 36 runs owes ONE ARGS_WD_BASE exclusion row (ms / alpha0 are CSV columns)")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE3) < 1e-6 and abs(EMAX4 * SIGMA_PRIOR / math.sqrt(3) - B_PRIOR) < 1e-6,
+        "A SE3 = SIGMA_PRIOR * sqrt(2/3); B_PRIOR = EMAX4 * SIGMA_PRIOR / sqrt(3)")
+    chk((SURV, RES, HEALTH_MIN, DIVERGED, BOXFREE_MAX, MATCH) == (0.30, 2.0, 80.0, 2.0, 0.05, 0.50),
+        "A the frozen bars: SURV 0.30 RES 2.0 HEALTH 80 DIVERGED 2.0 BOX 0.05 MATCH 0.50")
+    chk(all(compose_sigma(s)[0] == max(SIGMA_PRIOR, s) for s in (0.0, 0.1, SIGMA_PRIOR, 0.3, 2.0)), "A SIGMA_USED == max(floor, in-batch)")
+    dec_src = src[src.index("def select("):src.index("# READING THE RUNS")]
+    chk("CGW1" not in dec_src and "corpus" not in dec_src and "LANDED" not in dec_src,
+        "A no cgw1 level, landed value or corpus figure enters the decision functions (O2, read from source)")
+    sc_src = src[src.index("def score("):src.index("# SELFTEST")]
+    chk(sc_src.count("D.CGW1_W4[g]") == 4 and "REPLICATE-MATCHES-CGW1" in sc_src,
+        "A cgw1's levels are read in score() only for the descriptive replicate lines and the non-gating stamp")
+    chk(all(t in LICENCE for t in BRANCHES), "A every branch has a licence sentence")
+    chk(D.ENV_TEMPLATE.count("<P>") == 1 and "PROBE=5 " in D.ENV_TEMPLATE, "A ENV template: PROBE=5, one PROBE_DIR slot")
+    chk(abs(D.EXPECTED_GPU_H - 34.4) < 1e-9 and D.HARD_BOUND_GPU_H == 72.0, "A cost: 34.4 GPU-h expected, 72 hard bound")
+
+    # ---- B: the floor and the real landed records ---------------------------------------------------------------
+    print("\nB  THE FROZEN FLOOR THROUGH corpus_exclusions.filter_rows, AND THE SHRINK FUNCTION ON REAL LANDED cgw1 W4 RECORDS")
+    if csvpath and os.path.exists(csvpath):
+        sys.path.insert(0, HERE)
+        import corpus_exclusions as ce
+        sys.path.pop(0)
+        rows = [r for r in csv.DictReader(open(csvpath)) if not r["run"].startswith(PREFIX + "-")]
+        CK = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+              "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+        def pooled(R):
+            cells = {}
+            for r in R:
+                if (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                        and (r.get("plateau5") or "").strip() and r["network"] == D.NET and r["dataset"] == D.DSET
+                        and r["meta_stepsize"] == "1e-4" and r["alpha0"] in ("1e-3", "0.001") and r["beta_clip"] == D.CLIP
+                        and r["epochs_requested"] == str(D.EPOCHS) and r["augment"] == D.AUG
+                        and r["batch_size"] == str(D.BATCH)):
+                    cells.setdefault(tuple(r[k] for k in CK), []).append(float(r["plateau5"]))
+            s2, df_, nc = 0.0, 0, 0
+            for v in cells.values():
+                if len(v) > 1:
+                    mm = mean(v)
+                    s2 += sum((x - mm) ** 2 for x in v)
+                    df_ += len(v) - 1
+                    nc += 1
+            return math.sqrt(s2 / df_), df_, nc
+        filt = ce.filter_rows(rows)
+        sF, dF, nF = pooled(filt)
+        sN, dN, _ = pooled(rows)
+        chk(abs(sF - SIGMA_PRIOR) < 1e-12 and dF == SIGMA_PRIOR_DF and nF == 34,
+            "B SIGMA_PRIOR: the FROZEN literal %r IS the FILTERED value (df %d, %d cells) on this corpus (%d rows)"
+            % (SIGMA_PRIOR, dF, nF, len(rows)))
+        chk(abs(sN - SIGMA_PRIOR_NAIVE) < 1e-12, "B the UNFILTERED value is %.6f (df %d): the exclusion list is what removes "
+            "cgw1's W2 / W4 rows from this cell -- disclosure" % (sN, dN))
+    else:
+        skip("B no corpus at %s" % csvpath)
+    got_real = False
+    for base_ in ([runsdir] if runsdir else []) + ["/cluster/account_b/metaopt/runs",
+                                                     os.path.join(os.path.dirname(REPO), "runs_cluster_b")]:
+        pk = os.path.join(base_, "cgw1", "probe_cgw1-k01W4-s152", "probe.jsonl")
+        if not os.path.exists(pk):
+            continue
+        got_real = True
+        vals = {}
+        for g, arm, m in (("k01", "k01W4", 1), ("ch", "chW4", 14421), ("nd", "ndW4", 14420)):
+            pl, oks = [], []
+            for s in (152, 153, 154, 155):
+                ok, why, occ = probe_audit(read_probe(os.path.join(base_, "cgw1", "probe_cgw1-%s-s%d" % (arm, s), "probe.jsonl")), m)
+                oks.append(ok)
+                if ok:
+                    pl.append(occ["shrink_plateau"])
+            vals[g] = (all(oks), median(pl) if len(pl) == 4 else float("nan"))
+        chk(all(v[0] for v in vals.values()), "B the landed cgw1 W4 records (k01 / ch / nd, 4 seeds each) pass G-STRUCT with their own m")
+        chk(all(abs(vals[g][1] - D.CGW1_W4_SHRINK[g]) <= 5e-5 * D.CGW1_W4_SHRINK[g] for g in vals),
+            "B SHRINK CALIBRATION: this scorer's plateau shrink on landed cgw1 W4 reproduces 296.4 (k01 %.4e / ch %.4e / nd %.4e)"
+            % (vals["k01"][1], vals["ch"][1], vals["nd"][1]))
+        okx, whyx, _o = probe_audit(read_probe(os.path.join(base_, "cgw1", "probe_cgw1-chW4-s152", "probe.jsonl")), 14420)
+        chk(not okx and "n_beta" in whyx, "B the chunk777 records FAIL G-STRUCT when read as nodewise (%s)" % whyx[:60])
+        break
+    if not got_real:
+        skip("B no landed cgw1 W4 probe records on this host")
+
+    # ---- H: the selection-bias constant -----------------------------------------------------------------------
+    print("\nH  THE SELECTION-BIAS BOUND")
+    e4 = _emax(4)
+    chk(abs(e4 - EMAX4) < 1e-7, "H EMAX4 = E[max of 4 iid N(0,1)] re-derived by quadrature: %.10f" % e4)
+    chk(abs(_emax(3) - 3 / (2 * math.sqrt(math.pi))) < 1e-7, "H the quadrature is exact on the closed form E[max of 3] = 3/(2 sqrt(pi))")
+    rng = random.Random(300)
+    s_arm = SIGMA_PRIOR / math.sqrt(3)
+    tot = 0.0
+    NMC = 40000
+    for _ in range(NMC):
+        tot += max(rng.gauss(0, s_arm) for _k in range(4))
+    chk(abs(tot / NMC - B_PRIOR) < 0.004, "H Monte Carlo (40,000 draws, equal means): the test-selected arm's mean overshoot %.4f "
+        "matches B_PRIOR %.4f" % (tot / NMC, B_PRIOR))
+    tot = 0.0
+    for _ in range(NMC):
+        mus = (0.0, -0.1, -0.3, -0.6)
+        tot += max(m_ + rng.gauss(0, s_arm) for m_ in mus) - max(mus)
+    chk(tot / NMC <= B_PRIOR, "H with UNEQUAL means the overshoot over the best true mean (%.4f) is below B (equal means is the "
+        "worst case of the expectation)" % (tot / NMC))
+    tot = 0.0
+    for _ in range(NMC):
+        tr = [rng.gauss(0, s_arm) for _k in range(4)]
+        te = [0.5 * t + math.sqrt(0.75) * rng.gauss(0, s_arm) for t in tr]
+        tot += te[tr.index(max(tr))]
+    chk(0 < tot / NMC < B_PRIOR, "H TRAIN-selection with train/test noise correlation 0.5: the test overshoot %.4f is below B"
+        % (tot / NMC))
+
+    # ---- C: decision tables -------------------------------------------------------------------------------------
+    print("\nC  THE DECISION, AT ITS BARS AND EXHAUSTIVELY")
+    se, b = SE3, B_PRIOR
+    e = 1e-9
+    chk(reading_of(True, 90, True, True, 0.30 + b + e, 2.0, se, b) == "SCALAR-BEATS-BEST",
+        "C T_ch - B just above +0.30 (and > 2 SE) -> BEATS")
+    chk(reading_of(True, 90, True, True, 0.30 + b - e, 2.0, se, b) == "SCALAR-TIES-BEST",
+        "C T_ch - B just below +0.30 -> not BEATS (TIES)")
+    chk(reading_of(True, 90, True, True, 0.40, 2.0, 0.25, 0.0) == "SCALAR-TIES-BEST", "C T 0.40 with SE 0.25 is not > 2 SE -> not BEATS")
+    chk(reading_of(True, 90, True, True, -0.30 + b + 2 * se, 2.0, se, b) == "SCALAR-TIES-BEST", "C min T - B - 2 SE == -0.30 -> TIES (edge)")
+    chk(reading_of(True, 90, True, True, -0.30 + b + 2 * se - e, 2.0, se, b) == "UNRESOLVED", "C just below the tie edge -> UNRESOLVED")
+    chk(reading_of(True, 90, True, True, -0.30 - b, 2.0, 0.05, b) == "PARTITION-ABOVE-SCALAR", "C min T + B == -0.30 (resolved) -> PARTITION-ABOVE")
+    chk(reading_of(True, 90, True, True, -0.30 - b + e, 2.0, 0.05, b) == "UNRESOLVED", "C min T + B just above -0.30 -> UNRESOLVED")
+    chk(reading_of(True, 90, True, True, -0.5, 2.0, 0.3, 0.0) == "UNRESOLVED", "C T -0.5 with SE 0.3 (not < -2 SE) -> UNRESOLVED")
+    chk(reading_of(True, 90, True, True, -0.45, 2.0, 0.01, 0.10) == "PARTITION-ABOVE-SCALAR"
+        and reading_of(True, 90, True, True, -0.35, 2.0, 0.01, 0.10) == "UNRESOLVED",
+        "C the bias term is ADVERSE to the partition reading: T -0.45 (T+B -0.35) is PARTITION-ABOVE, T -0.35 (T+B -0.25) is not")
+    chk(reading_of(True, 90, True, True, 0.45, 0.45, 0.01, 0.10) == "SCALAR-BEATS-BEST"
+        and reading_of(True, 90, True, True, 0.35, 0.45, 0.01, 0.10) == "SCALAR-TIES-BEST",
+        "C the bias term is ADVERSE to the scalar reading: T 0.45 (T-B 0.35) BEATS, T 0.35 (T-B 0.25) does not")
+    chk(reading_of(False, 0, True, True, 0, 0, se, b) == "SCALAR-DIVERGED" and reading_of(True, 70, True, True, 0, 0, se, b) == "SCALAR-COLLAPSED"
+        and reading_of(True, 90, False, True, 0, 0, se, b) == "UNREADABLE" and reading_of(True, 90, True, False, 0, 0, se, b) == "UNREADABLE",
+        "C the three gates precede every reading")
+    reach = set()
+    for _ in range(30000):
+        reach.add(reading_of(rng.random() > 0.03, rng.choice((70.0, 90.0, 90.0, 90.0)), rng.random() > 0.03, rng.random() > 0.03,
+                             rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5), rng.choice((0.02, 0.146, 0.3)), rng.choice((0.0, 0.106, 0.2))))
+    chk(reach == set(READINGS), "C every reading is reachable, and nothing else is (30,000 draws)")
+    creach = set()
+    for _ in range(20000):
+        creach.add(cfg_state(rng.choice((70.0, 90.0, 90.0)), rng.random() < 0.05, rng.random() > 0.05,
+                             rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5), rng.choice((0.02, 0.146, 0.3))))
+    chk(creach == set(CFG_STATES), "C every per-config state is reachable, and nothing else is")
+    br = set()
+    for t in TUNED_TOKENS:
+        for o in ORACLE_TOKENS:
+            br.add(branch_of(t, o))
+    chk(br == set(BRANCHES), "C EXHAUSTIVE: the 49 (TUNED, ORACLE) pairs map onto exactly the 6 registered branches")
+    chk(branch_of("TUNED-SCALAR-BEATS-BEST", "ORACLE-PARTITION-ABOVE-SCALAR") == "SELECTION-DEPENDENT"
+        and branch_of("TUNED-PARTITION-ABOVE-SCALAR", "ORACLE-SCALAR-BEATS-BEST") == "HEADLINE-REFUTED-BY-RETUNE"
+        and branch_of("TUNED-SCALAR-TIES-BEST", "ORACLE-SCALAR-BEATS-BEST") == "WEAKENED-TO-TIE",
+        "C the TRAIN-selected reading is primary; the oracle only splits a BEATS")
+    chk(select([("M2", dict(train=97.0)), ("A2", dict(train=97.0)), ("M3", dict(train=96.0))], "train") == "M2"
+        and select([("A2", dict(train=97.0)), ("M3", dict(train=97.5))], "train") == "M3" and select([], "train") is None,
+        "C select: argmax; an EXACT tie goes to the earlier config; no candidate -> None")
+    # decide() on arm tables
+    br0, t0, o0, c0, K0 = decide(_A(_levels()), SIGMA_PRIOR)
+    chk(br0 == "NOT-A-TUNING-ARTEFACT" and K0["SEL_TUNED"] == {"ch": "M3", "nd": "M3", "k01": "A2"},
+        "C decide: the default grid -> NOT-A-TUNING-ARTEFACT, train-selected ch=M3 nd=M3 k01=A2")
+    trains = dict((a, 97.0) for a in D.ARMS)
+    trains.update(chM1=98.0, ndM1=98.0, k01M1=98.0)
+    lv = _levels(chA2=90.9, ndA2=90.8)
+    brx, tx, ox, _c, Kx = decide(_A(lv, trains), SIGMA_PRIOR)
+    chk(Kx["SEL_TUNED"] == {"ch": "M1", "nd": "M1", "k01": "M1"} and Kx["SEL_ORACLE"]["ch"] == "A2"
+        and tx == "TUNED-SCALAR-BEATS-BEST" and ox == "ORACLE-UNRESOLVED"
+        and brx == "SELECTION-DEPENDENT", "C decide: TRAIN picks M1 everywhere (scalar beats), TEST picks A2 for the partitions "
+        "(unresolved) -> SELECTION-DEPENDENT: the selection really is on TRAIN")
+    lv = _levels(chA2=91.4, ndA2=91.2)
+    tr2 = dict((a, 97.0) for a in D.ARMS)
+    tr2.update(chA2=99.0, ndA2=99.0)
+    brr = decide(_A(lv, tr2), SIGMA_PRIOR)[0]
+    chk(brr == "HEADLINE-REFUTED-BY-RETUNE", "C decide: A2 partitions at 91.4 / 91.2, train-selected, scalar best 90.6 -> REFUTED")
+    brd = decide(_A(_levels(), None, dict(("k01" + c, 2.5) for c in D.CONFIG_IDS)), SIGMA_PRIOR)
+    chk(brd[0] == "BRANCH-UNREADABLE" and brd[1] == "TUNED-SCALAR-DIVERGED", "C decide: every scalar config diverged -> BRANCH-UNREADABLE")
+    brd2 = decide(_A(_levels(), None, {"chM3": 2.5}), SIGMA_PRIOR)
+    chk(brd2[4]["SEL_TUNED"]["ch"] == "A2" and brd2[3]["M3"] == "UNREADABLE",
+        "C decide: a diverged arm is dropped from selection (chM3 -> ch picks A2) and makes its config UNREADABLE")
+    tot = set()
+    for _ in range(3000):
+        A_ = dict((a, dict(level=rng.choice((rng.uniform(86, 92), rng.uniform(40, 92))), train=rng.uniform(90, 100),
+                           range=rng.choice((0.1, 2.5)) if rng.random() < 0.1 else 0.2, n=3, boxfree=True)) for a in D.ARMS)
+        r_ = decide(A_, rng.choice((SIGMA_PRIOR, 0.3)))
+        tot.add(r_[0] in BRANCHES and r_[1] in TUNED_TOKENS and r_[2] in ORACLE_TOKENS and set(r_[3].values()) <= set(CFG_STATES))
+    chk(tot == {True}, "C TOTALITY: decide() returns registered tokens on 3,000 random arm tables")
+
+    # ---- E: the REAL score() on synthetic runs ------------------------------------------------------------------
+    print("\nE  THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="crt1_selftest_")
+    try:
+        template = os.path.join(tmp, "template")
+        for (arm, seed) in D.RUNS:
+            _write_probe(os.path.join(template, D.probe_dir_name(arm, seed)), D.M_OF_ARM[arm])
+        n = [0]
+
+        def case(label, levels, want_rc, want, **kw):
+            n[0] += 1
+            cp = kw.pop("csv", None)
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, levels, **kw)
+            rc, fin, lines = _run(root, cp)
+            ok = (rc == want_rc and all(w in fin for w in want)) if want_rc == 0 else \
+                (rc == want_rc and any(all(w in ln for w in want) for ln in lines))
+            if not chk(ok, "E %s -> rc %d %s" % (label, rc, fin[:150] if fin else [l for l in lines if "HARNESS" in l or "FINAL" in l][:1])):
+                print("\n".join("      | " + x for x in lines[-30:]))
+            return rc, fin, lines
+
+        base = _levels()
+        case("NOT-A-TUNING-ARTEFACT (default grid)", base, 0,
+             ["FINAL NOT-A-TUNING-ARTEFACT | TUNED-SCALAR-BEATS-BEST | ORACLE-SCALAR-BEATS-BEST |",
+              "M2-BEATS+A2-BEATS+M3-BEATS+M1-BEATS", "SEL-TRAIN:ch=M3,nd=M3,k01=A2", "REPLICATE-MATCHES-CGW1",
+              "ONE-CELL", "SELBIAS-B=0.1059", "NO-VALIDATION-SPLIT", "UNDER-DECAYED-VS-STANDARD-RECIPE", "GRID-EDGE-ch-M3"])
+        case("WEAKENED-TO-TIE (A2 partitions reach 90.5 / 90.3; scalar best 90.6)", _levels(chA2=90.5, ndA2=90.3), 0,
+             ["FINAL WEAKENED-TO-TIE | TUNED-SCALAR-TIES-BEST", "A2-TIES"],
+             trains=dict(chA2=99.5, ndA2=99.5))
+        case("HEADLINE-REFUTED-BY-RETUNE (A2 partitions 91.4 / 91.2)", _levels(chA2=91.4, ndA2=91.2), 0,
+             ["FINAL HEADLINE-REFUTED-BY-RETUNE | TUNED-PARTITION-ABOVE-SCALAR", "A2-BELOW"],
+             trains=dict(chA2=99.5, ndA2=99.5))
+        case("RETUNE-UNDECIDED (A2 ch 90.95: T -0.35, inside neither bar)", _levels(chA2=90.95, ndA2=90.0), 0,
+             ["FINAL RETUNE-UNDECIDED | TUNED-UNRESOLVED"], trains=dict(chA2=99.5, ndA2=99.5))
+        trx = dict((a, 97.0) for a in D.ARMS)
+        trx.update(chM1=98.0, ndM1=98.0, k01M1=98.0)
+        case("SELECTION-DEPENDENT (TRAIN picks M1, TEST picks A2 for the partitions)", _levels(chA2=90.9, ndA2=90.8), 0,
+             ["FINAL SELECTION-DEPENDENT | TUNED-SCALAR-BEATS-BEST | ORACLE-UNRESOLVED", "SEL-TRAIN:ch=M1,nd=M1,k01=M1",
+              "SEL-TEST:ch=A2,nd=A2", "SEL-DISAGREE-ch"], trains=trx)
+        case("ORACLE-PARTITION-ABOVE stamp beside a train-selected BEATS", _levels(chA2=91.3, ndA2=91.2), 0,
+             ["FINAL SELECTION-DEPENDENT", "ORACLE-PARTITION-ABOVE-SCALAR", "SEL-DISAGREE-k01 ORACLE-PARTITION-ABOVE"], trains=trx)
+        case("BRANCH-UNREADABLE (every scalar config diverged)", base, 0, ["FINAL BRANCH-UNREADABLE | TUNED-SCALAR-DIVERGED"],
+             jit=lambda arm, i: (0.0, 1.5, -1.5)[i] if arm.startswith("k01") else JIT[i])
+        case("BRANCH-UNREADABLE (the selected scalar arm < 80)", _levels(k01A2=60.0), 0, ["FINAL BRANCH-UNREADABLE | TUNED-SCALAR-COLLAPSED"],
+             trains=dict(k01A2=99.9))
+        case("a diverged partition arm is dropped from selection and stamped", base, 0, ["DIVERGED-chM3", "M3-UNREADABLE", "SEL-TRAIN:ch=A2"],
+             jit=lambda arm, i: (0.0, 1.5, -1.5)[i] if arm == "chM3" else JIT[i])
+        case("REPLICATE-DIFFERS-nd stamp (ndM2 1 pp off cgw1), non-gating", _levels(ndM2=86.6), 0,
+             ["FINAL NOT-A-TUNING-ARTEFACT", "REPLICATE-DIFFERS-nd"])
+        case("box-bound selected arm is a STAMP, not a gate", base, 0, ["FINAL NOT-A-TUNING-ARTEFACT", "SELECTED-BOX-BOUND-ch", "BOX-BOUND-chM3"],
+             probe_over={("chM3", 177): dict(hi_frac=0.2)})
+        case("SIGMA-INBATCH binds when the seeds are noisy", base, 0, ["SIGMA-INBATCH"], jit=lambda arm, i: (0.0, 0.5, -0.5)[i])
+        wd_break = lambda p: [(f, "0.1" if f == "weight-decay-base" else v) for f, v in p]
+        case("HARNESS: chM2 s176 ran wd 0.1", base, 3, ["G-ARGS", "crt1-chM2-s176"], over={("chM2", 176): dict(args_over=wd_break)})
+        case("HARNESS: ndA2 s177 ran alpha0 1e-3 (another config's token)", base, 3, ["G-ARGS", "crt1-ndA2-s177"],
+             over={("ndA2", 177): dict(args_over=lambda p: [(f, "1e-3" if f == "alpha0" else v) for f, v in p])})
+        case("HARNESS: k01M3 s178 ran ms 1e-4", base, 3, ["G-ARGS", "crt1-k01M3-s178"],
+             over={("k01M3", 178): dict(args_over=lambda p: [(f, "1e-4" if f == "meta-stepsize" else v) for f, v in p])})
+        case("HARNESS: ms written 0.0003 (not the registered token)", base, 3, ["G-ARGS", "crt1-chM3-s176"],
+             over={("chM3", 176): dict(args_over=lambda p: [(f, "0.0003" if f == "meta-stepsize" else v) for f, v in p])})
+        case("HARNESS: ndM1 s176 ran chunk777", base, 3, ["G-ARGS", "crt1-ndM1-s176"],
+             over={("ndM1", 176): dict(args_over=lambda p: [(f, "chunk777" if f == "stepsize-groups" else v) for f, v in p])})
+        case("HARNESS: a repeated --alpha0", base, 3, ["G-ARGS", "alpha0"],
+             over={("chM2", 177): dict(args_over=lambda p: p + [("alpha0", "1e-2")])})
+        case("HARNESS: ENV with BETA_CLIP -30:9.0", base, 3, ["G-ENV", "crt1-ndM2-s176"],
+             over={("ndM2", 176): dict(env_over=lambda e_: e_.replace("-15:-2.3026", "-30:9.0"))})
+        case("HARNESS: a DECAY_MASK: on witness", base, 3, ["G-KIND", "crt1-chA2-s178"],
+             over={("chA2", 178): dict(extra_line="DECAY_MASK: on base=SGDm wd=0.0005 spec=x")})
+        case("HARNESS: a PROBE_TENSOR line", base, 3, ["G-KIND"], over={("k01A2", 177): dict(extra_line="PROBE_TENSOR: on every=5")})
+        case("HARNESS: a REPEATED epoch line (cgw1's latent F1, now a failure)", base, 3, ["G-ONCE", "crt1-ndM3-s177"],
+             over={("ndM3", 177): dict(dup_epoch=97)})
+        case("HARNESS: n_beta 14420 on a chunk777 run", base, 3, ["G-STRUCT", "crt1-chM1-s177", "n_beta"],
+             probe_over={("chM1", 177): dict(nb=14420)})
+        case("HARNESS: records without a beta list", base, 3, ["G-STRUCT", "beta list"], probe_over={("k01M2", 176): dict(no_beta=True)})
+        case("HARNESS: 9,999 probe records", base, 3, ["G-STRUCT", "records"], probe_over={("ndA2", 176): dict(n=9999)})
+        case("HARNESS: provenance names another scorer", base, 3, ["G-PROV", "SCORER_SHA256"], prov_over={"SCORER_SHA256": "0" * 64})
+        case("HARNESS: provenance names another HF", base, 3, ["G-PROV", "HF_SHA256"], prov_over={"HF_SHA256": "1" * 64})
+        case("HARNESS: an unregistered seed 179", base, 3, ["not a registered run"],
+             extra=[lambda d: _write_out(d, "chM2", 179, 8100001, 88.0, 97.0, "/SAVE/runs/crt1")])
+        case("HARNESS: a cgw1-style arm name (chW4) under the crt1 prefix", base, 3, ["not a registered run"],
+             extra=[lambda d: _write_out(d, "k01M2", 176, 8100009, 90.5, 99.0, "/SAVE/runs/crt1") or
+                    os.rename(os.path.join(d, "crt1-k01M2-s176-8100009.out"), os.path.join(d, "crt1-chW4-s176-8100009.out"))])
+        case("HARNESS: two COMPLETE .out files for one run", base, 3, ["COMPLETE .out files"],
+             extra=[lambda d: _write_out(d, "ndM2", 178, 8100002, 87.7, 97.0, "/SAVE/runs/crt1")])
+        case("a TRUNCATED resubmission is ignored", base, 0, ["FINAL NOT-A-TUNING-ARTEFACT"],
+             extra=[lambda d: _write_out(d, "ndM2", 178, 8100003, 50.0, 60.0, "/SAVE/runs/crt1", n_ep=40, done=False)])
+        case("INCOMPLETE: one run dropped", base, 2, ["FINAL INCOMPLETE"], drop=(("k01M1", 177),))
+        case("INCOMPLETE: no RUN_DONE on one run", base, 2, ["FINAL INCOMPLETE"], over={("chA2", 176): dict(done=False)})
+        fins = set()
+        for label, cp in (("real corpus", csvpath), ("no corpus", None), ("missing path", "/nonexistent.csv")):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            fins.add(_run(root, cp)[:2])
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for i in range(6):
+                    r = dict(rows[0])
+                    r.update(run="zzinv-%d" % i, job_id=str(9910000 + i), network=D.NET, dataset=D.DSET, granularity="scalar",
+                             base="SGDm", meta="Lion", meta_stepsize="1e-4", alpha0="1e-3", gamma="1", augment="1",
+                             beta_clip=D.CLIP, batch_size="100", epochs_requested="100", hier="", lam="na", eta_ratio="na",
+                             superseded="0", collapsed="0", complete="1", plateau5=str(80 + 4 * i))
+                    w.writerow(r)
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            fins.add(_run(root, inv)[:2])
+            chk(len(fins) == 1 and list(fins)[0][1].startswith("FINAL NOT-A-TUNING-ARTEFACT"),
+                "E O2: FINAL byte-identical on the real corpus, no corpus, a missing path and a corpus with invented rows at "
+                "this cell (%s)" % list(fins)[0][1][:60])
+        else:
+            skip("E O2 invariance: no real corpus on this host")
+        n[0] += 1
+        root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), root], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL NOT-A-TUNING-ARTEFACT" in p.stdout,
+            "E the DOCUMENTED one-argument invocation `cRT1_retune_score.py <runsdir>` reaches FINAL")
+        fl = [ln for ln in p.stdout.splitlines() if ln.startswith("FINAL ")]
+        chk(len(fl) == 1 and p.stdout.rstrip("\n").splitlines()[-1] == fl[0] and all(bd in fl[0] for bd in BOUNDS),
+            "E the FINAL is the LAST line of stdout and carries every registered bound")
+        os.unlink(os.path.join(root, PREFIX, D.probe_dir_name("chM2", 176)))
+        chk(_run(root, None)[0] == 3, "E a missing probe directory -> HARNESS-FAIL rc 3")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- G: the floor gate (164.6) on the registered predictions --------------------------------------------------
+    print("\nG  THE FLOOR GATE (164.6): every predicted arm level against chance, HEALTH_MIN and the ceiling")
+    lo_m = min(lo for lo, _h in D.PRED.values())
+    hi_m = max(h for _l, h in D.PRED.values())
+    for a in D.ARMS:
+        lo, hi = D.PRED[a]
+        print("    %-6s predicted [%.1f, %.1f]: %+.1f over chance, %+.1f over HEALTH_MIN, %.1f below 100"
+              % (a, lo, hi, lo - D.CHANCE, lo - HEALTH_MIN, 100.0 - hi))
+    chk(set(D.PRED) == set(D.ARMS) and lo_m - HEALTH_MIN >= 6.0 and 100.0 - hi_m >= 8.0,
+        "G every predicted level is >= 6 pp above HEALTH_MIN (min %.1f) and >= 8 pp below 100 (min %.1f): no contrast is "
+        "floor- or ceiling-bounded; the only route to a bounded reading is an arm FAILING, which the gates catch"
+        % (lo_m - HEALTH_MIN, 100.0 - hi_m))
+    chk(all(D.PRED["k01M2"][0] <= D.CGW1_W4["k01"] <= D.PRED["k01M2"][1] and D.PRED[g + "M2"][0] <= D.CGW1_W4[g] <= D.PRED[g + "M2"][1]
+            for g in D.GRAIN_IDS), "G M2 is predicted AT cgw1's W4 levels")
+    chk(abs(sum(D.PRIOR_P.values()) - 1.0) < 1e-9 and set(D.PRIOR_P) == set(BRANCHES), "G the six branch priors sum to 1")
+
+    print("\nSELFTEST %d PASS / %d FAIL / %d SKIP" % (RESULTS["PASS"], RESULTS["FAIL"], RESULTS["SKIP"]))
+    return 0 if RESULTS["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    raise SystemExit(score(a.runsdir, a.csv))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1073 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cSH1_horizon_score.py -- THE REGISTERED SCORER FOR `csh1` (CORRECTIONS 301): THE SHORT-HORIZON gamma CONTROL
+#   (ICML-PLAN row 1.20, threat T-C: Wu, Ren, Liao, Grosse, arXiv:1803.02021).  Does shortening the hypergradient
+#   horizon WITHOUT the decay dose reproduce the scalar collapse at the mechanism cell?
+#   ONE SUBMISSION, 18 JOBS (6 arms x 3 seeds), 100 EPOCHS, SEEDS {180,181,182}, ResNet18_c100 / CIFAR-100,
+#   SGDm(0.99) + Lion(0.99,0.9), ms 1e-3, alpha0 1e-6, wd 5e-4 (cwd5's W4 rung), PROBE=100, PROBE_TENSOR=1,
+#   --constraint=L4, cwd1's tree and runner UNCHANGED, every patch OFF.  Only --gamma and the grain vary.
+#
+# Committed and pushed BEFORE any csh1 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cSH1_horizon_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# THE HARNESS (read in $WS/harness_cwd1/cifar10/Optimizers/HF.py; analysis/csh1_gamma_cpu_check.py proves it bitwise):
+#   SGDm_base_update:  delta = a*(m + wd*w);  w <- w - delta;  h <- gamma*(1 - wd*a)*h - delta
+# The decay is ALPHA-SCALED (CORRECTIONS 292's name): it shrinks the weights by a*wd per step AND shortens the trace's
+# horizon to ~1/(wd*a).  csh1 removes the dose (wd 5e-4) and shortens the horizon with a CONSTANT gamma instead.
+#
+# THE ARMS (analysis/csh1_design.py; gamma DERIVED there from cwd5 k01W1's own records, re-derived by selftest B)
+#   cell A  G1S | G1L   gamma 1         the in-batch anchor (= landed cwd5 k01W4 / kLW4, 72.41 / 67.88)
+#   cell M  GMS | GML   gamma 0.999685  MATCHED: 1 - gamma = the collapsing arm's onset-window median shrink 3.15e-4
+#   cell P  GPS | GPL   gamma 0.99941   DOMINATING: 1 - gamma = 5.9e-4 >= the collapsing arm's shrink at EVERY step
+#
+# PER-CELL STATE, WITHIN the cell only (scalar vs its OWN in-batch layerwise arm) -- caw2's definitions, unchanged:
+#   UNREADABLE iff layerwise mean < REF_MIN (55) or the layerwise seed range > DIVERGED_BAR (5 pp)
+#   SPLIT      iff 1 or 2 of the 3 scalar seeds are <= R50 x layerwise mean
+#   COLLAPSE   iff scalar mean <= R50 (0.50) x layerwise mean
+#   NOGAP      iff layerwise - scalar < GAP_BAR (10 pp)              -- a BOUND, never "the grains are equal"
+#   PARTIAL    otherwise
+#
+# BRANCH (first match wins): INCOMPLETE -> HARNESS-UNSOUND -> ANCHOR-NOT-HEALTHY (A is not NOGAP: the gamma-1 cell did
+#   not reproduce cwd5 W4's healthy scalar arm, so nothing about gamma can be read) -> HORIZON-REPRODUCES-COLLAPSE
+#   (M COLLAPSE) -> HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY (M NOGAP and P COLLAPSE) -> HORIZON-DOES-NOT-REPRODUCE
+#   (M NOGAP and P NOGAP) -> HORIZON-REFERENCE-UNREADABLE (M or P UNREADABLE) -> HORIZON-PARTIAL (every other mix).
+# CO-REPORTED, descriptive (+/-2 SE, SE = SIGMA_USED*sqrt(2/3)): G_c = L_c - k_c; D_c = k_c - k_A (the horizon's cost to
+#   the scalar arm); E_c = L_c - L_A (to the layerwise arm).  MEASURED from each arm's own probe records: the realised
+#   trace shrink q = 1 - gamma*(1 - wd*a) (a = median over the arm's step sizes of exp(beta)) -- its median over the
+#   onset window 7,500 <= step < 8,700 and its peak; the realised DECAY dose wd*a (peak) against the collapsing source
+#   arm's (RHO_D; DOSE word BELOW iff < 0.5, the caw2 bar); the scalar arm's own beta TURN; its late beta-floor share.
+#
+# WHAT THIS BATCH CANNOT DO, STAMPED UNCONDITIONALLY ON EVERY SCORED FINAL:
+#   CONSTANT-GAMMA-NOT-A-LEARNED-HORIZON, SUFFICIENCY-NOT-NECESSITY, TRACE-ONLY-PATCH-NOT-RUN, TWO-GAMMAS-BRACKET-NOT-
+#   LOCATE, NO-INBATCH-COLLAPSE-CONTROL, KAPPA-5E-4-ONLY, ALPHA-SCALED-DECAY-ONLY, ONE-NETWORK-RESNET18,
+#   ONE-CELL-OTHERWISE, EPOCHS-100-ONLY, THREE-SEEDS, FLOOR-READINGS-ARE-BOUNDS, NOGAP-IS-A-BOUND.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("csh1_design", os.path.join(HERE, "csh1_design.py"))
+C = _load("cwd_common", os.path.join(HERE, "cwd_common.py"))
+mean, sd, fmt = C.mean, C.sd, C.fmt
+
+PREFIX = D.PREFIX
+ARMS = D.ARMS
+SEEDS = D.SEEDS
+EPOCHS = D.EPOCHS
+NTENS = D.NTENS
+N_RECORDS = D.N_RECORDS
+
+# ---- FROZEN LITERALS (O2) --------------------------------------------------------------------------------------------
+SIGMA_R18ALL = 0.636565585885168           # ResNet18_c100 std cell, FILTERED (corpus_exclusions.filter_rows), df 274, 53 cells
+SIGMA_R18ALL_DF = 274
+SIGMA_R18ALL_NAIVE = 14.485344810557217    # UNFILTERED -- disclosure only (the OPERATIONS 36 trap), df 401
+SIGMA_PRIOR = SIGMA_R18ALL
+SE_PRIOR = 0.519754                        # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_ROWS = 3383
+REG_CORPUS_SHA = "cc189bd1fa7be5c4a1ee5b080e2da821930ea9498ccc9f307cefbe49f547a2ea"
+REG_EXCL_SHA = "7b034d3efeba5bbe4f9e356a129e0812c863bc520745f56203d3505d199da642"
+R50 = 0.50
+GAP_BAR = 10.0
+REF_MIN = 55.0
+DIVERGED_BAR = 5.0
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+DECOMP_TOL = 1e-3
+DOSE_BAR_LO = 0.5
+ONSET_LO, ONSET_HI = D.ONSET_STEP, 8700    # the source arm's onset window [G_0.5, TURN)
+SRC_DOSE_PEAK_MED = 5.5256e-4             # median over seeds of cwd5 k01W1's recorded peak wd*a (caw2 290.7)
+SRC_ONSET_MEDIAN = D.SRC_ONSET_MEDIAN     # 3.1477e-4
+FLOOR_BETA = -14.99                       # beta at the -15 clip (a = exp(-15)): the collapse's terminal state
+FLOOR_SHARE_BAR = 0.5
+MATCH_BAR = 5.0                           # the anchor's non-gating replication bar against landed cwd5 W4
+CWD5_W4 = {"G1S": 72.4080, "G1L": 67.8813}  # landed cwd5 k01W4 / kLW4 (CORRECTIONS 285.3), 3 seeds each
+K01_LANDED = {"cmo1 k01": 22.7887, "cwd3 k01": 22.9853, "cwd4 k01WD": 22.8213, "cwd5 k01W1": 23.2240}
+
+# ---- predicted levels per account (UNSURE bands, registered before any run) -----------------------------------------
+FREE_PL = (60.0, 76.0)       # a healthy arm at wd 5e-4, either grain (landed 67.88 / 72.41)
+COLL_PL = (1.0, 30.0)        # a collapsed scalar arm
+PART_PL = (36.0, 52.0)       # a degraded scalar arm above its R50 bar (~34) but >= 10 pp below its reference
+SICK_PL = (20.0, 54.0)       # an UNHEALTHY layerwise reference (below REF_MIN)
+_H = dict((a, FREE_PL) for a in ARMS)
+ACCOUNTS = {  # token -> (arm -> predicted band), prior P (UNSURE, a judgement)
+    "HORIZON-DOES-NOT-REPRODUCE": (dict(_H), 0.55),
+    "HORIZON-REPRODUCES-COLLAPSE": (dict(_H, GMS=COLL_PL, GPS=COLL_PL), 0.08),
+    "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY": (dict(_H, GPS=COLL_PL), 0.12),
+    "HORIZON-PARTIAL": (dict(_H, GPS=PART_PL), 0.15),
+    "HORIZON-REFERENCE-UNREADABLE": (dict(_H, GPS=SICK_PL, GPL=SICK_PL), 0.07),
+    "ANCHOR-NOT-HEALTHY": (dict(_H, G1S=COLL_PL), 0.03),
+}
+ACCOUNT_TOKENS = list(ACCOUNTS)
+# THE REGISTERED PREDICTION (UNSURE, stated before any run): HORIZON-DOES-NOT-REPRODUCE.  Reason: on the fair event
+# (CORRECTIONS 289.4) the collapsing arm's accuracy deficit opens 700-1,700 steps BEFORE its beta turn on 15/15 pairs,
+# while beta -- and so the trace-driven meta update's output -- is still IDENTICAL to the healthy partner's; the early
+# damage is the weight shrink, which csh1 removes.  Against it: Wu et al.'s bias is toward SMALLER learned steps, which is
+# the collapse's direction, and gamma_P's horizon (~1,700 steps) is short from step 0.
+PREDICTION = "HORIZON-DOES-NOT-REPRODUCE"
+TOKENS = ["INCOMPLETE", "HARNESS-UNSOUND", "ANCHOR-NOT-HEALTHY", "HORIZON-REPRODUCES-COLLAPSE",
+          "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY", "HORIZON-DOES-NOT-REPRODUCE", "HORIZON-REFERENCE-UNREADABLE",
+          "HORIZON-PARTIAL"]
+STATES = ("UNREADABLE", "SPLIT", "COLLAPSE", "NOGAP", "PARTIAL")
+BOUND_STAMPS = ["CONSTANT-GAMMA-NOT-A-LEARNED-HORIZON", "SUFFICIENCY-NOT-NECESSITY", "TRACE-ONLY-PATCH-NOT-RUN",
+                "TWO-GAMMAS-BRACKET-NOT-LOCATE", "NO-INBATCH-COLLAPSE-CONTROL", "KAPPA-5E-4-ONLY", "ALPHA-SCALED-DECAY-ONLY",
+                "ONE-NETWORK-RESNET18", "ONE-CELL-OTHERWISE", "EPOCHS-100-ONLY", "THREE-SEEDS",
+                "FLOOR-READINGS-ARE-BOUNDS", "NOGAP-IS-A-BOUND"]
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def gpu_of(path):
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if ln.endswith(" MiB") and ", " in ln and not ln.startswith(("ARGS:", "ENV:", "Epoch")):
+            return ln.split(",")[0].strip()
+    return None
+
+
+def _fin(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def _med(v):
+    v = sorted(v)
+    n = len(v)
+    if not n:
+        return float("nan")
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _sg(x):
+    return (x > 0) - (x < 0)
+
+
+# =============================================================================
+# THE LION VOTE DECOMPOSITION (the harness-null that the meta update is Lion on the recorded trace), scalar arms only
+# =============================================================================
+def vote_terms(r):
+    try:
+        mp, b2 = float(r["pt_mp"]), float(r["pt_b2"])
+        z, m = r["z_tensor"], r["m_tensor"]
+        mom, za = float(r["mom_pre"][0][0]), float(r["z_agg"][0][0])
+    except (KeyError, TypeError, IndexError, ValueError):
+        return None
+    if len(z) != NTENS or len(m) != NTENS or not all(_fin(x) for x in z) or not all(_fin(x) for x in m):
+        return None
+    L = [b2 * mi + (1.0 - b2) * zi for mi, zi in zip(m, z)]
+    app = b2 * mom + (1.0 - b2) * za
+    if not (_fin(app) and all(_fin(x) for x in L)):
+        return None
+    return L, app
+
+
+def decomposition(recs):
+    """-> (n_usable, n_bad_sum, n_bad_sign, n_nonfinite)."""
+    n = bad = bads = nonf = 0
+    for r in recs or []:
+        v = vote_terms(r) if isinstance(r, dict) else None
+        if v is None:
+            nonf += 1
+            continue
+        L, app = v
+        s = sum(L)
+        scale = sum(abs(x) for x in L)
+        n += 1
+        bad += not (abs(s - app) <= DECOMP_TOL * scale or abs(s - app) <= 1e-30)
+        bads += _sg(s) != _sg(app) and abs(app) > DECOMP_TOL * scale
+    return n, bad, bads, nonf
+
+
+# =============================================================================
+# THE MEASURED TRACE AND DOSE, from the arm's own probe records
+# =============================================================================
+def rec_a(r):
+    b = r.get("beta") if isinstance(r, dict) else None
+    if not isinstance(b, list) or not b or not all(_fin(x) for x in b):
+        return None
+    return _med([math.exp(x) for x in b])
+
+
+def trace_of_seed(recs, gamma, wd):
+    """-> dict: q_onset (median of 1 - gamma*(1 - wd*a) over ONSET_LO <= step < ONSET_HI), q_peak, q_min, dose_peak
+    (max wd*a), turn (first record with applied Lion sign +1; scalar records only), floor_share (share of the last 20 %
+    of records with the scalar beta <= FLOOR_BETA)."""
+    q, qo, dose, late, turn = [], [], [], [], None
+    last0 = 4 * N_RECORDS * D.PROBE // 5
+    for r in recs or []:
+        a = rec_a(r)
+        if a is None or not isinstance(r.get("step"), int):
+            continue
+        qq = 1.0 - gamma * (1.0 - wd * a)
+        q.append(qq)
+        dose.append(wd * a)
+        if ONSET_LO <= r["step"] < ONSET_HI:
+            qo.append(qq)
+        if r["step"] >= last0:
+            late.append(min(r["beta"]) <= FLOOR_BETA)
+        if turn is None and "z_agg" in r:
+            v = vote_terms(r)
+            if v is not None and _sg(v[1]) == 1:
+                turn = r["step"]
+    return {"q_onset": _med(qo), "q_peak": max(q) if q else float("nan"), "q_min": min(q) if q else float("nan"),
+            "dose_peak": max(dose) if dose else float("nan"), "turn": turn,
+            "floor_share": (sum(late) / len(late)) if late else float("nan")}
+
+
+def dose_word(rho):
+    if not _fin(rho):
+        return "UNREAD"
+    return "BELOW" if rho < DOSE_BAR_LO else "REACHED"
+
+
+# =============================================================================
+# THE STATES AND THE BRANCH
+# =============================================================================
+def cell_state(Lseeds, kseeds):
+    L, k = mean(Lseeds), mean(kseeds)
+    if L < REF_MIN or (max(Lseeds) - min(Lseeds)) > DIVERGED_BAR:
+        return "UNREADABLE"
+    ncol = sum(1 for x in kseeds if x <= R50 * L)
+    if 1 <= ncol <= len(kseeds) - 1:
+        return "SPLIT"
+    if k <= R50 * L:
+        return "COLLAPSE"
+    if L - k < GAP_BAR:
+        return "NOGAP"
+    return "PARTIAL"
+
+
+def decide(states):
+    """states: {"A","M","P": state} -> branch token.  Pure function."""
+    if states["A"] != "NOGAP":
+        return "ANCHOR-NOT-HEALTHY"
+    m, p = states["M"], states["P"]
+    if m == "COLLAPSE":
+        return "HORIZON-REPRODUCES-COLLAPSE"
+    if m == "NOGAP" and p == "COLLAPSE":
+        return "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY"
+    if m == "NOGAP" and p == "NOGAP":
+        return "HORIZON-DOES-NOT-REPRODUCE"
+    if "UNREADABLE" in (m, p):
+        return "HORIZON-REFERENCE-UNREADABLE"
+    return "HORIZON-PARTIAL"
+
+
+BOUND_NOTE = ("Every COLLAPSE and NOGAP state is a BOUND, never a point effect (164.6): a collapsed arm's gap is a "
+              "LOCATION, and NOGAP means 'below the 10 pp bar', never 'the grains are equal'.")
+CONST_NOTE = ("gamma is CONSTANT; the collapsing arm's horizon 1/(0.1*a) shrinks as its learned a grows.  gamma_M matches "
+              "the onset-window MEDIAN; gamma_P is at least as short at every step.  Neither is the learned horizon.")
+NOT_ELSE = ("Not licensed: any other network, dataset, meta step, alpha0, horizon, grouping, base or meta optimiser, "
+            "decay value (only wd 5e-4 ran), a trace-only patch (not run), or anything about the collapse's NECESSARY "
+            "causes at wd 0.1 (there the dose and the short trace act together); nothing about the parent paper.")
+LICENSE = {
+    "INCOMPLETE": ["Not every run finished.  No branch is taken and NO NUMBER HERE IS QUOTABLE."],
+    "HARNESS-UNSOUND": ["A harness gate failed: a run's own ARGS line (INCLUDING ITS --gamma TOKEN), ENV line, witness "
+                        "lines, probe records or provenance do not say what the design registers.  NO level, state or "
+                        "contrast may be quoted."],
+    "ANCHOR-NOT-HEALTHY": ["The gamma-1 anchor (= the landed cwd5 W4 cell, scalar healthy at 72.41) is not NOGAP in this "
+                           "batch.  Without a healthy anchor a gamma < 1 collapse cannot be attributed to the horizon: no "
+                           "account is read, and the levels are printed as levels only."],
+    "HORIZON-REPRODUCES-COLLAPSE": [
+        "\"At the mechanism cell with the decay dose removed (wd 5e-4), a constant hypergradient horizon matched to the "
+        "collapsing arm's onset-window median (gamma 0.999685) collapses the scalar step size to at most half its "
+        "in-batch layerwise level.\"  The short-horizon account (T-C, Wu et al. 2018) is a LIVE SUFFICIENT RIVAL: the "
+        "collapse section may NOT attribute the wd-0.1 collapse to the weight shrink (or to vote capture) alone; the trace "
+        "route suffices here.", BOUND_NOTE, CONST_NOTE, NOT_ELSE],
+    "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY": [
+        "\"The matched horizon (gamma 0.999685) does not collapse the scalar arm (grains within the 10 pp bar), but the "
+        "dominating horizon (gamma 0.99941, at least as short as the collapsing arm's at every step, applied from step "
+        "0) does.\"  Short-horizon bias can produce the collapse at this cell, but only when the horizon is shortened "
+        "beyond the time-matched value; T-C is NOT excluded and NOT confirmed as the wd-0.1 mechanism.  The collapse "
+        "section must name T-C as an unexcluded rival.", BOUND_NOTE, CONST_NOTE, NOT_ELSE],
+    "HORIZON-DOES-NOT-REPRODUCE": [
+        "\"At the mechanism cell with the decay dose removed (wd 5e-4), shortening the hypergradient horizon with a "
+        "constant gamma -- to the collapsing arm's onset-window median (0.999685) and to a horizon at least as short as "
+        "the collapsing arm's at every step (0.99941) -- does not collapse the scalar step size: at both, scalar and "
+        "layerwise stay within the 10 pp bar.\"  Short-horizon bias through the trace is NOT SUFFICIENT for the collapse "
+        "at this cell; T-C is excluded as a sufficient account, as a BOUND and for a constant gamma.  It does NOT show "
+        "that the short trace plays no part at wd 0.1, where it acts together with the dose.", BOUND_NOTE, CONST_NOTE,
+        NOT_ELSE],
+    "HORIZON-REFERENCE-UNREADABLE": [
+        "\"At a shortened horizon the layerwise reference itself is unhealthy (below 55 or seed range above 5 pp).\"  The "
+        "short horizon damages BOTH grains: that is a finding about gamma < 1 in this harness, not a scalar collapse, "
+        "and no T-C sentence about the scalar collapse is licensed.", BOUND_NOTE, CONST_NOTE, NOT_ELSE],
+    "HORIZON-PARTIAL": [
+        "\"At a shortened horizon the scalar arm is degraded (or collapses on some seeds only) but does not meet the "
+        "registered collapse definition.\"  Neither a reproduction nor a clean null: T-C is NOT excluded, and the cell "
+        "is the one to replicate with more seeds before anything is said.", BOUND_NOTE, CONST_NOTE, NOT_ELSE],
+}
+
+
+# =============================================================================
+# SCORE
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound, 2 incomplete."""
+    print("=" * 78)
+    print(" csh1 -- THE SHORT-HORIZON gamma CONTROL (T-C).  At the mechanism cell with the decay dose removed (wd %s),"
+          % D.WD_TOKEN)
+    print("         does a shortened hypergradient horizon (constant gamma < 1) reproduce the scalar collapse?")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1  SGDm(0.99)+Lion"
+          % (D.NET, D.DSET, EPOCHS, ",".join(str(s) for s in SEEDS), D.AUG, D.CLIP, D.PROBE))
+    for a in ARMS:
+        print("   %-4s cell %s %-9s gamma %-9s %s" % (a, D.CELL_OF[a], D.SPEC[a], D.GTOK[a], D.ROLE[a]))
+    print(" Every state is WITHIN its cell.  plateau5 = mean TEST over epochs %d..%d.  BARS ARE FROZEN LITERALS (O2)."
+          % (EPOCHS - 5, EPOCHS - 1))
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+
+    runs, rnotes = C.read_runs(runsdir, PREFIX, ARMS, EPOCHS)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        print("  NOTE %s" % n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        for ln in LICENSE["INCOMPLETE"]:
+            print("  " + ln)
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    [HARNESS-NULL] every run's OWN ARGS line == its arm's registered flags, --gamma token included")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = C.parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = dict(D.args_pairs(a, s, "<save>"))
+            bad = [k for k, v in want.items() if k != "save-directory" and f.get(k, [None])[-1] != v]
+            extra = sorted(set(f) - set(want))
+            sv = f.get("save-directory", [""])[-1] or ""
+            ok = not dup and not bad and not extra and sv.rstrip("/").endswith("/" + PREFIX)
+            hchk(ok, "G-ARGS %s-s%d (%s gamma %s wd %s)" % (a, s, D.SPEC[a], D.GTOK[a], D.WD_TOKEN),
+                 "" if ok else "repeated %s; wrong %s; unregistered %s; save %s"
+                 % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad], extra, sv))
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(" ".join(t for t in ln.split() if not t.startswith("PROBE_DIR=")) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "G-ENV one distinct ENV line (PROBE_DIR stripped), one per run", "%d distinct" % len(envs))
+    hchk(envs == [D.ENV_EXPECTED], "G-ENV the ENV line is cvt1 ... cwd5's, byte for byte (PROBE_DIR stripped)")
+
+    print("\nG-PT      ONE PROBE_TENSOR line per run == its arm's witness (grain, 62 tensors, Lion meta)")
+    for s in SEEDS:
+        for a in ARMS:
+            pt = runs[(a, s)]["pt"]
+            ok = len(pt) == 1 and pt[0].startswith(D.pt_witness_prefix(a) + " dir=")
+            hchk(ok, "G-PT %s-s%d" % (a, s), "" if ok else "got %r" % ([x[:150] for x in pt],))
+
+    print("\nG-WITNESS the five `off` lines once each; no COMP_HOLD / WINDOW_HOLD line")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            ok = all(r[k.split(":")[0]] == [k] for k in D.OFF_LINES) and not r["COMP_HOLD"] and not r["WINDOW_HOLD"]
+            hchk(ok, "G-WITNESS %s-s%d" % (a, s), "" if ok else str(dict((k, r[k]) for k in C.KINDS if r[k])))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == csh1_design.manifest_text(), byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(open(mp).read() == D.manifest_text(), "G-STRUCT byte-identical")
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        me = file_sha(os.path.abspath(__file__))
+        for key, want, lab in (("MODE", "submit", "MODE submit"),
+                               ("BUILD_NETWORK_SHA256", D.BN_SHA, "build_network.py == cvt8's"),
+                               ("HF_SHA256", D.HF_SHA, "HF.py == cwd1's tree, UNCHANGED"),
+                               ("RUNNER_SHA256", D.RUNNER_SHA, "runner == run_cifar_cwd1.sh, UNCHANGED"),
+                               ("TRAIN_SHA256", D.TRAIN_SHA, "train.py == the tree's (declares --gamma type=float)"),
+                               ("SCORER_SHA256", me, "SCORER == this file"),
+                               ("DESIGN_SHA256", file_sha(D.__file__), "DESIGN == the csh1_design.py this scorer loaded"),
+                               ("CWD_DESIGN_SHA256", file_sha(D.W.__file__), "the reused cwd_design.py this scorer loaded"),
+                               ("COMMON_SHA256", file_sha(C.__file__), "COMMON == the cwd_common.py this scorer loaded")):
+            hchk(prov.get(key) == want, "G-PROV %s" % lab, "%s=%s" % (key, str(prov.get(key))[:16]))
+
+    print("\nG-PROBE   [HARNESS-NULL] %d records per run; the step-size count is the GRAIN's (1 or %d); on the scalar"
+          " arms the per-tensor Lion vote sums to the harness's applied term (within %g of sum|L_i|) with its sign"
+          % (N_RECORDS, NTENS, DECOMP_TOL))
+    recs_all, nonfin = {}, {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = C.load_probe(runsdir, PREFIX, a, s)
+            recs_all[(a, s)] = recs
+            if recs is None:
+                hchk(False, "G-PROBE %s-s%d probe.jsonl present" % (a, s))
+                continue
+            want_nb = 1 if D.SPEC[a] == "scalar" else NTENS
+            badrec = sum(1 for r in recs if not (isinstance(r, dict) and isinstance(r.get("step"), int)
+                                                   and isinstance(r.get("beta"), list) and len(r["beta"]) == want_nb
+                                                   and isinstance(r.get("z_tensor"), list) and len(r["z_tensor"]) == NTENS))
+            line = "%d records, %d malformed / wrong step-size count" % (len(recs), badrec)
+            ok = len(recs) == N_RECORDS and badrec == 0
+            if D.SPEC[a] == "scalar":
+                n, bsum, bsign, nf = decomposition(recs)
+                nonfin[(a, s)] = nf
+                line += "; Lion decomposition: %d usable, %d off, %d wrong sign, %d non-finite (disclosed)" % (n, bsum, bsign, nf)
+                ok = ok and bsum == 0 and bsign == 0 and n > 0
+            hchk(ok, "G-PROBE %s-s%d (%s, %d step size(s))" % (a, s, D.SPEC[a], want_nb), line)
+
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    print("\nG-FLOOR / G-CEIL")
+    hi = max(M.values())
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp" % FLOOR_MIN, "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (
+            len(harness), "; ".join(sorted(set(h.split()[0] for h in harness))))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [C.tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-4s %-9s gamma %-9s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, D.SPEC[a], D.GTOK[a], M[a], fmt(sd(v), 4), max(v) - min(v), T[a], "/".join(fmt(x, 3) for x in sl)))
+        print("           seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+
+    print("\nG-HW      DISCLOSURE ONLY: the GPU each run's own nvidia-smi line names -- NO gate reads it")
+    hw = dict(((a, s), gpu_of(os.path.join(runsdir, runs[(a, s)]["file"]))) for s in SEEDS for a in ARMS)
+    hwset = sorted(set(str(v) for v in hw.values()))
+    print("  distinct devices: %s" % hwset)
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / len(SEEDS))
+    print("  SIGMA_USED %.6f (= %s); SE_ARM_DIFF %.6f; 2 SE %.6f is the HALF-WIDTH of a +/-2 SE interval, NOT a"
+          " bound on any effect (278.6 C1)" % (sigma_used, which, se, 2 * se))
+
+    print("\nTHE TRACE AND THE DOSE, MEASURED from each arm's OWN records (arm value = median over its 3 seeds)")
+    print("  q = 1 - gamma*(1 - wd*a): the realised per-step trace shrink.  The collapsing source arm (cwd5 k01W1, wd 0.1,"
+          " gamma 1): onset-window median %.4e, recorded peak %.4e (frozen literals)" % (SRC_ONSET_MEDIAN, SRC_DOSE_PEAK_MED))
+    tr = {}
+    for a in ARMS:
+        per = [trace_of_seed(recs_all[(a, s)], D.GF[a], D.WD) for s in SEEDS]
+        tr[a] = dict((k, _med([p[k] for p in per if p[k] is not None]) if any(p[k] is not None for p in per)
+                      else float("nan")) for k in ("q_onset", "q_peak", "q_min", "dose_peak", "floor_share"))
+        tr[a]["turns"] = [p["turn"] for p in per]
+        print("  %-4s gamma %-9s q onset-median %.4e  q min %.4e  q peak %.4e   decay dose peak wd*a %.4e   turns %s   late"
+              " beta-floor share %s" % (a, D.GTOK[a], tr[a]["q_onset"], tr[a]["q_min"], tr[a]["q_peak"], tr[a]["dose_peak"],
+                                        "/".join(str(t) for t in tr[a]["turns"]), fmt(tr[a]["floor_share"], 3)))
+    RHO_T, RHO_D, DW = {}, {}, {}
+    for c in D.CELLS:
+        k = D.SCALAR_OF[c]
+        RHO_T[c] = tr[k]["q_onset"] / SRC_ONSET_MEDIAN
+        RHO_D[c] = tr[k]["dose_peak"] / SRC_DOSE_PEAK_MED
+        DW[c] = dose_word(RHO_D[c])
+        print("  cell %s: trace ratio q_onset(%s)/source %.4f (descriptive);  RHO_D = dose peak / source peak %.4f -> "
+              "DECAY-DOSE-%s-%s" % (c, k, RHO_T[c], RHO_D[c], c, DW[c]))
+    dom = tr[D.SCALAR_OF["P"]]["q_min"] >= D.SRC_TRUE_MAX_BOUND and tr[D.LAYER_OF["P"]]["q_min"] >= D.SRC_TRUE_MAX_BOUND
+    print("  cell P dominance: min q over every record of GPS / GPL %.4e / %.4e vs the bound on the source arm's shrink at"
+          " ANY step %.4e -> %s" % (tr["GPS"]["q_min"], tr["GPL"]["q_min"], D.SRC_TRUE_MAX_BOUND,
+                                    "TRACE-P-DOMINATES" if dom else "TRACE-P-NOT-DOMINATING"))
+
+    print("\nTHE CELLS (every contrast WITHIN its cell)")
+    states, G, Dk, El = {}, {}, {}, {}
+    for c in D.CELLS:
+        k, L = D.SCALAR_OF[c], D.LAYER_OF[c]
+        st = cell_state(arm_v[L], arm_v[k])
+        states[c] = st
+        G[c] = M[L] - M[k]
+        ncol = sum(1 for x in arm_v[k] if x <= R50 * M[L])
+        print("  %s gamma %-9s scalar %7.4f  layerwise %7.4f   G_%s = %+.4f pp = %+.2f SE   R = %.4f   -> %s"
+              % (c, D.GAMMA_TOKEN[c], M[k], M[L], c, G[c], G[c] / se, M[k] / M[L] if M[L] else float("nan"), st))
+        print("           +/-2 SE [%+.4f, %+.4f]   TRAIN gap %+.4f   seeds %s   scalar seeds at/below the bar: %d/3"
+              % (G[c] - 2 * se, G[c] + 2 * se, T[L] - T[k],
+                 " / ".join("%+.3f" % (runs[(L, s)]["plateau5"] - runs[(k, s)]["plateau5"]) for s in SEEDS), ncol))
+    print("           bars: COLLAPSE iff scalar <= %.2f x layerwise; NOGAP iff G < %.1f pp; reference healthy iff"
+          " layerwise >= %.1f and its seed range <= %.1f" % (R50, GAP_BAR, REF_MIN, DIVERGED_BAR))
+    print("\nTHE HORIZON's COST, across cells, IN BATCH (descriptive; +/-2 SE)")
+    for c in ("M", "P"):
+        Dk[c] = M[D.SCALAR_OF[c]] - M["G1S"]
+        El[c] = M[D.LAYER_OF[c]] - M["G1L"]
+        print("  D_%s = %s - G1S = %+.4f pp [%+.4f, %+.4f]    E_%s = %s - G1L = %+.4f pp [%+.4f, %+.4f]"
+              % (c, D.SCALAR_OF[c], Dk[c], Dk[c] - 2 * se, Dk[c] + 2 * se, c, D.LAYER_OF[c], El[c], El[c] - 2 * se,
+                 El[c] + 2 * se))
+
+    branch = decide(states)
+    word = "A-%s+M-%s+P-%s" % (states["A"], states["M"], states["P"])
+    stamps = [word] + ["DECAY-DOSE-%s-%s" % (c, DW[c]) for c in D.CELLS]
+    stamps.append("TRACE-P-DOMINATES" if dom else "TRACE-P-NOT-DOMINATING")
+    stamps += ["HARNESS-CLEAN", "BOTH-GRAINS-IN-BATCH", "ANCHOR-IN-BATCH"] + BOUND_STAMPS
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    for c in D.CELLS:
+        if G[c] <= -2 * se and states[c] == "NOGAP":
+            stamps.append("SCALAR-AHEAD-%s-DESCRIPTIVE" % c)
+    for c in ("M", "P"):
+        if Dk[c] <= -2 * se:
+            stamps.append("SCALAR-COST-%s-DESCRIPTIVE" % c)
+        if El[c] <= -2 * se:
+            stamps.append("LAYERWISE-COST-%s-DESCRIPTIVE" % c)
+    for a in ("G1S", "GMS", "GPS"):
+        if _fin(tr[a]["floor_share"]) and tr[a]["floor_share"] >= FLOOR_SHARE_BAR:
+            stamps.append("BETA-FLOOR-%s" % a)
+    for a in ("G1S", "G1L"):
+        if abs(M[a] - CWD5_W4[a]) > MATCH_BAR:
+            stamps.append("ANCHOR-DIFFERS-FROM-CWD5-%s" % a)
+    for a in ("G1S", "GMS", "GPS"):
+        if any(nonfin.get((a, s)) for s in SEEDS):
+            stamps.append("NONFINITE-RECORDS-%s" % a)
+    stamps.append(("HW-UNIFORM-%s" % hwset[0].replace(" ", "_")) if len(hwset) == 1 else "HW-MIXED")
+    agree = all((T[D.LAYER_OF[c]] - T[D.SCALAR_OF[c]] > 0) == (G[c] > 0) for c in D.CELLS if abs(G[c]) >= GAP_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals): the landed cwd5 W4 cell G1S %.4f / G1L %.4f (this batch %.4f /"
+          " %.4f; bar %.1f pp); the landed wd-0.1 collapse %s" % (CWD5_W4["G1S"], CWD5_W4["G1L"], M["G1S"], M["G1L"],
+                                                                  MATCH_BAR, ", ".join("%s %.4f" % kv for kv in K01_LANDED.items())))
+    print("REGISTERED PREDICTION (UNSURE): %s; this batch: %s" % (PREDICTION, branch))
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        print("  " + ln)
+    print("\nOWED AT LANDING: 18 CORPUS-EXCLUSIONS rows, ARGS_WD_BASE (weight-decay-base=5e-4), one per run; gamma is a CSV"
+          " cell-key column, so no gamma kind is owed and no run deviates on two ARGS kinds.")
+    return 0, final
+
+
+# =============================================================================
+# SELFTEST HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_SAVE = "/x/runs/csh1"
+_E_ENV = D.ENV_EXPECTED.replace(" PROBE=100 ", " PROBE=100 PROBE_DIR=/x/probe ")
+_E_BASE = {"G1S": 72.0, "G1L": 68.0, "GMS": 71.5, "GML": 67.5, "GPS": 71.0, "GPL": 67.0}
+
+
+def _e_curve(level):
+    return [level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0)) for e in range(EPOCHS)]
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, args=None, pt=None, offs=None):
+    lines = ["NODE=[HOST_2f2f29d9e1] | JOB=%s-%s-s%d %d | AUGMENT=1" % (PREFIX, arm, s, jid),
+             "ARGS: %s" % (args if args is not None else D.args_string(arm, s, _E_SAVE)), env, "NVIDIA L4, 23034 MiB"]
+    lines += list(offs if offs is not None else D.OFF_LINES)
+    lines.append(pt if pt is not None else "%s dir=/x/probe_%s-%s-s%d" % (D.pt_witness_prefix(arm), PREFIX, arm, s))
+    for e, v in enumerate(_e_curve(level)[:n_ep]):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(v + 20, 99.9), v))
+    if run_done:
+        lines.append("RUN_DONE")
+    open(os.path.join(d, "%s-%s-s%d-%d.out" % (PREFIX, arm, s, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_records(arm, seed, nb=None, decomp_break=False, beta=None, floor=False, rng=None):
+    """500 synthetic records under Lion algebra: L_i drawn, m_i drawn, z_i solved, aggregates the harness's."""
+    rng = rng or random.Random(seed * 7 + len(arm))
+    mp, b2 = 0.99, 0.9
+    nb = nb if nb is not None else (1 if D.SPEC[arm] == "scalar" else NTENS)
+    out = []
+    for k in range(N_RECORDS):
+        L = [rng.gauss(0, 1e-6) for _ in range(NTENS)]
+        m = [rng.gauss(0, 1e-6) for _ in range(NTENS)]
+        z = [(Li - b2 * mi) / (1 - b2) for Li, mi in zip(L, m)]
+        mom, za = sum(m), sum(z)
+        if decomp_break:
+            za = -za - 1e-3
+        bv = beta if beta is not None else (-15.0 if (floor and k >= 400) else -5.0)
+        out.append({"step": k * D.PROBE, "beta": [bv] * nb, "z_tensor": z, "m_tensor": m,
+                    "mom_pre": [[mom]], "z_agg": [[za]], "pt_mp": mp, "pt_b2": b2, "beta_pre": [[bv] * nb]})
+    return out
+
+
+def _e_probe_templates(root):
+    t = {}
+    os.makedirs(root, exist_ok=True)
+    for a in ARMS:
+        for s in SEEDS:
+            p = os.path.join(root, "tpl_%s_%d.jsonl" % (a, s))
+            with open(p, "w") as fh:
+                for r in _e_records(a, s):
+                    fh.write(json.dumps(r) + "\n")
+            t[(a, s)] = p
+    return t
+
+
+def _e_build(d, tpl, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, prov_over=None, man_break=False,
+             rec_over=None):
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    lv = dict(_E_BASE)
+    lv.update(levels or {})
+    jid = 7000000
+    for s, j in zip(SEEDS, jit):
+        for a in ARMS:
+            jid += 1
+            if drop == (a, s):
+                continue
+            L = lv[a] if not isinstance(lv[a], (list, tuple)) else lv[a][SEEDS.index(s)]
+            kw = dict((over or {}).get((a, s), {}))
+            _e_write(d, a, s, jid, L + (0 if isinstance(lv[a], (list, tuple)) else j), **kw)
+            pd = os.path.join(d, PREFIX, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(pd, exist_ok=True)
+            if rec_over and (a, s) in rec_over:
+                with open(os.path.join(pd, "probe.jsonl"), "w") as fh:
+                    for r in rec_over[(a, s)]:
+                        fh.write(json.dumps(r) + "\n")
+            else:
+                os.symlink(tpl[(a, s)], os.path.join(pd, "probe.jsonl"))
+    man = D.manifest_text() + ("X\n" if man_break else "")
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(man)
+    prov = {"MODE": "submit", "BUILD_NETWORK_SHA256": D.BN_SHA, "HF_SHA256": D.HF_SHA, "RUNNER_SHA256": D.RUNNER_SHA,
+            "TRAIN_SHA256": D.TRAIN_SHA, "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+            "DESIGN_SHA256": file_sha(D.__file__), "CWD_DESIGN_SHA256": file_sha(D.W.__file__),
+            "COMMON_SHA256": file_sha(C.__file__)}
+    prov.update(prov_over or {})
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % kv for kv in prov.items()))
+
+
+def _e_score(d, csvpath):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc, final = score(d, csvpath)
+    return rc, final, buf.getvalue()
+
+
+def _mid(pl):
+    return (pl[0] + pl[1]) / 2.0
+
+
+# =============================================================================
+# SELFTEST
+# =============================================================================
+RES = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    RES["PASS" if cond else "FAIL"] += 1
+    return bool(cond)
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+    RES["SKIP"] += 1
+
+
+def _find_out(runsdir, name_prefix):
+    if not runsdir or not os.path.isdir(runsdir):
+        return None
+    for fn in sorted(os.listdir(runsdir)):
+        if fn.startswith(name_prefix) and fn.endswith(".out"):
+            return os.path.join(runsdir, fn)
+    return None
+
+
+def selftest(csvpath, runsdir):
+    print("csh1 scorer SELFTEST  (scorer sha %s)" % file_sha(os.path.abspath(__file__)))
+
+    print("\nA  design, literals, reused files")
+    chk(file_sha(D.W.__file__) == D.CWD_DESIGN_SHA, "A analysis/cwd_design.py is the registered file (RULE 16)")
+    chk(file_sha(C.__file__) == D.CWD_COMMON_SHA, "A analysis/cwd_common.py is the registered file (RULE 16)")
+    chk(ARMS == ("G1S", "G1L", "GMS", "GML", "GPS", "GPL") and SEEDS == (180, 181, 182) and SEEDS == D.SEED_BLOCK
+        and D.NJOBS == 18, "A six arms, seeds 180/181/182 (Track C's block), 18 jobs")
+    chk(len(D.TENSORS) == NTENS and sum(t[1] for t in D.TENSORS) == D.TOTPAR, "A 62 tensors / 11,220,132 parameters")
+    chk(D.GAMMA_TOKEN == {"A": "1", "M": "0.999685", "P": "0.99941"}
+        and abs((1 - D.GAMMA["M"]) - D.Q_M) < 1e-12 and abs((1 - D.GAMMA["P"]) - D.Q_P) < 1e-12,
+        "A the gamma tokens are 1 / 1 - Q_M / 1 - Q_P exactly (Q_M 3.15e-4, Q_P 5.9e-4)")
+    chk(D.Q_P >= D.SRC_TRUE_MAX_BOUND and abs(max(D.SRC_PEAK.values()) * D.BETWEEN_RECORD_FACTOR - D.SRC_TRUE_MAX_BOUND)
+        < 5e-9 and D.Q_M >= D.SRC_ONSET_MEDIAN and abs(D.Q_M - D.SRC_ONSET_MEDIAN) < 5e-7,
+        "A Q_P >= max recorded peak x exp(0.05) (dominance at every step); Q_M = the onset median to 3 s.f.")
+    chk(all(D.SPEC[D.SCALAR_OF[c]] == "scalar" and D.SPEC[D.LAYER_OF[c]] == "layerwise"
+            and D.GTOK[D.SCALAR_OF[c]] == D.GTOK[D.LAYER_OF[c]] for c in D.CELLS), "A both grains in every cell at ONE gamma")
+    base = dict(D.args_pairs("G1S", 0, "x"))
+    diffs = set()
+    for a in ARMS:
+        f = dict(D.args_pairs(a, 0, "x"))
+        diffs |= set(k for k in f if f[k] != base[k])
+    chk(diffs == {"gamma", "stepsize-groups", "run-name"}, "A across arms ONLY --gamma and --stepsize-groups vary", str(diffs))
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE_PRIOR) < 1e-6, "A SE_PRIOR = SIGMA_PRIOR*sqrt(2/3)")
+    chk([D.args_deviating_kinds(a) for a in ARMS] == [("ARGS_WD_BASE",)] * 6,
+        "A exclusion kinds owed: ARGS_WD_BASE on every arm; none on two kinds")
+    ce = _exclusions()
+    chk("gamma" in ce.CELLKEYS, "A gamma is a corpus cell-key column (corpus_exclusions.CELLKEYS): no gamma ARGS kind needed")
+    src = open(os.path.abspath(__file__)).read()
+    body = src[src.index("def score("):src.index("# SELFTEST HELPERS")]
+    chk("read_corpus(" in body and "_pooled" not in body and "SIGMA_R18ALL" not in body and "all_runs" not in body,
+        "A O2: score() reads the corpus only for its disclosure line and never the floor's derivation")
+    for arm, landed in (("G1S", "cwd5-k01W4-s146-"), ("G1L", "cwd5-kLW4-s146-")):
+        fo = _find_out(runsdir, landed)
+        if not fo:
+            skip("A %s vs the landed %s ARGS line" % (arm, landed), "not under %s" % runsdir)
+            continue
+        txt = open(fo, errors="replace").read().splitlines()
+        f = C.parse_args_line([ln for ln in txt if ln.startswith("ARGS:")][0])
+        want = dict(D.args_pairs(arm, 146, "x"))
+        diff = sorted(k for k in set(f) | set(want) if k not in ("seed", "save-directory", "run-name")
+                      and f.get(k, [None])[-1] != want.get(k))
+        chk(not diff and list(f) == [k for k, _v in D.args_pairs(arm, 146, "x")],
+            "A %s's flags == the landed %s ARGS line, flag for flag AND in order (seed / save / run-name aside)"
+            % (arm, landed.rstrip("-")), str(diff))
+        pt = [ln for ln in txt if ln.startswith("PROBE_TENSOR:")]
+        chk(len(pt) == 1 and pt[0].split(" dir=")[0] == D.pt_witness_prefix(arm),
+            "A %s's PROBE_TENSOR witness == the landed %s line" % (arm, landed.rstrip("-")))
+        envl = [ln for ln in txt if ln.startswith("ENV:")]
+        chk(len(envl) == 1 and " ".join(t for t in envl[0].split() if not t.startswith("PROBE_DIR=")) == D.ENV_EXPECTED,
+            "A the landed %s ENV line == ENV_EXPECTED (PROBE_DIR stripped)" % landed.rstrip("-"))
+
+    print("\nB  THE DERIVATION of gamma, re-run on the LANDED records of cwd5 k01W1 (and the calibration on k01W4)")
+    got = D.derive_gammas(runsdir) if runsdir else None
+    if got is None:
+        skip("B the derivation", "no cwd5 k01W1 records under %s" % runsdir)
+    else:
+        per, dv = got
+        for s in D.SRC_SEEDS:
+            print("       s%d TURN %s onset median %.5e (n %d) peak %.5e @ %d" % (s, per[s]["turn"], per[s]["onset_median"],
+                                                                           per[s]["n_onset"], per[s]["peak"], per[s]["peak_step"]))
+        chk(all(per[s]["turn"] == D.SRC_TURN[s] for s in D.SRC_SEEDS), "B the beta TURN is step 8,700 on all three seeds")
+        chk(all(per[s]["n_onset"] == 12 and abs(per[s]["onset_median"] - D.SRC_ONSET_MEDIAN) < 5e-9 for s in D.SRC_SEEDS),
+            "B the onset-window median shrink is %.4e on every seed (12 records each)" % D.SRC_ONSET_MEDIAN)
+        chk(all(abs(per[s]["peak"] - D.SRC_PEAK[s]) < 5e-9 for s in D.SRC_SEEDS),
+            "B the recorded peaks are 5.5256 / 5.5589 / 5.4488e-4 (caw2's DOSE_PEAK calibration, 290.7)")
+        chk(dv["gamma_M"] == D.GAMMA_TOKEN["M"] and dv["gamma_P"] == D.GAMMA_TOKEN["P"],
+            "B the derivation reproduces the registered tokens: gamma_M %s, gamma_P %s" % (dv["gamma_M"], dv["gamma_P"]))
+        recs = [json.loads(ln) for ln in open(D.src_probe_path(runsdir, 147)) if ln.strip()]
+        jumps = [abs(b["beta"][0] - a_["beta"][0]) for a_, b in zip(recs, recs[1:])]
+        chk(max(jumps) <= 100 * 1e-3 * 1.001 and max(D.SRC_PEAK.values()) * math.exp(0.05 * 1.001) <= D.Q_P,
+            "B |beta| moves at most meta-step x 100 between records, to float32 rounding (max %.5f; Lion's exact 1e-3 step"
+            " is the exp(0.05) premise); Q_P still dominates with a 0.1 %% rounding allowance" % max(jumps))
+        wd4 = [C.load_probe(runsdir, "cwd5", "k01W4", s) for s in D.SRC_SEEDS]
+        wd1 = [C.load_probe(runsdir, "cwd5", "k01W1", s) for s in D.SRC_SEEDS]
+        if all(x is not None for x in wd4 + wd1):
+            t4 = [trace_of_seed(r, 1.0, 5e-4) for r in wd4]
+            t1 = [trace_of_seed(r, 1.0, 0.1) for r in wd1]
+            chk(all(abs(t["dose_peak"] - D.SRC_PEAK[s]) < 5e-9 for t, s in zip(t1, D.SRC_SEEDS))
+                and all(abs(t["q_onset"] - SRC_ONSET_MEDIAN) < 5e-9 for t in t1),
+                "B trace_of_seed on landed k01W1 reproduces the source literals (gamma 1: q = wd*a)")
+            chk(all(dose_word(t["dose_peak"] / SRC_DOSE_PEAK_MED) == "BELOW" for t in t4),
+                "B the landed healthy k01W4 (wd 5e-4, gamma 1) is DECAY-DOSE BELOW: %s" %
+                " / ".join("%.4f" % (t["dose_peak"] / SRC_DOSE_PEAK_MED) for t in t4))
+            chk(all(t["floor_share"] >= FLOOR_SHARE_BAR for t in t1) and all(t["floor_share"] < FLOOR_SHARE_BAR for t in t4),
+                "B BETA-FLOOR calibration: the collapsed k01W1 sits at the -15 floor late (%s), the healthy k01W4 does not (%s)"
+                % ("/".join("%.2f" % t["floor_share"] for t in t1), "/".join("%.2f" % t["floor_share"] for t in t4)))
+            chk(max(t["q_peak"] for t in t4) < 0.1 * D.Q_M,
+                "B at gamma 1 the landed wd-5e-4 arm's horizon was never short: its peak q %.3e < Q_M/10"
+                % max(t["q_peak"] for t in t4))
+            n, bsum, bsign, nf = decomposition([r for v in wd1 + wd4 for r in v])
+            chk(n == 6 * N_RECORDS and bsum == 0 and bsign == 0, "B the Lion decomposition holds on every landed k01W1 /"
+                " k01W4 record (%d usable)" % n)
+        else:
+            skip("B the k01W4 calibration", "records absent")
+    chk(abs(trace_of_seed(_e_records("GPS", 180, beta=math.log(2e-2)), 0.99941, 5e-4)["q_min"]
+            - (1 - 0.99941 * (1 - 5e-4 * 2e-2))) < 1e-15, "B q = 1 - gamma*(1 - wd*a) exactly on synthetic records")
+    chk(decomposition(_e_records("GMS", 180))[1:3] == (0, 0) and decomposition(_e_records("GMS", 180, decomp_break=True))[2] > 0,
+        "B the Lion decomposition passes on consistent synthetic records and FAILS when broken")
+
+    print("\nC  the floor, freshness")
+    if csvpath and os.path.exists(csvpath):
+        rows = list(csv.DictReader(open(csvpath)))
+        sR = ce._pooled(ce.filter_rows(rows), "ResNet18_c100")
+        nR = ce._pooled(rows, "ResNet18_c100")
+        if file_sha(csvpath) == REG_CORPUS_SHA:
+            chk(abs(sR[0] - SIGMA_R18ALL) < 1e-12 and sR[1] == SIGMA_R18ALL_DF and len(rows) == REG_CORPUS_ROWS,
+                "C SIGMA_R18ALL: the FROZEN literal %r IS the FILTERED value (df %d) on the CURRENT corpus (%d rows)"
+                % (SIGMA_R18ALL, SIGMA_R18ALL_DF, len(rows)))
+            chk(abs(nR[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and nR[0] > 5 * SIGMA_R18ALL,
+                "C the NAIVE (unfiltered) value is the disclosed trap, not the literal")
+        else:
+            print("       corpus moved since registration (%s); the frozen literal stands (O2): filtered now %.6f" %
+                  (file_sha(csvpath)[:12], sR[0]))
+            chk(True, "C the corpus moved; the FROZEN floor is not re-read (O2)")
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in rows) or file_sha(csvpath) != REG_CORPUS_SHA,
+            "C ZERO corpus rows carry the csh1- prefix (at registration)")
+        chk(not any(r.get("seed") in [str(x) for x in D.SEED_BLOCK] for r in rows
+                    if not r.get("run", "").startswith(PREFIX + "-")),
+            "C ZERO corpus rows OUTSIDE csh1 carry a seed of the block 180..182")
+    else:
+        skip("C the floor", "no corpus")
+
+    print("\nD  the branch function: reachability, bars, predicted levels")
+    reach = set(decide({"A": a, "M": m, "P": p}) for a in STATES for m in STATES for p in STATES)
+    chk(reach == set(TOKENS) - {"INCOMPLETE", "HARNESS-UNSOUND"}, "D every registered branch is reachable", str(sorted(reach)))
+    chk(decide({"A": "NOGAP", "M": "COLLAPSE", "P": "UNREADABLE"}) == "HORIZON-REPRODUCES-COLLAPSE"
+        and decide({"A": "NOGAP", "M": "SPLIT", "P": "COLLAPSE"}) == "HORIZON-PARTIAL"
+        and decide({"A": "NOGAP", "M": "NOGAP", "P": "SPLIT"}) == "HORIZON-PARTIAL"
+        and decide({"A": "NOGAP", "M": "NOGAP", "P": "UNREADABLE"}) == "HORIZON-REFERENCE-UNREADABLE"
+        and decide({"A": "PARTIAL", "M": "NOGAP", "P": "NOGAP"}) == "ANCHOR-NOT-HEALTHY",
+        "D the ladder's order: M COLLAPSE first; SPLIT is partial; UNREADABLE before PARTIAL; the anchor gates all")
+    chk(cell_state([68.0] * 3, [34.0] * 3) == "COLLAPSE" and cell_state([68.0] * 3, [34.001] * 3) == "PARTIAL",
+        "D the R50 bar is inclusive, exact")
+    chk(cell_state([68.0] * 3, [58.0001] * 3) == "NOGAP" and cell_state([68.0] * 3, [58.0] * 3) == "PARTIAL",
+        "D the GAP_BAR is strict (< 10 pp)")
+    chk(cell_state([54.99] * 3, [20.0] * 3) == "UNREADABLE" and cell_state([60.0, 66.0, 63.0], [60.0] * 3) == "UNREADABLE",
+        "D REF_MIN and the reference's seed range gate the cell")
+    chk(cell_state([68.0] * 3, [20.0, 20.0, 66.0]) == "SPLIT" and cell_state([68.0] * 3, [75.0] * 3) == "NOGAP",
+        "D one or two collapsed seeds -> SPLIT; scalar ABOVE layerwise is NOGAP")
+    chk(dose_word(0.5) == "REACHED" and dose_word(0.4999) == "BELOW" and dose_word(float("nan")) == "UNREAD",
+        "D the dose bar is inclusive at 0.5")
+    chk(abs(sum(p for _b, p in ACCOUNTS.values()) - 1.0) < 1e-9, "D the account priors sum to 1")
+    for tok, (pl, _p) in ACCOUNTS.items():
+        lv = dict((a, _mid(b)) for a, b in pl.items())
+        st = dict((c, cell_state([lv[D.LAYER_OF[c]]] * 3, [lv[D.SCALAR_OF[c]]] * 3)) for c in D.CELLS)
+        chk(decide(st) == tok, "D the midpoints of %s's predicted bands -> %s" % (tok, tok), str(st))
+    chk(FREE_PL[0] >= REF_MIN + 5 and 100 - FREE_PL[1] >= 7 and COLL_PL[1] <= R50 * FREE_PL[0],
+        "D 164.6 floor gate: every healthy band starts >= 5 pp above REF_MIN, ends >= 7 pp below 100, and the collapsed"
+        " band sits below R50 x the lowest healthy reference")
+
+    print("\nE  the REAL score() on synthetic runs (every number invented)")
+    tmp = tempfile.mkdtemp(prefix="csh1_selftest_")
+    try:
+        tpl = _e_probe_templates(os.path.join(tmp, "tpl"))
+        flo = dict((("GPS", s), _e_records("GPS", s, floor=True)) for s in SEEDS)
+        cases = [
+            ("prediction: does not reproduce", dict(), None, 0, "HORIZON-DOES-NOT-REPRODUCE",
+             ["A-NOGAP+M-NOGAP+P-NOGAP", "DECAY-DOSE-A-BELOW", "DECAY-DOSE-P-BELOW", "TRACE-P-DOMINATES",
+              "CONSTANT-GAMMA-NOT-A-LEARNED-HORIZON", "SUFFICIENCY-NOT-NECESSITY", "NOGAP-IS-A-BOUND"]),
+            ("reproduces at matched", dict(levels={"GMS": 20.0, "GPS": 19.0}), flo, 0, "HORIZON-REPRODUCES-COLLAPSE",
+             ["M-COLLAPSE", "BETA-FLOOR-GPS", "SCALAR-COST-M-DESCRIPTIVE"]),
+            ("reproduces at dominating only", dict(levels={"GPS": 20.0}), None, 0,
+             "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY", ["P-COLLAPSE", "SCALAR-COST-P-DESCRIPTIVE"]),
+            ("partial at P", dict(levels={"GPS": 45.0}), None, 0, "HORIZON-PARTIAL", ["P-PARTIAL"]),
+            ("split at P", dict(levels={"GPS": (20.0, 21.0, 70.0)}), None, 0, "HORIZON-PARTIAL", ["P-SPLIT", "DIVERGED-GPS"]),
+            ("reference sick at P", dict(levels={"GPL": 45.0, "GPS": 44.0}), None, 0, "HORIZON-REFERENCE-UNREADABLE",
+             ["P-UNREADABLE", "LAYERWISE-COST-P-DESCRIPTIVE"]),
+            ("anchor collapsed", dict(levels={"G1S": 20.0}), None, 0, "ANCHOR-NOT-HEALTHY", ["ANCHOR-DIFFERS-FROM-CWD5-G1S"]),
+            ("anchor partial", dict(levels={"G1S": 50.0}), None, 0, "ANCHOR-NOT-HEALTHY", ["A-PARTIAL"]),
+            ("scalar ahead at M", dict(levels={"GMS": 75.0}), None, 0, "HORIZON-DOES-NOT-REPRODUCE",
+             ["SCALAR-AHEAD-M-DESCRIPTIVE"]),
+            ("near-bar: GPS exactly at R50", dict(levels={"GPS": 34.0, "GPL": 68.0}, jit=(0.0, 0.0, 0.0)), None, 0,
+             "HORIZON-REPRODUCES-AT-DOMINATING-HORIZON-ONLY", []),
+            ("near-bar: GPS just above R50", dict(levels={"GPS": 34.01, "GPL": 68.0}, jit=(0.0, 0.0, 0.0)), None, 0,
+             "HORIZON-PARTIAL", []),
+            ("near-bar: gap 9.99", dict(levels={"GPS": 58.01, "GPL": 68.0}, jit=(0.0, 0.0, 0.0)), None, 0,
+             "HORIZON-DOES-NOT-REPRODUCE", []),
+        ]
+        for lab, kw, ro, rcw, tok, must in cases:
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, rec_over=ro, **kw)
+            rc, final, out = _e_score(d, csvpath)
+            ok = rc == rcw and final.startswith("FINAL: %s |" % tok) and all(m in final for m in must)
+            chk(ok, "E %-34s -> %s %s" % (lab, tok, " ".join(must)), "" if ok else final[:300])
+        d = os.path.join(tmp, "case_bounds")
+        _e_build(d, tpl)
+        rc, final, out = _e_score(d, csvpath)
+        chk(all(b in final for b in BOUND_STAMPS), "E every registered BOUND is printed on the FINAL line (%d)" % len(BOUND_STAMPS))
+        wr = lambda a, s: D.args_string(a, s, _E_SAVE)
+        breaks = [
+            ("HARNESS-NULL: GPS ran gamma 1", {("GPS", 181): {"args": wr("GPS", 181).replace("--gamma 0.99941", "--gamma 1")}}),
+            ("HARNESS-NULL: GMS ran gamma_P", {("GMS", 180): {"args": wr("GMS", 180).replace("--gamma 0.999685", "--gamma 0.99941")}}),
+            ("HARNESS-NULL: G1L ran gamma_M", {("G1L", 182): {"args": wr("G1L", 182).replace("--gamma 1", "--gamma 0.999685")}}),
+            ("HARNESS-NULL: gamma flag dropped", {("GPL", 180): {"args": wr("GPL", 180).replace("--gamma 0.99941 ", "")}}),
+            ("a repeated --gamma", {("GMS", 181): {"args": wr("GMS", 181) + " --gamma 1"}}),
+            ("wd 0.1 instead of 5e-4", {("GPS", 182): {"args": wr("GPS", 182).replace("--weight-decay-base 5e-4", "--weight-decay-base 0.1")}}),
+            ("GPS ran layerwise", {("GPS", 180): {"args": wr("GPS", 180).replace("--stepsize-groups scalar", "--stepsize-groups layerwise")}}),
+            ("an unregistered flag", {("G1S", 181): {"args": wr("G1S", 181) + " --Lion-beta2-base 0.9"}}),
+            ("PT says scalar on a layerwise arm", {("GML", 180): {"pt": D.pt_witness_prefix("GML").replace("type=layerwise", "type=scalar") + " dir=/x"}}),
+            ("ENV break", {("GPL", 182): {"env": _E_ENV.replace("AUGMENT=1", "AUGMENT=0")}}),
+            ("a hold witness ON", {("GMS", 182): {"offs": ("VOTE_W: on x",) + D.OFF_LINES[1:]}}),
+        ]
+        for lab, over in breaks:
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, over=over)
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and final.startswith("FINAL: HARNESS-UNSOUND"), "E break: %-40s -> HARNESS-UNSOUND" % lab, final[:120])
+        for lab, ro in (("a scalar arm's records carry 62 step sizes", {("GPS", 180): _e_records("GPS", 180, nb=NTENS)}),
+                        ("a layerwise arm's records carry 1 step size", {("GML", 181): _e_records("GML", 181, nb=1)}),
+                        ("the vote decomposition broken", {("GMS", 182): _e_records("GMS", 182, decomp_break=True)}),
+                        ("a truncated probe file", {("G1S", 180): _e_records("G1S", 180)[:400]})):
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, rec_over=ro)
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and "G-PROBE" in final, "E break: %-48s -> HARNESS-UNSOUND (G-PROBE)" % lab, final[:120])
+        for lab, kw in (("manifest", dict(man_break=True)), ("provenance: wrong scorer", dict(prov_over={"SCORER_SHA256": "0" * 64})),
+                        ("provenance: dry-run mode", dict(prov_over={"MODE": "dry-run"})),
+                        ("provenance: another train.py", dict(prov_over={"TRAIN_SHA256": "1" * 64}))):
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, **kw)
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and final.startswith("FINAL: HARNESS-UNSOUND"), "E break: %-40s -> HARNESS-UNSOUND" % lab, final[:120])
+        d = os.path.join(tmp, "case_drop")
+        _e_build(d, tpl, drop=("GPL", 181))
+        rc, final, out = _e_score(d, csvpath)
+        chk(rc == 2 and final.startswith("FINAL: INCOMPLETE") and "GPL-s181" in final, "E a dropped run -> INCOMPLETE rc 2")
+        d = os.path.join(tmp, "case_trunc")
+        _e_build(d, tpl)
+        _e_write(d, "GPS", 180, 6999999, 60.0, n_ep=40, run_done=False)
+        rc, final, out = _e_score(d, csvpath)
+        chk(rc == 0 and final.startswith("FINAL: HORIZON-DOES-NOT-REPRODUCE"),
+            "E a truncated EARLIER resubmission is ignored (the complete file is used)")
+        d = os.path.join(tmp, "case_cli")
+        _e_build(d, tpl)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, cwd=REPO)
+        chk(p.returncode == 0 and "FINAL: HORIZON-DOES-NOT-REPRODUCE" in p.stdout,
+            "E `python3 cSH1_horizon_score.py <runsdir>` exits 0 and prints FINAL")
+        shutil.rmtree(os.path.join(d, PREFIX, "probe_%s-GML-s180" % PREFIX))
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, cwd=REPO)
+        chk(p.returncode == 1 and "HARNESS-UNSOUND" in p.stdout, "E ... and with a probe directory missing exits 1")
+
+        print("\nF  O2: the FINAL line is invariant to the corpus (it is read for disclosure only)")
+        d = os.path.join(tmp, "case_o2")
+        _e_build(d, tpl)
+        finals = set()
+        variants = [csvpath, None]
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            fields = list(rows[0].keys())
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=fields)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for k in range(40):
+                    r = dict(rows[0])
+                    r.update({"run": "zz-invented-%d" % k, "job_id": str(9000000 + k), "network": "ResNet18_c100",
+                              "gamma": "0.99941", "plateau5": "%.3f" % (40 + 30 * (k % 2))})
+                    w.writerow(r)
+            variants.append(inv)
+        for v in variants:
+            rc, final, out = _e_score(d, v)
+            finals.add(final)
+        chk(len(finals) == 1 and len(variants) == 3,
+            "F FINAL identical over %d corpus variants (real, none, real + 40 invented rows)" % len(variants))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nSELFTEST: %d PASS / %d FAIL / %d SKIP" % (RES["PASS"], RES["FAIL"], RES["SKIP"]))
+    return 0 if RES["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--csv", default=os.path.join(REPO, "results", "all_runs.csv"))
+    ap.add_argument("--manifest", default="")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt", default="")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    rc, _final = score(a.runsdir, a.csv, a.manifest)
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()

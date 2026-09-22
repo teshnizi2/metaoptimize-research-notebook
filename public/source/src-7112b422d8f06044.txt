@@ -1,0 +1,1012 @@
+#!/usr/bin/env python3
+"""cVL1_valsplit_score.py -- THE REGISTERED SCORER OF `cvl1` (CORRECTIONS 303; row 1.14 of docs/ICML-PLAN.md).
+
+QUESTION.  Do the audit's rankings, reported on TEST, hold on a held-out VALIDATION split, and would selecting on
+validation have picked the same configuration?  Read at `cgw1`'s cell (ResNet18 / CIFAR-10 / SGDm 0.99 + Lion / ms 1e-4 /
+alpha0 1e-3) at wd 0.1 (W1) and 5e-4 (W4), four grains (ch chunk777, nd nodewise, k01 scalar, kL layerwise), seeds
+{184..187}, 32 runs, every run trained on 45,000 images with VAL_SPLIT=5000:302 (analysis/cvl1_design.py).
+
+DOCUMENTED INVOCATION
+    python3 analysis/cVL1_valsplit_score.py <runsdir>          # runsdir = $WS/runs (or its cvl1/ subdirectory)
+    python3 analysis/cVL1_valsplit_score.py --selftest [--runsdir <dir>] [--csv <all_runs.csv>]
+EXIT  0 FINAL printed | 2 INCOMPLETE | 3 HARNESS-FAIL (a registered run is not the run the design says it is)
+
+TWO READERS OF THE SAME RUNS.  TEST plateau5 = mean over epochs 95-99 of the `Epoch e, ... Test Accuracy: x %` lines;
+VAL plateau5 = mean over epochs 95-99 of the `VAL: epoch e val_acc x % n_val 5000` lines; both from each run's OWN raw
+`.out`, never the CSV.  Every contrast is WITHIN a rung and WITHIN a reader.  SIGMA_X = max(SIGMA_PRIOR, the in-batch
+pooled within-arm sd of reader X) (O2): SIGMA_PRIOR is the TEST floor of this cell read ONCE through
+corpus_exclusions.filter_rows (a literal here) and it is used as the MINIMUM for VAL too (no VAL floor exists; with half
+the images VAL's own in-batch sd is expected to bind).  The corpus line printed at run time is DISCLOSURE ONLY.
+
+THE REGISTERED DECISION (303.4), bars and state functions IDENTICAL to cgw1's registered ones (291.6 / 296):
+  per reader X and rung r: D = ch - nd, SE = SIGMA_X * sqrt(1/4 + 1/4); state, first match: DIVERGED (a ch/nd seed range
+  > 2.0) | UNHEALTHY (a ch/nd arm < 85.0) | BOXBOUND (a ch/nd run's rec_lo or rec_hi >= 0.05; the box is a property of the
+  run and is the same for both readers) | REVERSES (D <= -0.15 and < -2 SE) | VANISHES (D <= +0.15 and D + 2 SE < +0.5556)
+  | SURVIVES (D >= +0.30 and > 2 SE) | UNDECIDED.   SCALAR at W4 per reader: cgw1's scalar_of (BEATS / TIES / BELOW /
+  UNRESOLVED / DIVERGED / COLLAPSED / UNREADABLE) at the same +/-0.30 bar.
+  Three CLAIMS, each read on TEST and on VAL from the same 32 runs: W1 (cgw1: SURVIVES), W4 (cgw1: UNDECIDED), SC
+  (cgw1: SCALAR-BEATS-BEST).  Per claim: SAME (the VAL state is the TEST state) | FLIP (resolved in OPPOSITE directions:
+  {SURVIVES, REVERSES} or {SCALAR-BEATS-BEST, SCALAR-BELOW-BEST}) | DIFF (otherwise).
+  PAIRED GAP per claim: gap = contrast(VAL) - contrast(TEST) from the SAME runs (W1: D_W1; W4: D_W4; SC: min(k01 - ch,
+  k01 - nd) at W4), SE_gap = s_delta * sqrt(1/4 + 1/4), s_delta = the in-batch pooled within-arm sd of each run's
+  (VAL plateau5 - TEST plateau5) (df 24; no frozen floor exists for it).  RESOLVED at |gap| >= 0.30 AND > 2 SE_gap.
+  PRIMARY FINAL, first match: UNREADABLE-TEST (a TEST claim state is DIVERGED / UNHEALTHY / BOXBOUND or a scalar gate
+  token) -> UNREADABLE-VAL (the same on VAL) -> VAL-FLIPS (any claim FLIP) -> VAL-AGREES (every claim SAME) ->
+  VAL-SHIFTS (a claim's state differs AND some claim's paired gap is RESOLVED: the reader moved a contrast by more than
+  the pairs' own noise) -> VAL-DIFFERS-UNRESOLVED (a state differs but no paired gap is resolved: the change of state is
+  not distinguishable from reader noise -- NOT evidence that the ranking is reader-dependent, and NOT a bound on it).
+  SELECTION (co-reported): pick_X = the argmax of reader X's arm level over the 8 configurations (grain x wd).
+  SELECT-SAME (pick_VAL == pick_TEST) | SELECT-DIFFERS-RESOLVED (the TEST regret TEST(pick_TEST) - TEST(pick_VAL) >= 0.30
+  and > 2 SE_TEST) | SELECT-DIFFERS-UNRESOLVED.  Per-rung best grain stamped SELECT-W1-SAME / -DIFFERS, SELECT-W4-....
+  DESCRIPTIVE (stamps, never the FINAL's first two words): the paired VAL-minus-TEST gap of each contrast, SE from the
+  in-batch sd of each run's (VAL - TEST) plateau5; the in-batch TEST states against cgw1's landed ones.
+
+BOUNDS PRINTED ON EVERY FINAL: ONE-CELL, TWO-RUNGS, MS-ALPHA0-NOT-RESELECTED, TRAIN-45K, ONE-SPLIT,
+ALPHA-INDEPENDENT-DECAY-NOT-TESTED, FLOOR-READINGS-ARE-BOUNDS; every VANISHES / TIES reading is a BOUND, never a zero.
+"""
+import argparse
+import csv
+import glob
+import hashlib
+import importlib.util
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("cvl1_design", os.path.join(HERE, "cvl1_design.py"))
+PREFIX = D.PREFIX
+
+# ---- FROZEN noise floor (O2).  corpus_exclusions.filter_rows on results/all_runs.csv @ 3,383 rows (268 exclusion rows
+# ---- -> 3,115 kept); ResNet18 / CIFAR10 / 100 ep / aug 1 / clip -15:-2.3026 / ms 1e-4 / alpha0 1e-3 / bs 100, pooled
+# ---- within the 15-key cells (cgw1's definition, 291.7); cgw1's 12 unlisted W1 rows now sit in it (178 -> 190 df). ----
+SIGMA_PRIOR = 0.17818264951145454     # FILTERED; df 190, 34 cells, 227 rows
+SIGMA_PRIOR_DF = 190
+SIGMA_PRIOR_NAIVE = 1.034332721154537  # UNFILTERED (cgw1's 28 wd-deviating rows join the cells) -- disclosure only
+CORPUS_ROWS_AT_REG = 3383
+EXCL_ROWS_AT_REG = 268
+DEMO_R18ALL_AT_REG = 0.636566         # corpus_exclusions --check's noise-floor DEMONSTRATION (df 274), quoted, no bar
+SE4 = 0.125994                        # SIGMA_PRIOR * sqrt(2/4), 6 d.p.
+
+# ---- FROZEN bars (O2) -- cgw1's, verbatim --------------------------------------------------------------------------------
+SURV = 0.30
+NULLBAR = 0.15
+POOL_EXCLUDE = 0.5556
+RES = 2.0
+HEALTH_MIN = 85.0
+DIVERGED = 2.0
+BOXFREE_MAX = 0.05
+BOX_EPS = 1e-3
+MATCH = 0.50                          # non-gating: |in-batch TEST level - cgw1 landed level| stamp
+PL_LO, PL_HI = 95, 99
+WIN_STEP = PL_LO * D.STEPS_PER_EPOCH  # 42,750: the plateau5 window's first meta step at 450 steps / epoch
+
+READERS = ("TEST", "VAL")
+CLAIMS = ("W1", "W4", "SC")
+PRIMARY_TOKENS = ("VAL-AGREES", "VAL-SHIFTS", "VAL-DIFFERS-UNRESOLVED", "VAL-FLIPS", "UNREADABLE-TEST", "UNREADABLE-VAL")
+SELECT_TOKENS = ("SELECT-SAME", "SELECT-DIFFERS-UNRESOLVED", "SELECT-DIFFERS-RESOLVED")
+RUNG_STATES = ("DIVERGED", "UNHEALTHY", "BOXBOUND", "REVERSES", "VANISHES", "SURVIVES", "UNDECIDED")
+SCALAR_TOKENS = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST", "SCALAR-BELOW-BEST", "SCALAR-UNRESOLVED",
+                 "SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+GATE_STATES = ("DIVERGED", "UNHEALTHY", "BOXBOUND", "SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+OPPOSITE = ({"SURVIVES", "REVERSES"}, {"SCALAR-BEATS-BEST", "SCALAR-BELOW-BEST"})
+BOUNDS = ("ONE-CELL", "TWO-RUNGS", "MS-ALPHA0-NOT-RESELECTED", "TRAIN-45K", "ONE-SPLIT",
+          "ALPHA-INDEPENDENT-DECAY-NOT-TESTED", "FLOOR-READINGS-ARE-BOUNDS")
+
+LICENCE = {
+    "VAL-AGREES": "at this ONE cell, on models trained on 45,000 images, each of the audit's three load-bearing readings "
+                  "(D at 0.1, D at 5e-4, scalar vs the partitions at 5e-4) is in the SAME registered state on the "
+                  "held-out validation split as on the test set: the rankings this batch reports on test are not "
+                  "artefacts of reading them on test.  The ms that WAS selected on test is not re-selected here.",
+    "VAL-SHIFTS": "at least one reading is in a different state on validation than on test AND at least one paired "
+                  "VAL-minus-TEST gap is resolved (>= 0.30 pp, > 2 paired SE): the held-out reader moves a contrast by "
+                  "more than the runs' own reader noise; that claim may be stated only with both readings beside it.",
+    "VAL-DIFFERS-UNRESOLVED": "a reading changes state between test and validation but no paired gap is resolved: the "
+                              "change is not distinguishable from reader noise at this seed count; report both states "
+                              "and the paired intervals; no sentence that the ranking does or does not hold on validation.",
+    "VAL-FLIPS": "at least one reading is RESOLVED in OPPOSITE directions on validation and on test: that ranking is "
+                 "reader-dependent in this cell and may not be stated from test alone.",
+    "UNREADABLE-TEST": "a partition or scalar arm is diverged, unhealthy or box-bound on the test reader: no comparison.",
+    "UNREADABLE-VAL": "a partition or scalar arm is diverged or unhealthy on the validation reader: no comparison.",
+    "SELECT-SAME": "the configuration (grain x decay) with the best validation plateau is the one with the best test "
+                   "plateau: selecting on validation would have picked the same one, among these 8.",
+    "SELECT-DIFFERS-UNRESOLVED": "validation picks a different configuration, and its test cost is not resolved against "
+                                 "the 0.30 pp bar -- a BOUND on the regret, not a zero.",
+    "SELECT-DIFFERS-RESOLVED": "validation picks a different configuration that is RESOLVED worse on test by >= 0.30 pp: "
+                               "selecting on test and on validation disagree materially in this cell.",
+}
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+VAL_RE = re.compile(r"^VAL: epoch (\d+) val_acc ([0-9.]+|nan) % n_val (\d+)$")
+OUT_RE = re.compile(r"^%s-([A-Za-z0-9]+)-s(\d+)-(\d+)\.out$" % PREFIX)
+KIND_ON_RE = re.compile(r"^([A-Z][A-Z_]+): on\b")
+
+
+def mean(v):
+    return sum(v) / float(len(v))
+
+
+def sd(v):
+    if len(v) < 2:
+        return 0.0
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =====================================================================================================================
+# THE DECISION (pure functions of numbers; the selftest drives them exhaustively)
+# =====================================================================================================================
+def rung_state(d, se, diverged, healthy, boxfree):
+    if diverged:
+        return "DIVERGED"
+    if not healthy:
+        return "UNHEALTHY"
+    if not boxfree:
+        return "BOXBOUND"
+    if d <= -NULLBAR and d < -RES * se:
+        return "REVERSES"
+    if d <= NULLBAR and d + RES * se < POOL_EXCLUDE:
+        return "VANISHES"
+    if d >= SURV and d > RES * se:
+        return "SURVIVES"
+    return "UNDECIDED"
+
+
+def scalar_of(k_level, k_div, cmp_ok, t_ch, t_nd, se):
+    if k_div:
+        return "SCALAR-DIVERGED"
+    if k_level < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not cmp_ok:
+        return "SCALAR-UNREADABLE"
+    tmin = min(t_ch, t_nd)
+    if t_ch >= SURV and t_nd >= SURV and t_ch > RES * se and t_nd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    if tmin - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "SCALAR-BELOW-BEST"
+    return "SCALAR-UNRESOLVED"
+
+
+def agreement(s_test, s_val):
+    if s_test == s_val:
+        return "SAME"
+    if any({s_test, s_val} == o for o in OPPOSITE):
+        return "FLIP"
+    return "DIFF"
+
+
+def primary_of(st, gap_res=None):
+    """st[reader][claim] -> the primary token.  gap_res[claim] = the paired gap is RESOLVED."""
+    gap_res = gap_res or {}
+    if any(st["TEST"][c] in GATE_STATES for c in CLAIMS):
+        return "UNREADABLE-TEST"
+    if any(st["VAL"][c] in GATE_STATES for c in CLAIMS):
+        return "UNREADABLE-VAL"
+    ag = [agreement(st["TEST"][c], st["VAL"][c]) for c in CLAIMS]
+    if "FLIP" in ag:
+        return "VAL-FLIPS"
+    if all(a == "SAME" for a in ag):
+        return "VAL-AGREES"
+    if any(gap_res.get(c) for c in CLAIMS):
+        return "VAL-SHIFTS"
+    return "VAL-DIFFERS-UNRESOLVED"
+
+
+def gap_resolved(g, se):
+    return abs(g) >= SURV and abs(g) > RES * se
+
+
+def select_of(levels_test, levels_val, se_test):
+    """levels_X[arm] -> (token, pick_test, pick_val, regret)."""
+    pt = max(sorted(levels_test), key=lambda a: levels_test[a])
+    pv = max(sorted(levels_val), key=lambda a: levels_val[a])
+    reg = levels_test[pt] - levels_test[pv]
+    if pt == pv:
+        return "SELECT-SAME", pt, pv, reg
+    if reg >= SURV and reg > RES * se_test:
+        return "SELECT-DIFFERS-RESOLVED", pt, pv, reg
+    return "SELECT-DIFFERS-UNRESOLVED", pt, pv, reg
+
+
+def compose_sigma(sigma_in):
+    return (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sigma_in else (sigma_in, "SIGMA_INBATCH")
+
+
+def reader_states(A, sig):
+    """A[arm] = dict(level, range, n, boxfree) for ONE reader."""
+    st, K = {}, {}
+    for r in D.RUNG_IDS:
+        ch, nd = A["ch" + r], A["nd" + r]
+        d = ch["level"] - nd["level"]
+        se = sig * math.sqrt(1.0 / ch["n"] + 1.0 / nd["n"])
+        st[r] = rung_state(d, se, ch["range"] > DIVERGED or nd["range"] > DIVERGED,
+                           ch["level"] >= HEALTH_MIN and nd["level"] >= HEALTH_MIN, ch["boxfree"] and nd["boxfree"])
+        K["D_" + r] = (d, se)
+        k = A["k01" + r]
+        for g in ("ch", "nd", "kL"):
+            x = A[g + r]
+            K["T%s_%s" % (g, r)] = (k["level"] - x["level"], sig * math.sqrt(1.0 / k["n"] + 1.0 / x["n"]))
+    k4, c4, n4 = A["k01W4"], A["chW4"], A["ndW4"]
+    cmp_ok = (c4["level"] >= HEALTH_MIN and n4["level"] >= HEALTH_MIN and c4["range"] <= DIVERGED and n4["range"] <= DIVERGED)
+    st["SC"] = scalar_of(k4["level"], k4["range"] > DIVERGED, cmp_ok, K["Tch_W4"][0], K["Tnd_W4"][0], K["Tch_W4"][1])
+    return st, K
+
+
+def decide(AT, AV, sig_t, sig_v, s_delta):
+    stT, KT = reader_states(AT, sig_t)
+    stV, KV = reader_states(AV, sig_v)
+    st = {"TEST": stT, "VAL": stV}
+    se_gap = s_delta * math.sqrt(0.5)
+    gaps = {"W1": KV["D_W1"][0] - KT["D_W1"][0], "W4": KV["D_W4"][0] - KT["D_W4"][0],
+            "SC": min(KV["Tch_W4"][0], KV["Tnd_W4"][0]) - min(KT["Tch_W4"][0], KT["Tnd_W4"][0])}
+    gres = dict((c, gap_resolved(gaps[c], se_gap)) for c in CLAIMS)
+    KT["GAPS"], KT["GAP_SE"], KT["GAP_RES"] = gaps, se_gap, gres
+    prim = primary_of(st, gres)
+    sel = select_of(dict((a, AT[a]["level"]) for a in D.ARMS), dict((a, AV[a]["level"]) for a in D.ARMS),
+                    sig_t * math.sqrt(0.5))
+    return prim, sel, st, KT, KV
+
+
+# =====================================================================================================================
+# READING THE RUNS
+# =====================================================================================================================
+def parse_args_line(line):
+    toks = shlex.split(line[len("ARGS:"):])
+    pairs, seen, rep, i = [], set(), [], 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("--"):
+            return None, ["stray token %r" % t]
+        if i + 1 >= len(toks) or toks[i + 1].startswith("--"):
+            return None, ["flag %s has no value" % t]
+        f = t[2:]
+        if f in seen:
+            rep.append(f)
+        seen.add(f)
+        pairs.append((f, toks[i + 1]))
+        i += 2
+    return pairs, rep
+
+
+def read_out(path):
+    L = open(path, errors="replace").read().splitlines()
+    info = dict(path=path, args=None, env=None, gpu=None, done=False, eps={}, val={}, val_bad=[], kinds_on=[],
+                vs=[], pt=False, order_ok=True)
+    last_ep = None
+    for ln in L:
+        if ln.startswith("ARGS:") and info["args"] is None:
+            info["args"] = ln
+        elif ln.startswith("ENV:") and info["env"] is None:
+            info["env"] = ln
+        elif ln.startswith("NVIDIA") and info["gpu"] is None:
+            info["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            info["done"] = True
+        elif ln.startswith("PROBE_TENSOR:"):
+            info["pt"] = True
+        elif ln.startswith("VAL_SPLIT"):
+            info["vs"].append(ln)
+        elif ln.startswith("VAL:"):
+            m = VAL_RE.match(ln)
+            if not m or int(m.group(3)) != D.N_VAL:
+                info["val_bad"].append(ln[:80])
+                continue
+            e = int(m.group(1))
+            if e in info["val"] or last_ep != e:
+                info["order_ok"] = False
+            info["val"][e] = float(m.group(2))
+        else:
+            m = EPTR_RE.search(ln)
+            if m:
+                info["eps"][int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+                last_ep = int(m.group(1))
+            k = KIND_ON_RE.match(ln)
+            if k:
+                info["kinds_on"].append(ln.strip())
+    info["complete"] = (info["done"] and all(e in info["eps"] for e in range(D.EPOCHS)))
+    return info
+
+
+def find_outs(runsdir):
+    out = []
+    for base in (runsdir, os.path.join(runsdir, PREFIX)):
+        out += glob.glob(os.path.join(base, "%s-*.out" % PREFIX))
+    return sorted(set(os.path.realpath(p) for p in out))
+
+
+def probe_path(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, D.probe_dir_name(arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def read_probe(path):
+    import json
+    recs = []
+    for ln in open(path, errors="replace"):
+        if not ln.strip():
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            recs.append(None)
+            continue
+        recs.append({k: r.get(k) for k in ("step", "n_beta", "beta_true_min", "beta_true_max", "n_at_lo", "n_at_hi")}
+                    if isinstance(r, dict) else None)
+    return recs
+
+
+def probe_audit(recs, m_want, n_records=None, win_step=None):
+    """-> (ok, why, occ).  G-STRUCT: n_records records at steps 0,5,..; n_beta == the arm's m on EVERY record.
+    At 45,000 training images there are 9,000 records (a 50,000-image run's 10,000 FAIL here: the count is the witness
+    that the run trained on 450 batches per epoch)."""
+    n_records = D.N_RECORDS if n_records is None else n_records
+    win_step = WIN_STEP if win_step is None else win_step
+    if recs is None:
+        return False, "no probe.jsonl", None
+    if len(recs) != n_records:
+        return False, "%d records, want %d" % (len(recs), n_records), None
+    if any(r is None for r in recs):
+        return False, "an unreadable record", None
+    if [r["step"] for r in recs] != list(range(0, n_records * D.PROBE, D.PROBE)):
+        return False, "record steps are not 0,5,...,%d" % ((n_records - 1) * D.PROBE), None
+    nb = set(r["n_beta"] for r in recs)
+    if nb != {m_want}:
+        return False, "n_beta %s != the arm's registered m %d" % (sorted(nb)[:3], m_want), None
+    mins = [r["beta_true_min"] for r in recs]
+    maxs = [r["beta_true_max"] for r in recs]
+    if not (max(maxs) - min(mins) > 1e-9):
+        return False, "beta never moved", None
+    T = float(len(recs))
+    rec_lo = sum(1 for x in mins if x <= D.LO + BOX_EPS) / T
+    rec_hi = sum(1 for x in maxs if x >= D.HI - BOX_EPS) / T
+    win = [r for r in recs if r["step"] >= win_step]
+    return True, "", dict(rec_lo=rec_lo, rec_hi=rec_hi, boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX),
+                          beta_min_win=min(r["beta_true_min"] for r in win), beta_max_win=max(r["beta_true_max"] for r in win))
+
+
+def read_corpus_disclosure(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions as ce
+    finally:
+        sys.path.pop(0)
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return len(ce.filter_rows(rows))
+
+
+def resolve_prov(runsdir):
+    for p in (os.path.join(runsdir, PREFIX, "PROVENANCE.txt"), os.path.join(runsdir, "PROVENANCE.txt")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# =====================================================================================================================
+# SCORE
+# =====================================================================================================================
+def score(runsdir, csvpath=DEFAULT_CSV, out=print):
+    P = out
+    P("=" * 110)
+    P("cvl1 -- DO THE AUDIT'S TEST RANKINGS HOLD ON A HELD-OUT VALIDATION SPLIT?  (CORRECTIONS 303; ICML-PLAN 1.14)")
+    P("scorer sha256 %s   design sha256 %s" % (file_sha(os.path.abspath(__file__)), file_sha(os.path.join(HERE, "cvl1_design.py"))))
+    P("runsdir %s" % runsdir)
+    P("=" * 110)
+    harness = []
+
+    def hfail(msg):
+        harness.append(msg)
+        P("  !!! HARNESS %s" % msg)
+
+    found = {}
+    for p in find_outs(runsdir):
+        m = OUT_RE.match(os.path.basename(p))
+        if not m:
+            hfail("unparseable file name %s" % os.path.basename(p))
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        if arm not in D.ARMS or seed not in D.SEEDS[arm]:
+            hfail("a %s .out that is not a registered run: %s" % (PREFIX, os.path.basename(p)))
+            continue
+        found.setdefault((arm, seed), []).append((jid, p))
+    runs, missing, ignored = {}, [], []
+    for (arm, seed) in D.RUNS:
+        cands = [(jid, p, read_out(p)) for jid, p in sorted(found.get((arm, seed), []))]
+        comp = [c for c in cands if c[2]["complete"]]
+        ignored += [os.path.basename(c[1]) for c in cands if not c[2]["complete"]]
+        if not comp:
+            missing.append(D.run_name(arm, seed))
+        elif len(comp) > 1:
+            hfail("%s has %d COMPLETE .out files -- ambiguous" % (D.run_name(arm, seed), len(comp)))
+        else:
+            runs[(arm, seed)] = comp[0]
+    P("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(runs), D.NJOBS))
+    if ignored:
+        P("  ignored (incomplete): %s" % ", ".join(sorted(ignored)))
+    if missing:
+        P("  MISSING / INCOMPLETE: %s" % ", ".join(missing))
+
+    prov = resolve_prov(runsdir)
+    if prov is None:
+        hfail("G-PROV: no PROVENANCE.txt under %s/%s" % (runsdir, PREFIX))
+    else:
+        kv = dict(ln.split(" ", 1) for ln in open(prov).read().splitlines() if " " in ln)
+        want = {"SCORER_SHA256": file_sha(os.path.abspath(__file__)), "DESIGN_SHA256": file_sha(os.path.join(HERE, "cvl1_design.py")),
+                "HF_SHA256": D.HF_LIVE_SHA, "LOAD_DATA_SHA256": D.LOADDATA_POST_SHA, "TRAIN_SHA256": D.TRAIN_POST_SHA}
+        for k, v in sorted(want.items()):
+            if kv.get(k, "").strip() != v:
+                hfail("G-PROV: %s in %s is %r, want %s" % (k, prov, kv.get(k), v[:16]))
+        P("G-PROV  %s  MODE %s  SCORER %s  DESIGN %s  LOAD_DATA %s  TRAIN %s" % (prov, kv.get("MODE", "?"),
+          kv.get("SCORER_SHA256", "?")[:16], kv.get("DESIGN_SHA256", "?")[:16], kv.get("LOAD_DATA_SHA256", "?")[:16],
+          kv.get("TRAIN_SHA256", "?")[:16]))
+
+    per, gpus, save_dirs = {}, {}, set()
+    for (arm, seed), (jid, path, info) in sorted(runs.items()):
+        rn = D.run_name(arm, seed)
+        if info["args"] is None:
+            hfail("G-ARGS %s: no ARGS line" % rn)
+            continue
+        pairs, rep = parse_args_line(info["args"])
+        if pairs is None or rep:
+            hfail("G-ARGS %s: %s" % (rn, rep))
+            continue
+        sd_ = dict(pairs).get("save-directory", "")
+        save_dirs.add(sd_)
+        want = D.expected_args(arm, seed, sd_)
+        if pairs != want:
+            diff = [(f, v, dict(want).get(f)) for f, v in pairs if dict(want).get(f) != v]
+            hfail("G-ARGS %s: %d flags differ from the registered line %s" % (rn, len(diff), diff[:4]))
+            continue
+        if info["env"] != D.ENV_TEMPLATE.replace("<P>", os.path.join(sd_, D.probe_dir_name(arm, seed))):
+            hfail("G-ENV %s: ENV line is not the registered one (%r)" % (rn, (info["env"] or "")[:160]))
+            continue
+        if info["vs"] != [D.witness_on()]:
+            hfail("G-VALSPLIT %s: the VAL_SPLIT witness is %r, want exactly ONE %r" % (rn, info["vs"][:2], D.witness_on()[:90]))
+            continue
+        others = [k for k in info["kinds_on"] if not k.startswith("VAL_SPLIT")]
+        if others or info["pt"]:
+            hfail("G-KIND %s: prints another patch witness %s" % (rn, (others or ["PROBE_TENSOR"])[:2]))
+            continue
+        if info["val_bad"] or sorted(info["val"]) != list(range(D.EPOCHS)) or not info["order_ok"]:
+            hfail("G-VAL %s: VAL lines are not epochs 0..99 once each, each right after its Epoch line (%d read, bad %r)"
+                  % (rn, len(info["val"]), info["val_bad"][:1]))
+            continue
+        pp = probe_path(runsdir, arm, seed)
+        ok, why, occ = probe_audit(read_probe(pp) if pp else None, D.M_OF_ARM[arm])
+        if not ok:
+            hfail("G-STRUCT %s: %s" % (rn, why))
+            continue
+        eps, val = info["eps"], info["val"]
+        per[(arm, seed)] = dict(TEST=mean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+                                VAL=mean([val[e] for e in range(PL_LO, PL_HI + 1)]),
+                                train=mean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]), occ=occ, jid=jid)
+        gpus[info["gpu"]] = gpus.get(info["gpu"], 0) + 1
+    if len(save_dirs) > 1:
+        hfail("G-ARGS: the runs name %d different save directories" % len(save_dirs))
+    P("G-ARGS / G-ENV / G-VALSPLIT / G-KIND / G-VAL / G-STRUCT  %d of %d complete runs pass (20 flags, the registered ENV "
+      "line, ONE registered VAL_SPLIT witness, 100 VAL lines, %d probe records with n_beta == m)" % (len(per), len(runs), D.N_RECORDS))
+    P("G-HW (DISCLOSURE ONLY): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    n_corp = read_corpus_disclosure(csvpath)
+    P("corpus: %s  (DISCLOSURE ONLY -- enters no bar, sigma, level, state or stamp)"
+      % ("not readable" if n_corp is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (n_corp, PREFIX)))
+    if harness:
+        P("\nFINAL HARNESS-FAIL | %d harness failure(s); nothing is read" % len(harness))
+        return 3
+    if missing:
+        P("\nFINAL INCOMPLETE | %d of %d runs missing or incomplete; nothing is read" % (len(missing), D.NJOBS))
+        return 2
+
+    AR = {"TEST": {}, "VAL": {}}
+    sig_in = {}
+    for X in READERS:
+        ss, df = 0.0, 0
+        for a in D.ARMS:
+            xs = [per[(a, s)][X] for s in D.SEEDS[a]]
+            m_ = mean(xs)
+            ss += sum((x - m_) ** 2 for x in xs)
+            df += len(xs) - 1
+            AR[X][a] = dict(level=m_, range=max(xs) - min(xs), n=len(xs), sd=sd(xs),
+                            boxfree=all(per[(a, s)]["occ"]["boxfree"] for s in D.SEEDS[a]))
+        sig_in[X] = (math.sqrt(ss / df) if df else 0.0, df)
+    # the paired VAL - TEST gap per run
+    dss, ddf = 0.0, 0
+    for a in D.ARMS:
+        ds = [per[(a, s)]["VAL"] - per[(a, s)]["TEST"] for s in D.SEEDS[a]]
+        m_ = mean(ds)
+        dss += sum((x - m_) ** 2 for x in ds)
+        ddf += len(ds) - 1
+    s_delta = math.sqrt(dss / ddf) if ddf else 0.0
+
+    P("\nARMS  plateau5 over epochs %d-%d, TEST and VAL from the SAME runs; box from each run's OWN probe.jsonl" % (PL_LO, PL_HI))
+    P("  %-6s %-4s %-9s %2s %9s %7s %7s %9s %7s %7s %9s  %-5s" % ("arm", "wd", "grain", "n", "TEST", "sd", "range",
+      "VAL", "sd", "range", "VAL-TEST", "box"))
+    for a in D.ARMS:
+        t, v = AR["TEST"][a], AR["VAL"][a]
+        P("  %-6s %-4s %-9s %2d %9.4f %7.3f %7.3f %9.4f %7.3f %7.3f %+9.4f  %-5s" % (a, D.WD[a], D.SPEC[a], t["n"], t["level"],
+          t["sd"], t["range"], v["level"], v["sd"], v["range"], v["level"] - t["level"], "free" if t["boxfree"] else "BOUND"))
+    sig = {}
+    P("\nSIGMA  O2: max(frozen floor, in-batch) per reader -- nothing from the corpus")
+    for X in READERS:
+        sig[X] = compose_sigma(sig_in[X][0])
+        P("  %-4s SIGMA_PRIOR_frozen %.6f (df %d) | SIGMA_INBATCH %.6f (df %d) | SIGMA_USED %.6f (= %s)"
+          % (X, SIGMA_PRIOR, SIGMA_PRIOR_DF, sig_in[X][0], sig_in[X][1], sig[X][0], sig[X][1]))
+    P("  paired (VAL - TEST) per-run sd %.6f (df %d) -- DESCRIPTIVE gaps only" % (s_delta, ddf))
+
+    prim, sel, st, KT, KV = decide(AR["TEST"], AR["VAL"], sig["TEST"][0], sig["VAL"][0], s_delta)
+    P("\nCONTRASTS (WITHIN a rung, WITHIN a reader; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    sedd = KT["GAP_SE"]
+    for r in D.RUNG_IDS:
+        for X, K in (("TEST", KT), ("VAL", KV)):
+            d, se = K["D_" + r]
+            P("  %-4s D_%s = ch - nd = %+.4f pp = %+.2f SE (SE %.6f) [%+.4f, %+.4f]  state %s"
+              % (X, r, d, d / se, se, d - RES * se, d + RES * se, st[X][r]))
+        g = KT["GAPS"][r]
+        P("       GAP D_%s VAL - TEST = %+.4f pp = %+.2f paired SE (SE %.6f) [%+.4f, %+.4f]  %s"
+          % (r, g, g / sedd if sedd else 0.0, sedd, g - RES * sedd, g + RES * sedd, "RESOLVED" if KT["GAP_RES"][r] else "not resolved"))
+    for X, K in (("TEST", KT), ("VAL", KV)):
+        P("  %-4s T_W4 = k01 - ch %+.4f (%+.2f SE), k01 - nd %+.4f (%+.2f SE)  state %s" % (X, K["Tch_W4"][0],
+          K["Tch_W4"][0] / K["Tch_W4"][1], K["Tnd_W4"][0], K["Tnd_W4"][0] / K["Tnd_W4"][1], st[X]["SC"]))
+        for r in D.RUNG_IDS:
+            P("  %-4s G_%s = kL - k01 = %+.4f pp   DESCRIPTIVE" % (X, r, -K["TkL_" + r][0]))
+    tv = KT["GAPS"]["SC"]
+    P("       GAP min(T_W4) VAL - TEST = %+.4f pp = %+.2f paired SE [%+.4f, %+.4f]  %s" % (tv, tv / sedd if sedd else 0.0,
+      tv - RES * sedd, tv + RES * sedd, "RESOLVED" if KT["GAP_RES"]["SC"] else "not resolved"))
+    tok, pt, pv, reg = sel
+    P("\nSELECTION  over the 8 configurations: TEST picks %s (%.4f), VAL picks %s (%.4f); TEST regret of VAL's pick %+.4f pp"
+      " (SE %.6f)  -> %s" % (pt, AR["TEST"][pt]["level"], pv, AR["VAL"][pv]["level"], reg, sig["TEST"][0] * math.sqrt(0.5), tok))
+    stamps = list(BOUNDS)
+    for r in D.RUNG_IDS:
+        gt = max(D.GRAIN_IDS, key=lambda g: AR["TEST"][g + r]["level"])
+        gv = max(D.GRAIN_IDS, key=lambda g: AR["VAL"][g + r]["level"])
+        P("  rung %s: best grain on TEST %s, on VAL %s" % (r, D.SPEC_OF_GRAIN[gt], D.SPEC_OF_GRAIN[gv]))
+        stamps.append("SELECT-%s-%s" % (r, "SAME" if gt == gv else "DIFFERS"))
+    for X in READERS:
+        stamps.append("%s-%s" % (X, "SIGMA-PRIOR-FROZEN" if sig[X][1] == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"))
+    for c in CLAIMS:
+        if KT["GAP_RES"][c]:
+            stamps.append("GAP-RESOLVED-%s" % c)
+    # non-gating: the in-batch TEST states against cgw1's landed (50,000-image) ones
+    for c in CLAIMS:
+        if st["TEST"][c] != D.CGW1_STATES["SCALAR" if c == "SC" else c]:
+            stamps.append("TEST-STATE-DIFFERS-FROM-CGW1-%s" % c)
+    for a in D.ARMS:
+        if abs(AR["TEST"][a]["level"] - D.CGW1_TEST[a]) > MATCH:
+            stamps.append("TEST-LEVEL-DIFFERS-FROM-CGW1-%s" % a)
+    for a in D.ARMS:
+        if not AR["TEST"][a]["boxfree"] and D.GRAIN_OF[a] in ("k01", "kL"):
+            stamps.append("BOX-BOUND-%s" % a)
+    stateword = "+".join("%s-T%s/V%s" % (c, st["TEST"][c], st["VAL"][c]) for c in CLAIMS)
+    P("\nPER CLAIM  " + "  ".join("%s: TEST %s | VAL %s -> %s" % (c, st["TEST"][c], st["VAL"][c],
+                                  agreement(st["TEST"][c], st["VAL"][c])) for c in CLAIMS))
+    P("\nLICENCE (primary)    %s" % LICENCE.get(prim, ""))
+    P("LICENCE (selection)  %s" % LICENCE[tok])
+    P("\nFINAL %s | %s | %s | %s" % (prim, tok, stateword, " ".join(stamps)))
+    return 0
+
+
+# =====================================================================================================================
+# SELFTEST
+# =====================================================================================================================
+RESULTS = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label):
+    RESULTS["PASS" if cond else "FAIL"] += 1
+    print("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def skip(label):
+    RESULTS["SKIP"] += 1
+    print("  SKIP %s" % label)
+
+
+def _write_out(d, arm, seed, jid, level, vlevel, save_dir, args_over=None, env_over=None, extra_line=None, done=True,
+               n_ep=D.EPOCHS, vs_over=None, val_over=None, gpu="NVIDIA L4, 23034 MiB"):
+    rn = D.run_name(arm, seed)
+    pairs = D.expected_args(arm, seed, save_dir)
+    if args_over:
+        pairs = args_over(pairs)
+    env = D.ENV_TEMPLATE.replace("<P>", os.path.join(save_dir, D.probe_dir_name(arm, seed)))
+    if env_over:
+        env = env_over(env)
+    L = ["NODE=[HOST_2f2f29d9e1] | JOB=%s %d | AUGMENT=1" % (rn, jid), "ARGS: " + " ".join("--%s %s" % kv for kv in pairs), env, gpu, ""]
+    L += [D.witness_on()] if vs_over is None else vs_over
+    if extra_line:
+        L.append(extra_line)
+    for e in range(n_ep):
+        te = level if e >= PL_LO - 5 else level * (1 - math.exp(-(e + 1) / 12.0))
+        ve = vlevel if e >= PL_LO - 5 else vlevel * (1 - math.exp(-(e + 1) / 12.0))
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.99, te + 5.0), te))
+        vl = "VAL: epoch %d val_acc %.2f %% n_val 5000" % (e, round(ve * 50) / 50.0)
+        if val_over:
+            vl = val_over(e, vl)
+        if vl is not None:
+            L.append(vl)
+    L.append("45  minutes")
+    if done:
+        L.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(L) + "\n")
+
+
+def _write_probe(pdir, m, lo=-8.0, hi=-5.0, n=D.N_RECORDS, nb=None, hi_frac=0.0):
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "probe.jsonl"), "w") as fh:
+        for i in range(n):
+            bmax = D.HI if i >= n * (1 - hi_frac) else hi + 1e-4 * (i % 7)
+            fh.write('{"step": %d, "beta_true_min": %.6f, "beta_true_max": %.6f, "n_beta": %d, "n_at_lo": 0, '
+                     '"n_at_hi": %d}\n' % (i * D.PROBE, lo - 1e-4 * (i % 5), bmax, nb if nb is not None else m,
+                                           1 if bmax >= D.HI else 0))
+
+
+JIT = (0.02, 0.04, -0.04, -0.02)    # zero-mean over 4 seeds
+
+
+def _build(root, template, levels, vlevels=None, save_dir="/SAVE/runs/cvl1", over=None, drop=(), extra=None,
+           probe_over=None, prov_over=None, jit=None, vjit=None):
+    os.makedirs(os.path.join(root, PREFIX), exist_ok=True)
+    vlevels = vlevels or levels
+    jid = 7100000
+    for (arm, seed) in D.RUNS:
+        jid += 1
+        if (arm, seed) in drop:
+            continue
+        i = D.SEEDS[arm].index(seed)
+        lv = levels[arm] + (JIT[i] if jit is None else jit(arm, i))
+        vv = vlevels[arm] + (JIT[i] if vjit is None else vjit(arm, i))
+        _write_out(os.path.join(root, PREFIX), arm, seed, jid, lv, vv, save_dir, **dict((over or {}).get((arm, seed), {})))
+        dst = os.path.join(root, PREFIX, D.probe_dir_name(arm, seed))
+        if probe_over and (arm, seed) in probe_over:
+            _write_probe(dst, D.M_OF_ARM[arm], **probe_over[(arm, seed)])
+        else:
+            os.symlink(os.path.join(template, D.probe_dir_name(arm, seed)), dst)
+    for f in (extra or []):
+        f(os.path.join(root, PREFIX))
+    kv = {"MODE": "submit", "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+          "DESIGN_SHA256": file_sha(os.path.join(HERE, "cvl1_design.py")), "HF_SHA256": D.HF_LIVE_SHA,
+          "LOAD_DATA_SHA256": D.LOADDATA_POST_SHA, "TRAIN_SHA256": D.TRAIN_POST_SHA}
+    kv.update(prov_over or {})
+    open(os.path.join(root, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+    return root
+
+
+def _run(root, csvpath=None):
+    lines = []
+    rc = score(root, csvpath, out=lines.append)
+    lines = [x for ln in lines for x in ln.split("\n")]
+    fin = [ln for ln in lines if ln.startswith("FINAL ")]
+    return rc, (fin[0] if fin else ""), lines
+
+
+def _levels(w1=(92.20, 91.70, 91.90, 92.50), w4=(87.60, 87.35, 90.20, 89.60)):
+    L = {}
+    for r, v in (("W1", w1), ("W4", w4)):
+        for g, x in zip(D.GRAIN_IDS, v):
+            L[g + r] = x
+    return L
+
+
+def selftest(csvpath, runsdir):
+    print("cvl1 SELFTEST -- design, frozen floor through corpus_exclusions.filter_rows, decision tables with exhaustive")
+    print("reachability, and the REAL score() on synthetic runs (every account, every gate, the harness breaks).")
+    src = open(os.path.abspath(__file__)).read()
+    print("\nA  DESIGN")
+    chk(D.NJOBS == 32 and len(D.ARMS) == 8, "A 8 arms, 32 runs (4 grains x 2 rungs x 4 seeds)")
+    chk(all(set(D.SEEDS[a]) == {184, 185, 186, 187} for a in D.ARMS) and set(D.UNUSED_SEEDS) == {188, 189, 190, 191}
+        and set(D.SEED_BLOCK) == set(range(184, 192)), "A seeds {184..187} on every arm, from the assigned block {184..191}")
+    chk(D.WD_TOKEN == {"W1": "0.1", "W4": "5e-4"}, "A the two rung tokens are cgw1's 0.1 / 5e-4")
+    chk(D.M_OF_GRAIN == {"ch": 14421, "nd": 14420, "k01": 1, "kL": 62}, "A registered group counts 14421/14420/1/62")
+    chk(D.VAL_SPLIT == "5000:302" and D.N_TRAIN == 45000 and D.STEPS_PER_EPOCH == 450 and D.N_RECORDS == 9000,
+        "A VAL_SPLIT 5000:302 -> 45,000 train, 450 steps / epoch, 9,000 probe records")
+    chk(re.match(r"^[0-9a-f]{64}$", D.VAL_SHA or "") is not None and re.match(r"^[0-9a-f]{64}$", D.TRAIN_SPLIT_SHA or "") is not None,
+        "A the design pins the REAL split's val_sha / train_sha (from the proof job, 302)")
+    chk(all(len(D.expected_args(a, s, "/x")) == 20 for a, s in D.RUNS), "A every expected ARGS line has 20 flags")
+    chk(abs(SIGMA_PRIOR * math.sqrt(0.5) - SE4) < 1e-6, "A SE4 = SIGMA_PRIOR * sqrt(2/4)")
+    chk((SURV, NULLBAR, POOL_EXCLUDE, RES, HEALTH_MIN, DIVERGED, BOXFREE_MAX, MATCH) == (0.30, 0.15, 0.5556, 2.0, 85.0, 2.0, 0.05, 0.50),
+        "A the frozen bars are cgw1's: SURV 0.30 NULL 0.15 POOL 0.5556 RES 2 HEALTH 85 DIVERGED 2 BOX 0.05 MATCH 0.50")
+    dec_src = src[src.index("def rung_state("):src.index("# READING THE RUNS")]
+    chk("CGW1" not in dec_src and "corpus" not in dec_src and "PRED" not in dec_src,
+        "A no landed level, prediction or corpus figure enters the decision functions (O2, read from source)")
+    sc_src = src[src.index("def score("):src.index("# SELFTEST")]
+    chk(sc_src.count("CGW1_TEST") == 1 and sc_src.count("CGW1_STATES") == 1, "A cgw1's landed values are read ONCE each, for stamps only")
+    chk(all(t in LICENCE for t in PRIMARY_TOKENS + SELECT_TOKENS), "A every primary / selection token has a licence")
+    chk(WIN_STEP == 42750, "A plateau window starts at meta step 95 x 450 = 42,750")
+
+    print("\nB  THE FROZEN FLOOR, RE-DERIVED THROUGH corpus_exclusions.filter_rows")
+    if csvpath and os.path.exists(csvpath):
+        sys.path.insert(0, HERE)
+        import corpus_exclusions as ce
+        sys.path.pop(0)
+        rows = [r for r in csv.DictReader(open(csvpath)) if not r["run"].startswith(PREFIX + "-")]
+        CK = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+              "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+        def pooled(R):
+            cells = {}
+            for r in R:
+                if (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                        and (r.get("plateau5") or "").strip() and r["network"] == D.NET and r["dataset"] == D.DSET
+                        and r["meta_stepsize"] == D.MST and r["alpha0"] in (D.A0, "0.001") and r["beta_clip"] == D.CLIP
+                        and r["epochs_requested"] == str(D.EPOCHS) and r["augment"] == D.AUG and r["batch_size"] == str(D.BATCH)):
+                    cells.setdefault(tuple(r[k] for k in CK), []).append(float(r["plateau5"]))
+            s2, df_, nc = 0.0, 0, 0
+            for v in cells.values():
+                if len(v) > 1:
+                    mm = mean(v)
+                    s2 += sum((x - mm) ** 2 for x in v)
+                    df_ += len(v) - 1
+                    nc += 1
+            return math.sqrt(s2 / df_), df_, nc
+        filt = ce.filter_rows(rows)
+        sF, dF, nF = pooled(filt)
+        sN, _dN, _ = pooled(rows)
+        chk(abs(sF - SIGMA_PRIOR) < 1e-12 and dF == SIGMA_PRIOR_DF and nF == 34,
+            "B SIGMA_PRIOR: the FROZEN literal %r IS the FILTERED value (df %d, %d cells) on this corpus (%d rows)"
+            % (SIGMA_PRIOR, dF, nF, len(rows)))
+        chk(abs(sN - SIGMA_PRIOR_NAIVE) < 1e-12 and sN > 3 * sF,
+            "B the UNFILTERED value %.6f differs (cgw1's wd-deviating rows) -- the filter is load-bearing; disclosure" % sN)
+        dm = ce._pooled(filt, "ResNet18_c100")
+        print("  NOTE the corpus_exclusions noise-floor DEMONSTRATION (SIGMA_R18ALL, filtered) on this corpus is %.6f (df %d);"
+              " quoted at registration as %.6f -- no bar reads it" % (dm[0], dm[1], DEMO_R18ALL_AT_REG))
+    else:
+        skip("B no corpus at %s" % csvpath)
+
+    print("\nC  THE DECISION, AT ITS BARS AND EXHAUSTIVELY")
+    se = SE4
+    chk(rung_state(0.30 + 1e-9, se, False, True, True) == "SURVIVES" and rung_state(0.30 - 1e-9, se, False, True, True) == "UNDECIDED",
+        "C the SURVIVES edge +0.30 (cgw1's)")
+    chk(rung_state(0.15, se, False, True, True) == "VANISHES" and rung_state(0.15 + 1e-9, se, False, True, True) == "UNDECIDED",
+        "C the VANISHES edge +0.15")
+    chk(rung_state(0.10, 0.2276, False, True, True) == "VANISHES" and rung_state(0.10, 0.2279, False, True, True) == "UNDECIDED",
+        "C VANISHES needs D + 2 SE < +0.5556 (a noisy reader cannot print VANISHES)")
+    chk(rung_state(-0.15, 0.05, False, True, True) == "REVERSES" and rung_state(-0.20, 0.15, False, True, True) == "VANISHES",
+        "C REVERSES needs D <= -0.15 AND < -2 SE")
+    chk(rung_state(0.9, se, True, True, True) == "DIVERGED" and rung_state(0.9, se, False, False, True) == "UNHEALTHY"
+        and rung_state(0.9, se, False, True, False) == "BOXBOUND", "C DIVERGED > UNHEALTHY > BOXBOUND")
+    chk(agreement("SURVIVES", "SURVIVES") == "SAME" and agreement("SURVIVES", "REVERSES") == "FLIP"
+        and agreement("REVERSES", "SURVIVES") == "FLIP" and agreement("SURVIVES", "UNDECIDED") == "DIFF"
+        and agreement("SURVIVES", "VANISHES") == "DIFF" and agreement("SCALAR-BEATS-BEST", "SCALAR-BELOW-BEST") == "FLIP"
+        and agreement("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST") == "DIFF", "C agreement: SAME / FLIP only for resolved opposites / DIFF")
+    base = {"TEST": {"W1": "SURVIVES", "W4": "UNDECIDED", "SC": "SCALAR-BEATS-BEST"}}
+    chk(primary_of(dict(base, VAL=dict(base["TEST"]))) == "VAL-AGREES", "C all three SAME -> VAL-AGREES")
+    chk(primary_of(dict(base, VAL={"W1": "UNDECIDED", "W4": "UNDECIDED", "SC": "SCALAR-BEATS-BEST"})) == "VAL-DIFFERS-UNRESOLVED",
+        "C W1 SURVIVES on TEST, UNDECIDED on VAL, no gap resolved -> VAL-DIFFERS-UNRESOLVED")
+    chk(primary_of(dict(base, VAL={"W1": "UNDECIDED", "W4": "UNDECIDED", "SC": "SCALAR-BEATS-BEST"}), {"W1": True}) == "VAL-SHIFTS",
+        "C the same with W1's paired gap resolved -> VAL-SHIFTS")
+    chk(primary_of(dict(base, VAL=dict(base["TEST"])), {"SC": True}) == "VAL-AGREES",
+        "C every state SAME -> VAL-AGREES even when a gap is resolved (a magnitude change is a stamp, not a ranking change)")
+    chk(gap_resolved(0.30, 0.149) and not gap_resolved(0.30, 0.15) and not gap_resolved(0.29, 0.01) and gap_resolved(-0.4, 0.1),
+        "C paired gap resolved at |gap| >= 0.30 AND > 2 SE")
+    chk(primary_of(dict(base, VAL={"W1": "REVERSES", "W4": "UNDECIDED", "SC": "SCALAR-BEATS-BEST"})) == "VAL-FLIPS",
+        "C W1 resolved opposite -> VAL-FLIPS (outranks DIFF)")
+    chk(primary_of({"TEST": {"W1": "BOXBOUND", "W4": "UNDECIDED", "SC": "SCALAR-BEATS-BEST"}, "VAL": base["TEST"]}) == "UNREADABLE-TEST"
+        and primary_of(dict(base, VAL={"W1": "SURVIVES", "W4": "UNHEALTHY", "SC": "SCALAR-BEATS-BEST"})) == "UNREADABLE-VAL",
+        "C the two UNREADABLE gates, TEST before VAL")
+    got = set()
+    for a in RUNG_STATES:
+        for b in RUNG_STATES:
+            for c in SCALAR_TOKENS:
+                for dd in SCALAR_TOKENS:
+                    for gr in (None, {"W4": True}):
+                        got.add(primary_of({"TEST": {"W1": a, "W4": b, "SC": c}, "VAL": {"W1": b, "W4": a, "SC": dd}}, gr))
+    chk(got == set(PRIMARY_TOKENS), "C EXHAUSTIVE: every (state, state, scalar, scalar, gap) combination maps onto exactly the 6 primary tokens")
+    lv = dict((a, 90.0) for a in D.ARMS)
+    lv["kLW1"] = 92.5
+    chk(select_of(lv, dict(lv), 0.1)[0] == "SELECT-SAME", "C same argmax -> SELECT-SAME")
+    lv2 = dict(lv)
+    lv2["chW1"] = 93.0
+    chk(select_of(lv, lv2, 0.1)[0] == "SELECT-DIFFERS-RESOLVED", "C VAL picks chW1, 2.5 pp worse on TEST (> 0.30 and > 2 SE) -> RESOLVED")
+    lv3 = dict(lv)
+    lv3["chW1"] = 92.4
+    lvv = dict(lv3)
+    lvv["chW1"] = 93.0
+    chk(select_of(lv3, lvv, 0.1)[0] == "SELECT-DIFFERS-UNRESOLVED", "C VAL picks chW1, 0.1 pp worse on TEST -> UNRESOLVED (a bound)")
+    chk(select_of(lv3, lvv, 0.1)[3] == lv3["kLW1"] - lv3["chW1"], "C the regret is TEST(pick_TEST) - TEST(pick_VAL)")
+    rng = random.Random(303)
+    tot, reach = set(), set()
+    for _ in range(4000):
+        AT, AV = {}, {}
+        for a in D.ARMS:
+            for A_ in (AT, AV):
+                A_[a] = dict(level=rng.choice((rng.uniform(86, 93), rng.uniform(60, 93))), range=rng.choice((0.1, 0.3, 2.5)) if rng.random() < 0.1 else 0.2,
+                             n=4, boxfree=rng.random() > 0.03)
+        p, s_, _st, _kt, _kv = decide(AT, AV, rng.choice((SIGMA_PRIOR, 0.3)), rng.choice((SIGMA_PRIOR, 0.3, 0.5)), rng.choice((0.0, 0.1, 0.4)))
+        tot.add(p in PRIMARY_TOKENS and s_[0] in SELECT_TOKENS)
+        reach.add(p)
+    chk(tot == {True}, "C TOTALITY: decide() returns a registered (primary, selection) pair on 4,000 random arm tables")
+
+    print("\nE  THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="cvl1_selftest_")
+    try:
+        template = os.path.join(tmp, "template")
+        for (arm, seed) in D.RUNS:
+            _write_probe(os.path.join(template, D.probe_dir_name(arm, seed)), D.M_OF_ARM[arm])
+        n = [0]
+
+        def case(label, want_rc, want, levels=None, **kw):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, levels or _levels(), **kw)
+            rc, fin, lines = _run(root, None)
+            ok = rc == want_rc and (all(w in fin for w in want) if want_rc == 0 else any(all(w in ln for w in want) for ln in lines))
+            if not chk(ok, "E %s -> rc %d %s" % (label, rc, fin[:170] if fin else [l for l in lines if "HARNESS" in l or "FINAL" in l][:1])):
+                print("\n".join("      | " + x for x in lines[-30:]))
+            return rc, fin, lines
+
+        B = _levels()
+        # (B: D_W1 +0.50 SURVIVES; D_W4 +0.25 UNDECIDED; scalar +2.6 BEATS; TEST argmax kLW1)
+        case("VAL == TEST -> VAL-AGREES, SELECT-SAME", 0, ["FINAL VAL-AGREES | SELECT-SAME |",
+             "W1-TSURVIVES/VSURVIVES+W4-TUNDECIDED/VUNDECIDED+SC-TSCALAR-BEATS-BEST/VSCALAR-BEATS-BEST", "SELECT-W1-SAME",
+             "ONE-CELL", "MS-ALPHA0-NOT-RESELECTED", "TRAIN-45K", "ONE-SPLIT"])
+        case("VAL levels uniformly 0.6 lower -> still AGREES (a level offset is not a ranking)", 0, ["FINAL VAL-AGREES"],
+             vlevels=dict((a, x - 0.6) for a, x in B.items()))
+        case("VAL D_W1 +0.10 (VANISHES), paired gap -0.40 resolved -> VAL-SHIFTS", 0, ["FINAL VAL-SHIFTS", "W1-TSURVIVES/VVANISHES", "GAP-RESOLVED-W1"],
+             vlevels=_levels(w1=(91.80, 91.70, 91.90, 92.50)))
+        case("VAL D_W1 +0.28 on noisy VAL (UNDECIDED), paired gap -0.22 not resolved -> VAL-DIFFERS-UNRESOLVED", 0,
+             ["FINAL VAL-DIFFERS-UNRESOLVED", "W1-TSURVIVES/VUNDECIDED", "VAL-SIGMA-INBATCH"],
+             vlevels=_levels(w1=(91.98, 91.70, 91.90, 92.50)), vjit=lambda arm, i: (0.3, -0.3, 0.3, -0.3)[i])
+        case("VAL D_W1 -0.50 -> VAL-FLIPS", 0, ["FINAL VAL-FLIPS", "W1-TSURVIVES/VREVERSES"],
+             vlevels=_levels(w1=(91.20, 91.70, 91.90, 92.50)))
+        case("VAL scalar BELOW the partitions -> VAL-FLIPS", 0, ["FINAL VAL-FLIPS", "SC-TSCALAR-BEATS-BEST/VSCALAR-BELOW-BEST"],
+             vlevels=_levels(w4=(87.60, 87.35, 86.90, 89.60)))
+        case("VAL D_W4 +0.50 SURVIVES while TEST UNDECIDED, gap +0.25 not resolved (< 0.30) -> VAL-DIFFERS-UNRESOLVED", 0,
+             ["FINAL VAL-DIFFERS-UNRESOLVED", "W4-TUNDECIDED/VSURVIVES"],
+             vlevels=_levels(w4=(87.85, 87.35, 90.20, 89.60)))
+        case("noisy VAL (in-batch sd ~0.45 binds) -> SIGMA-INBATCH on VAL, W1 UNDECIDED on VAL", 0, ["VAL-SIGMA-INBATCH", "TEST-SIGMA-PRIOR-FROZEN", "W1-TSURVIVES/VUNDECIDED"],
+             vjit=lambda arm, i: (0.45, -0.45, 0.45, -0.45)[i])
+        case("VAL picks chW1 (+0.9 on VAL), 0.3 below kLW1 on TEST -> SELECT-DIFFERS-*", 0, ["| SELECT-DIFFERS-", "SELECT-W1-DIFFERS"],
+             vlevels=_levels(w1=(93.40, 91.70, 91.90, 92.50)))
+        case("VAL picks k01W4 (+3.8 on VAL), 2.3 pp below kLW1 on TEST -> SELECT-DIFFERS-RESOLVED; each rung's best grain unchanged", 0,
+             ["| SELECT-DIFFERS-RESOLVED |", "SELECT-W1-SAME", "SELECT-W4-SAME"],
+             vlevels=_levels(w4=(87.60, 87.35, 94.00, 89.60)))
+        case("a resolved VAL - TEST gap on D_W1 is stamped", 0, ["GAP-RESOLVED-W1"],
+             vlevels=_levels(w1=(91.20, 91.70, 91.90, 92.50)))
+        case("TEST W1 UNDECIDED in batch -> TEST-STATE-DIFFERS-FROM-CGW1-W1 stamp (non-gating)", 0, ["TEST-STATE-DIFFERS-FROM-CGW1-W1"],
+             levels=_levels(w1=(91.90, 91.70, 91.90, 92.50)), vlevels=_levels(w1=(91.90, 91.70, 91.90, 92.50)))
+        case("UNREADABLE-TEST: chW4 box-bound", 0, ["FINAL UNREADABLE-TEST"], probe_over={("chW4", 186): dict(hi_frac=0.10)})
+        case("box at 4 % of records is still free", 0, ["FINAL VAL-AGREES"], probe_over={("chW4", 186): dict(hi_frac=0.04)})
+        case("UNREADABLE-VAL: ndW4 below 85 on VAL only", 0, ["FINAL UNREADABLE-VAL"], vlevels=_levels(w4=(87.60, 84.00, 90.20, 89.60)))
+        case("UNREADABLE-TEST: k01W4 diverged on TEST (a 3 pp seed)", 0, ["FINAL UNREADABLE-TEST", "SC-TSCALAR-DIVERGED"],
+             jit=lambda arm, i: (3.0 if (arm == "k01W4" and i == 0) else JIT[i]))
+        # harness breaks
+        case("HARNESS: chW4 s184 ran wd 0.1", 3, ["G-ARGS", "cvl1-chW4-s184"],
+             over={("chW4", 184): dict(args_over=lambda p: [(f, "0.1" if f == "weight-decay-base" else v) for f, v in p])})
+        case("HARNESS: ndW1 s187 ran chunk777", 3, ["G-ARGS", "cvl1-ndW1-s187"],
+             over={("ndW1", 187): dict(args_over=lambda p: [(f, "chunk777" if f == "stepsize-groups" else v) for f, v in p])})
+        case("HARNESS: a repeated flag", 3, ["G-ARGS", "alg-meta"], over={("chW1", 184): dict(args_over=lambda p: p + [("alg-meta", "Lion")])})
+        case("HARNESS: ENV with PROBE=100", 3, ["G-ENV"], over={("kLW1", 185): dict(env_over=lambda e: e.replace("PROBE=5 ", "PROBE=100 "))})
+        case("HARNESS: VAL_SPLIT: off (the switch did not reach the run)", 3, ["G-VALSPLIT", "cvl1-k01W1-s186"],
+             over={("k01W1", 186): dict(vs_over=["VAL_SPLIT: off"])})
+        case("HARNESS: a DIFFERENT split (split seed 303)", 3, ["G-VALSPLIT"],
+             over={("k01W4", 184): dict(vs_over=[D.witness_on().replace("split_seed=302", "split_seed=303")])})
+        case("HARNESS: a second witness line", 3, ["G-VALSPLIT"], over={("kLW4", 187): dict(vs_over=[D.witness_on(), D.witness_on()])})
+        case("HARNESS: a DECAY_MASK: on witness", 3, ["G-KIND", "cvl1-chW1-s185"],
+             over={("chW1", 185): dict(extra_line="DECAY_MASK: on base=SGDm wd=0.01 spec=x")})
+        case("HARNESS: a missing VAL line (epoch 97)", 3, ["G-VAL", "cvl1-ndW4-s185"],
+             over={("ndW4", 185): dict(val_over=lambda e, l: None if e == 97 else l)})
+        case("HARNESS: a VAL line with n_val 4999", 3, ["G-VAL"],
+             over={("ndW4", 186): dict(val_over=lambda e, l: l.replace("n_val 5000", "n_val 4999") if e == 3 else l)})
+        case("HARNESS: 10,000 probe records (a 50,000-image run)", 3, ["G-STRUCT", "10000 records"],
+             probe_over={("kLW4", 184): dict(n=10000)})
+        case("HARNESS: n_beta 14420 on a chunk777 run", 3, ["G-STRUCT", "n_beta"], probe_over={("chW1", 186): dict(nb=14420)})
+        case("HARNESS: provenance names the UNPATCHED load_data", 3, ["G-PROV", "LOAD_DATA_SHA256"],
+             prov_over={"LOAD_DATA_SHA256": D.LOADDATA_PRE_SHA})
+        case("HARNESS: provenance names another scorer", 3, ["G-PROV", "SCORER_SHA256"], prov_over={"SCORER_SHA256": "0" * 64})
+        case("HARNESS: an unregistered seed 188", 3, ["not a registered run"],
+             extra=[lambda d: _write_out(d, "chW1", 188, 8100001, 92.5, 92.5, "/SAVE/runs/cvl1")])
+        case("HARNESS: two COMPLETE .out files for one run", 3, ["COMPLETE .out files"],
+             extra=[lambda d: _write_out(d, "ndW4", 184, 8100002, 87.2, 87.2, "/SAVE/runs/cvl1")])
+        case("a TRUNCATED resubmission is ignored", 0, ["FINAL VAL-AGREES"],
+             extra=[lambda d: _write_out(d, "ndW4", 184, 8100003, 50.0, 50.0, "/SAVE/runs/cvl1", n_ep=40, done=False)])
+        case("INCOMPLETE: one run dropped", 2, ["FINAL INCOMPLETE"], drop=(("kLW1", 184),))
+        # O2: FINAL invariant to the corpus
+        fins = set()
+        for cp in (csvpath, None, "/nonexistent.csv"):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, B)
+            fins.add(_run(root, cp)[:2])
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for i in range(6):
+                    r = dict(rows[0])
+                    r.update(run="zzinv-%d" % i, job_id=str(9910000 + i), network=D.NET, dataset=D.DSET, granularity="chunk777",
+                             meta_stepsize=D.MST, alpha0=D.A0, beta_clip=D.CLIP, batch_size="100", epochs_requested="100",
+                             augment="1", superseded="0", collapsed="0", complete="1", plateau5=str(80 + 4 * i))
+                    w.writerow(r)
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, B)
+            fins.add(_run(root, inv)[:2])
+            chk(len(fins) == 1 and list(fins)[0][1].startswith("FINAL VAL-AGREES"),
+                "E O2: FINAL byte-identical on the real corpus, no corpus, a missing path and invented rows at this cell")
+        else:
+            skip("E O2 invariance: no real corpus on this host")
+        n[0] += 1
+        root = _build(os.path.join(tmp, "c%03d" % n[0]), template, B)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL VAL-AGREES" in p.stdout, "E the DOCUMENTED one-argument invocation reaches FINAL")
+        fl = [l for l in p.stdout.splitlines() if l.startswith("FINAL ")]
+        chk(len(fl) == 1 and p.stdout.rstrip().splitlines()[-1] == fl[0] and all(b in fl[0] for b in BOUNDS),
+            "E the FINAL line is the LAST line and carries every registered bound")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nF  THE PROBE AUDIT ON REAL LANDED RECORDS OF THIS CELL (gn1 BN arms, 50,000-image runs)")
+    got_real = False
+    for base_ in ([runsdir] if runsdir else []) + ["/cluster/account_b/metaopt/runs"]:
+        pc = os.path.join(base_, "gn1", "probe_bn-ch_gn1_s0", "probe.jsonl")
+        if os.path.exists(pc):
+            got_real = True
+            rc_ = read_probe(pc)
+            ok1, why1, o1 = probe_audit(rc_, 14421, n_records=10000, win_step=47500)
+            chk(ok1 and o1["boxfree"], "F landed gn1 bn-ch s0 passes the audit read as a 10,000-record run, box-free (%s)" % why1)
+            ok2, why2, _o = probe_audit(rc_, 14421)
+            chk(not ok2 and "10000 records" in why2, "F the same records FAIL this batch's G-STRUCT (9,000 records): the count bites (%s)" % why2)
+            break
+    if not got_real:
+        skip("F no landed gn1 probe records on this host")
+
+    print("\nG  THE FLOOR GATE (164.6) on the registered predictions")
+    lo = min(v[0] for v in D.PRED.values()) + D.PRED_VAL_MINUS_TEST[0]
+    hi = max(v[1] for v in D.PRED.values()) + D.PRED_VAL_MINUS_TEST[1]
+    chk(lo - D.CHANCE >= 70.0 and 100.0 - hi >= 6.0,
+        "G every predicted level (TEST and VAL) is >= 70 pp above chance (min %.1f) and >= 6 pp below 100 (max %.1f): no "
+        "contrast is floor- or ceiling-bounded" % (lo, hi))
+    near = sorted(a for a, v in D.PRED.items() if v[0] + D.PRED_VAL_MINUS_TEST[0] - HEALTH_MIN < 3.0)
+    print("  NOTE DISCLOSED: arms whose predicted low edge sits within 3 pp of HEALTH_MIN 85 (a run-FAILURE bar, not a floor;"
+          " cgw1's W4 partitions landed 2.7-2.9 pp above it): %s" % near)
+    chk(abs(sum(D.PRIOR_P.values()) - 1.0) < 1e-9 and abs(sum(D.PRIOR_SELECT.values()) - 1.0) < 1e-9
+        and set(D.PRIOR_P) == (set(PRIMARY_TOKENS) - {"UNREADABLE-TEST", "UNREADABLE-VAL"}) | {"VAL-UNREADABLE"},
+        "G the priors sum to 1 over the registered accounts")
+    print("\nSELFTEST %d PASS / %d FAIL / %d SKIP" % (RESULTS["PASS"], RESULTS["FAIL"], RESULTS["SKIP"]))
+    return 0 if RESULTS["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    raise SystemExit(score(a.runsdir, a.csv))
+
+
+if __name__ == "__main__":
+    main()

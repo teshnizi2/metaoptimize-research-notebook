@@ -1,0 +1,128 @@
+#!/bin/bash
+# =============================================================================
+# cDR1_stage_harness.sh -- BUILD OR VERIFY THE ISOLATED `cdr1` HARNESS TREE (PATCH_DECAYROUTE).
+#   (CORRECTIONS 305.)  Touches NO existing file.  Submits nothing.  A copy of cVL1_stage_harness.sh
+#   whose ONE patch step is patches/patch_decayroute.py on Optimizers/HF.py only (train.py, load_data.py,
+#   build_network.py, build_optimizer.py, tin_data.py stay the pinned bytes of cgw1's tree).
+#
+# WHY AN ISOLATED TREE.  A PENDING Slurm job imports whatever is on disk when it STARTS, and other
+# tracks share this workspace; the copy freezes the bytes the proof job and the guards tested.
+#
+# WHAT IT BUILDS (under $METAOPT_WS, every path new and cdr1-namespaced):
+#   harness_cdr1/cifar10/            a copy of the live harness's *.py files, each equal to the pinned
+#                                    PRE sha, then PATCH_DECAYROUTE on Optimizers/HF.py (post sha pinned;
+#                                    HF.py.pre_decayroute backup == the pre sha)
+#   harness_cdr1/cifar10/data  ->    SYMLINK to the live tree's data/ (no copy)
+#   jobs/run_cifar_cdr1.sh           jobs/run_cifar.sh with EXACTLY ONE line changed: the `cd`
+#   harness_cdr1/STAGE-MANIFEST.txt  sha256 of every staged file (after the patch)
+#
+# USAGE
+#   bash bin/cDR1_stage_harness.sh            # VERIFY ONLY (exit 0 iff consistent)
+#   bash bin/cDR1_stage_harness.sh --stage    # build it (refuses if it exists), then verify
+# =============================================================================
+set -u
+MODE=verify; [ "${1:-}" = "--stage" ] && MODE=stage
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+HROOT=$WS/harness_cdr1
+DEST=$HROOT/cifar10
+RUNNER_SRC=$WS/jobs/run_cifar.sh
+RUNNER=$WS/jobs/run_cifar_cdr1.sh
+# the pinned bytes (the PRE shas are cgw1's STAGE-MANIFEST; HF_POST_SHA was computed on the Mac from the same pre bytes)
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+PATCHF=$REPO/patches/patch_decayroute.py
+HF_POST_SHA=17ee0a2862b31b48c4196a75e88d60cf19f49d0f993cecc2750af832fe44b020
+HF_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+TRAIN_SHA=3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7
+BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+BUILDOPT_SHA=25a899b3745e9d66fbf630795a1202c6075e2067daffa077e4a54c28e54c7ec2
+LOADDATA_SHA=b52b58a35dcecd80ce6d8f8033b09c20dad9f4827b808f4ea2a828ce88138c46
+TINDATA_SHA=9e0f3322e5025e966aa18e6ac39c1d1b347c9ce2bf6e50423f301e965a6eecb7
+RUNNER_SRC_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+FAIL=0; bad() { echo "!!! STAGE FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+live_py() { (cd "$LIVE" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort); }
+
+echo "cDR1_stage_harness: mode=$MODE  WS=$WS"
+echo "  live tree   $LIVE"
+echo "  cdr1 tree   $DEST"
+echo "  runner      $RUNNER  (from $RUNNER_SRC)"
+
+if [ "$MODE" = stage ]; then
+  [ -e "$HROOT" ] && { echo "!!! $HROOT already exists -- refusing to overwrite. Verify it instead."; exit 2; }
+  [ -e "$RUNNER" ] && { echo "!!! $RUNNER already exists -- refusing to overwrite."; exit 2; }
+  for pr in "Optimizers/HF.py $HF_SHA" "train.py $TRAIN_SHA" "build_network.py $BN_SHA" \
+            "Optimizers/build_optimizer.py $BUILDOPT_SHA" "load_data.py $LOADDATA_SHA" "tin_data.py $TINDATA_SHA"; do
+    set -- $pr
+    [ "$(sha "$LIVE/$1")" = "$2" ] || { echo "!!! live $1 is $(sha "$LIVE/$1"), not the pinned $2 -- refusing to stage"; exit 2; }
+  done
+  [ "$(sha "$RUNNER_SRC")" = "$RUNNER_SRC_SHA" ] || { echo "!!! $RUNNER_SRC moved from the pinned $RUNNER_SRC_SHA"; exit 2; }
+  mkdir -p "$DEST" || exit 2
+  for f in $(live_py); do
+    mkdir -p "$DEST/$(dirname "$f")"; cp -p "$LIVE/$f" "$DEST/$f" || exit 2
+  done
+  ln -s "$LIVE/data" "$DEST/data" || exit 2
+  HF_PATH="$DEST/Optimizers/HF.py" PYTHONDONTWRITEBYTECODE=1 python3 "$PATCHF" || { echo "!!! patch_decayroute refused"; exit 2; }
+  sed "s#^cd $LIVE\$#cd $DEST#" "$RUNNER_SRC" > "$RUNNER" || exit 2
+  chmod --reference="$RUNNER_SRC" "$RUNNER" 2>/dev/null || chmod 755 "$RUNNER"
+  { echo "STAGED_UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "LIVE $LIVE"; echo "DEST $DEST"
+    for f in $(cd "$DEST" && find . -type f -not -path '*/__pycache__/*' | sort); do
+      echo "FILE $(sha "$DEST/$f") $f"; done
+    echo "RUNNER $(sha "$RUNNER") $RUNNER"
+    echo "RUNNER_SRC $(sha "$RUNNER_SRC") $RUNNER_SRC"; } > "$HROOT/STAGE-MANIFEST.txt"
+  echo "staged; now verifying"
+fi
+
+# ---------------------------------------------------------------- VERIFY ------
+[ -d "$DEST" ] || { echo "!!! no cdr1 tree at $DEST -- run with --stage"; exit 2; }
+# V-h: the five UNPATCHED files carry the pinned bytes; HF.py carries the pinned POST bytes and its backup the PRE bytes
+for pr in "Optimizers/HF.py $HF_POST_SHA" "Optimizers/HF.py.pre_decayroute $HF_SHA" "build_network.py $BN_SHA" \
+          "Optimizers/build_optimizer.py $BUILDOPT_SHA" "tin_data.py $TINDATA_SHA" "load_data.py $LOADDATA_SHA" "train.py $TRAIN_SHA"; do
+  set -- $pr
+  [ "$(sha "$DEST/$1")" = "$2" ] && echo "V-h: $1 == pinned $(echo "$2" | cut -c1-16)" || bad "V-h $1 is $(sha "$DEST/$1"), not the pinned $2"
+done
+grep -q "PATCH_DECAYROUTE" "$DEST/Optimizers/HF.py" && echo "V-h2: HF.py carries PATCH_DECAYROUTE" || bad "V-h2 PATCH_DECAYROUTE missing"
+# V-a: every staged .py matches the manifest written at stage time (no edit since)
+N=0
+while read -r tag s f; do
+  [ "$tag" = FILE ] || continue
+  case "$f" in *.py) ;; *) continue ;; esac
+  [ "$(sha "$DEST/$f")" = "$s" ] && N=$((N+1)) || bad "V-a $f changed since staging"
+done < "$HROOT/STAGE-MANIFEST.txt"
+echo "V-a: $N staged .py files unchanged since staging (STAGE-MANIFEST.txt)"
+# V-a1: vs the LIVE tree (a NOTE only if the live tree moved; V-h is what binds)
+M=0; MOV=""
+for f in $(live_py); do
+  [ -f "$DEST/$f" ] || { MOV="$MOV $f(new-in-live)"; continue; }
+  [ "$(sha "$LIVE/$f")" = "$(sha "$DEST/$f")" ] && M=$((M+1)) || MOV="$MOV $f"
+done
+echo "V-a1: $M live harness .py files byte-identical in the cdr1 tree; differing:${MOV:- none} (EXPECTED: exactly ./Optimizers/HF.py, the patched file)"
+[ "$(echo $MOV)" = "./Optimizers/HF.py" ] || echo "V-a1: NOTE -- the set of differing files is not exactly the patched HF.py (V-h is what binds)"
+# V-a2: no PATCH marker whose gate could fire, and no .py the stage did not copy
+EXTRA=$(cd "$DEST" && find . -name '*.py' -not -path '*/__pycache__/*' -not -path './data/*' | sort | while read -r f; do grep -q " $f\$" "$HROOT/STAGE-MANIFEST.txt" || echo "$f"; done)
+[ -z "$EXTRA" ] && echo "V-a2: no .py in the cdr1 tree that the stage did not copy" || bad "V-a2 extra .py: $EXTRA"
+for mk in PATCH_BETAHOLD PATCH_GROUPHOLD PATCH_RESTHOLD PATCH_VOTEWEIGHT PATCH_DECAYMASK PATCH_VALSPLIT PATCH_SHADOWVOTE; do
+  grep -q "$mk" "$DEST/Optimizers/HF.py" "$DEST/train.py" "$DEST/load_data.py" && bad "V-a3 the tree carries $mk" || true
+done
+echo "V-a3: HF.py / train.py / load_data.py carry none of PATCH_BETAHOLD / GROUPHOLD / RESTHOLD / VOTEWEIGHT / DECAYMASK / VALSPLIT / SHADOWVOTE"
+# V-c: data is a symlink to the live data, CIFAR-10 visible
+[ -L "$DEST/data" ] && [ "$(readlink "$DEST/data")" = "$LIVE/data" ] && echo "V-c: data -> $LIVE/data (symlink)" || bad "V-c data is not a symlink to $LIVE/data"
+[ -d "$DEST/data/cifar-10-batches-py" ] && echo "V-c2: cifar-10-batches-py visible through the symlink" || bad "V-c2 cifar-10-batches-py not visible"
+# V-d: the runner differs from the PINNED run_cifar.sh in EXACTLY the cd line
+[ "$(sha "$RUNNER_SRC")" = "$RUNNER_SRC_SHA" ] && echo "V-d0: $RUNNER_SRC == pinned $(echo $RUNNER_SRC_SHA | cut -c1-16)" || bad "V-d0 $RUNNER_SRC moved"
+if [ -f "$RUNNER" ]; then
+  D=$(diff "$RUNNER_SRC" "$RUNNER" | grep -c '^[<>]')
+  DL=$(diff "$RUNNER_SRC" "$RUNNER" | grep '^[<>]')
+  if [ "$D" = 2 ] && echo "$DL" | grep -qx "< cd $LIVE" && echo "$DL" | grep -qx "> cd $DEST"; then
+    echo "V-d: $RUNNER differs from run_cifar.sh in EXACTLY one line: cd $LIVE -> cd $DEST"
+  else
+    bad "V-d the runner diff is not exactly the cd line:"; diff "$RUNNER_SRC" "$RUNNER"
+  fi
+  grep -q "^RUNNER $(sha "$RUNNER") $RUNNER\$" "$HROOT/STAGE-MANIFEST.txt" && echo "V-d2: runner unchanged since staging ($(sha "$RUNNER" | cut -c1-16))" || bad "V-d2 runner changed since staging"
+else
+  bad "V-d no runner at $RUNNER"
+fi
+[ "$FAIL" = 0 ] && { echo "cDR1_stage_harness: VERIFIED"; exit 0; } || { echo "cDR1_stage_harness: NOT CONSISTENT"; exit 2; }

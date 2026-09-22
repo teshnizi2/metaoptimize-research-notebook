@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""csh1_design.py -- THE FROZEN DESIGN TABLE OF `csh1` (CORRECTIONS 301): THE SHORT-HORIZON gamma CONTROL (ICML-PLAN row
+1.20, threat T-C: Wu, Ren, Liao, Grosse, "Understanding Short-Horizon Bias in Stochastic Meta-Optimization",
+arXiv:1803.02021, ICLR 2018).
+
+THE QUESTION.  The harness's meta trace is h <- gamma * (1 - wd * a) * h - delta (every base optimiser; SGDm_base_update
+in $WS/harness_cwd1/cifar10/Optimizers/HF.py, the tree cwd5 and caw2 ran).  So the alpha-scaled decay does TWO things
+at once: it shrinks the weights by a*wd per step, AND it shortens the hypergradient horizon to ~1/(wd*a) steps.  The
+scalar collapse at the mechanism cell (cwd5 k01W1, wd 0.1) could therefore be short-horizon bias acting through the
+trace, not the weight shrink.  csh1 asks: at the mechanism cell with the decay dose REMOVED (wd 5e-4, the cwd5 W4 rung,
+where the scalar arm is healthy at 72.41), does shortening the horizon with --gamma < 1 -- to the collapsing arm's
+realised horizon -- reproduce the scalar collapse?
+
+gamma IS DERIVED FROM THE RECORDS, NOT GUESSED (derive_gammas(), re-run by the scorer's selftest B on the landed probe
+records of cwd5 k01W1, seeds 146/147/148, wd 0.1, scalar).  Per record the realised trace shrink is
+q = 1 - (1 - wd * a) = wd * a, a = exp(beta), beta the one scalar log step size.
+  * THE ONSET WINDOW: from the same-seed accuracy-deficit onset G_0.5 (step 7,500 on all three seeds, CORRECTIONS 289.4:
+    cwd5 W1 vs W4, epoch 14) to the beta TURN (the first record whose applied Lion sign is +1: step 8,700 on all three).
+    Records 7,500 <= step < TURN: 12 per seed.  Before the turn Lion's saturated climb makes beta identical across seeds,
+    so the window median is the same on all three: 3.1477e-4.
+  * gamma_M ("MATCHED", the registered statistic): 1 - the MEDIAN of q over the onset window, the median over seeds,
+    rounded to 3 s.f. of (1 - gamma): 1 - 3.15e-4 = 0.999685 (horizon ~3,175 steps).
+  * gamma_P ("DOMINATING", the shorter-horizon bracket): a constant gamma cannot track a learned a, and gamma_M's horizon
+    is LONGER than the collapsing arm's from step ~8,055 (where 0.1 * a first reaches 3.15e-4) through the turn, i.e.
+    in the ~650 steps where the collapse sets in, so a gamma_M null could be dismissed as "not short enough where it
+    mattered".  gamma_P is chosen so its horizon is AT LEAST AS SHORT AS THE COLLAPSING ARM'S AT
+    EVERY STEP OF THE RUN, recorded or not: the largest recorded q over the three seeds (5.5589e-4, seed 147, step 8,700)
+    times the largest excursion between records (Lion moves beta by exactly the meta step 1e-3 per step and every step
+    is within 50 steps of a record, so a can exceed the nearest record's by at most exp(0.05)): 5.8439e-4, rounded UP to
+    2 s.f.: 1 - gamma_P = 5.9e-4, gamma_P = 0.99941 (horizon ~1,695 steps).  In the gamma arm itself the trace factor is
+    gamma * (1 - 5e-4 * a) <= gamma, so the arm's own decay only shortens it further.
+So a gamma_P null is a DOMINANCE null: a horizon no longer than the collapsing arm's at any step, applied from step 0,
+without the dose, does not collapse the scalar step.  gamma_M is the time-matched reading; gamma_P brackets it.
+
+THE ARMS (6 arms x seeds {180, 181, 182} = 18 jobs, ONE submission).  The cell is cwd5's W4 rung byte for byte
+(ResNet18_c100, CIFAR-100, 100 epochs, batch 100, SGDm(0.99) + Lion(0.99, 0.9), meta wd 0, meta step 1e-3, alpha0
+1e-6, wd 5e-4, AUGMENT=1, BETA_CLIP=-15:-2.3026, PROBE=100, PROBE_TENSOR=1, cwd1's tree and runner UNCHANGED, every patch
+OFF) except --gamma:
+  cell A  G1S | G1L   gamma 1         the IN-BATCH ANCHOR (the landed cwd5 k01W4 / kLW4 cell: 72.41 / 67.88)
+  cell M  GMS | GML   gamma 0.999685  the MATCHED horizon (onset-window median)
+  cell P  GPS | GPL   gamma 0.99941   the DOMINATING horizon (>= the collapsing arm's shrink at every step)
+Both grains in every cell: a collapse is defined against the cell's OWN in-batch layerwise arm, and a short horizon that
+damages BOTH grains is a different finding from a scalar collapse.
+
+WHAT IS DROPPED, WITH REASONS.  (i) an in-batch wd-0.1 positive control: the collapse has landed on five batches at
+this cell (cmo1 / cwd3 / cwd4 / cwd5 / caw2 K01, 22.79-23.22) and the question is whether it appears WITHOUT the dose;
+the landed levels are frozen literals for a non-gating comparison.  (ii) a trace-only patch (h <- (1 - 0.1*a) h - delta
+with the weights at wd 5e-4): it would track the learned a exactly, but it is new harness code; --gamma is an existing
+registered CLI flag.  Not run, and stamped (TRACE-ONLY-PATCH-NOT-RUN).  (iii) more seeds: 3 per arm, as every cwd batch.
+
+NO NEW HARNESS CODE: --gamma is train.py's existing float flag (`parser.add_argument("--gamma", type=float, default=1)`),
+build_optimizer passes `gamma=args.gamma` to HF, and HF stores it as self.gamma and reads it ONLY in the trace update
+(SGDm_base_update: `self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta`,
+and the unused DECAY_MASK branch).  analysis/csh1_gamma_cpu_check.py proves on the login node's CPU (no GPU) that each
+arm's ARGS reaches that line bitwise and that the gamma-1 formula FAILS on the gamma < 1 arms.  Stdlib only.
+
+    python3 analysis/csh1_design.py [<dir holding cwd5/probe_cwd5-k01W1-s14x/probe.jsonl>]
+"""
+import hashlib
+import importlib.util
+import json
+import math
+import os
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+W = _load("cwd_design_for_csh1", os.path.join(HERE, "cwd_design.py"))
+CWD_DESIGN_SHA = "03d2d7614915757798699ff75ca971a11fca2056d383649fecbbf5adf06c0195"   # analysis/cwd_design.py (RULE 16)
+CWD_COMMON_SHA = "d7ddb49e71013e3a21eaf5129861ab43dbc16e181bbd92af7c70cdc95e82bf52"   # analysis/cwd_common.py (RULE 16)
+
+# ---- the common cell: cwd5's W4 rung, byte for byte ------------------------------------------------------------------
+DSET, EPOCHS, BATCH, CLIP, MST, A0, AUG, PROBE = W.DSET, W.EPOCHS, W.BATCH, W.CLIP, W.MST, W.A0, W.AUG, W.PROBE
+STEPS_PER_EPOCH, N_RECORDS, ENV_EXPECTED = W.STEPS_PER_EPOCH, W.N_RECORDS, W.ENV_EXPECTED
+WALL = "03:00:00"
+NET = "ResNet18_c100"
+NTENS = 62
+TOTPAR = 11220132
+TENSORS = W.tensors_of(False)
+NAMES = [t[0] for t in TENSORS]
+SEEDS = (180, 181, 182)
+SEED_BLOCK = (180, 181, 182)          # Track C's assigned block (cycle 4); nothing else is taken
+PREFIX = "csh1"
+WD_TOKEN = "5e-4"
+WD = 5e-4
+
+# ---- gamma, DERIVED (derive_gammas() re-derives every literal below from the landed records) -------------------------
+SRC_WD = 0.1                          # the collapsing source arm: cwd5 k01W1 (wd 0.1, scalar), seeds 146/147/148
+SRC_SEEDS = (146, 147, 148)
+ONSET_STEP = 7500                     # G_0.5 on all three seeds (CORRECTIONS 289.4, cwd5 W1 vs W4, epoch 14)
+SRC_TURN = {146: 8700, 147: 8700, 148: 8700}
+SRC_ONSET_MEDIAN = 3.1477e-4          # median q over 7,500 <= step < TURN, identical on the three seeds (5 s.f.)
+SRC_PEAK = {146: 5.5256e-4, 147: 5.5589e-4, 148: 5.4488e-4}   # max recorded q per seed (caw2's DOSE_PEAK, 290.7)
+BETWEEN_RECORD_FACTOR = math.exp(0.05)   # |d beta| = meta step 1e-3 per step (Lion, meta wd 0) x <= 50 steps to a record
+SRC_TRUE_MAX_BOUND = 5.8439e-4        # max(SRC_PEAK) * exp(0.05), 5 s.f.
+Q_M = 3.15e-4                         # 1 - gamma_M: SRC_ONSET_MEDIAN rounded to 3 s.f.
+Q_P = 5.9e-4                          # 1 - gamma_P: SRC_TRUE_MAX_BOUND rounded UP to 2 s.f.
+GAMMA_TOKEN = {"A": "1", "M": "0.999685", "P": "0.99941"}
+GAMMA = dict((c, float(t)) for c, t in GAMMA_TOKEN.items())
+
+# ---- the arms ---------------------------------------------------------------------------------------------------------
+# (arm, cell, grain, role)
+ARM_TABLE = (
+    ("G1S", "A", "scalar",    "gamma 1: the in-batch anchor (landed cwd5 k01W4 72.41)"),
+    ("G1L", "A", "layerwise", "gamma 1: the anchor's in-batch reference (landed cwd5 kLW4 67.88)"),
+    ("GMS", "M", "scalar",    "gamma 0.999685: the MATCHED horizon (onset-window median of the collapsing arm)"),
+    ("GML", "M", "layerwise", "gamma 0.999685: M's in-batch reference"),
+    ("GPS", "P", "scalar",    "gamma 0.99941: the DOMINATING horizon (>= the collapsing arm's shrink at every step)"),
+    ("GPL", "P", "layerwise", "gamma 0.99941: P's in-batch reference"),
+)
+ARMS = tuple(r[0] for r in ARM_TABLE)
+CELL_OF = dict((r[0], r[1]) for r in ARM_TABLE)
+SPEC = dict((r[0], r[2]) for r in ARM_TABLE)
+ROLE = dict((r[0], r[3]) for r in ARM_TABLE)
+CELLS = ("A", "M", "P")
+SCALAR_OF = {"A": "G1S", "M": "GMS", "P": "GPS"}
+LAYER_OF = {"A": "G1L", "M": "GML", "P": "GPL"}
+GTOK = dict((a, GAMMA_TOKEN[CELL_OF[a]]) for a in ARMS)
+GF = dict((a, GAMMA[CELL_OF[a]]) for a in ARMS)
+
+OFF_LINES = ("VOTE_W: off", "BETA_HOLD: off", "GROUP_HOLD: off", "REST_HOLD: off", "DECAY_MASK: off")
+PT_TAIL = "meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9"
+
+# cwd1's tree and runner, UNCHANGED (cwd3 / cwd4 / cwd5 / caw2 ran on the same bytes)
+HF_SHA = W.HF_CWD1_SHA
+BN_SHA = W.BN_CVT8_SHA
+RUNNER_SHA = W.RUNNER_CWD1_SHA
+TRAIN_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+BUILD_OPT_SHA = "25a899b3745e9d66fbf630795a1202c6075e2067daffa077e4a54c28e54c7ec2"
+TREE = "harness_cwd1"
+RUNNER_NAME = "run_cifar_cwd1.sh"
+GPU_CONSTRAINT = "L4"
+GPU_NAME = "NVIDIA L4"
+PER_RUN_GPUH = 0.6855                    # cwd5's sacct mean over 27 runs of THIS cell on L4 (CORRECTIONS 285.1)
+NJOBS = len(ARMS) * len(SEEDS)           # 18
+
+
+def args_pairs(arm, seed, save):
+    """-> the ordered (flag, value) pairs of one run's train.py command line: cwd5 k01W4 / kLW4's, flag for flag, with
+    only --gamma, --stepsize-groups, --seed, --save-directory and --run-name set by the arm."""
+    return [("optimizer", "HF"), ("alg-base", "SGDm"), ("momentum-param-base", "0.99"), ("weight-decay-base", WD_TOKEN),
+            ("alg-meta", "Lion"), ("momentum-param-meta", "0.99"), ("Lion-beta2-meta", "0.9"), ("weight-decay-meta", "0"),
+            ("dataset", DSET), ("NN-name", NET), ("batch-size", str(BATCH)), ("max-time", "999:00:00"),
+            ("gamma", GTOK[arm]), ("meta-stepsize", MST), ("alpha0", A0), ("num-epochs", str(EPOCHS)),
+            ("stepsize-groups", SPEC[arm]), ("seed", str(seed)), ("save-directory", save),
+            ("run-name", "%s-%s-s%d" % (PREFIX, arm, seed))]
+
+
+def args_string(arm, seed, save):
+    return " ".join("--%s %s" % (f, v) for f, v in args_pairs(arm, seed, save))
+
+
+def pt_witness_prefix(arm):
+    """the PROBE_TENSOR line up to (not including) ` dir=`.  It does NOT carry gamma: the ARGS line is gamma's witness."""
+    return "PROBE_TENSOR: on every=%d type=%s tensors=%d %s" % (PROBE, SPEC[arm], NTENS, PT_TAIL)
+
+
+def manifest_text():
+    lines = ["BATCH %s" % PREFIX, "NETWORK %s" % NET, "NUM_PARAM_TENSORS %d" % len(TENSORS),
+             "TOTAL_PARAMS %d" % sum(t[1] for t in TENSORS), "CLIP_C %s" % CLIP, "EPOCHS %d" % EPOCHS,
+             "META_STEPS %d" % (EPOCHS * STEPS_PER_EPOCH), "SEEDS %s" % ",".join(str(s) for s in SEEDS),
+             "WD_BASE %s" % WD_TOKEN]
+    for i, (n, q, o, nd) in enumerate(TENSORS, 1):
+        lines.append("TENSOR %d %s %d %s ndim=%d" % (i, n, q, o, nd))
+    for a in ARMS:
+        lines.append("ARM %s CELL %s GRAIN %s GAMMA %s" % (a, CELL_OF[a], SPEC[a], GTOK[a]))
+        lines.append("ARGS %s %s" % (a, args_string(a, 0, "<save>")))
+        lines.append("PTWITNESS %s %s" % (a, pt_witness_prefix(a)))
+    return "\n".join(lines) + "\n"
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# ---- the derivation, on the landed records ---------------------------------------------------------------------------
+def _med(v):
+    v = sorted(v)
+    n = len(v)
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def _sg(x):
+    return (x > 0) - (x < 0)
+
+
+def src_probe_path(root, seed):
+    for base in (os.path.join(root, "cwd5"), root):
+        p = os.path.join(base, "probe_cwd5-k01W1-s%d" % seed, "probe.jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def derive_seed(recs):
+    """-> {turn, onset_median, n_onset, peak, peak_step} from one seed's cwd5 k01W1 records (Lion meta, scalar)."""
+    q, turn = [], None
+    for r in recs:
+        a = math.exp(r["beta"][0])
+        q.append((r["step"], SRC_WD * a))
+        s = _sg(r["pt_b2"] * r["mom_pre"][0][0] + (1 - r["pt_b2"]) * r["z_agg"][0][0])
+        if turn is None and s == 1:
+            turn = r["step"]
+    win = [v for t, v in q if ONSET_STEP <= t < turn]
+    pk = max(q, key=lambda x: x[1])
+    return {"turn": turn, "onset_median": _med(win), "n_onset": len(win), "peak": pk[1], "peak_step": pk[0]}
+
+
+def derive_gammas(root):
+    """-> (per-seed dict, derived {Q_M_raw, Q_P_raw, gamma tokens}) or None if the records are not under root."""
+    per = {}
+    for s in SRC_SEEDS:
+        p = src_probe_path(root, s)
+        if p is None:
+            return None
+        recs = [json.loads(ln) for ln in open(p) if ln.strip()]
+        per[s] = derive_seed(recs)
+    qm = _med([per[s]["onset_median"] for s in SRC_SEEDS])
+    qp = max(per[s]["peak"] for s in SRC_SEEDS) * BETWEEN_RECORD_FACTOR
+    qm_tok = float("%.3g" % qm)
+    qp_tok = math.ceil(qp / 10 ** math.floor(math.log10(qp) - 1)) * 10 ** math.floor(math.log10(qp) - 1)
+    return per, {"Q_M_raw": qm, "Q_P_raw": qp, "Q_M": qm_tok, "Q_P": float("%.2g" % qp_tok),
+                 "gamma_M": "%.6f" % (1 - qm_tok), "gamma_P": ("%.6f" % (1 - float("%.2g" % qp_tok))).rstrip("0")}
+
+
+# ---- the exclusion rows owed at landing (corpus_exclusions.py's existing ARGS kind, CORRECTIONS 263) -----------------
+# gamma is a CSV CELL-KEY column (analysis/aggregate.py writes it from the ARGS line; corpus_exclusions.CELLKEYS carries
+# it), so a gamma < 1 row can never pool with a gamma-1 row and NO gamma ARGS kind is needed.  The decay is not a column:
+# every csh1 run owes ONE ARGS_WD_BASE row (weight-decay-base=5e-4).  No run deviates on two ARGS kinds.
+ARGS_STD = {"momentum-param-base": "0.99", "weight-decay-base": "0.1"}
+
+
+def args_deviating_kinds(arm):
+    fl = dict(args_pairs(arm, 0, "x"))
+    out = []
+    if float(fl["momentum-param-base"]) != float(ARGS_STD["momentum-param-base"]):
+        out.append("ARGS_MOMENTUM_BASE")
+    if float(fl["weight-decay-base"]) != float(ARGS_STD["weight-decay-base"]):
+        out.append("ARGS_WD_BASE")
+    return tuple(out)
+
+
+if __name__ == "__main__":
+    import sys
+    print(manifest_text())
+    for a in ARMS:
+        print("%-4s cell %s %-9s gamma %-9s  deviates on %s   %s" % (a, CELL_OF[a], SPEC[a], GTOK[a],
+                                                                    args_deviating_kinds(a), ROLE[a]))
+    print("%d jobs, expected %.2f GPU-h (%.4f x %d), hard bound %d GPU-h (WALL %s x %d)"
+          % (NJOBS, NJOBS * PER_RUN_GPUH, PER_RUN_GPUH, NJOBS, 3 * NJOBS, WALL, NJOBS))
+    root = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(REPO), "runs_cluster_b")
+    got = derive_gammas(root)
+    if got is None:
+        print("derivation: cwd5 k01W1 records not under %s" % root)
+    else:
+        per, dv = got
+        for s in SRC_SEEDS:
+            print("cwd5 k01W1 s%d: TURN %d, onset-window [%d, TURN) median q %.5e over %d records, peak q %.5e at step %d"
+                  % (s, per[s]["turn"], ONSET_STEP, per[s]["onset_median"], per[s]["n_onset"], per[s]["peak"],
+                     per[s]["peak_step"]))
+        print("derived: 1-gamma_M = %.5e -> %g -> gamma_M %s ; max peak x exp(0.05) = %.5e -> %g -> gamma_P %s"
+              % (dv["Q_M_raw"], dv["Q_M"], dv["gamma_M"], dv["Q_P_raw"], dv["Q_P"], dv["gamma_P"]))

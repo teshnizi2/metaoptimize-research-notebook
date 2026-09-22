@@ -33,8 +33,8 @@ const CWD2_FINAL = ['WD-ROUTE', 'SCALAR-NEEDS-CARRIER-WD', 'HARNESS-CLEAN', 'PAT
   'SIGMA-PRIOR-FROZEN', 'POSITIVE-CONTROL-REPRODUCES', 'FLOOR-READINGS-ARE-BOUNDS', 'TRAIN-AGREES (two branch tokens + 14 stamps)'];
 
 test('MT232-MT235 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-9, -5).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended in line order, before the later cwd3, cwd4, cwd5, caw2 and cgw1 rows');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [177, 159, 18, 3383]);
+  assert.deepEqual(data.experiments.slice(-11, -7).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended in line order, before the later cwd3, cwd4, cwd5, caw2, cgw1, crt1 and csh1 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [179, 161, 18, 3437]);
   assert.deepEqual([CVT10_FINAL.length, CWD1_FINAL.length, CSV1_FINAL.length, CWD2_FINAL.length], [23, 13, 22, 16]);
   // cwd2 is the one row of the cycle whose FINAL carries two branch tokens, so its reason opens with both.
   const cases: [string, string, string[], number, string][] = [
@@ -137,11 +137,11 @@ test('the four intervention warnings name the arms, the patches and the exclusio
     assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 2972d48; CORRECTIONS \d+, 269 and 27\d\.$|results\/CORPUS-EXCLUSIONS\.tsv at 2972d48; CORRECTIONS 258 and 270\.$/, id);
   }
   // None of the four ran with a base-optimiser flag deviation, so the ARGS-value kind stays cmo1's alone.
-  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation']);
+  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation']);
 });
 
 test('the 72 runs link to MT232-MT235 with sanitized logs, and exactly the 45 intervened runs are marked', () => {
-  assert.equal(runs.length, 3383);
+  assert.equal(runs.length, 3437);
   const batches: [string, string, number, string[], string, number][] = [
     ['cvt10', 'MT232', 30, ['120', '121', '122'], 'ResNet18_c100', 15],
     ['cwd1', 'MT233', 9, ['128', '129', '130'], 'ResNet18_c100', 6],

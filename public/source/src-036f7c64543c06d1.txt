@@ -1,0 +1,379 @@
+#!/bin/bash
+# =============================================================================
+# cVL1_valsplit.sh -- `cvl1`: DO THE AUDIT'S TEST RANKINGS HOLD ON A HELD-OUT VALIDATION SPLIT?
+#   ONE SUBMISSION, 32 JOBS (8 arms x seeds {184,185,186,187}), 100 EPOCHS, ResNet18 / CIFAR-10 -- cgw1's cell and ARGS
+#   lines VERBATIM at wd 0.1 and 5e-4 -- PROBE=5, VAL_SPLIT=5000:302 (PATCH_VALSPLIT, CORRECTIONS 302) on EVERY job,
+#   --constraint=L4 ON EVERY JOB.  CORRECTIONS 303 (row 1.14 of docs/ICML-PLAN.md).  A copy of bin/cGW1_auditwd.sh.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Every guard and scancel line is filtered on `cvl1-`.
+#
+# REGISTERED SCORER: analysis/cVL1_valsplit_score.py (+ analysis/cvl1_design.py), committed and pushed BEFORE this
+# batch is submitted (RULE 21).   DOCUMENTED INVOCATION:  python3 analysis/cVL1_valsplit_score.py <runsdir>
+#
+# THE ARMS (VAL_SPLIT=5000:302 on every arm -- the model trains on 45,000; no hold / mask / probe-tensor variable)
+#   rung W1  wd 0.1   chW1 chunk777 | ndW1 nodewise | k01W1 scalar | kLW1 layerwise
+#   rung W4  wd 5e-4  chW4          | ndW4          | k01W4        | kLW4
+#
+# RULE 20.  Every ARGS value is ONE shell token; `weight-decay-base` and `stepsize-groups` VARY BY ARM and are checked
+# per composed line.  VAL_SPLIT is ONE --export token ([0-9:]) and is checked present exactly once per line.  At landing
+# EVERY run owes an exclusion row (VAL_SPLIT: on), the 16 W4 runs two-axis (+ ARGS_WD_BASE); corpus_exclusions.py has
+# no VAL_SPLIT kind yet -- that code gap is owed before the ingest (CORRECTIONS 303.9).  It is NOT edited here.
+#
+# COST.  Expected 21.65 GPU-h (cgw1's per-grain L4 minutes x 0.9 + 1 min of VAL passes).  HARD BOUND = WALL x 32 = 64.
+#
+# USAGE   bash bin/cVL1_valsplit.sh [--dry-run]   |   bash bin/cVL1_valsplit.sh --submit   (the ONLY submitting form)
+# ENV     on a host with no git repo (the cluster_b stage copy), --submit requires BOTH
+#           CVL1_REGISTERED_COMMIT=<40-hex sha of the PUSHED registration commit>
+#           CVL1_SCORER_SHA256=<sha256 of analysis/cVL1_valsplit_score.py AT THAT COMMIT, computed from origin>
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD REST_HOLD DECAY_MASK PROBE_TENSOR SHADOW_VOTE VAL_SPLIT
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+B=cvl1
+HARN=$WS/harness_cvl1/cifar10
+RUNNER=$WS/jobs/run_cifar_cvl1.sh
+SAVE=$WS/runs/cvl1
+PROOF=$WS/runs/cvl1/proof_valsplit.log
+VALSPLIT=5000:302
+CWD1_HF=$WS/harness_cwd1/cifar10/Optimizers/HF.py
+CWD1_HF_SHA=94aedc33046afb12782ffb7f2eb729bafc7fcba5f42227fec373fa67b6f58ebf
+BITE5=$WS/runs/cwd5/bite_decaymask_cwd5.log
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=5
+DSET=CIFAR10
+NET=ResNet18
+MST=1e-4
+A0=1e-3
+NTENS=62
+TOTPAR=11173962
+WD_W1=0.1
+WD_W4=5e-4
+SEEDS_W1="184 185 186 187"
+SEEDS_W4="184 185 186 187"
+GRAINS="ch nd k01 kL"
+NJOBS=32
+WALL=02:00:00
+GPU_CONSTRAINT=L4
+HF_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+TRAIN_SHA=8706d8c752ff8971818cb3b6625af1d77dbeed9a79f0560027f628f19be8b0f5
+LOADDATA_SHA=c8eb83859312487162f8a41a132388f4f560403ae99b68865882f5ff00ad2c03
+BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+RUNNER_SRC_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL" "gpu-l4-24g")
+
+SC="$REPO/analysis/cVL1_valsplit_score.py"
+DES="$REPO/analysis/cvl1_design.py"
+LIVEC="$REPO/analysis/cvl1_live_check.py"
+SELF="$REPO/bin/cVL1_valsplit.sh"
+STAGE="$REPO/bin/cVL1_stage_harness.sh"
+R20="$REPO/bin/cVL1_rule20.sh"
+R20E="$REPO/analysis/cvl1_rule20_envaudit.py"
+PATCHF="$REPO/patches/patch_valsplit.py"
+TVS="$REPO/tests/test_valsplit.py"
+TVR="$REPO/tests/test_valsplit_realrun.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo " cvl1 -- DO THE AUDIT'S TEST RANKINGS HOLD ON A HELD-OUT VALIDATION SPLIT?  (CORRECTIONS 303; ICML-PLAN 1.14)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  clamp $CLIP_C   ms=$MST alpha0=$A0  $EPOCHS epochs  VAL_SPLIT=$VALSPLIT"
+echo "   rung W1  wd $WD_W1   seeds $SEEDS_W1   ch chunk777 | nd nodewise | k01 scalar | kL layerwise"
+echo "   rung W4  wd $WD_W4  seeds $SEEDS_W4   the same four grains"
+echo " 8 arms, $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN   runner $RUNNER   partitions $PARTS   constraint $GPU_CONSTRAINT   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cVL1_valsplit_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] && [ -z "${DECAY_MASK+x}" ] && [ -z "${PROBE_TENSOR+x}" ] && [ -z "${VAL_SPLIT+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, REST_HOLD, DECAY_MASK, PROBE_TENSOR and VAL_SPLIT are UNSET in the launcher's environment (VAL_SPLIT reaches each job through --export only)" \
+  || guard_fail "guard 0b: a hold / mask / probe-tensor variable is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$DES" "$LIVEC" "$SELF" "$STAGE" "$R20" "$R20E" "$PATCHF" "$TVS" "$TVR" "$EXCL" "$EXCLT" "$LIBF" "$AGF" "$CSVP" "$RUNNER" "$CWD1_HF" "$BITE5" "$PROOF"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cVL1_valsplit_score.py analysis/cvl1_design.py analysis/cvl1_live_check.py analysis/cvl1_rule20_envaudit.py bin/cVL1_valsplit.sh bin/cVL1_stage_harness.sh bin/cVL1_rule20.sh bin/cVL1_realrun_proof.sbatch patches/patch_valsplit.py tests/test_valsplit.py tests/test_valsplit_realrun.py"
+REUSEF="analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  PUSHED=$(git -C "$REPO" branch -r --contains HEAD 2>/dev/null | grep -c 'origin/master')
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ] && [ "${PUSHED:-0}" -ge 1 ]; then
+    echo "guard 1b: the registration files are TRACKED, COMMITTED and PUSHED (HEAD $(git -C "$REPO" rev-parse --short HEAD) is on origin/master) (RULE 21)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: not committed and pushed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}; on origin/master: ${PUSHED:-0}"
+  else
+    echo "guard 1b: NOTE (dry run) -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}; on origin/master: ${PUSHED:-0}; --submit would refuse"
+  fi
+else
+  if [ -n "${CVL1_REGISTERED_COMMIT:-}" ] && [ -n "${CVL1_SCORER_SHA256:-}" ]; then
+    if printf '%s' "$CVL1_REGISTERED_COMMIT" | grep -qE '^[0-9a-f]{40}$' && [ "$CVL1_SCORER_SHA256" = "$(sha "$SC")" ]; then
+      echo "guard 1b: no git repo on this host; the operator declares commit $CVL1_REGISTERED_COMMIT (40 hex) and the staged"
+      echo "          scorer's sha256 EQUALS the declared sha of that commit's scorer ($(echo "$CVL1_SCORER_SHA256" | cut -c1-16))"
+    else
+      guard_fail "guard 1b: CVL1_REGISTERED_COMMIT is not 40 hex, or the staged scorer $(sha "$SC" | cut -c1-16) != CVL1_SCORER_SHA256"
+    fi
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CVL1_REGISTERED_COMMIT / CVL1_SCORER_SHA256 are unset"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CVL1_REGISTERED_COMMIT and CVL1_SCORER_SHA256"
+  fi
+fi
+
+SELFT=/tmp/cvl1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|Error' "$SELFT" | head -20; tail -5 "$SELFT"; }
+[ "$(grep -c '^  SKIP' "$SELFT")" = 0 ] && echo "guard 1c1: no SKIP (the corpus and the landed gn1 probe records were found on this host)" || guard_fail "guard 1c1: the selftest SKIPPED a section"
+grep -q "^  PASS B SIGMA_PRIOR: the FROZEN literal 0.17818264951145454 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c2: the frozen floor IS the corpus_exclusions.filter_rows value on THIS host's corpus" \
+  || guard_fail "guard 1c2: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS E O2: FINAL byte-identical" "$SELFT" && grep -q "^  PASS E the DOCUMENTED one-argument invocation" "$SELFT" \
+  && echo "guard 1c3: O2 invariance ran against the real corpus + invented rows; the documented invocation reached FINAL" \
+  || guard_fail "guard 1c3: the O2 invariance / documented-invocation checks did not pass"
+grep -q "^  PASS F landed gn1 bn-ch s0" "$SELFT" && grep -q "^  PASS F the same records FAIL this batch" "$SELFT" && grep -q "^  PASS G every predicted level" "$SELFT" \
+  && echo "guard 1c4: the probe audit passed on REAL landed records of this cell (and bit on their 10,000-record count); the 164.6 floor gate passed" \
+  || guard_fail "guard 1c4: real-record probe audit or floor gate did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+grep -q '^cvl1-' "$CSVP" && guard_fail "guard 2: cvl1-* already in the CSV" || echo "guard 2: no cvl1-* row in the corpus"
+NOUT=$(ls "$WS/runs"/cvl1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cvl1-*.out on disk" || guard_fail "guard 2b: $NOUT cvl1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (18[4-9]|19[01])( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 184..191 (the block is fresh)" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran a seed in 184..191"
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2d2: a corpus row already carries a seed in 184..191"
+import csv, sys
+n = sum(1 for r in csv.DictReader(open(sys.argv[1])) if r.get("seed", "").strip() in [str(s) for s in range(184, 192)])
+print("guard 2d2: %d corpus rows carry a seed in 184..191" % n)
+raise SystemExit(0 if n == 0 else 1)
+PYEOF
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cvl1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cvl1-* jobs" || guard_fail "guard 2e: sacct shows $NS cvl1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cvl1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cvl1-* in squeue" || guard_fail "guard 2f: $NQ cvl1-* already queued"
+fi
+
+# ---- guard 3: the isolated tree ----------------------------------------------------------------------------------
+bash "$STAGE" >/tmp/cvl1_stage.$$ 2>&1 \
+  && { echo "guard 3: cVL1_stage_harness.sh (verify mode) VERIFIES the cvl1 tree:"; grep -E '^V-' /tmp/cvl1_stage.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 3: the cvl1 tree is NOT consistent"; tail -20 /tmp/cvl1_stage.$$; }
+[ "$(sha "$HARN/Optimizers/HF.py")" = "$HF_SHA" ] && [ "$(sha "$HARN/train.py")" = "$TRAIN_SHA" ] && [ "$(sha "$HARN/build_network.py")" = "$BN_SHA" ] && [ "$(sha "$HARN/load_data.py")" = "$LOADDATA_SHA" ] \
+  && echo "guard 3b: tree HF.py (unpatched) / train.py + load_data.py (PATCH_VALSPLIT) / build_network.py == the pinned shas" || guard_fail "guard 3b: a pinned tree file moved"
+# ---- guard 3g: the PATCH_VALSPLIT proof job (CORRECTIONS 302) passed on THIS tree --------------------------------------
+if [ -f "$PROOF" ] && grep -q "^REALRUN_RC 0$" "$PROOF" && grep -q "^TEST_VALSPLIT_RC 0$" "$PROOF" && grep -q "^STAGE_VERIFY_RC 0$" "$PROOF" \
+   && [ "$(grep -c '^  FAIL' "$PROOF")" = 0 ] && grep -q "^TREE_POST $HARN load_data $LOADDATA_SHA train $TRAIN_SHA HF $HF_SHA$" "$PROOF" \
+   && grep -q "^PATCH_SHA256 $(sha "$PATCHF")$" "$PROOF" && grep -q "^TEST_SHA256 $(sha "$TVS")$" "$PROOF" && grep -q "^DRIVER_SHA256 $(sha "$TVR")$" "$PROOF"; then
+  echo "guard 3g: the PATCH_VALSPLIT proof log (sha $(sha "$PROOF" | cut -c1-8)): $(grep -c '^  PASS' "$PROOF") PASS / 0 FAIL, on THIS tree's"
+  echo "          load_data / train / HF shas, with THIS stage's patch, unit test and real-run driver"
+else
+  guard_fail "guard 3g: the proof log $PROOF does not vouch for this tree, patch and tests"
+fi
+grep -q -- '--weight-decay-base' "$HARN/train.py" \
+  && echo "guard 3f: train.py declares --weight-decay-base (the axis is an EXISTING registered CLI flag; no new code)" \
+  || guard_fail "guard 3f: train.py has no --weight-decay-base flag"
+
+# ---- guard 4f: the premise, inherited by code identity from cwd5's landed bite log --------------------------------
+if [ "$(sha "$CWD1_HF")" = "$CWD1_HF_SHA" ] && [ -f "$BITE5" ] && grep -q "^REALRUN_RC 0$" "$BITE5" \
+   && [ "$(grep -c '^  FAIL' "$BITE5")" = 0 ] && grep -q "^TREE_POST $WS/harness_cwd1/cifar10 HF $CWD1_HF_SHA " "$BITE5" \
+   && [ "$(grep -c "PASS RW2 W. wd .*: w', h', m' BITWISE the coupled formula" "$BITE5")" = 4 ] \
+   && grep -q "PASS RW2 W4 wd 5e-4 : w', h', m' BITWISE" "$BITE5" \
+   && grep -q "PASS RW2 W1 wd 0.1  : w', h', m' BITWISE" "$BITE5"; then
+  echo "guard 4f: cwd5's landed bite log (sha $(sha "$BITE5" | cut -c1-8)) on harness_cwd1 HF $CWD1_HF_SHA: $(grep -c '^  PASS' "$BITE5") PASS / 0 FAIL,"
+  echo "          RW2 BITWISE at 0.1 and 5e-4 (this batch's two tokens); guard 4e below ties that HF's"
+  echo "          SGDm_base_update to this tree's by source text"
+else
+  guard_fail "guard 4f: cwd5's bite log / harness_cwd1 HF do not vouch for the ladder's premise"
+fi
+
+# ---- guard 4c': the launcher's literals == the design module's == the stage script's -------------------------------
+python3 - "$DES" "$STAGE" "$WD_W1" "$WD_W4" "$SEEDS_W1" "$SEEDS_W4" "$GRAINS" "$NET" "$NTENS" "$TOTPAR" \
+          "$HF_SHA" "$TRAIN_SHA" "$BN_SHA" "$RUNNER_SRC_SHA" "$GPU_CONSTRAINT" "$NJOBS" "$MST" "$A0" "$CLIP_C" "$WALL" "$LOADDATA_SHA" "$VALSPLIT" <<'PYEOF' || guard_fail "guard 4c': launcher / design / stage literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("cvl1_design", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+(stage, w1, w4, s1, s4, grains, net, ntens, totpar, hf, tr, bn, rsrc, gpu, nj, mst, a0, clip, wall, ld, vs) = sys.argv[2:23]
+bad = []
+if [Dm.WD_TOKEN[r] for r in Dm.RUNG_IDS] != [w1, w4]: bad.append("WD_LADDER")
+if [tuple(int(x) for x in s.split()) for s in (s1, s4)] != [Dm.SEEDS_OF_RUNG[r] for r in Dm.RUNG_IDS]: bad.append("SEEDS")
+if tuple(grains.split()) != Dm.GRAIN_IDS: bad.append("GRAINS")
+if (net, int(ntens), int(totpar)) != (Dm.NET, Dm.NTENS, Dm.TOTPAR): bad.append("NET/NTENS/TOTPAR")
+if (hf, tr, bn, rsrc, ld) != (Dm.HF_LIVE_SHA, Dm.TRAIN_POST_SHA, Dm.BN_SHA, Dm.RUNNER_SRC_SHA, Dm.LOADDATA_POST_SHA): bad.append("SHAS")
+if vs != Dm.VAL_SPLIT: bad.append("VAL_SPLIT")
+if gpu != Dm.GPU_CONSTRAINT or int(nj) != Dm.NJOBS or wall != Dm.WALL: bad.append("GPU/NJOBS/WALL")
+if (mst, a0, clip) != (Dm.MST, Dm.A0, Dm.CLIP): bad.append("MST/A0/CLIP")
+st = open(stage).read()
+for name, v in (("HF_SHA", Dm.HF_LIVE_SHA), ("TRAIN_SHA", Dm.TRAIN_PRE_SHA), ("BN_SHA", Dm.BN_SHA), ("BUILDOPT_SHA", Dm.BUILDOPT_SHA),
+                ("LOADDATA_SHA", Dm.LOADDATA_PRE_SHA), ("TINDATA_SHA", Dm.TINDATA_SHA), ("RUNNER_SRC_SHA", Dm.RUNNER_SRC_SHA),
+                ("LOADDATA_POST_SHA", Dm.LOADDATA_POST_SHA), ("TRAIN_POST_SHA", Dm.TRAIN_POST_SHA)):
+    m = re.search(r"^%s=([0-9a-f]{64})$" % name, st, re.M)
+    if not m or m.group(1) != v: bad.append("stage " + name)
+if any(Dm.SEEDS[g + r] != Dm.SEEDS_OF_RUNG[r] for r in Dm.RUNG_IDS for g in Dm.GRAIN_IDS): bad.append("GRAIN-SEEDS")
+if Dm.N_EXCLUSION_ROWS != 32: bad.append("EXCLUSION-COUNT")
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': the two weight-decay tokens, the seeds, the four grains, NET/NTENS/TOTPAR, ms/alpha0/clip, VAL_SPLIT,")
+print("           the tree / runner shas (launcher, design AND stage script, pre and post patch), the GPU constraint, NJOBS")
+print("           and WALL agree; every grain at a rung runs that rung's seeds; all 32 runs owe an exclusion row")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST (CPU construction only; no forward pass, no GPU) ------------------------------
+mkdir -p "$SAVE"
+MTMP=/tmp/cvl1_manifest.$$
+python3 "$LIVEC" "$HARN" "$MTMP" "$CWD1_HF" 2>&1 | sed 's/^/  /'
+[ -s "$MTMP" ] || guard_fail "guard 4: the live-model check FAILED (spec / m / wd / base_update / manifest / SGDm source)"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"
+    echo "guard 4b3: live manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)) -> $MANIFEST"
+  fi
+fi
+
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "DESIGN_SHA256 $(sha "$DES")"
+  echo "LIVECHECK_SHA256 $(sha "$LIVEC")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "STAGE_SCRIPT_SHA256 $(sha "$STAGE")"
+  echo "HF_SHA256 $(sha "$HARN/Optimizers/HF.py")"
+  echo "PATCH_SHA256 $(sha "$PATCHF")"
+  echo "PROOF_LOG_SHA256 $(sha "$PROOF")"
+  echo "VAL_SPLIT $VALSPLIT"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "BUILD_NETWORK_SHA256 $(sha "$HARN/build_network.py")"
+  echo "BUILD_OPTIMIZER_SHA256 $(sha "$HARN/Optimizers/build_optimizer.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cvl1/STAGE-MANIFEST.txt")"
+  echo "CWD1_HF_SHA256 $(sha "$CWD1_HF")"
+  echo "CWD5_BITE_LOG_SHA256 $(sha "$BITE5")"
+  echo "REGISTERED_COMMIT ${CVL1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "CORPUS_SHA256 $(sha "$CSVP")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "WD_LADDER W1=$WD_W1 W4=$WD_W4"
+  echo "SEEDS W1=$SEEDS_W1 W4=$SEEDS_W4"
+  echo "GRAINS ch=chunk777 nd=nodewise k01=scalar kL=layerwise"
+  echo "EPOCHS $EPOCHS PROBE $PROBE"
+  echo "GPU_CONSTRAINT $GPU_CONSTRAINT PARTITIONS $PARTS WALL $WALL"
+  echo "VOTE_W BETA_HOLD GROUP_HOLD REST_HOLD DECAY_MASK PROBE_TENSOR unset on every arm; VAL_SPLIT=$VALSPLIT on every arm"; } > "$PROV"
+echo "guard 4g: provenance written to $PROV"
+
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+case ",$PARTS," in *,gpu-mig-40g,*|*,gpu-a100-80g,*|*,gpu-2080ti-11g,*) guard_fail "guard 5b: a partition without L4 nodes is in $PARTS" ;; *) echo "guard 5b: partitions $PARTS all carry L4 nodes; --constraint=$GPU_CONSTRAINT" ;; esac
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS (32 probe dirs at PROBE=5 need ~2.5 GB: gn1's landed ch/nd dirs are 67 / 70 MB); $PEND jobs pending, adding $NJOBS"
+[ "${FREE:-0}" -ge 20 ] || guard_fail "guard 5: under 20 GB free"
+[ "${PEND:-0}" -le 60 ] || guard_fail "guard 5: $PEND pending, over cap"
+
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+DESIGN=(optimizer=HF alg-base=SGDm momentum-param-base=0.99 alg-meta=Lion momentum-param-meta=0.99 Lion-beta2-meta=0.9 \
+        weight-decay-meta=0 dataset=$DSET NN-name=$NET batch-size=$BATCH max-time=999:00:00 gamma=$GAMMA \
+        meta-stepsize=$MST alpha0=$A0 num-epochs=$EPOCHS save-directory=$SAVE)
+N=0; REJ=0; BAD=0
+for R in W1 W4; do
+  case $R in W1) WD=$WD_W1; SS=$SEEDS_W1 ;; W4) WD=$WD_W4; SS=$SEEDS_W4 ;; esac
+  for S in $SS; do
+    for GR in $GRAINS; do
+      case $GR in ch) G=chunk777 ;; nd) G=nodewise ;; k01) G=scalar ;; kL) G=layerwise ;; *) echo "!!! unknown grain $GR"; exit 2 ;; esac
+      ARM=$GR$R
+      RN="cvl1-$ARM-s$S"
+      PDIR="$SAVE/probe_$RN"
+      CMD="sbatch --job-name=$RN --partition=$PARTS --constraint=$GPU_CONSTRAINT --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_DIR=$PDIR,VAL_SPLIT=$VALSPLIT \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base $WD --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+      guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+        || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+      guard_presubmit "$CMD" "seed=$S" "run-name=$RN" "weight-decay-base=$WD" "stepsize-groups=$G" >/dev/null 2>&1 \
+        || { echo "!!! RULE 20: an axis does not round-trip for $RN (wd=$WD grain=$G)"; BAD=$((BAD+1)); }
+      # the composed train.py half must equal the design module's registered ARGS line for this run, token for token
+      python3 - "$DES" "$ARM" "$S" "$SAVE" "$CMD" <<'PYEOF' >/dev/null 2>&1 || { echo "!!! $RN: composed line != cvl1_design.args_line"; BAD=$((BAD+1)); }
+import sys, importlib.util
+spm = importlib.util.spec_from_file_location("d", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+arm, seed, save, cmd = sys.argv[2], int(sys.argv[3]), sys.argv[4], " ".join(sys.argv[5].replace("\\\n", " ").split())
+tail = cmd[cmd.index(" --optimizer "):].strip()
+raise SystemExit(0 if "ARGS: " + tail == Dm.args_line(arm, seed, save) else 1)
+PYEOF
+      NWDF=$(printf '%s\n' "$CMD" | grep -o -- '--weight-decay-base [^ ]*' | wc -l | tr -d ' ')
+      [ "$NWDF" = 1 ] || { echo "!!! $RN carries $NWDF --weight-decay-base flags"; BAD=$((BAD+1)); }
+      NVW=$(printf '%s\n' "$CMD" | grep -c 'VOTE_W=\|BETA_HOLD=\|GROUP_HOLD=\|REST_HOLD=\|COMP_HOLD=\|WINDOW_HOLD=\|DECAY_MASK=\|PROBE_TENSOR=\|SHADOW_VOTE=')
+      [ "$NVW" = 0 ] || { echo "!!! $RN carries a hold / mask / probe-tensor variable"; BAD=$((BAD+1)); }
+      NVS=$(printf '%s\n' "$CMD" | grep -o 'VAL_SPLIT=[^, ]*' | wc -l | tr -d ' ')
+      [ "$NVS" = 1 ] && [ "$(printf '%s\n' "$CMD" | grep -o 'VAL_SPLIT=[^, ]*')" = "VAL_SPLIT=$VALSPLIT" ] || { echo "!!! $RN does not carry exactly one VAL_SPLIT=$VALSPLIT"; BAD=$((BAD+1)); }
+      [ "$(printf '%s\n' "$CMD" | grep -o -- '--constraint=[^ ]*')" = "--constraint=$GPU_CONSTRAINT" ] || { echo "!!! $RN lacks --constraint=$GPU_CONSTRAINT"; BAD=$((BAD+1)); }
+      if [ "$SUBMIT" = 1 ]; then
+        mkdir -p "$PDIR"
+        eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+      else
+        echo "$CMD"; echo; N=$((N+1))
+      fi
+    done
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / design-line / weight-decay / constraint pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  cp "$PROV" "$WS/runs/cvl1-PROVENANCE.txt"
+  grep -qx 'cvl1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cvl1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cvl1- present in bin/PROTECTED.txt (stage copy) ----"
+  guard_postlaunch "$WS/runs" "cvl1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cvl1 job started inside the window" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cvl1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 32/32 RUN_DONE):  python3 $REPO/analysis/cVL1_valsplit_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cVL1_valsplit.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

@@ -1,0 +1,46 @@
+#!/bin/bash
+# cSH1_rule20.sh -- CORRECTIONS 301: RULE 20 at current coverage for `csh1` (cAW2_rule20.sh's structure with csh1's
+# table; the ENV half is analysis/csh1_rule20_envaudit.py).  READ-ONLY: no accuracy number is opened.
+# analysis/argsline_guard.py is used UNEDITED from the stage.
+#
+# WHAT IS PINNED: only --gamma, --stepsize-groups, --seed and --run-name may vary across the batch (batch-consistency
+#   half, --strict); the per-run half pins EVERY flag of the run -- --gamma included -- to its OWN arm's registered value
+#   (analysis/csh1_design.args_pairs, read from the design) AND checks the flag COUNT, so a run at the wrong gamma, with
+#   the flag dropped, or with it repeated is a PER-RUN VIOLATION.  The ENV half cannot see gamma (declared there).
+#   bash bin/cSH1_rule20.sh            (run from the csh1 stage on cluster_b)
+set +u
+source /etc/profile >/dev/null 2>&1
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1
+source /cluster/account_b/metaopt/envs/mo/bin/activate
+export METAOPT_WS=/cluster/account_b/metaopt
+WS=$METAOPT_WS; R=$WS/runs; P=csh1
+S="$(cd "$(dirname "$0")/.." && pwd)"
+G=$S/analysis/argsline_guard.py
+DES=$S/analysis/csh1_design.py
+echo "RULE20 run utc=$(date -u +%FT%TZ) host=$(hostname) batch=$P guard_sha=$(sha256sum $G | cut -c1-16) design_sha=$(sha256sum $DES | cut -c1-16)"
+echo "  .out files: $(ls $R/$P-*.out 2>/dev/null | wc -l)   with ARGS: $(grep -l -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | wc -l)   squeue: $(squeue -h -u account_b -o '%j %T' | awk -v p="^$P-" '$1 ~ p {print $2}' | sort | uniq -c | tr '\n' ' ')"
+VARY="--vary seed --vary run-name --vary stepsize-groups --vary gamma"
+OUT=$(python3 $G $R --name $P- --batch-consistency --strict $VARY 2>&1); RC=$?
+echo "  BATCH-CONSISTENCY --name $P- $VARY -> rc=$RC  $(echo "$OUT" | grep -E '^argsline_guard:|^VERDICT|no candidate|NONE carried|ACROSS-RUN|^    --' | tr '\n' ' ')"
+n=0; bad=0; noargs=0
+for f in $(ls $R/$P-*.out 2>/dev/null); do
+  b=$(basename $f .out); rn=${b%-*}; rest=${rn#$P-}; arm=${rest%-s*}; seed=${rest##*-s}
+  grep -q -m1 '^ARGS:' "$f" || { noargs=$((noargs+1)); continue; }
+  n=$((n+1))
+  EXP=$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('d',sys.argv[1]); d=importlib.util.module_from_spec(s); s.loader.exec_module(d)
+a=sys.argv[2]
+if a not in d.ARMS: print('UNKNOWN'); raise SystemExit
+print(' '.join('--expect %s=%s' % kv for kv in d.args_pairs(a, int(sys.argv[3]), sys.argv[4])))" "$DES" "$arm" "$seed" "$R/$P")
+  [ "$EXP" = UNKNOWN ] && { bad=$((bad+1)); echo "  PER-RUN VIOLATION $b: UNKNOWN ARM"; continue; }
+  NFL=$(printf '%s\n' "$EXP" | grep -o -- '--expect' | wc -l | tr -d ' ')
+  O=$(python3 $G "$f" $EXP 2>&1); RCX=$?
+  NFG=$(echo "$O" | grep -o 'no repeated flag ([0-9]* flags)' | grep -o '[0-9]*')
+  if [ $RCX != 0 ] || [ "$NFG" != "$NFL" ]; then bad=$((bad+1)); echo "  PER-RUN VIOLATION $b rc=$RCX flags=$NFG want $NFL"; echo "$O" | grep -E '!!!|DESIGN|declared' | sed 's/^/      /'; fi
+done
+echo "  PER-RUN --expect ($P, EVERY flag pinned to the run's OWN arm, flag count checked): $n runs with an ARGS line checked, $bad violations, $noargs .out without ARGS yet"
+for FL in gamma weight-decay-base stepsize-groups; do
+  echo "  $FL COVERAGE across the started runs (read from the runs' ARGS lines):"
+  grep -h -m1 '^ARGS:' $R/$P-*.out 2>/dev/null | grep -o -- "--$FL [^ ]*" | sort | uniq -c | sed 's/^/    /'
+done
+python3 $S/analysis/csh1_rule20_envaudit.py $R | sed 's/^/  /'
+echo "RULE20 end utc=$(date -u +%FT%TZ)"

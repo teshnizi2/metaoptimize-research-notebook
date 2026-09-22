@@ -346,6 +346,29 @@ ADDED_PHASES = [{
     # MECH7_LAST_ROW is 240; it is defined further down the file, so the ID is written out.
     "experimentIds": ["MT240"],
     "source": "docs/CORRECTIONS.md 296 at 8a99001",
+}, {
+    # crt1, the ICML plan's 4a rank 2 (the retune that could refute cgw1's SCALAR-BEATS-BEST): registered on 22 Sep
+    # (CORRECTIONS 300, 34e564f), submitted at 07:17 UTC, scored at 23d1896, ingested at 5db62be with csh1 and written up at
+    # c06738d / a53bce1 (CORRECTIONS 309). A separate phase from phase-16: that phase measured the scalar-over-partition
+    # reading at the tuning chosen at 0.1; this one re-tunes every grain at 5e-4 to see whether the reading survives.
+    "id": "phase-17", "date": "2026-09-22", "period": "22 Sep", "title": "Does the scalar reading survive re-tuning",
+    "test": "cgw1's 5e-4 cell with the meta step size and the initial step size re-tuned per grain over a four-point grid, for the uniform and aligned partitions and plain scalar, three fresh seeds each, the best setting of each grain chosen on training accuracy",
+    "observed_result": "After re-tuning, the gap closes from about 2.8 points to about half a point: plain scalar is no longer resolved above both partitions once the selection bound is applied, and no partition is resolved above scalar either, so the reading is weakened to a tie, which is a bound; every grain chose the largest initial step size on the grid, and the reading would have been a win at the corpus noise floor",
+    "next_question": "Whether a larger initial step size would close the gap further or reopen it, and whether the tie holds on the audit's CIFAR-100 cell",
+    # MECH8_FIRST_ROW is 241; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT241"],
+    "source": "docs/CORRECTIONS.md 309 at a53bce1",
+}, {
+    # csh1, the ICML plan's 4a rank 3 (the short-horizon gamma control, threat T-C): registered on 22 Sep (CORRECTIONS 301,
+    # 5ac1dd7), submitted at 07:21 UTC, scored at 4603851, ingested at 5db62be with crt1 and written up at c06738d / a53bce1
+    # (CORRECTIONS 310). A separate phase from phase-17: it asks about a rival mechanism of the collapse, not the audit.
+    "id": "phase-18", "date": "2026-09-22", "period": "22 Sep", "title": "Does a short meta-horizon alone cause the collapse",
+    "test": "The mechanism cell with its weight-decay dose removed and the hypergradient horizon shortened by a constant discount, to the collapsing arm's own onset horizon and to one at least as short at every step, with scalar and layerwise run at each discount beside an undiscounted anchor",
+    "observed_result": "Neither discount collapses the scalar arm: in every cell scalar finishes above layerwise, so a short horizon acting through the trace is not sufficient for the collapse at this cell, for a constant discount; both discounts cost both grains 6 to 12 points, and the shorter one's layerwise reference only just passed its health check",
+    "next_question": "Whether the learned horizon, which shortens as the step size grows, reproduces the collapse where a constant one does not",
+    # MECH8_LAST_ROW is 242; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT242"],
+    "source": "docs/CORRECTIONS.md 310 at a53bce1",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -481,7 +504,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
                              (MECH5_COMMIT, MECH5_INTERVENTIONS_TSV_SHA256),
                              (MECH6_CWD4_INGEST_COMMIT, MECH6_CWD4_INTERVENTIONS_TSV_SHA256),
                              (MECH6_INGEST_COMMIT, MECH6_INTERVENTIONS_TSV_SHA256),
-                             (MECH7_INGEST_COMMIT, MECH7_INTERVENTIONS_TSV_SHA256)]:
+                             (MECH7_INGEST_COMMIT, MECH7_INTERVENTIONS_TSV_SHA256),
+                             (MECH8_INGEST_COMMIT, MECH8_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -500,7 +524,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
             runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": False}
     # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
     # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
-    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS}.items():
+    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if not is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
@@ -2340,6 +2364,111 @@ def mech7_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 18. The crt1 and csh1 landings (CORRECTIONS 309 and 310): two appended rows, in ONE step.
+# ---------------------------------------------------------------------------
+# Campaign commit a53bce1 (cycle 163; CORRECTIONS 309-310 written at c06738d, then a53bce1 corrected row 241's stamp count
+# from 14 to 12 and named two licence citations as scorer-LOG lines) appended the crt1 landing as MASTER-TABLE line 241 and
+# the csh1 landing as line 242 and recounted header line 3. It amended no earlier row, did not touch line 5, and no line
+# moved. The joint ingest 5db62be touched results/ alone. Entries 298-308 between the two pins are audits, registrations,
+# patches and code debts; none owns a row.
+#
+# MT241 (crt1) is MIXED. It returns a definite registered branch -- WEAKENED-TO-TIE, with the registered licence that the
+# scalar-beats-both row is rewritten from 'beats' to 'ties (a bound) after re-tuning' -- every gate passes and the in-batch
+# replicate of cgw1 W4 matches. But its registered clauses split (the TUNED reading ties while every one of the four
+# per-config readings still beats), the favoured account (NOT-A-TUNING-ARTEFACT, prior 0.45) was not returned, six of the
+# twelve registered level bands were missed (chA2, ndA2, k01A2, k01M3, ndM1 and k01M1), and the branch itself rests on the
+# in-batch sigma lying above a break-even value: at the frozen floor the same rule reads the opposite branch. That is
+# "a registered expectation was defied", as at MT231 and MT237.
+# MT242 (csh1) is MIXED, as MT237. It returns the registered PREDICTION (HORIZON-DOES-NOT-REPRODUCE) with every cell NOGAP
+# in the registered direction, every gate passes and the anchor reproduces cwd5 W4, but the fired account's own registered
+# level band for GPL (60-76) is missed -- GPL landed at 56.9707 -- and cell P's layerwise reference clears REF_MIN by
+# only 1.9707 pp.
+# Neither row corrects an earlier PUBLISHED notebook claim, so neither carries a Corrected badge. MT241 bears on MT240's
+# SCALAR-BEATS-BEST reading; MASTER-TABLE row 240 was NOT amended in place, so MT240 keeps its record and outcome, and the
+# relationship is listed in MECH8_BEARS_ON.
+MECH8_COMMIT = "a53bce17a526a1e34bad595f1089cc0c319c4627"
+MECH8_MASTER_TABLE_SHA256 = "b6360d0073f03996eac3294add525732f4698b3c8ad7e145131e12b9170b573c"
+MECH8_FIRST_ROW, MECH8_LAST_ROW = 241, 242
+MECH8_EDITED_LINES = {3}  # the run / GPU-hour header and the tally, recounted in place; no row amended, line 5 untouched.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH8_ROWS = {
+    241: ("mixed", 10, ["crt1"], ["page-8"], None, "WEAKENED-TO-TIE: the registered branch is returned with its licence -- after re-tuning each grain's meta step size and alpha0 over a four-point grid at alpha-scaled 5e-4 on the audit's core cell (ResNet18 / CIFAR-10), plain scalar ties the better audited partition, a BOUND: every grain selects A2 (alpha0 1e-2) on TRAIN and on TEST alike, the tuned contrasts are T_ch = +0.4487 pp and T_nd = +0.6880 pp, and net of the selection bound B 0.1485 the chunk777 lead misses the 2 SE resolution clause by 0.1078 pp (min T - B - 2 SE = -0.1078 >= -0.30, TIES), while the partition-above reading is 0.90 pp from its bar, so HEADLINE-REFUTED-BY-RETUNE is not reached. The registered TMLR consequence binds: row 240's scalar-beats-both reading is rewritten from 'beats' to 'ties (a bound) after re-tuning', and cgw1's +2.6-2.8 pp was, at least in part, a tuning artefact. Every gate passes, the in-batch M2 replicate matches cgw1 W4 within 0.16 pp, the registered scorer exits 0 UNEDITED on both hosts and again post-ingest, and an independent parser passes 22 of 22 checks, byte-identical on both hosts. BUT THE REGISTERED CLAUSES SPLIT AND EXPECTATIONS WERE DEFIED: the TUNED reading ties while every one of the four per-config readings still BEATS (M2 +2.7593 / +2.9140 pp), the favoured account (NOT-A-TUNING-ARTEFACT) was not returned, six of the twelve registered level bands were missed (chA2, ndA2, k01A2, k01M3, ndM1, k01M1), and the branch rests on the in-batch sigma 0.2498 lying above the break-even 0.2014 -- at the frozen floor 0.1782 the same rule would read NOT-A-TUNING-ARTEFACT, the opposite licence (descriptive). So the record is Mixed, not Goal met. Bounded, and led with: one cell and one decay; a four-point grid with two alpha0 points and every grain selected at its edge, so no optimum was located; B is an expected-bias bound; no validation split; every arm 43-965x less decayed than a standard SGD recipe; a tie is a bound, never 'the grains are equal'. DESCRIPTIVE: most of the gap closes at alpha0 1e-2 (partitions +3.59 / +3.50 pp, scalar +1.28), consistent with the partitions' bulk step sizes having stayed at their initial value, but A2 moves all three grains' initial step size together, so the mechanism is not isolated. A refute pass could not refute the verdict and applied two overreach fixes and three wording fixes; no RULE 16 defect."),
+    242: ("mixed", 9, ["csh1"], ["page-19"], None, "HORIZON-DOES-NOT-REPRODUCE: the registered prediction is returned -- at the mechanism cell (ResNet18_c100) with the decay dose removed (wd 5e-4; RHO_D <= 0.0454 in every cell), shortening the hypergradient horizon with a constant gamma to the collapsing arm's onset-window median (0.999685) and to a horizon at least as short at every step (0.99941, TRACE-P-DOMINATES) does not collapse the scalar arm: G = layerwise - scalar is -4.0127 pp (-7.72 SE) at gamma 1, -5.6273 pp (-10.83 SE) at 0.999685 and -3.6780 pp (-7.08 SE) at 0.99941, all NOGAP with scalar ahead, and 0/9 scalar seeds reach a collapse bar. The registered licence: short-horizon bias through the trace is NOT SUFFICIENT for the collapse at this cell, and T-C is excluded as a sufficient account, as a BOUND and for a constant gamma. Every gate passes, the in-batch anchor reproduces cwd5 W4 (72.4673 / 68.4547 against 72.4080 / 67.8813), the registered scorer exits 0 UNEDITED on both hosts and again post-ingest, and an independent parser rebuilds all 200 printed lines and passes 44 of 44 checks, byte-identical on both hosts. BUT A REGISTERED LEVEL BAND OF THE FIRED ACCOUNT IS MISSED: the account predicted every arm at 60-76, and GPL landed at 56.9707, so cell P's layerwise reference clears REF_MIN 55 by only 1.9707 pp (about 2 pp worse and P would have been UNREADABLE). That is MT237's shape -- the branch returned, one of its own bands defied -- so the record is Mixed, not Goal met. Bounded, and led with: gamma is constant, not the learned horizon; sufficiency, not necessity (nothing about whether the short trace plays a part at wd 0.1, where it acts with the dose); two gammas bracket and locate nothing; every NOGAP is a bound; one cell, kappa 5e-4 only, alpha-scaled decay, one network, 100 epochs, three seeds, no in-batch collapse control, and the trace-only patch not run; crd1 has not run, so no joint reading with the learned horizon is applied. DESCRIPTIVE: both discounts cost both grains 6-12 pp and the gamma < 1 arms under-fit (TRAIN 71.9-93.0); the loss is not specific to scalar. A refute pass could not refute the verdict; it fixed one bookkeeping error (the proposed exclusion rows' looks_like column, corrected in the ingested rows), one overstatement and four wording slips; no RULE 16 defect."),
+}
+# Earlier records these rows bear on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH8_BEARS_ON = {
+    241: ["MT240", "MT175", "MT181"],  # cgw1's SCALAR-BEATS-BEST, which this retune weakens to a tie; the audit headline; its core cell
+    242: ["MT238", "MT233", "MT236", "MT239"],  # the wd ladder whose dose this removes; the carrier-decay results; caw2's corner case
+}
+MECH8_INTERVENTIONS: dict[str, dict] = {}  # neither batch ran a patch; every exclusion row of the ingest is an ARGS-value row
+# The 54 ARGS-deviating rows of the joint ingest 5db62be (CORRECTIONS 310.9): crt1 36 and csh1 18, every one ARGS_WD_BASE at
+# 5e-4, one kind per run (meta step size, alpha0 and gamma are CSV columns). The landing commits left the list byte-identical.
+MECH8_INGEST_COMMIT = "5db62be0acd9683f9845d00c2b71611befa1b40f"
+MECH8_INTERVENTIONS_TSV_SHA256 = "9610062750625df70c1aaf7f1223241f3f60fe9c60acaef20a615013e3f029fa"
+MECH8_ARGS_DEVIATIONS = {
+    "MT241": {
+        "batch": "crt1", "arms": {f"{grain}{config}": 3 for config in ("M2", "A2", "M3", "M1") for grain in ("ch", "nd", "k01")},
+        "title": "Every crt1 run differs from the audit cell in the base weight-decay flag",
+        "source": f"{INTERVENTIONS_TSV} at {MECH8_INGEST_COMMIT[:7]}; CORRECTIONS 263, 300 and 309",
+        "note": "crt1 re-tunes cgw1's 5e-4 cell: every one of its 36 runs is the audit's core cell at --weight-decay-base 5e-4, with the meta step size and alpha0 varied over a four-point grid for the uniform and aligned partitions and plain scalar. results/all_runs.csv carries the meta step size and alpha0 as columns but has no column for a base-optimiser CLI flag, so the 36 runs carry the plain 0.1 cell key of their own grain and configuration and are NOT measurements of that cell. No patch ran: the witness is the run's OWN ARGS: line, read with argparse last-wins semantics, and each row is listed under the ARGS-value witness kind ARGS_WD_BASE added at CORRECTIONS 263. No run deviates on a second ARGS kind. Drop every listed row before pooling runs by cell.",
+    },
+    "MT242": {
+        "batch": "csh1", "arms": {arm: 3 for arm in ("G1S", "G1L", "GMS", "GML", "GPS", "GPL")},
+        "title": "Every csh1 run differs from the mechanism cell in the base weight-decay flag",
+        "source": f"{INTERVENTIONS_TSV} at {MECH8_INGEST_COMMIT[:7]}; CORRECTIONS 263, 301 and 310",
+        "note": "csh1 runs the mechanism cell with its decay dose removed: every one of its 18 runs is at --weight-decay-base 5e-4 against the cell's standard 0.1, with only the hypergradient discount --gamma (1, 0.999685 or 0.99941) and the grain varied. The discount is a column of results/all_runs.csv, so the three discounts never pool with each other, but the corpus has no column for a base-optimiser CLI flag, so the runs carry the plain 0.1 cell key of their grain and discount. No patch ran: the witness is the run's OWN ARGS: line, and each row is listed under the ARGS-value witness kind ARGS_WD_BASE added at CORRECTIONS 263, with the corpus lookalike arm (k01 or kL) named as the row's lookalike. No run deviates on a second ARGS kind. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md at the landing is the caw2 / cgw1 landing's file with every line above its closing trailer unchanged and
+# entries 298-310 below it, closed by a fresh trailer.
+MECH8_CORRECTIONS_SHA256 = "3f5fca64e3ccd4093e570f0157809407969617a432b44e27f51ed03fb87f0081"
+MECH8_ENTRIES = tuple(range(298, 311))
+
+
+def mech8_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the crt1 / csh1 landing; ONE step that edits header line 3 and appends TWO rows, and nothing else."""
+    before = mech7_master_table(repo)
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH8_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH8_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH8_COMMIT[:12]} does not match the pinned crt1/csh1-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH8_LAST_ROW or len(before) != MECH8_FIRST_ROW - 1 or changed != MECH8_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH8_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH8_EDITED_LINES)}: {sorted(changed)}")
+    mech8_corrections(repo)  # neither landing amends a row, so the append-only CORRECTIONS check rides here
+    return lines
+
+
+def mech8_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the crt1 / csh1 landing; append-only below the caw2 / cgw1 landing's closing trailer."""
+    older = mech7_corrections(repo)[0]
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH8_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH8_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH8_COMMIT[:12]} does not match the pinned bytes")
+    later = raw.decode("utf-8").splitlines()
+    if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MUST_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH8_COMMIT[:7]} does not append entries below the previous closing trailer")
+    if later[:len(older) - 1] != older[:-1]:
+        changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH8_COMMIT[:7]} changed an earlier line: {changed[:8]}")
+    appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MECH8_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH8_COMMIT[:7]} does not append exactly entries {MECH8_ENTRIES}: {appended[:4]}")
+    return later, older
+
+
+def mech8_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 241-242 (crt1, csh1) and attach their ARGS-value exclusion notes.  Neither amends a row."""
+    rows = with_interventions(appended_rows(lines, MECH8_ROWS, MECH8_FIRST_ROW, MECH8_LAST_ROW, MECH8_COMMIT), MECH8_INTERVENTIONS)
+    for row in rows:
+        spec = MECH8_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
     """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
     lines, before = mech4_master_table(repo), must_master_table(repo)
@@ -2671,7 +2800,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + must_rows(must_master_table(Path(repo))) + mech4_rows(mech4_master_table(Path(repo)))
              + mech5_rows(mech5_master_table(Path(repo)))
              + mech6_rows(mech6_master_table(Path(repo)))
-             + mech7_rows(mech7_master_table(Path(repo))))
+             + mech7_rows(mech7_master_table(Path(repo)))
+             + mech8_rows(mech8_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""crd1_rule20_envaudit.py <runsdir> -- CORRECTIONS 307: RULE 20's SEPARATE ENV half for `crd1`.
+
+A copy of csh1_rule20_envaudit.py's logic with `crd1`'s table.  **The witness lines below are RE-TYPED literals, NOT
+imported from analysis/crd1_design.py**: this file is an INDEPENDENT audit of what the runs printed.
+
+WHAT THIS HALF CAN AND CANNOT DISCRIMINATE, DECLARED AT REGISTRATION.  The runner's `ENV:` line cannot carry
+DECAY_ROUTE, so the harness prints its OWN witness `DECAY_ROUTE: on mode=... wd=... lambda=... lambda_f32=... gamma=...`
+at construction (PATCH_DECAYROUTE, 305.2): THIS half therefore DISCRIMINATES THE ROUTE AND LAMBDA on every run, and --
+through the witness's `wd=` field -- the weight decay that reached the update.  It also discriminates the GRAIN
+(`PROBE_TENSOR ... type=`) and the META alg, and requires that NO hold / mask witness line exists (the cdr1 tree has
+none of those patches).  The ARGS half (bin/cRD1_rule20.sh) pins --weight-decay-base and every other flag.
+
+READ-ONLY.  For each crd1-<arm>-s<seed>-<jobid>.out it looks ONLY at lines starting with `NODE=`, `ENV:`,
+`PROBE_TENSOR:`, `DECAY_ROUTE`, the GPU line or one of the seven hold / mask prefixes; no accuracy number is touched.
+    python3 analysis/crd1_rule20_envaudit.py $WS/runs
+"""
+import collections
+import glob
+import os
+import re
+import sys
+
+WS = "/cluster/account_b/metaopt"
+PREFIX = "crd1"
+NET_TENSORS = 62
+ARMS = ["SRS", "SRL", "TRS", "TRL", "AIS", "AIL"]
+SEEDS = [196, 197, 198]
+# RE-TYPED, not imported: the grain and the META alg's constants each arm must print in its PROBE_TENSOR line
+GRAIN = {"SRS": "scalar", "SRL": "layerwise", "TRS": "scalar", "TRL": "layerwise", "AIS": "scalar", "AIL": "layerwise"}
+META_TAIL = dict((a, "meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9") for a in ARMS)
+# RE-TYPED: the DECAY_ROUTE witness each arm must print EXACTLY ONCE (PATCH_DECAYROUTE._dr_init's format)
+_SR = "DECAY_ROUTE: on mode=shrink_only base=SGDm wd=0.1 lambda=na lambda_f32=na gamma=1.0"
+_TR = "DECAY_ROUTE: on mode=trace_only base=SGDm wd=0.1 lambda=na lambda_f32=na gamma=1.0"
+_AI = "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=0.000315 lambda_f32=0.0003150000120513141 gamma=1.0"
+DRW = {"SRS": _SR, "SRL": _SR, "TRS": _TR, "TRL": _TR, "AIS": _AI, "AIL": _AI}
+COMMON = {"AUGMENT": "1", "BETA_CLIP": "-15:-2.3026", "HIER": "none", "LAM": "na",
+          "ETA_RATIO": "na", "COS_TOTAL": "default", "COS_WARMUP": "default",
+          "SCHED": "none", "SCHED_TOTAL": "none", "SCHED_WARMUP": "none",
+          "SCHED_MIN": "none", "PROBE": "100", "EB_RHO": "na", "EB_LOG": "0"}
+KINDS = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK")
+WIT = dict((a, dict((k, None) for k in KINDS)) for a in ARMS)   # the cdr1 tree prints NONE of them
+
+
+def main():
+    runsdir = sys.argv[1]
+    pat = re.compile(r"^%s-(%s)-s(\d+)-(\d+)\.out$" % (PREFIX, "|".join(ARMS)))
+    found = collections.defaultdict(list)
+    for p in sorted(glob.glob(os.path.join(runsdir, PREFIX + "-*.out"))):
+        m = pat.match(os.path.basename(p))
+        if m:
+            found[(m.group(1), int(m.group(2)))].append((m.group(3), p))
+        else:
+            print("  NOTE unrecognised file %s" % os.path.basename(p))
+    bad = 0
+    distinct = collections.Counter()
+    pt_seen = collections.Counter()
+    gpu_seen = collections.Counter()
+    seen = dict((k, collections.Counter()) for k in KINDS)
+    dr_seen = collections.Counter()
+    n_pt_missing = 0
+    for key in sorted(found):
+        arm, seed = key
+        if len(found[key]) > 1:
+            print("  NOTE %d .out files for %s-s%d" % (len(found[key]), arm, seed))
+        for jid, p in found[key]:
+            rn = "%s-%s-s%d" % (PREFIX, arm, seed)
+            node, env, pt, gpu, drl = [], [], [], [], []
+            wl = dict((k, []) for k in KINDS)
+            with open(p, errors="replace") as fh:
+                for ln in fh:
+                    if ln.startswith("NODE="):
+                        node.append(ln.rstrip("\n"))
+                    elif ln.startswith("ENV:"):
+                        env.append(ln.rstrip("\n"))
+                    elif ln.startswith("PROBE_TENSOR:"):
+                        pt.append(ln.rstrip("\n"))
+                    elif ln.startswith("DECAY_ROUTE"):
+                        drl.append(ln.rstrip("\n"))
+                    elif ln.rstrip("\n").endswith(" MiB") and ", " in ln:
+                        gpu.append(ln.rstrip("\n"))
+                    else:
+                        for k in KINDS:
+                            if ln.startswith(k):
+                                wl[k].append(ln.rstrip("\n"))
+            errs = []
+            if len(env) != 1:
+                errs.append("%d ENV lines" % len(env))
+            else:
+                toks = env[0][len("ENV:"):].split()
+                kv = dict(t.split("=", 1) for t in toks if "=" in t)
+                want = dict(COMMON)
+                want["PROBE_DIR"] = "%s/runs/%s/probe_%s" % (WS, PREFIX, rn)
+                if len(toks) != len(kv) or set(kv) != set(want):
+                    errs.append("ENV keys %s differ from the runner's 15" % sorted(set(kv) ^ set(want)))
+                for k, w in want.items():
+                    if kv.get(k) != w:
+                        errs.append("ENV %s=%s want %s" % (k, kv.get(k), w))
+                distinct[re.sub(r" PROBE_DIR=\S+", "", env[0])] += 1
+            for k in KINDS:
+                w = WIT[arm][k]
+                want_l = [] if w is None else [w]
+                if wl[k] != want_l:
+                    errs.append("%s lines %r want %r" % (k, [x[:140] for x in wl[k]], want_l))
+                elif w is not None:
+                    seen[k][w] += 1
+            if drl != [DRW[arm]]:
+                errs.append("DECAY_ROUTE lines %r want [%r]" % ([x[:140] for x in drl], DRW[arm]))
+            else:
+                dr_seen[drl[0]] += 1
+            if len(node) != 1:
+                errs.append("%d NODE lines" % len(node))
+            else:
+                mm = re.match(r"^NODE=(\S+) \| JOB=(\S+) (\d+) \| AUGMENT=(\S+)$", node[0])
+                if not mm:
+                    errs.append("NODE header unparseable")
+                elif (mm.group(2), mm.group(3), mm.group(4)) != (rn, jid, "1"):
+                    errs.append("NODE header JOB=%s %s AUGMENT=%s, want %s %s 1"
+                                % (mm.group(2), mm.group(3), mm.group(4), rn, jid))
+            if gpu:
+                gpu_seen[gpu[0].split(",")[0].strip()] += 1
+            if not pt:
+                n_pt_missing += 1
+            else:
+                if len(pt) != 1:
+                    errs.append("%d PROBE_TENSOR lines" % len(pt))
+                s = pt[0]
+                ty = re.search(r"\btype=(\S+)", s)
+                nt = re.search(r"\btensors=(\d+)", s)
+                if not ty or ty.group(1) != GRAIN[arm]:
+                    errs.append("PROBE_TENSOR type=%s want %s" % (ty.group(1) if ty else None, GRAIN[arm]))
+                if (" %s dir=" % META_TAIL[arm]) not in s:
+                    errs.append("PROBE_TENSOR meta tail is not %r" % META_TAIL[arm])
+                if not nt or int(nt.group(1)) != NET_TENSORS:
+                    errs.append("PROBE_TENSOR tensors=%s want %d" % (nt.group(1) if nt else None, NET_TENSORS))
+                if ("dir=%s/runs/%s/probe_%s" % (WS, PREFIX, rn)) not in s:
+                    errs.append("PROBE_TENSOR dir is not the run's own probe dir")
+                pt_seen[re.sub(r" dir=.*", "", s)] += 1
+            if errs:
+                bad += 1
+                print("  VIOLATION %s: %s" % (os.path.basename(p), "; ".join(errs)))
+    n_exp = len(ARMS) * len(SEEDS)
+    n = len(found)
+    print("  DECLARED: the runner's ENV line cannot carry DECAY_ROUTE; the harness's OWN `DECAY_ROUTE:` witness is")
+    print("  checked instead, and it DISCRIMINATES the route, LAMBDA and the wd that reached the update on every run.  The")
+    print("  ARGS half (bin/cRD1_rule20.sh) pins --weight-decay-base and every other flag.")
+    print("  DECAY_ROUTE witness lines (exact match to the arm's registered line):")
+    for line, c in sorted(dr_seen.items()):
+        print("    x%d  %s" % (c, line))
+    print("  distinct ENV lines (PROBE_DIR stripped): %d" % len(distinct))
+    for line, c in distinct.items():
+        print("    x%d  %s" % (c, line))
+    print("  distinct PROBE_TENSOR lines (dir stripped): %d  (%d started runs have none yet)" % (len(pt_seen), n_pt_missing))
+    for line, c in sorted(pt_seen.items()):
+        print("    x%d  %s" % (c, line))
+    print("  GPU devices named by the runs' own nvidia-smi lines (DISCLOSURE, --constraint=L4 was requested):")
+    for line, c in sorted(gpu_seen.items()):
+        print("    x%d  %s" % (c, line))
+    for k in KINDS:
+        if seen[k]:
+            print("  %s witness lines (exact match to the arm's registered line):" % k)
+            for line, c in sorted(seen[k].items()):
+                print("    x%d  %s" % (c, line[:240]))
+    if len(distinct) > 1:
+        bad += 1
+        print("  VIOLATION more than one distinct ENV line")
+    print("  coverage %d/%d runs with an .out, %d violations" % (n, n_exp, bad))
+    verdict = "FAIL" if bad else ("PASS" if n == n_exp and n_pt_missing == 0 else
+                                  "UNVERIFIED (%d/%d present, %d without PROBE_TENSOR yet)" % (n, n_exp, n_pt_missing))
+    print("ENV AUDIT VERDICT %s: %s" % (PREFIX, verdict))
+    sys.exit(1 if bad else 0)
+
+
+main()

@@ -1,0 +1,386 @@
+#!/bin/bash
+# =============================================================================
+# cAI1_alphaindep.sh -- `cai1`: THE COUNT-MATCHED AUDIT UNDER ALPHA-INDEPENDENT DECAY.
+#   ONE SUBMISSION, 32 JOBS (8 arms x seeds {192,193,194,195}), 100 EPOCHS, ResNet18 / CIFAR-10 -- cgw1's cell and ARGS
+#   lines VERBATIM except --weight-decay-base 0 -- PROBE=5, DECAY_ROUTE=alpha_indep:<LAMBDA> (PATCH_DECAYROUTE,
+#   CORRECTIONS 305) on EVERY job, --constraint=L4 ON EVERY JOB.  CORRECTIONS 306 (ICML-PLAN 1.6, DECOUPLED-NOT-TESTED).
+#   A copy of bin/cVL1_valsplit.sh.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Every guard and scancel line is filtered on `cai1-`.
+#
+# REGISTERED SCORER: analysis/cAI1_alphaindep_score.py (+ analysis/cai1_design.py), committed and pushed BEFORE this
+# batch is submitted (RULE 21).   DOCUMENTED INVOCATION:  python3 analysis/cAI1_alphaindep_score.py <runsdir>
+#
+# THE ARMS (--weight-decay-base 0 on every arm; no hold / mask / probe-tensor / val-split variable)
+#   rung I5  DECAY_ROUTE=alpha_indep:5e-5   chI5 chunk777 | ndI5 nodewise | k01I5 scalar | kLI5 layerwise
+#   rung I4  DECAY_ROUTE=alpha_indep:5e-4   chI4          | ndI4          | k01I4        | kLI4
+#
+# RULE 20.  Every ARGS value is ONE shell token; only `stepsize-groups` VARIES BY ARM (wd is 0 everywhere) and is checked
+# per composed line.  DECAY_ROUTE is ONE --export token ([a-z0-9_.:-]) and is checked present EXACTLY once per line with
+# the arm's OWN rung's value.  The two rungs' train.py halves are identical but for --run-name: the rung reaches the
+# job ONLY through --export, and is witnessed by the run's own `DECAY_ROUTE: on` line and probe records (scorer gates
+# G-WITNESS / G-SHRINK; RULE 20's ENV half).  At landing EVERY run owes a TWO-AXIS exclusion row (DECAY_ROUTE on +
+# ARGS_WD_BASE weight-decay-base=0); corpus_exclusions.py has no DECAY_ROUTE kind yet -- that code gap is owed before the
+# ingest (CORRECTIONS 305.6 d / 306.9).  It is NOT edited here.
+#
+# THE TREE is harness_cdr1 (CORRECTIONS 305), verified by bin/cDR1_stage_harness.sh (verify mode, never --stage) and
+# tied to its passed proof job 5081090 by sha; this launcher WRITES NOTHING in it.
+#
+# COST.  Expected 26.99 GPU-h (cgw1's per-grain L4 minutes x 1.15 for the probe-step shrink measurement).  HARD BOUND =
+# WALL x 32 = 64.
+#
+# USAGE   bash bin/cAI1_alphaindep.sh [--dry-run]   |   bash bin/cAI1_alphaindep.sh --submit   (the ONLY submitting form)
+# ENV     on a host with no git repo (the cluster_b stage copy), --submit requires BOTH
+#           CAI1_REGISTERED_COMMIT=<40-hex sha of the PUSHED registration commit>
+#           CAI1_SCORER_SHA256=<sha256 of analysis/cAI1_alphaindep_score.py AT THAT COMMIT, computed from origin>
+# =============================================================================
+set -u
+SUBMIT=0
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD REST_HOLD DECAY_MASK PROBE_TENSOR SHADOW_VOTE VAL_SPLIT DECAY_ROUTE SCHED_WARMUP
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+B=cai1
+HARN=$WS/harness_cdr1/cifar10
+RUNNER=$WS/jobs/run_cifar_cdr1.sh
+SAVE=$WS/runs/cai1
+PROOF=$WS/runs/cdr1/proof_decayroute.log
+MANI=$WS/harness_cdr1/STAGE-MANIFEST.txt
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; GAMMA=1; AUG=1; PROBE=5
+DSET=CIFAR10
+NET=ResNet18
+MST=1e-4
+A0=1e-3
+WD=0
+NTENS=62
+TOTPAR=11173962
+ROUTE_I5=alpha_indep:5e-5
+ROUTE_I4=alpha_indep:5e-4
+SEEDS="192 193 194 195"
+GRAINS="ch nd k01 kL"
+NJOBS=32
+WALL=02:00:00
+GPU_CONSTRAINT=L4
+HF_SHA=17ee0a2862b31b48c4196a75e88d60cf19f49d0f993cecc2750af832fe44b020
+HF_PRE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+TRAIN_SHA=3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7
+LOADDATA_SHA=b52b58a35dcecd80ce6d8f8033b09c20dad9f4827b808f4ea2a828ce88138c46
+BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+RUNNER_SRC_SHA=a0d0a1b904e64ea5a3de8c0649b58454beff0322419c97ea9e6d77481cfd9f3a
+RUNNER_SHA=d3d3bdd781282416316be2eab91a70cf796e2d725a24df4c153696146b81083c
+MANI_SHA=7f82f0a1c25240d6fe395c576f393a33d00a2cd1d5a385af75e47bbffea752ff
+PROOF_SHA=dc73dfbabf25fa01f2d0669a46fdb3202502e0e4a5851d4b4cce99146c8f25b1
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL" "gpu-l4-24g")
+
+SC="$REPO/analysis/cAI1_alphaindep_score.py"
+DES="$REPO/analysis/cai1_design.py"
+LIVEC="$REPO/analysis/cai1_live_check.py"
+SELF="$REPO/bin/cAI1_alphaindep.sh"
+STAGE="$REPO/bin/cDR1_stage_harness.sh"
+R20="$REPO/bin/cAI1_rule20.sh"
+R20E="$REPO/analysis/cai1_rule20_envaudit.py"
+PATCHF="$REPO/patches/patch_decayroute.py"
+TDR="$REPO/tests/test_decayroute.py"
+TDRR="$REPO/tests/test_decayroute_realrun.py"
+CGWS="$REPO/analysis/cGW1_auditwd_score.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+
+echo "=============================================================="
+echo " cai1 -- THE COUNT-MATCHED AUDIT UNDER ALPHA-INDEPENDENT DECAY  (CORRECTIONS 306; ICML-PLAN 1.6)"
+echo " $DSET / $NET   AUGMENT=$AUG  PROBE=$PROBE  clamp $CLIP_C   ms=$MST alpha0=$A0  $EPOCHS epochs  --weight-decay-base $WD"
+echo "   rung I5  DECAY_ROUTE=$ROUTE_I5   seeds $SEEDS   ch chunk777 | nd nodewise | k01 scalar | kL layerwise"
+echo "   rung I4  DECAY_ROUTE=$ROUTE_I4   seeds $SEEDS   the same four grains"
+echo " 8 arms, $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN   runner $RUNNER   partitions $PARTS   constraint $GPU_CONSTRAINT   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cAI1_alphaindep_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] && [ -z "${DECAY_MASK+x}" ] && [ -z "${PROBE_TENSOR+x}" ] && [ -z "${VAL_SPLIT+x}" ] && [ -z "${DECAY_ROUTE+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, REST_HOLD, DECAY_MASK, PROBE_TENSOR, VAL_SPLIT and DECAY_ROUTE are UNSET in the launcher's environment (DECAY_ROUTE reaches each job through --export only)" \
+  || guard_fail "guard 0b: a hold / mask / probe-tensor / route variable is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$DES" "$LIVEC" "$SELF" "$STAGE" "$R20" "$R20E" "$PATCHF" "$TDR" "$TDRR" "$CGWS" "$EXCL" "$EXCLT" "$LIBF" "$AGF" "$CSVP" "$RUNNER" "$PROOF" "$MANI"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cAI1_alphaindep_score.py analysis/cai1_design.py analysis/cai1_live_check.py analysis/cai1_rule20_envaudit.py bin/cAI1_alphaindep.sh bin/cAI1_rule20.sh"
+REUSEF="bin/cDR1_stage_harness.sh patches/patch_decayroute.py tests/test_decayroute.py tests/test_decayroute_realrun.py analysis/cGW1_auditwd_score.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/_lib_guards.sh analysis/argsline_guard.py"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  PUSHED=$(git -C "$REPO" branch -r --contains HEAD 2>/dev/null | grep -c 'origin/master')
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ] && [ "${PUSHED:-0}" -ge 1 ]; then
+    echo "guard 1b: the registration files are TRACKED, COMMITTED and PUSHED (HEAD $(git -C "$REPO" rev-parse --short HEAD) is on origin/master) (RULE 21)"
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: not committed and pushed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}; on origin/master: ${PUSHED:-0}"
+  else
+    echo "guard 1b: NOTE (dry run) -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}; on origin/master: ${PUSHED:-0}; --submit would refuse"
+  fi
+else
+  if [ -n "${CAI1_REGISTERED_COMMIT:-}" ] && [ -n "${CAI1_SCORER_SHA256:-}" ]; then
+    if printf '%s' "$CAI1_REGISTERED_COMMIT" | grep -qE '^[0-9a-f]{40}$' && [ "$CAI1_SCORER_SHA256" = "$(sha "$SC")" ]; then
+      echo "guard 1b: no git repo on this host; the operator declares commit $CAI1_REGISTERED_COMMIT (40 hex) and the staged"
+      echo "          scorer's sha256 EQUALS the declared sha of that commit's scorer ($(echo "$CAI1_SCORER_SHA256" | cut -c1-16))"
+    else
+      guard_fail "guard 1b: CAI1_REGISTERED_COMMIT is not 40 hex, or the staged scorer $(sha "$SC" | cut -c1-16) != CAI1_SCORER_SHA256"
+    fi
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CAI1_REGISTERED_COMMIT / CAI1_SCORER_SHA256 are unset"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CAI1_REGISTERED_COMMIT and CAI1_SCORER_SHA256"
+  fi
+fi
+
+SELFT=/tmp/cai1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|Error' "$SELFT" | head -20; tail -5 "$SELFT"; }
+[ "$(grep -c '^  SKIP' "$SELFT")" = 0 ] && echo "guard 1c1: no SKIP (the corpus and the landed gn1 probe records were found on this host)" || guard_fail "guard 1c1: the selftest SKIPPED a section"
+grep -q "^  PASS B SIGMA_PRIOR: the FROZEN literal 0.17818264951145454 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c2: the frozen floor IS the corpus_exclusions.filter_rows value on THIS host's corpus" \
+  || guard_fail "guard 1c2: the frozen floor was not shown to be the filtered value"
+grep -q "^  PASS E O2: FINAL byte-identical" "$SELFT" && grep -q "^  PASS E the DOCUMENTED one-argument invocation" "$SELFT" \
+  && echo "guard 1c3: O2 invariance ran against the real corpus + invented rows; the documented invocation reached FINAL" \
+  || guard_fail "guard 1c3: the O2 invariance / documented-invocation checks did not pass"
+grep -q "^  PASS F landed gn1 bn-ch s0" "$SELFT" && grep -q "^  PASS F the same records FAIL this batch's G-SHRINK" "$SELFT" && grep -q "^  PASS G DISCLOSED" "$SELFT" \
+  && grep -q "^  PASS A rung_state and scalar_of are cgw1's registered functions VERBATIM" "$SELFT" \
+  && echo "guard 1c4: the probe audit passed on REAL landed records of this cell (and G-SHRINK bit on their missing route keys); cgw1's decision functions verbatim; the 164.6 floor gate passed" \
+  || guard_fail "guard 1c4: real-record probe audit, cgw1 identity or floor gate did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+grep -q '^cai1-' "$CSVP" && guard_fail "guard 2: cai1-* already in the CSV" || echo "guard 2: no cai1-* row in the corpus"
+NOUT=$(ls "$WS/runs"/cai1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no cai1-*.out on disk" || guard_fail "guard 2b: $NOUT cai1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed 19[2-5]( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry --seed 192..195 (the block is fresh)" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran a seed in 192..195"
+python3 - "$CSVP" <<'PYEOF' || guard_fail "guard 2d2: a corpus row already carries a seed in 192..195"
+import csv, sys
+n = sum(1 for r in csv.DictReader(open(sys.argv[1])) if r.get("seed", "").strip() in [str(s) for s in range(192, 196)])
+print("guard 2d2: %d corpus rows carry a seed in 192..195" % n)
+raise SystemExit(0 if n == 0 else 1)
+PYEOF
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^cai1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 cai1-* jobs" || guard_fail "guard 2e: sacct shows $NS cai1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^cai1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 cai1-* in squeue" || guard_fail "guard 2f: $NQ cai1-* already queued"
+fi
+
+# ---- guard 3: the isolated tree (harness_cdr1), VERIFY mode only -------------------------------------------------
+bash "$STAGE" >/tmp/cai1_stage.$$ 2>&1 \
+  && { echo "guard 3: cDR1_stage_harness.sh (verify mode) VERIFIES the cdr1 tree:"; grep -E '^V-' /tmp/cai1_stage.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 3: the cdr1 tree is NOT consistent"; tail -20 /tmp/cai1_stage.$$; }
+[ "$(sha "$HARN/Optimizers/HF.py")" = "$HF_SHA" ] && [ "$(sha "$HARN/Optimizers/HF.py.pre_decayroute")" = "$HF_PRE_SHA" ] \
+  && [ "$(sha "$HARN/train.py")" = "$TRAIN_SHA" ] && [ "$(sha "$HARN/build_network.py")" = "$BN_SHA" ] && [ "$(sha "$HARN/load_data.py")" = "$LOADDATA_SHA" ] \
+  && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && [ "$(sha "$MANI")" = "$MANI_SHA" ] \
+  && echo "guard 3b: tree HF.py (PATCH_DECAYROUTE) / its pre backup / train.py / build_network.py / load_data.py, the runner and the STAGE-MANIFEST == the pinned shas" \
+  || guard_fail "guard 3b: a pinned tree file, the runner or the stage manifest moved"
+# ---- guard 3g: the PATCH_DECAYROUTE proof job 5081090 (CORRECTIONS 305.5) passed on THIS tree ---------------------------
+if [ "$(sha "$PROOF")" = "$PROOF_SHA" ] && grep -q "^REALRUN_RC 0$" "$PROOF" && grep -q "^TEST_DECAYROUTE_RC 0$" "$PROOF" && grep -q "^STAGE_VERIFY_RC 0$" "$PROOF" \
+   && [ "$(grep -c '^  FAIL' "$PROOF")" = 0 ] && grep -q "^TREE_POST $HARN HF $HF_SHA train $TRAIN_SHA$" "$PROOF" \
+   && grep -q "^$(sha "$PATCHF")  patches/patch_decayroute.py$" "$PROOF" && grep -q "^TEST_SHA256 $(sha "$TDR")$" "$PROOF" \
+   && grep -q "^DRIVER_SHA256 $(sha "$TDRR")$" "$PROOF" \
+   && grep -q "PASS RR2 alpha_indep:5e-05: measured per-step shrink == 5e-05 at every record" "$PROOF" \
+   && grep -q "PASS RR3 DECAY_ROUTE=alpha_indep:5e-05 at wd 0.1 FAILS loudly" "$PROOF"; then
+  echo "guard 3g: the PATCH_DECAYROUTE proof log (sha $(sha "$PROOF" | cut -c1-8), job 5081090): $(grep -c '^  PASS' "$PROOF") PASS / 0 FAIL, on THIS tree's"
+  echo "          HF / train shas, with THIS stage's patch, unit test and real-run driver; its real run measured alpha_indep's shrink"
+  echo "          == LAMBDA at every record and refused alpha_indep at wd 0.1"
+else
+  guard_fail "guard 3g: the proof log $PROOF does not vouch for this tree, patch and tests"
+fi
+grep -q "PATCH_DECAYROUTE" "$HARN/Optimizers/HF.py" && grep -q -- '--weight-decay-base' "$HARN/train.py" \
+  && echo "guard 3f: HF.py carries PATCH_DECAYROUTE; train.py declares --weight-decay-base (wd 0 is an existing CLI value)" \
+  || guard_fail "guard 3f: HF.py lacks PATCH_DECAYROUTE or train.py lacks --weight-decay-base"
+
+# ---- guard 4c': the launcher's literals == the design module's == the stage script's -------------------------------
+python3 - "$DES" "$STAGE" "$ROUTE_I5" "$ROUTE_I4" "$SEEDS" "$GRAINS" "$NET" "$NTENS" "$TOTPAR" "$HF_SHA" "$HF_PRE_SHA" \
+          "$TRAIN_SHA" "$BN_SHA" "$RUNNER_SRC_SHA" "$GPU_CONSTRAINT" "$NJOBS" "$MST" "$A0" "$CLIP_C" "$WALL" "$LOADDATA_SHA" \
+          "$WD" "$RUNNER_SHA" "$MANI_SHA" "$PROOF_SHA" <<'PYEOF' || guard_fail "guard 4c': launcher / design / stage literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("cai1_design", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+(stage, r5, r4, seeds, grains, net, ntens, totpar, hf, hfpre, tr, bn, rsrc, gpu, nj, mst, a0, clip, wall, ld, wd, rsha, msha, psha) = sys.argv[2:26]
+bad = []
+if [Dm.route_value(r) for r in Dm.RUNG_IDS] != [r5, r4]: bad.append("ROUTES")
+if any(Dm.SEEDS_OF_RUNG[r] != tuple(int(x) for x in seeds.split()) for r in Dm.RUNG_IDS): bad.append("SEEDS")
+if tuple(grains.split()) != Dm.GRAIN_IDS: bad.append("GRAINS")
+if (net, int(ntens), int(totpar)) != (Dm.NET, Dm.NTENS, Dm.TOTPAR): bad.append("NET/NTENS/TOTPAR")
+if (hf, hfpre, tr, bn, rsrc, ld) != (Dm.HF_POST_SHA, Dm.HF_PRE_SHA, Dm.TRAIN_SHA, Dm.BN_SHA, Dm.RUNNER_SRC_SHA, Dm.LOADDATA_SHA): bad.append("SHAS")
+if (rsha, msha, psha) != (Dm.RUNNER_SHA, Dm.STAGE_MANIFEST_SHA, Dm.PROOF_LOG_SHA): bad.append("RUNNER/MANIFEST/PROOF")
+if wd != Dm.WD_TOKEN: bad.append("WD")
+if gpu != Dm.GPU_CONSTRAINT or int(nj) != Dm.NJOBS or wall != Dm.WALL: bad.append("GPU/NJOBS/WALL")
+if (mst, a0, clip) != (Dm.MST, Dm.A0, Dm.CLIP): bad.append("MST/A0/CLIP")
+st = open(stage).read()
+for name, v in (("HF_POST_SHA", Dm.HF_POST_SHA), ("HF_SHA", Dm.HF_PRE_SHA), ("TRAIN_SHA", Dm.TRAIN_SHA), ("BN_SHA", Dm.BN_SHA),
+                ("BUILDOPT_SHA", Dm.BUILDOPT_SHA), ("LOADDATA_SHA", Dm.LOADDATA_SHA), ("TINDATA_SHA", Dm.TINDATA_SHA),
+                ("RUNNER_SRC_SHA", Dm.RUNNER_SRC_SHA)):
+    m = re.search(r"^%s=([0-9a-f]{64})$" % name, st, re.M)
+    if not m or m.group(1) != v: bad.append("stage " + name)
+if Dm.N_EXCLUSION_ROWS != 32: bad.append("EXCLUSION-COUNT")
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': the two DECAY_ROUTE values, wd 0, the seeds, the four grains, NET/NTENS/TOTPAR, ms/alpha0/clip, the tree /")
+print("           runner / manifest / proof-log shas (launcher, design AND stage script), the GPU constraint, NJOBS and WALL")
+print("           agree; all 32 runs owe a two-axis exclusion row")
+PYEOF
+
+# ---- guard 4: THE LIVE-MODEL MANIFEST AND ROUTE (CPU construction only; no forward pass, no GPU) ---------------------
+mkdir -p "$SAVE"
+MTMP=/tmp/cai1_manifest.$$
+python3 "$LIVEC" "$HARN" "$MTMP" 2>&1 | sed 's/^/  /'
+[ -s "$MTMP" ] || guard_fail "guard 4: the live-model check FAILED (spec / m / wd / base_update / route / witness / manifest)"
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"
+    echo "guard 4b3: live manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)) -> $MANIFEST"
+  fi
+fi
+
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "DESIGN_SHA256 $(sha "$DES")"
+  echo "LIVECHECK_SHA256 $(sha "$LIVEC")"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "STAGE_SCRIPT_SHA256 $(sha "$STAGE")"
+  echo "HF_SHA256 $(sha "$HARN/Optimizers/HF.py")"
+  echo "PATCH_SHA256 $(sha "$PATCHF")"
+  echo "PROOF_LOG_SHA256 $(sha "$PROOF")"
+  echo "DECAY_ROUTE I5=$ROUTE_I5 I4=$ROUTE_I4"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "BUILD_NETWORK_SHA256 $(sha "$HARN/build_network.py")"
+  echo "BUILD_OPTIMIZER_SHA256 $(sha "$HARN/Optimizers/build_optimizer.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$MANI")"
+  echo "REGISTERED_COMMIT ${CAI1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "CORPUS_SHA256 $(sha "$CSVP")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "WEIGHT_DECAY_BASE $WD"
+  echo "SEEDS $SEEDS"
+  echo "GRAINS ch=chunk777 nd=nodewise k01=scalar kL=layerwise"
+  echo "EPOCHS $EPOCHS PROBE $PROBE"
+  echo "GPU_CONSTRAINT $GPU_CONSTRAINT PARTITIONS $PARTS WALL $WALL"
+  echo "VOTE_W BETA_HOLD GROUP_HOLD REST_HOLD DECAY_MASK PROBE_TENSOR VAL_SPLIT unset on every arm; DECAY_ROUTE per rung on every arm"; } > "$PROV"
+echo "guard 4g: provenance written to $PROV"
+
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+case ",$PARTS," in *,gpu-mig-40g,*|*,gpu-a100-80g,*|*,gpu-2080ti-11g,*) guard_fail "guard 5b: a partition without L4 nodes is in $PARTS" ;; *) echo "guard 5b: partitions $PARTS all carry L4 nodes; --constraint=$GPU_CONSTRAINT" ;; esac
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS (32 probe dirs at PROBE=5 need ~2.5 GB); $PEND jobs pending, adding $NJOBS"
+[ "${FREE:-0}" -ge 20 ] || guard_fail "guard 5: under 20 GB free"
+[ "${PEND:-0}" -le 100 ] || guard_fail "guard 5: $PEND pending, over cap 100"
+
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4 tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+DESIGN=(optimizer=HF alg-base=SGDm momentum-param-base=0.99 weight-decay-base=$WD alg-meta=Lion momentum-param-meta=0.99 \
+        Lion-beta2-meta=0.9 weight-decay-meta=0 dataset=$DSET NN-name=$NET batch-size=$BATCH max-time=999:00:00 gamma=$GAMMA \
+        meta-stepsize=$MST alpha0=$A0 num-epochs=$EPOCHS save-directory=$SAVE)
+N=0; REJ=0; BAD=0
+for R in I5 I4; do
+  case $R in I5) ROUTE=$ROUTE_I5 ;; I4) ROUTE=$ROUTE_I4 ;; esac
+  for S in $SEEDS; do
+    for GR in $GRAINS; do
+      case $GR in ch) G=chunk777 ;; nd) G=nodewise ;; k01) G=scalar ;; kL) G=layerwise ;; *) echo "!!! unknown grain $GR"; exit 2 ;; esac
+      ARM=$GR$R
+      RN="cai1-$ARM-s$S"
+      PDIR="$SAVE/probe_$RN"
+      CMD="sbatch --job-name=$RN --partition=$PARTS --constraint=$GPU_CONSTRAINT --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_DIR=$PDIR,DECAY_ROUTE=$ROUTE \
+$RUNNER --optimizer HF --alg-base SGDm --momentum-param-base 0.99 \
+--weight-decay-base $WD --alg-meta Lion --momentum-param-meta 0.99 --Lion-beta2-meta 0.9 \
+--weight-decay-meta 0 --dataset $DSET --NN-name $NET --batch-size $BATCH --max-time 999:00:00 \
+--gamma $GAMMA --meta-stepsize $MST --alpha0 $A0 --num-epochs $EPOCHS \
+--stepsize-groups $G --seed $S --save-directory $SAVE --run-name $RN"
+      guard_presubmit "$CMD" "${DESIGN[@]}" >/dev/null 2>&1 \
+        || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" "${DESIGN[@]}"; BAD=$((BAD+1)); }
+      guard_presubmit "$CMD" "seed=$S" "run-name=$RN" "stepsize-groups=$G" >/dev/null 2>&1 \
+        || { echo "!!! RULE 20: an axis does not round-trip for $RN (grain=$G)"; BAD=$((BAD+1)); }
+      python3 - "$DES" "$ARM" "$S" "$SAVE" "$CMD" <<'PYEOF' >/dev/null 2>&1 || { echo "!!! $RN: composed line != cai1_design.args_line / route"; BAD=$((BAD+1)); }
+import sys, importlib.util
+spm = importlib.util.spec_from_file_location("d", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+arm, seed, save, cmd = sys.argv[2], int(sys.argv[3]), sys.argv[4], " ".join(sys.argv[5].replace("\\\n", " ").split())
+tail = cmd[cmd.index(" --optimizer "):].strip()
+exp = [t for t in cmd.split() if t.startswith("--export=")]
+ok = "ARGS: " + tail == Dm.args_line(arm, seed, save) and len(exp) == 1 \
+     and exp[0].split(",").count("DECAY_ROUTE=" + Dm.route_value(Dm.RUNG_OF[arm])) == 1 \
+     and sum(1 for t in exp[0].split(",") if t.startswith("DECAY_ROUTE=")) == 1
+raise SystemExit(0 if ok else 1)
+PYEOF
+      NWDF=$(printf '%s\n' "$CMD" | grep -o -- '--weight-decay-base [^ ]*' | wc -l | tr -d ' ')
+      [ "$NWDF" = 1 ] && [ "$(printf '%s\n' "$CMD" | grep -o -- '--weight-decay-base [^ ]*')" = "--weight-decay-base 0" ] || { echo "!!! $RN does not carry exactly one --weight-decay-base 0"; BAD=$((BAD+1)); }
+      NVW=$(printf '%s\n' "$CMD" | grep -c 'VOTE_W=\|BETA_HOLD=\|GROUP_HOLD=\|REST_HOLD=\|COMP_HOLD=\|WINDOW_HOLD=\|DECAY_MASK=\|PROBE_TENSOR=\|SHADOW_VOTE=\|VAL_SPLIT=\|SCHED_WARMUP=')
+      [ "$NVW" = 0 ] || { echo "!!! $RN carries a hold / mask / probe-tensor / val-split / warm-up variable"; BAD=$((BAD+1)); }
+      NDR=$(printf '%s\n' "$CMD" | grep -o 'DECAY_ROUTE=[^, ]*' | wc -l | tr -d ' ')
+      [ "$NDR" = 1 ] && [ "$(printf '%s\n' "$CMD" | grep -o 'DECAY_ROUTE=[^, ]*')" = "DECAY_ROUTE=$ROUTE" ] || { echo "!!! $RN does not carry exactly one DECAY_ROUTE=$ROUTE"; BAD=$((BAD+1)); }
+      [ "$(printf '%s\n' "$CMD" | grep -o -- '--constraint=[^ ]*')" = "--constraint=$GPU_CONSTRAINT" ] || { echo "!!! $RN lacks --constraint=$GPU_CONSTRAINT"; BAD=$((BAD+1)); }
+      if [ "$SUBMIT" = 1 ]; then
+        mkdir -p "$PDIR"
+        eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+      else
+        echo "$CMD"; echo; N=$((N+1))
+      fi
+    done
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / design-line / route / weight-decay / constraint pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  cp "$PROV" "$WS/runs/cai1-PROVENANCE.txt"
+  grep -qx 'cai1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "cai1-" >> "$REPO/bin/PROTECTED.txt"
+  echo "---- cai1- present in bin/PROTECTED.txt (stage copy) ----"
+  guard_postlaunch "$WS/runs" "cai1-" "${DESIGN[@]}"; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line" ;;
+    2) echo "guard 7: UNVERIFIED -- no cai1 job started inside the window" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^cai1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 32/32 RUN_DONE):  python3 $REPO/analysis/cAI1_alphaindep_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cAI1_alphaindep.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

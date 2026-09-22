@@ -1,0 +1,462 @@
+#!/bin/bash
+# =============================================================================
+# cRD1_route.sh -- `crd1`: THE COLLAPSE ROUTE (ICML-PLAN 1.6, stamp DECOUPLED-NOT-TESTED).  CORRECTIONS 307.
+#   ONE SUBMISSION, 18 JOBS (6 arms x 3 seeds), 100 EPOCHS, SEEDS {196,197,198}, ResNet18_c100 / CIFAR-100,
+#   SGDm(0.99) + Lion(0.99,0.9), ms 1e-3, alpha0 1e-6, gamma 1, PROBE=100, PROBE_TENSOR=1, --constraint=L4 ON EVERY JOB.
+#   DECAY_ROUTE {shrink_only, trace_only} at wd 0.1 and alpha_indep:3.15e-4 at wd 0, x {scalar, layerwise}.
+#
+# ACCOUNT: account_b (cluster_b).  WORKSPACE: /cluster/account_b/metaopt.  Every guard and scancel line is filtered on `crd1-`.
+#
+# REGISTERED SCORER: analysis/cRD1_route_score.py (+ analysis/crd1_design.py; cwd1's analysis/cwd_design.py and
+# analysis/cwd_common.py and csh1's analysis/csh1_design.py REUSED UNEDITED), committed and pushed BEFORE this batch is
+# submitted (RULE 21).   DOCUMENTED INVOCATION:  python3 analysis/cRD1_route_score.py <runsdir>
+#
+# THE TREE: $WS/harness_cdr1/cifar10 (PATCH_DECAYROUTE, CORRECTIONS 305; HF.py 17ee0a28...) and its runner
+# $WS/jobs/run_cifar_cdr1.sh (d3d3bdd7...), UNCHANGED; bin/cDR1_stage_harness.sh (verify mode) re-verifies them.  The
+# harness-null for THIS batch's wiring is analysis/crd1_route_cpu_check.py (guard 4h): each arm's OWN ARGS + its OWN
+# DECAY_ROUTE value reach the patched update BITWISE, on the login node's CPU, 3 steps of a batch of 4 -- no GPU work.
+#
+# RULE 20.  Every ARGS value is ONE shell token; each composed line is checked against its OWN arm's FULL registered
+# flag list (analysis/crd1_design.args_pairs), and its --export list must carry exactly the arm's DECAY_ROUTE value.
+# analysis/argsline_guard.py IS NOT EDITED.
+#
+# COST: cwd5's sacct mean 0.6855 GPU-h per run of this cell on L4 -> 18 jobs ~= 12.3 GPU-h expected.
+#   HARD BOUND = WALL 3 h x 18 = 54 GPU-h.
+#
+# USAGE   bash bin/cRD1_route.sh [--dry-run]   |   bash bin/cRD1_route.sh --submit   (the ONLY submitting form)
+# ENV     CRD1_REGISTERED_COMMIT=<40-hex sha>   on a host with no git repo, --submit requires it (271.6 F1: full sha)
+# =============================================================================
+set -u
+case "${1:-}" in
+  --submit)      SUBMIT=1 ;;
+  --dry-run|"")  SUBMIT=0 ;;
+  *) echo "usage: bash $0 [--dry-run|--submit]"; exit 2 ;;
+esac
+[ $# -le 1 ] || { echo "usage: bash $0 [--dry-run|--submit]"; exit 2; }
+unset VOTE_W BETA_HOLD COMP_HOLD WINDOW_HOLD GROUP_HOLD REST_HOLD DECAY_MASK DECAY_ROUTE
+FAIL=0; guard_fail() { echo "!!! GUARD FAIL: $*"; FAIL=1; }
+sha() { (sha256sum "$1" 2>/dev/null || shasum -a 256 "$1") | awk '{print $1}'; }
+
+USER_NAME="${USER:-$(whoami)}"
+export METAOPT_WS=${METAOPT_WS:-/cluster/account_b/metaopt}
+WS=$METAOPT_WS
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+LIVE=$WS/MetaOptimize/codes/Supervised_tasks/MetaOptimize/cifar10
+B=crd1
+HARN=$WS/harness_cdr1/cifar10
+RUNNER=$WS/jobs/run_cifar_cdr1.sh
+SAVE=$WS/runs/crd1
+
+module load Python/3.10.4-GCCcore-11.3.0 >/dev/null 2>&1 || true
+# shellcheck disable=SC1091
+[ -f "$WS/envs/mo/bin/activate" ] && . "$WS/envs/mo/bin/activate" 2>/dev/null || true
+export PYTHONDONTWRITEBYTECODE=1
+
+CLIP_C="-15:-2.3026"
+EPOCHS=100; BATCH=100; AUG=1; PROBE=100; PT=1
+DSET=CIFAR100
+NET=ResNet18_c100
+SEEDS="196 197 198"
+MST=1e-3
+A0=1e-6
+LAMBDA_TOKEN=3.15e-4
+NTENS=62
+TOTPAR=11220132
+ARMS="SRS SRL TRS TRL AIS AIL"
+NJOBS=18
+WALL=03:00:00
+GPU_CONSTRAINT=L4
+BN_SHA=c79988833c4399a06cc84d15c0830f54d86f59feeec345f47a2287c1cf2ba77d
+HF_SHA=17ee0a2862b31b48c4196a75e88d60cf19f49d0f993cecc2750af832fe44b020
+HF_PRE_SHA=4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd
+RUNNER_SHA=d3d3bdd781282416316be2eab91a70cf796e2d725a24df4c153696146b81083c
+PATCH_SHA=12c107884db4c9285a012ef06c4bdcb3f5f6528c6c3da0c16421944718be4c95
+TRAIN_SHA=3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7
+# shellcheck disable=SC1091
+. "$REPO/bin/_lib_guards.sh"
+PARTS=$(slurm_parts_for_wall "$WALL" "gpu-l4-24g")
+
+SC="$REPO/analysis/cRD1_route_score.py"
+DES="$REPO/analysis/crd1_design.py"
+GCK="$REPO/analysis/crd1_route_cpu_check.py"
+HDES="$REPO/analysis/csh1_design.py"
+PATCHF="$REPO/patches/patch_decayroute.py"
+WDES="$REPO/analysis/cwd_design.py"
+COM="$REPO/analysis/cwd_common.py"
+SELF="$REPO/bin/cRD1_route.sh"
+R20="$REPO/bin/cRD1_rule20.sh"
+R20E="$REPO/analysis/crd1_rule20_envaudit.py"
+EXCL="$REPO/analysis/corpus_exclusions.py"
+EXCLT="$REPO/results/CORPUS-EXCLUSIONS.tsv"
+STAGEW="$REPO/bin/cDR1_stage_harness.sh"
+ARCHR="$REPO/jobs/run_cifar_cdr1.sh"
+LIBF="$REPO/bin/_lib_guards.sh"
+AGF="$REPO/analysis/argsline_guard.py"
+CSVP="$REPO/results/all_runs.csv"
+HFH="$HARN/Optimizers/HF.py"
+BNH="$HARN/build_network.py"
+
+echo "=============================================================="
+echo " crd1 -- THE COLLAPSE ROUTE: at the mechanism cell (wd 0.1), weight shrink, shortened trace, or neither alone?"
+echo "         and does the collapse survive alpha-INDEPENDENT decay (LAMBDA $LAMBDA_TOKEN, wd 0)?"
+echo " $DSET / $NET   SGDm(0.99)+Lion   AUGMENT=$AUG  PROBE=$PROBE  PROBE_TENSOR=$PT  clamp $CLIP_C   ms=$MST alpha0=$A0  $EPOCHS epochs; seeds $SEEDS"
+echo "   SRS | SRL  wd 0.1  DECAY_ROUTE=shrink_only          weight shrink alone (trace factor 1)"
+echo "   TRS | TRL  wd 0.1  DECAY_ROUTE=trace_only           trace factor (1 - 0.1*a) alone (weights undecayed)"
+echo "   AIS | AIL  wd 0    DECAY_ROUTE=alpha_indep:$LAMBDA_TOKEN  alpha-independent decay (both routes, constant)"
+echo " 6 arms x 3 seeds = $NJOBS jobs, ONE submission; mode: $([ "$SUBMIT" = 1 ] && echo SUBMIT || echo DRY-RUN)"
+echo " harness tree $HARN (cdr1's, UNCHANGED)   runner $RUNNER (cdr1's, UNCHANGED)   partitions $PARTS   constraint $GPU_CONSTRAINT   walltime $WALL"
+echo " DOCUMENTED INVOCATION: python3 analysis/cRD1_route_score.py <runsdir>"
+echo "=============================================================="
+
+[ -z "${VOTE_W+x}" ] && [ -z "${BETA_HOLD+x}" ] && [ -z "${GROUP_HOLD+x}" ] && [ -z "${REST_HOLD+x}" ] && [ -z "${DECAY_MASK+x}" ] && [ -z "${DECAY_ROUTE+x}" ] \
+  && echo "guard 0b: VOTE_W, BETA_HOLD, GROUP_HOLD, REST_HOLD, DECAY_MASK and DECAY_ROUTE are UNSET in the launcher's environment (each job's --export sets DECAY_ROUTE)" \
+  || guard_fail "guard 0b: a hold / mask variable is set in the launcher's environment"
+[ -f "$CSVP" ] && echo "guard 0: CSV present ($(wc -l < "$CSVP") lines, sha $(sha "$CSVP"))" || guard_fail "guard 0: no CSV at $CSVP"
+
+for f in "$SC" "$DES" "$GCK" "$HDES" "$PATCHF" "$WDES" "$COM" "$SELF" "$R20" "$R20E" "$EXCL" "$EXCLT" "$STAGEW" "$ARCHR" "$LIBF" "$AGF" \
+         "$CSVP" "$RUNNER" "$HFH" "$BNH"; do
+  [ -f "$f" ] && echo "guard 1a: present  $(sha "$f" | cut -c1-16)  $f" || guard_fail "guard 1a: missing $f"
+done
+
+NEWF="analysis/cRD1_route_score.py analysis/crd1_design.py analysis/crd1_route_cpu_check.py bin/cRD1_route.sh bin/cRD1_rule20.sh analysis/crd1_rule20_envaudit.py"
+REUSEF="analysis/cwd_design.py analysis/cwd_common.py analysis/csh1_design.py patches/patch_decayroute.py analysis/corpus_exclusions.py results/CORPUS-EXCLUSIONS.tsv bin/cDR1_stage_harness.sh bin/_lib_guards.sh analysis/argsline_guard.py jobs/run_cifar_cdr1.sh"
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  UNTR=""; for f in $NEWF $REUSEF; do git -C "$REPO" ls-files --error-unmatch "$f" >/dev/null 2>&1 || UNTR="$UNTR $f"; done
+  DIRTY=$(git -C "$REPO" status --porcelain -- $NEWF $REUSEF 2>/dev/null)
+  if [ -z "$UNTR" ] && [ -z "$DIRTY" ]; then
+    echo "guard 1b: the registration files and reused files are TRACKED and COMMITTED at $(git -C "$REPO" rev-parse --short HEAD) (RULE 21)"
+  else
+    guard_fail "guard 1b: not committed -- untracked:${UNTR:- none}; dirty: ${DIRTY:-none}"
+  fi
+else
+  if [ -n "${CRD1_REGISTERED_COMMIT:-}" ]; then
+    if printf '%s' "$CRD1_REGISTERED_COMMIT" | grep -qE '^[0-9a-f]{40}$'; then
+      echo "guard 1b: no git repo on this host; the operator declares the staged tree is commit $CRD1_REGISTERED_COMMIT (40 hex, 271.6 F1)"
+    else
+      guard_fail "guard 1b: CRD1_REGISTERED_COMMIT is not a full 40-hex commit name (271.6 F1): $CRD1_REGISTERED_COMMIT"
+    fi
+  elif [ "$SUBMIT" = 1 ]; then
+    guard_fail "guard 1b: no git repo at $REPO and CRD1_REGISTERED_COMMIT is unset"
+  else
+    echo "guard 1b: NOTE (dry run) -- no git repo at $REPO; --submit will require CRD1_REGISTERED_COMMIT=<40-hex sha>"
+  fi
+fi
+[ "$(sha "$ARCHR")" = "$RUNNER_SHA" ] && [ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] \
+  && echo "guard 1b2: the archived jobs/run_cifar_cdr1.sh == \$WS/jobs/run_cifar_cdr1.sh == $RUNNER_SHA (cdr1's runner, UNCHANGED)" \
+  || guard_fail "guard 1b2: the archived runner or the live runner is not $RUNNER_SHA"
+[ "$(sha "$WDES")" = 03d2d7614915757798699ff75ca971a11fca2056d383649fecbbf5adf06c0195 ] && [ "$(sha "$COM")" = d7ddb49e71013e3a21eaf5129861ab43dbc16e181bbd92af7c70cdc95e82bf52 ] \
+  && [ "$(sha "$AGF")" = 81cea8b586e124a6996d462d8321f21803238ac9af91526f6f190a84b04e5388 ] \
+  && [ "$(sha "$HDES")" = 7925e0edf31baa827c4b446739a7b0f9192855295eaa720956a056a3f8dad394 ] && [ "$(sha "$PATCHF")" = "$PATCH_SHA" ] \
+  && echo "guard 1b3: the REUSED cwd_design.py / cwd_common.py / csh1_design.py / patch_decayroute.py and argsline_guard.py are their registered bytes (RULE 16)" \
+  || guard_fail "guard 1b3: a reused registration file moved"
+
+SELFT=/tmp/crd1_selftest.$$
+python3 "$SC" --selftest --runsdir "$WS/runs" --csv "$CSVP" >"$SELFT" 2>&1 \
+  && echo "guard 1c: scorer --selftest PASSES ($(grep -c '^  PASS' "$SELFT") PASS, $(grep -c '^  FAIL' "$SELFT") FAIL, $(grep -c '^  SKIP' "$SELFT") SKIP)" \
+  || { guard_fail "guard 1c: scorer --selftest FAILED"; grep '^  FAIL\|EXCEPTION\|Traceback' "$SELFT" | head -20; tail -5 "$SELFT"; }
+[ "$(grep -c '^  SKIP' "$SELFT")" = 0 ] && echo "guard 1c1: no SKIP (the landed records and the corpus were found on this host)" || guard_fail "guard 1c1: the selftest SKIPPED a section"
+grep -q "^  PASS F FINAL identical over 3 corpus variants" "$SELFT" \
+  && echo "guard 1c2: the O2 invariance proof RAN against THIS host's real corpus plus invented rows, and passed" \
+  || guard_fail "guard 1c2: the O2 invariance proof did not run against the real corpus on this host"
+grep -q "^  PASS E .python3 cRD1_route_score.py <runsdir>. exits 0" "$SELFT" && grep -q "^  PASS E a dropped run -> INCOMPLETE rc 2" "$SELFT" \
+  && echo "guard 1c3: the DOCUMENTED one-argument invocation reached FINAL on synthetic runs; a dropped run -> INCOMPLETE" \
+  || guard_fail "guard 1c3: the documented invocation / dropped-run check did not pass"
+grep -q "^  PASS C ZERO corpus rows OUTSIDE crd1 carry a seed of the block 196..198" "$SELFT" && grep -q "^  PASS C ZERO corpus rows carry the crd1- prefix" "$SELFT" \
+  && echo "guard 1c4: the scorer's own fresh-seed / fresh-prefix checks ran and passed" \
+  || guard_fail "guard 1c4: fresh-seed / prefix check did not pass"
+grep -q "^  PASS B csh1_design.derive_gammas re-derives Q_M = LAMBDA 0.000315" "$SELFT" \
+  && grep -q "^  PASS B the PREMISE: the landed OFF cell cwd5 W1" "$SELFT" && grep -q "^  PASS B the DOSE word" "$SELFT" \
+  && echo "guard 1c5: LAMBDA RE-DERIVED from the landed cwd5 k01W1 records; the OFF premise (cwd5 W1 COLLAPSE) and the dose words re-read" \
+  || guard_fail "guard 1c5: the derivation / calibration on landed records did not pass"
+grep -q "^  PASS C SIGMA_R18ALL: the FROZEN literal 0.636565585885168 IS the FILTERED value" "$SELFT" \
+  && echo "guard 1c6: the frozen floor 0.636566 (df 274) IS the corpus_exclusions.filter_rows value on the CURRENT corpus" \
+  || guard_fail "guard 1c6: the frozen floor was not shown to be the filtered value on the current corpus"
+[ "$(grep -c "^  PASS A [STA][RI][SL]'s flags == the landed cwd5-k[0L][1W]*-s146 ARGS line" "$SELFT")" = 6 ] \
+  && echo "guard 1c7: every arm == the landed cwd5 k01W1 / kLW1 ARGS line, flag for flag and in order (AI*: wd only)" \
+  || guard_fail "guard 1c7: the landed-ARGS checks did not pass"
+echo "guard 1c: scorer sha256 $(sha "$SC")"
+
+grep -q '^crd1-' "$CSVP" && guard_fail "guard 2: crd1-* already in the CSV" || echo "guard 2: no crd1-* row in the corpus"
+NOUT=$(ls "$WS/runs"/crd1-*.out 2>/dev/null | wc -l | tr -d ' ')
+[ "${NOUT:-0}" = 0 ] && echo "guard 2b: no crd1-*.out on disk" || guard_fail "guard 2b: $NOUT crd1-*.out already exist"
+NSEED=$(grep -h -m1 '^ARGS:' "$WS/runs"/*.out 2>/dev/null | grep -c -E -- '--seed (19[6-8])( |$)')
+[ "${NSEED:-0}" = 0 ] && echo "guard 2d: ZERO .out ARGS lines under $WS/runs carry a seed of the block 196..198" \
+                      || guard_fail "guard 2d: $NSEED .out files already ran a seed of 196..198"
+NG=$(grep -l -m1 '^DECAY_ROUTE: on' "$WS/runs"/*.out 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 2c: $NG existing .out files under \$WS/runs print a DECAY_ROUTE: on witness (DISCLOSURE: 0 expected before 306 / 307)"
+if command -v sacct >/dev/null 2>&1; then
+  NS=$(sacct -u "$USER_NAME" -S 2025-01-01 -X -n -o JobName%60 2>/dev/null | awk '{print $1}' | grep -c '^crd1-')
+  [ "${NS:-0}" = 0 ] && echo "guard 2e: sacct all-time: 0 crd1-* jobs" || guard_fail "guard 2e: sacct shows $NS crd1-* jobs already"
+  NQ=$(squeue -h -u "$USER_NAME" -o '%j' 2>/dev/null | grep -c '^crd1-')
+  [ "${NQ:-0}" = 0 ] && echo "guard 2f: 0 crd1-* in squeue" || guard_fail "guard 2f: $NQ crd1-* already queued"
+fi
+
+bash "$STAGEW" >/tmp/crd1_stagew.$$ 2>&1 \
+  && { echo "guard 4a1: cDR1_stage_harness.sh (verify mode) VERIFIES cdr1's tree, which crd1 uses UNCHANGED:"; grep -E 'V-a|V-h|V-d|V-c|VERIFIED' /tmp/crd1_stagew.$$ | sed 's/^/          /'; } \
+  || { guard_fail "guard 4a1: cdr1's tree is NOT consistent"; tail -20 /tmp/crd1_stagew.$$; }
+[ -d "$HARN/data/cifar-100-python" ] && echo "guard 3: cifar-100-python visible under $HARN/data" || guard_fail "guard 3: CIFAR-100 not visible"
+[ "$(sha "$BNH")" = "$BN_SHA" ] && echo "guard 3b: build_network.py == $BN_SHA" || guard_fail "guard 3b: build_network.py"
+[ "$(sha "$HFH")" = "$HF_SHA" ] && [ "$(sha "$HFH.pre_decayroute")" = "$HF_PRE_SHA" ] \
+  && echo "guard 3c: HF.py == $HF_SHA (PATCH_DECAYROUTE), HF.py.pre_decayroute == $HF_PRE_SHA (the live HF.py)" || guard_fail "guard 3c: the tree's HF.py is not cdr1's"
+[ "$(sha "$RUNNER")" = "$RUNNER_SHA" ] && echo "guard 3e: runner == $RUNNER_SHA (cdr1's run_cifar_cdr1.sh)" || guard_fail "guard 3e: runner sha"
+[ "$(sha "$HARN/train.py")" = "$TRAIN_SHA" ] && echo "guard 3f: train.py == $TRAIN_SHA" || guard_fail "guard 3f: train.py sha"
+
+# ---- guard 4h: the harness-null for this batch's wiring, on the login node's CPU (no GPU) ----------------------------
+GLOG=/tmp/crd1_rcheck.$$
+python3 "$GCK" "$HARN" "$DES" >"$GLOG" 2>&1
+if [ $? = 0 ] && grep -q "^ROUTE CPU CHECK: ALL PASS$" "$GLOG" && [ "$(grep -c '^  FAIL' "$GLOG")" = 0 ] \
+   && [ "$(grep -c '^  PASS R2 weights BITWISE' "$GLOG")" = 6 ] && [ "$(grep -c '^  PASS R2 trace BITWISE' "$GLOG")" = 6 ] \
+   && [ "$(grep -c '^  PASS R3 NON-VACUITY' "$GLOG")" = 6 ] && [ "$(grep -c '^  PASS R1 exactly one DECAY_ROUTE line' "$GLOG")" = 6 ] \
+   && [ "$(grep -c '^  PASS R4 ' "$GLOG")" = 2 ]; then
+  echo "guard 4h: crd1_route_cpu_check ALL PASS ($(grep -c '^  PASS' "$GLOG") PASS / 0 FAIL): every arm's OWN ARGS + DECAY_ROUTE value"
+  echo "          print its registered witness and reach the patched update BITWISE (weights 6/6, trace 6/6), OFF's formula"
+  echo "          FAILS on every arm (6/6), and the two wrong wd combinations are LOUD (2/2); CPU only"
+  mkdir -p "$SAVE"; cp "$GLOG" "$SAVE/route_cpu_check$([ "$SUBMIT" = 1 ] || echo .dryrun).log"
+else
+  guard_fail "guard 4h: the route CPU check did not pass"; grep '^  FAIL\|Traceback\|Error' "$GLOG" | head -10
+fi
+
+python3 - "$DES" "$NET" "$NTENS" "$TOTPAR" "$SEEDS" "$ARMS" "$BN_SHA" "$HF_SHA" "$RUNNER_SHA" "$STAGEW" "$GPU_CONSTRAINT" \
+          "$NJOBS" "$WALL" "$MST" "$A0" "$DSET" "$EPOCHS" "$BATCH" "$CLIP_C" "$PROBE" "$LAMBDA_TOKEN" "$TRAIN_SHA" "$HF_PRE_SHA" "$PATCH_SHA" <<'PYEOF' || guard_fail "guard 4c': launcher / design / stage-script literals disagree"
+import sys, re, importlib.util
+spm = importlib.util.spec_from_file_location("crd1_design", sys.argv[1]); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+(net, ntens, totpar, seeds, arms, bn, hf, runner, stage, gpu, njobs, wall, mst, a0, dset, ep, bat, clip, probe, lamt, trs, hfpre, patch) = sys.argv[2:25]
+bad = []
+if tuple(arms.split()) != Dm.ARMS: bad.append("ARMS")
+if net != Dm.NET or int(ntens) != Dm.NTENS or int(totpar) != Dm.TOTPAR: bad.append("NET/NTENS/TOTPAR")
+if tuple(int(x) for x in seeds.split()) != Dm.SEEDS: bad.append("SEEDS")
+if (bn, hf, runner, trs, hfpre, patch) != (Dm.BN_SHA, Dm.HF_SHA, Dm.RUNNER_SHA, Dm.TRAIN_SHA, Dm.HF_PRE_SHA, Dm.PATCH_SHA): bad.append("SHAS")
+if gpu != Dm.GPU_CONSTRAINT or int(njobs) != Dm.NJOBS or wall != Dm.WALL: bad.append("GPU/NJOBS/WALL")
+if (mst, a0, dset, int(ep), int(bat), clip, int(probe), lamt) != (Dm.MST, Dm.A0, Dm.DSET, Dm.EPOCHS, Dm.BATCH, Dm.CLIP, Dm.PROBE, Dm.LAMBDA_TOKEN): bad.append("CELL")
+blk = open(stage).read()
+for name, v in (("BN_SHA", bn), ("HF_POST_SHA", hf), ("HF_SHA", hfpre), ("TRAIN_SHA", trs)):
+    m = re.search(r"^%s=([0-9a-f]{64})" % name, blk, re.M)
+    if not m or m.group(1) != v: bad.append("stage " + name)
+if bad:
+    print("!!! guard 4c': disagreement on %s" % sorted(bad)); raise SystemExit(1)
+print("guard 4c': ARMS, SEEDS, NET, NTENS, TOTPAR, the cell, LAMBDA, NJOBS, WALL, the GPU constraint and the tree / runner / train / patch shas")
+print("           agree in launcher / design / cdr1's stage script (HF post / pre, build_network, train)")
+for a in Dm.ARMS:
+    print("           %-4s %-9s wd %-3s DECAY_ROUTE=%-22s -> %d flags" % (a, Dm.SPEC[a], Dm.WDTOK[a], Dm.ROUTE[a], len(Dm.args_pairs(a, 0, "x"))))
+PYEOF
+
+# ---- guard 4: THE LIVE MODEL AND THE LIVE OPTIMISER, per arm, from cdr1's tree, DECAY_ROUTE set per arm (CPU construction only) --------------
+mkdir -p "$SAVE"
+MTMP=/tmp/crd1_manifest.$$
+python3 - "$HARN" "$MTMP" "$DES" <<'PYEOF' || guard_fail "guard 4: live model / optimiser / witness / manifest check FAILED"
+import sys, os, io, ast, types, argparse, contextlib, importlib.util, tempfile, shutil
+harn, out, desp = sys.argv[1], sys.argv[2], sys.argv[3]
+spm = importlib.util.spec_from_file_location("crd1_design", desp); Dm = importlib.util.module_from_spec(spm); spm.loader.exec_module(Dm)
+sys.path.insert(0, harn); os.chdir(harn)
+import torch
+from build_network import build_network
+from Optimizers.build_optimizer import build_optimizer
+src = open(os.path.join(harn, "train.py")).read()
+fn = [n for n in ast.parse(src).body if isinstance(n, ast.FunctionDef) and n.name == "parse_args"]
+TR = types.ModuleType("train_parse_args"); TR.argparse = argparse
+exec(compile(ast.Module(body=fn, type_ignores=[]), os.path.join(harn, "train.py"), "exec"), TR.__dict__)
+net = build_network(Dm.NET, "cpu")
+nps = [(n, p.data.size()) for n, p in net.named_parameters()]
+names = [n for n, _ in nps]; numel = [int(p.numel()) for _n, p in net.named_parameters()]
+own = {}
+for mn, m in net.named_modules():
+    for pn, _p in m.named_parameters(recurse=False):
+        own[(mn + "." if mn else "") + pn] = type(m).__name__
+bad = 0
+T, tot = len(nps), sum(numel)
+print("guard 4: live %s from cdr1's tree -- %d tensors, %d parameters" % (Dm.NET, T, tot))
+if T != Dm.NTENS or tot != Dm.TOTPAR or names != Dm.NAMES:
+    bad += 1; print("!!! guard 4: the live model is not the registered one")
+lines = ["BATCH %s" % Dm.PREFIX, "NETWORK %s" % Dm.NET, "NUM_PARAM_TENSORS %d" % T, "TOTAL_PARAMS %d" % tot,
+         "CLIP_C %s" % Dm.CLIP, "EPOCHS %d" % Dm.EPOCHS, "META_STEPS %d" % (Dm.EPOCHS * Dm.STEPS_PER_EPOCH),
+         "SEEDS %s" % ",".join(str(s) for s in Dm.SEEDS), "LAMBDA %s" % Dm.LAMBDA_TOKEN]
+lines += ["TENSOR %d %s %d %s ndim=%d" % (i + 1, names[i], numel[i], own[names[i]], len(nps[i][1])) for i in range(T)]
+KEYS = ("VOTE_W", "BETA_HOLD", "COMP_HOLD", "WINDOW_HOLD", "GROUP_HOLD", "REST_HOLD", "DECAY_MASK", "DECAY_ROUTE")
+tmpd = tempfile.mkdtemp(prefix="crd1_live_")
+try:
+    for arm in Dm.ARMS:
+        for k in KEYS:
+            os.environ.pop(k, None)
+        argv = []
+        for f, v in Dm.args_pairs(arm, Dm.SEEDS[0], tmpd):
+            argv += ["--" + f, v]
+        sys.argv = ["train.py"] + argv
+        args = TR.parse_args()
+        for k in ("normalizer_param_base", "momentum_param_base", "weight_decay_base", "Lion_beta2_base",
+                  "normalizer_param_meta", "momentum_param_meta", "weight_decay_meta", "Lion_beta2_meta", "meta_stepsize"):
+            if getattr(args, k) == -1:
+                setattr(args, k, None)
+        args.device = torch.device("cpu")
+        os.environ.update({"PROBE": str(Dm.PROBE), "PROBE_TENSOR": "1", "PROBE_DIR": os.path.join(tmpd, "p_" + arm),
+                           "BETA_CLIP": Dm.CLIP, "HIER": "none", "SCHED": "none", "AUGMENT": "1",
+                           "DECAY_ROUTE": Dm.ROUTE[arm]})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            opt = build_optimizer(net, args, None)
+            opt._pt_init()
+        L = buf.getvalue().splitlines()
+        got = dict((k, [ln for ln in L if ln.startswith(k)]) for k in KEYS)
+        pt = [ln for ln in L if ln.startswith("PROBE_TENSOR:")]
+        ptw = pt[0].split(" dir=")[0] if len(pt) == 1 else "(none)"
+        drw = got["DECAY_ROUTE"][0] if len(got["DECAY_ROUTE"]) == 1 else "(none or several)"
+        ok = (all(got[k] == [] for k in Dm.NO_LINE_KINDS) and drw == Dm.dr_witness(arm)
+              and ptw == Dm.pt_witness_prefix(arm) and opt.stepsize_type == Dm.SPEC[arm]
+              and int(opt.beta[0].reshape(-1).numel()) == (1 if Dm.SPEC[arm] == "scalar" else Dm.NTENS)
+              and opt.base_update.__name__ == "_dr_SGDm_base_update" and opt.meta_update.__name__ == "Lion_meta_update"
+              and opt.args_base["alg"] == "SGDm" and opt.args_meta["alg"] == "Lion"
+              and opt._dr_mode == Dm.MODE[arm] and opt._dr_lam == Dm.LAM_OF[arm]
+              and float(opt.args_base["weight_decay"]) == Dm.WD[arm] and float(opt.args_meta["weight_decay"]) == 0.0
+              and isinstance(opt.gamma, float) and opt.gamma == 1.0)
+        print("guard 4: %-4s %-9s wd %s base_update=%s meta_update=%s mode=%s lambda=%r n_beta=%d witness `%s` | `%s` -> %s"
+              % (arm, opt.stepsize_type, opt.args_base["weight_decay"], opt.base_update.__name__, opt.meta_update.__name__,
+                 getattr(opt, "_dr_mode", None), getattr(opt, "_dr_lam", None), int(opt.beta[0].reshape(-1).numel()), ptw, drw,
+                 "as registered" if ok else "MISMATCH"))
+        if not ok:
+            bad += 1; print("!!! guard 4: %s: %r" % (arm, got))
+        lines.append("ARM %s CELL %s GRAIN %s WD %s DECAY_ROUTE %s" % (arm, Dm.CELL_OF[arm], opt.stepsize_type, Dm.WDTOK[arm], Dm.ROUTE[arm]))
+        lines.append("ARGS %s %s" % (arm, Dm.args_string(arm, 0, "<save>")))
+        lines.append("PTWITNESS %s %s" % (arm, ptw))
+        lines.append("DRWITNESS %s %s" % (arm, drw))
+finally:
+    for k in ("PROBE", "PROBE_TENSOR", "PROBE_DIR", "DECAY_ROUTE"):
+        os.environ.pop(k, None)
+    shutil.rmtree(tmpd, ignore_errors=True)
+txt = "\n".join(lines) + "\n"
+if txt != Dm.manifest_text():
+    a_, b_ = txt.splitlines(), Dm.manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("!!! guard 4d: live manifest differs at line %d:\n    live      %s\n    synthetic %s" % (k + 1, (a_[k] if k < len(a_) else "")[:200], (b_[k] if k < len(b_) else "")[:200])); break
+    bad += 1
+else:
+    print("guard 4d: the LIVE manifest (live model, live optimisers, live PROBE_TENSOR and DECAY_ROUTE witnesses) is BYTE-IDENTICAL to crd1_design.manifest_text() (%d bytes)" % len(txt))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)
+PYEOF
+MANIFEST="$SAVE/PARTITION-MANIFEST.txt"; MANIFEST2="$WS/runs/crd1-PARTITION-MANIFEST.txt"
+if [ -s "$MTMP" ]; then
+  if [ -f "$MANIFEST" ] && ! cmp -s "$MTMP" "$MANIFEST"; then
+    guard_fail "guard 4b3: an existing $MANIFEST differs from the live one -- refusing to overwrite"
+  else
+    cp "$MTMP" "$MANIFEST"; cp "$MTMP" "$MANIFEST2"
+    echo "guard 4b3: manifest ($(wc -c < "$MANIFEST") bytes, sha $(sha "$MANIFEST" | cut -c1-16)...) -> $MANIFEST and $MANIFEST2"
+  fi
+else
+  guard_fail "guard 4b3: no manifest"
+fi
+
+PROV="$SAVE/PROVENANCE.txt"; [ "$SUBMIT" = 1 ] || PROV="$SAVE/PROVENANCE.dryrun.txt"
+{ echo "MODE $([ "$SUBMIT" = 1 ] && echo submit || echo dry-run)"
+  echo "BUILD_NETWORK_SHA256 $(sha "$BNH")"
+  echo "HF_SHA256 $(sha "$HFH")"
+  echo "HF_PRE_SHA256 $(sha "$HFH.pre_decayroute")"
+  echo "PATCH_SHA256 $(sha "$PATCHF")"
+  echo "RUNNER_SHA256 $(sha "$RUNNER")"
+  echo "TRAIN_SHA256 $(sha "$HARN/train.py")"
+  echo "SCORER_SHA256 $(sha "$SC")"
+  echo "DESIGN_SHA256 $(sha "$DES")"
+  echo "CSH1_DESIGN_SHA256 $(sha "$HDES")"
+  echo "CWD_DESIGN_SHA256 $(sha "$WDES")"
+  echo "COMMON_SHA256 $(sha "$COM")"
+  echo "ROUTE_CHECK_SHA256 $(sha "$GCK")"
+  echo "ROUTE_CHECK_LOG_SHA256 $(sha "$GLOG" 2>/dev/null)"
+  echo "LAUNCHER_SHA256 $(sha "$SELF")"
+  echo "REGISTERED_COMMIT ${CRD1_REGISTERED_COMMIT:-$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)}"
+  echo "HARNESS_DIR $HARN"
+  echo "LIVE_HF_SHA256 $(sha "$LIVE/Optimizers/HF.py")"
+  echo "BUILD_OPTIMIZER_SHA256 $(sha "$HARN/Optimizers/build_optimizer.py")"
+  echo "LOAD_DATA_SHA256 $(sha "$HARN/load_data.py")"
+  echo "STAGE_MANIFEST_SHA256 $(sha "$WS/harness_cdr1/STAGE-MANIFEST.txt")"
+  echo "CORPUS_SHA256 $(sha "$CSVP")"
+  echo "CORPUS_EXCLUSIONS_SHA256 $(sha "$EXCLT")"
+  echo "UTC $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "ARMS $ARMS"; echo "SEEDS $SEEDS"; echo "EPOCHS $EPOCHS"; echo "PROBE $PROBE PROBE_TENSOR $PT"
+  echo "ROUTES SR=shrink_only@0.1 TR=trace_only@0.1 AI=alpha_indep:$LAMBDA_TOKEN@0"
+  echo "GPU_CONSTRAINT $GPU_CONSTRAINT PARTITIONS $PARTS"
+  echo "VOTE_W BETA_HOLD GROUP_HOLD REST_HOLD DECAY_MASK unset on every arm; DECAY_ROUTE set per arm by --export"; } > "$PROV"
+[ "$SUBMIT" = 1 ] && cp "$PROV" "$WS/runs/crd1-PROVENANCE.txt"
+echo "guard 4g: provenance written to $PROV"
+
+guard_parts_for_wall "$PARTS" "$WALL" || guard_fail "guard 5a: PARTS/WALL disagree"
+case ",$PARTS," in *,gpu-mig-40g,*|*,gpu-a100-80g,*|*,gpu-2080ti-11g,*) guard_fail "guard 5b: a partition without L4 nodes is in $PARTS" ;; *) echo "guard 5b: partitions $PARTS all carry L4 nodes; --constraint=$GPU_CONSTRAINT" ;; esac
+FREE=$(df -BG "$WS" 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+PEND=$(squeue -h -u "$USER_NAME" -t PENDING 2>/dev/null | wc -l | tr -d ' ')
+echo "guard 5: ${FREE:-?} GB free on \$WS; $PEND jobs pending, adding $NJOBS"
+[ "${PEND:-0}" -le 120 ] || guard_fail "guard 5: $PEND pending, over the cap of 120"
+
+python3 - "$SC" "$WS/runs" "$MANIFEST" <<'PYEOF' || guard_fail "guard 8: the scorer's DEFAULT manifest resolution does not find the manifest"
+import sys, os, importlib.util
+spec = importlib.util.spec_from_file_location("crd1", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p, how = m.resolve_manifest(sys.argv[2], None)
+print("guard 8: with NO --manifest, `%s <runsdir>` resolves the manifest to %s (%s)" % (os.path.basename(sys.argv[1]), p, how))
+raise SystemExit(0 if p and os.path.realpath(p) == os.path.realpath(sys.argv[3]) else 1)
+PYEOF
+
+RUN_CIF=$(awk '$1=="cd"{print $2; exit}' "$RUNNER" 2>/dev/null)
+[ "$(cd "$HARN" 2>/dev/null && pwd -P)" = "$(cd "$RUN_CIF" 2>/dev/null && pwd -P)" ] \
+  && echo "guard 9: the runner cd's into $RUN_CIF -- the SAME tree guards 3/4/4h tested" \
+  || guard_fail "guard 9: guards tested $HARN but the runner cd's into $RUN_CIF"
+
+if [ "$FAIL" = 1 ]; then
+  if [ "$SUBMIT" = 1 ]; then echo "!!! SUBMIT ABORTED -- nothing submitted."; exit 2; fi
+  echo; echo "!!! ONE OR MORE GUARDS FAILED.  DRY RUN: the composition below still prints, but --submit WOULD ABORT."; echo
+fi
+
+N=0; REJ=0; BAD=0
+dget() { python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('d',sys.argv[1]); d=importlib.util.module_from_spec(s); s.loader.exec_module(d); print(eval(sys.argv[2]))" "$DES" "$1"; }
+for S in $SEEDS; do
+  for ARM in $ARMS; do
+    RN="crd1-$ARM-s$S"
+    PDIR="$SAVE/probe_$RN"
+    TARGS=$(dget "d.args_string('$ARM', $S, '$SAVE')")
+    EXPECT=$(dget "' '.join('%s=%s' % kv for kv in d.args_pairs('$ARM', $S, '$SAVE'))")
+    ROUTEV=$(dget "d.ROUTE['$ARM']")
+    WDT=$(dget "d.WDTOK['$ARM']")
+    NFL=$(printf '%s\n' "$EXPECT" | wc -w | tr -d ' ')
+    CMD="sbatch --job-name=$RN --partition=$PARTS --constraint=$GPU_CONSTRAINT --gres=gpu:1 --cpus-per-task=6 \
+--mem=16G --time=$WALL --export=ALL,AUGMENT=$AUG,BETA_CLIP=$CLIP_C,HIER=none,SCHED=none,PROBE=$PROBE,PROBE_TENSOR=$PT,PROBE_DIR=$PDIR,DECAY_ROUTE=$ROUTEV \
+$RUNNER $TARGS"
+    # shellcheck disable=SC2086
+    guard_presubmit "$CMD" $EXPECT >/dev/null 2>&1 \
+      || { echo "!!! RULE 20 PRE-CHECK FAILED for $RN"; guard_presubmit "$CMD" $EXPECT; BAD=$((BAD+1)); }
+    NGOT=$(printf '%s\n' "$TARGS" | grep -o -- ' --[a-zA-Z0-9-]*\|^--[a-zA-Z0-9-]*' | wc -l | tr -d ' ')
+    [ "$NGOT" = "$NFL" ] || { echo "!!! $RN: $NGOT train.py flags composed, the design registers $NFL"; BAD=$((BAD+1)); }
+    [ "$(printf '%s\n' "$TARGS" | grep -o -- '--weight-decay-base [^ ]*')" = "--weight-decay-base $WDT" ] \
+      || { echo "!!! $RN: the composed --weight-decay-base token is not the arm's"; BAD=$((BAD+1)); }
+    [ "$(printf '%s\n' "$CMD" | grep -o 'DECAY_ROUTE=[^ ,]*')" = "DECAY_ROUTE=$ROUTEV" ] \
+      || { echo "!!! $RN: the --export list does not carry exactly DECAY_ROUTE=$ROUTEV"; BAD=$((BAD+1)); }
+    NVW=$(printf '%s\n' "$CMD" | grep -c 'VOTE_W=\|BETA_HOLD=\|GROUP_HOLD=\|REST_HOLD=\|COMP_HOLD=\|WINDOW_HOLD=\|DECAY_MASK=')
+    [ "$NVW" = 0 ] || { echo "!!! $RN carries a hold / mask variable"; BAD=$((BAD+1)); }
+    [ "$(printf '%s\n' "$CMD" | grep -o -- '--constraint=[^ ]*')" = "--constraint=$GPU_CONSTRAINT" ] || { echo "!!! $RN lacks --constraint=$GPU_CONSTRAINT"; BAD=$((BAD+1)); }
+    if [ "$SUBMIT" = 1 ]; then
+      mkdir -p "$PDIR"
+      eval "$CMD" >/dev/null 2>&1 && N=$((N+1)) || REJ=$((REJ+1))
+    else
+      echo "$CMD"; echo "    ($NFL flags, every one pinned by the RULE 20 pre-check; DECAY_ROUTE=$ROUTEV)"; echo; N=$((N+1))
+    fi
+  done
+done
+echo "guard 6: $N composed command lines, $BAD failed the RULE 20 / flag-count / wd / DECAY_ROUTE / hold / constraint pre-check"
+[ "$BAD" = 0 ] || { echo "!!! composed lines are malformed"; exit 2; }
+[ "$N" = "$NJOBS" ] || { echo "!!! composed $N lines, the design says $NJOBS"; exit 2; }
+echo "---- $N jobs ($( [ "$SUBMIT" = 1 ] && echo 'ACCEPTED BY SLURM' || echo 'DRY RUN, NOTHING SUBMITTED' )); $REJ rejected ----"
+
+if [ "$SUBMIT" = 1 ]; then
+  grep -qx 'crd1-' "$REPO/bin/PROTECTED.txt" 2>/dev/null || echo "crd1-" >> "$REPO/bin/PROTECTED.txt"
+  FIRST_EXPECT=$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('d',sys.argv[1]); d=importlib.util.module_from_spec(s); s.loader.exec_module(d); print(' '.join('%s=%s' % kv for kv in d.args_pairs('SRS', 196, sys.argv[2]) if kv[0] in ('optimizer','alg-base','momentum-param-base','weight-decay-base','alg-meta','dataset','NN-name','batch-size','meta-stepsize','alpha0','num-epochs','weight-decay-meta')))" "$DES" "$SAVE")
+  # shellcheck disable=SC2086
+  guard_postlaunch "$WS/runs" "crd1-" $FIRST_EXPECT; RC=$?
+  case $RC in
+    0) echo "guard 7: RULE 20 post-launch check PASSED against a run's own ARGS line (the batch-wide flags); FULL coverage: bin/cRD1_rule20.sh" ;;
+    2) echo "guard 7: UNVERIFIED -- no crd1 job started inside the window; run bin/cRD1_rule20.sh once all have started" ;;
+    *) echo "!!! guard 7: RULE 20 MISMATCH -- scancel THIS batch only:"
+       echo "    squeue -h -u $USER_NAME -o '%i %j' | awk '\$2 ~ /^crd1-/ {print \$1}' | xargs -r scancel" ;;
+  esac
+  echo "SCORE IT WITH, AND ONLY WITH (at 18/18 RUN_DONE):  python3 $REPO/analysis/cRD1_route_score.py $WS/runs"
+else
+  echo
+  echo "NOTHING WAS SUBMITTED.  The submitting form is:  bash bin/cRD1_route.sh --submit"
+  [ "$FAIL" = 1 ] && { echo "(dry run ended with guard failures -- exit 2)"; exit 2; }
+fi
+exit 0

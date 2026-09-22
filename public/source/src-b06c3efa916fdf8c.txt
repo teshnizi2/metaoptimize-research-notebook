@@ -1,0 +1,1202 @@
+#!/usr/bin/env python3
+"""cAI1_alphaindep_score.py -- THE REGISTERED SCORER OF `cai1` (CORRECTIONS 306; ICML-PLAN row 1.6's alpha-independent
+half, stamp DECOUPLED-NOT-TESTED).
+
+QUESTION.  Does the count-matched partition audit's sign -- uniform `chunk777` beats architecture-aligned `nodewise` at
+matched group count -- survive, and does cgw1's SCALAR-BEATS-BEST hold, when the base optimiser's weight decay no
+longer moves with the learned step size?  Or is the audit effect an ARTEFACT of the harness's alpha-scaled decay?
+
+DESIGN (analysis/cai1_design.py).  cgw1's cell verbatim (ResNet18 / CIFAR-10 / SGDm 0.99 + Lion 0.99/0.9 / ms 1e-4 /
+alpha0 1e-3 / box -15:-2.3026 / 100 ep / AUGMENT=1 / PROBE=5) with `--weight-decay-base 0` and PATCH_DECAYROUTE's
+alpha-independent decay (w <- w - LAMBDA*w - a*u; h <- gamma*(1 - LAMBDA)*h - a*u) at TWO standard-recipe LAMBDAs:
+I5 = 5e-5 (lr*wd of SGD 0.1 / 5e-4) and I4 = 5e-4 (the same with its 0.9 momentum amplification).  Four grains at each:
+`ch` chunk777, `nd` nodewise, `k01` scalar, `kL` layerwise.  Seeds {192..195} on every arm.  32 runs.
+
+DOCUMENTED INVOCATION
+    python3 analysis/cAI1_alphaindep_score.py <runsdir>        # runsdir = $WS/runs (or its cai1/ subdirectory)
+    python3 analysis/cAI1_alphaindep_score.py --selftest [--runsdir <dir>] [--csv <all_runs.csv>]
+EXIT  0 FINAL printed | 2 INCOMPLETE | 3 HARNESS-FAIL (a registered run is not the run the design says it is)
+
+EVERY READING IS WITHIN THIS BATCH.  Levels are plateau5 = mean TEST accuracy over epochs 95-99 from each run's OWN raw
+`.out` (never the CSV).  SIGMA_USED = max(the FROZEN prior, the in-batch pooled within-arm sd) (O2): the prior is cgw1's
+definition read ONCE through corpus_exclusions.filter_rows on the 3,383-row corpus and is a literal here; the corpus
+line printed at run time is DISCLOSURE ONLY.  cgw1's landed alpha-scaled readings (cai1_design.CGW1_*) are the
+BETWEEN-BATCH reference quoted in the licences and read by non-gating stamps only.
+
+THE DECAY IS GATED, NOT ASSUMED (G-WITNESS, G-SHRINK).  Each run must print exactly ONE `DECAY_ROUTE: on` line, its own
+rung's registered one (the two rungs' ARGS lines are identical but for --run-name, so this line and the probe records
+are what separate them), and EVERY one of its 10,000 probe records must carry dr_mode alpha_indep, dr_lam == its rung's
+LAMBDA, dr_n == step + 2, dr_shrink_applied == LAMBDA, dr_trace_decay == 1 - LAMBDA, and a MEASURED per-step shrink
+dr_shrink_meas within SHRINK_TOL (1 %) of LAMBDA (the proof job's worst case was 3.98e-4 relative, 305.5).
+
+THE REGISTERED DECISION (306.5).  cgw1's rung_state and scalar_of VERBATIM, bars VERBATIM.  Per rung r in {I5, I4}:
+D_r = plateau5(ch_r) - plateau5(nd_r), SE_r = SIGMA_USED * sqrt(1/4 + 1/4).  Rung state, first match: DIVERGED (a ch/nd
+seed range > 2.0) | UNHEALTHY (a ch/nd arm mean < 85.0) | BOXBOUND (the published 5 % box gate) | REVERSES (D <= -0.15
+and D < -2 SE) | VANISHES (D <= +0.15 AND D + 2 SE < +0.5556) | SURVIVES (D >= +0.30 and D > 2 SE) | UNDECIDED.
+Groups: BAD = {DIVERGED, UNHEALTHY, BOXBOUND}, S = SURVIVES, X = {VANISHES, REVERSES} ("absent"), U = UNDECIDED.
+PRIMARY, first match (exhaustive over the 49 state pairs):
+    both BAD                         -> AI-UNREADABLE
+    one BAD, the other S / X / U     -> AI-ONE-RUNG-SURVIVES / AI-ONE-RUNG-ABSENT / AI-ONE-RUNG-UNDECIDED
+    S, S                             -> AI-SURVIVES
+    X, X, either REVERSES            -> AI-ARTEFACT-REVERSES
+    X, X                             -> AI-ARTEFACT-VANISHES
+    S and X                          -> AI-LAMBDA-DEPENDENT
+    S and U                          -> AI-SURVIVES-ONE-LAMBDA
+    X and U                          -> AI-ABSENT-ONE-LAMBDA
+    U, U                             -> AI-UNDECIDED
+"The audit effect is an artefact of alpha-scaled decay" is AI-ARTEFACT-VANISHES / AI-ARTEFACT-REVERSES: absent at BOTH
+standard-recipe LAMBDAs, against cgw1's in-batch SURVIVES at alpha-scaled 0.1 and 1e-2 (between batch).
+SCALAR (co-reported), per rung: cgw1's scalar_of on T_ch = k01 - ch, T_nd = k01 - nd -> one of SCALAR-BEATS-BEST /
+-TIES-BEST / -BELOW-BEST / -UNRESOLVED / -DIVERGED / -COLLAPSED / -UNREADABLE.  Combined, first match:
+    both gated (DIVERGED / COLLAPSED / UNREADABLE)  -> SC-UNREADABLE
+    BEATS, BEATS                                   -> SC-BEATS-BOTH          (SCALAR-BEATS-BEST holds at both LAMBDAs)
+    BELOW, BELOW                                   -> SC-BELOW-BOTH          (partitioning pays: the scalar reading is
+                                                                              an artefact of alpha-scaled decay HERE)
+    both in {BEATS, TIES}                          -> SC-TIES-OR-BEATS-BOTH
+    one in {BEATS, TIES}, the other BELOW          -> SC-LAMBDA-DEPENDENT
+    anything else                                  -> SC-PARTIAL
+BOUNDS PRINTED ON EVERY FINAL: ONE-CELL, TWO-LAMBDAS-BRACKET, ALPHA-SCALED-REFERENCE-BETWEEN-BATCH,
+ROTATIONAL-EQUILIBRIUM-CONFOUND, SHRINK-MATCHED-NOT-RATIO-MATCHED, CONSTANT-SCHEDULE, FLOOR-READINGS-ARE-BOUNDS.
+"""
+import argparse
+import csv
+import glob
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("cai1_design", os.path.join(HERE, "cai1_design.py"))
+PREFIX = D.PREFIX
+
+# ---- FROZEN noise floor (O2).  cgw1's definition (ResNet18 / CIFAR10 / 100 ep / aug 1 / clip -15:-2.3026 / ms 1e-4 /
+# ---- alpha0 1e-3 / bs 100, pooled within the 15-key cells) through corpus_exclusions.filter_rows on results/all_runs.csv
+# ---- @ 3,383 rows (268 exclusion rows -> 3,115 kept) -- the value cvl1 froze at the same corpus (303.4). --------------
+SIGMA_PRIOR = 0.17818264951145454     # FILTERED; df 190, 34 cells, 227 rows
+SIGMA_PRIOR_DF = 190
+SIGMA_PRIOR_NAIVE = 1.034333          # UNFILTERED (6 d.p.; cgw1's wd-deviating rows join the cells) -- disclosure
+CORPUS_ROWS_AT_REG = 3383
+EXCL_ROWS_AT_REG = 268
+DEMO_R18ALL_AT_REG = 0.636566         # corpus_exclusions --check's noise-floor DEMONSTRATION (df 274), quoted, no bar
+SE4 = 0.125994                        # SIGMA_PRIOR * sqrt(2/4), 6 d.p.
+
+# ---- FROZEN bars (O2), cgw1's VERBATIM (291.6).  pp unless stated. --------------------------------------------------------
+SURV = 0.30
+NULLBAR = 0.15
+POOL_EXCLUDE = 0.5556
+RES = 2.0
+HEALTH_MIN = 85.0
+DIVERGED = 2.0
+BOXFREE_MAX = 0.05
+BOX_EPS = 1e-3
+MATCH = 0.50
+PL_LO, PL_HI = 95, 99
+WIN_STEP = PL_LO * D.STEPS_PER_EPOCH      # 47,500
+# ---- FROZEN decay gates (G-SHRINK) --------------------------------------------------------------------------------------
+SHRINK_TOL = 0.01        # |dr_shrink_meas / LAMBDA - 1| on EVERY record (proof worst case 3.98e-4, 305.5: 25x margin)
+APPLIED_TOL = 1e-9       # dr_shrink_applied is a float64 numel-mean of LAMBDA
+TRACE_TOL = 1e-12        # dr_trace_decay is a float64 numel-mean of 1 - LAMBDA
+
+BAD = ("DIVERGED", "UNHEALTHY", "BOXBOUND")
+ABSENT = ("VANISHES", "REVERSES")
+PRIMARY_TOKENS = ("AI-UNREADABLE", "AI-ONE-RUNG-SURVIVES", "AI-ONE-RUNG-ABSENT", "AI-ONE-RUNG-UNDECIDED",
+                  "AI-SURVIVES", "AI-ARTEFACT-REVERSES", "AI-ARTEFACT-VANISHES", "AI-LAMBDA-DEPENDENT",
+                  "AI-SURVIVES-ONE-LAMBDA", "AI-ABSENT-ONE-LAMBDA", "AI-UNDECIDED")
+SCALAR_TOKENS = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST", "SCALAR-BELOW-BEST", "SCALAR-UNRESOLVED",
+                 "SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+SC_GATED = ("SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+SC_TOKENS = ("SC-UNREADABLE", "SC-BEATS-BOTH", "SC-BELOW-BOTH", "SC-TIES-OR-BEATS-BOTH", "SC-LAMBDA-DEPENDENT",
+             "SC-PARTIAL")
+RUNG_STATES = ("DIVERGED", "UNHEALTHY", "BOXBOUND", "REVERSES", "VANISHES", "SURVIVES", "UNDECIDED")
+BOUNDS = ("ONE-CELL", "TWO-LAMBDAS-BRACKET", "ALPHA-SCALED-REFERENCE-BETWEEN-BATCH", "ROTATIONAL-EQUILIBRIUM-CONFOUND",
+          "SHRINK-MATCHED-NOT-RATIO-MATCHED", "CONSTANT-SCHEDULE", "FLOOR-READINGS-ARE-BOUNDS")
+
+_REF = ("cgw1 (between batch, alpha-scaled): D +0.3693 SURVIVES at 0.1 and +0.4533 SURVIVES at 1e-2")
+LICENCE = {
+    "AI-SURVIVES": "at this ONE cell the uniform partition beats the aligned one at matched count by at least the audit's "
+                   "+0.30 pp bar, resolved, under alpha-INDEPENDENT decay at BOTH standard-recipe shrinks (5e-5 and "
+                   "5e-4): the audit's sign is not an artefact of the harness's alpha-scaled decay HERE.  TMLR: the "
+                   "headline may drop its 'at alpha-scaled decay' qualifier for this cell only; DECOUPLED-NOT-TESTED "
+                   "becomes 'tested at one cell'.",
+    "AI-ARTEFACT-VANISHES": "under alpha-independent decay at BOTH standard-recipe shrinks the count-matched gap is at or "
+                            "below +0.15 pp (a BOUND, not a measured zero), while " + _REF + ": at this ONE cell the "
+                            "audit's sign is a property of alpha-scaled decay -- an ARTEFACT of it in the sense this "
+                            "batch can test.  TMLR: the headline must be stated as conditional on alpha-scaled decay, "
+                            "with this row beside it; and it carries ROTATIONAL-EQUILIBRIUM-CONFOUND (the partition may "
+                            "simply stop controlling the effective step of normalised tensors).",
+    "AI-ARTEFACT-REVERSES": "under alpha-independent decay the gap is absent at BOTH LAMBDAs and REVERSED (aligned beats "
+                            "uniform, resolved) at one or both, while " + _REF + ": at this ONE cell the audit's sign "
+                            "does not survive a change of decay form.  TMLR: the headline may not be stated without "
+                            "'under alpha-scaled decay'; the reversal is reported, bounded by ROTATIONAL-EQUILIBRIUM-"
+                            "CONFOUND.",
+    "AI-LAMBDA-DEPENDENT": "under alpha-independent decay the gap SURVIVES at one standard-recipe LAMBDA and is ABSENT at "
+                           "the other: at this cell the audit's sign depends on the decay STRENGTH within the standard "
+                           "bracket.  TMLR: report both rows; no 'artefact' and no 'robust' sentence.",
+    "AI-SURVIVES-ONE-LAMBDA": "the gap SURVIVES at one LAMBDA and is UNDECIDED at the other: report both intervals; "
+                              "no artefact sentence, and 'robust to the decay form' is licensed at the surviving "
+                              "LAMBDA only.",
+    "AI-ABSENT-ONE-LAMBDA": "the gap is ABSENT (a bound) at one LAMBDA and UNDECIDED at the other: report both intervals; "
+                            "the artefact sentence is NOT licensed (it needs both), and neither is a survive sentence.",
+    "AI-UNDECIDED": "the gap is between the bars (or unresolved) at both LAMBDAs: report the intervals; no seeds may be "
+                    "added after seeing them (108.6a); no survive / artefact sentence.",
+    "AI-ONE-RUNG-SURVIVES": "one LAMBDA rung is unreadable (diverged / unhealthy / box-bound -- itself a fact about that "
+                            "decay strength in this cell); at the other the gap SURVIVES: licensed at that LAMBDA only.",
+    "AI-ONE-RUNG-ABSENT": "one LAMBDA rung is unreadable; at the other the gap is ABSENT (a bound): the artefact sentence "
+                          "is NOT licensed (it needs both); report that rung's interval.",
+    "AI-ONE-RUNG-UNDECIDED": "one LAMBDA rung is unreadable and the other is undecided: report the levels and interval.",
+    "AI-UNREADABLE": "both LAMBDA rungs are unreadable: no partition reading under alpha-independent decay; the levels "
+                     "themselves are the finding.",
+}
+SC_LICENCE = {
+    "SC-BEATS-BOTH": "plain scalar is ABOVE both audit partitions by >= 0.30 pp, resolved, under alpha-independent decay "
+                     "at BOTH standard-recipe LAMBDAs: cgw1's SCALAR-BEATS-BEST (alpha-scaled 5e-4) is not an artefact "
+                     "of the decay form at this cell.",
+    "SC-BELOW-BOTH": "plain scalar is resolved BELOW an audit partition by >= 0.30 pp at BOTH LAMBDAs: under "
+                     "alpha-independent decay partitioning pays in this cell, so cgw1's SCALAR-BEATS-BEST is a property "
+                     "of alpha-scaled decay here -- an artefact of it for the practical-significance qualifier.",
+    "SC-TIES-OR-BEATS-BOTH": "at both LAMBDAs scalar ties (a BOUND: at most 0.30 pp below the better partition at the "
+                             "2 SE edge) or beats the audit partitions: under alpha-independent decay too, the partition "
+                             "buys nothing a single step size does not; the practical-significance qualifier stands.",
+    "SC-LAMBDA-DEPENDENT": "scalar ties or beats at one LAMBDA and is resolved below a partition at the other: the "
+                           "scalar reading depends on the decay strength; report both.",
+    "SC-PARTIAL": "at least one LAMBDA's scalar reading is unresolved or gated: report both rungs' intervals; no "
+                  "combined scalar sentence.",
+    "SC-UNREADABLE": "the scalar comparison is gated (diverged / collapsed / comparator unreadable) at both LAMBDAs.",
+}
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^%s-([A-Za-z0-9]+)-s(\d+)-(\d+)\.out$" % PREFIX)
+KIND_ON_RE = re.compile(r"^([A-Z][A-Z_]+): on\b")
+
+
+def mean(v):
+    return sum(v) / float(len(v))
+
+
+def sd(v):
+    if len(v) < 2:
+        return 0.0
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def median(v):
+    s = sorted(v)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =====================================================================================================================
+# THE DECISION (pure functions of numbers; the selftest drives them exhaustively)
+# =====================================================================================================================
+def rung_state(d, se, diverged, healthy, boxfree):
+    """cgw1's rung_state, VERBATIM."""
+    if diverged:
+        return "DIVERGED"
+    if not healthy:
+        return "UNHEALTHY"
+    if not boxfree:
+        return "BOXBOUND"
+    if d <= -NULLBAR and d < -RES * se:
+        return "REVERSES"
+    if d <= NULLBAR and d + RES * se < POOL_EXCLUDE:
+        return "VANISHES"
+    if d >= SURV and d > RES * se:
+        return "SURVIVES"
+    return "UNDECIDED"
+
+
+def _grp(s):
+    return "B" if s in BAD else ("S" if s == "SURVIVES" else ("X" if s in ABSENT else "U"))
+
+
+def primary_of(s5, s4):
+    g5, g4 = _grp(s5), _grp(s4)
+    if g5 == "B" and g4 == "B":
+        return "AI-UNREADABLE"
+    if g5 == "B" or g4 == "B":
+        o = g4 if g5 == "B" else g5
+        return {"S": "AI-ONE-RUNG-SURVIVES", "X": "AI-ONE-RUNG-ABSENT", "U": "AI-ONE-RUNG-UNDECIDED"}[o]
+    pair = set((g5, g4))
+    if pair == {"S"}:
+        return "AI-SURVIVES"
+    if pair == {"X"}:
+        return "AI-ARTEFACT-REVERSES" if "REVERSES" in (s5, s4) else "AI-ARTEFACT-VANISHES"
+    if pair == {"S", "X"}:
+        return "AI-LAMBDA-DEPENDENT"
+    if pair == {"S", "U"}:
+        return "AI-SURVIVES-ONE-LAMBDA"
+    if pair == {"X", "U"}:
+        return "AI-ABSENT-ONE-LAMBDA"
+    return "AI-UNDECIDED"
+
+
+def scalar_of(k_level, k_div, cmp_ok, t_ch, t_nd, se):
+    """cgw1's scalar_of, VERBATIM."""
+    if k_div:
+        return "SCALAR-DIVERGED"
+    if k_level < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not cmp_ok:
+        return "SCALAR-UNREADABLE"
+    tmin = min(t_ch, t_nd)
+    if t_ch >= SURV and t_nd >= SURV and t_ch > RES * se and t_nd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    if tmin - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "SCALAR-BELOW-BEST"
+    return "SCALAR-UNRESOLVED"
+
+
+def sc_of(t5, t4):
+    if t5 in SC_GATED and t4 in SC_GATED:
+        return "SC-UNREADABLE"
+    if t5 == t4 == "SCALAR-BEATS-BEST":
+        return "SC-BEATS-BOTH"
+    if t5 == t4 == "SCALAR-BELOW-BEST":
+        return "SC-BELOW-BOTH"
+    ok = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST")
+    if t5 in ok and t4 in ok:
+        return "SC-TIES-OR-BEATS-BOTH"
+    if (t5 in ok and t4 == "SCALAR-BELOW-BEST") or (t4 in ok and t5 == "SCALAR-BELOW-BEST"):
+        return "SC-LAMBDA-DEPENDENT"
+    return "SC-PARTIAL"
+
+
+def compose_sigma(sigma_in):
+    return (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sigma_in else (sigma_in, "SIGMA_INBATCH")
+
+
+def decide(A, sigma_used):
+    """A[arm] = dict(level, train, range, n, boxfree).  Returns (primary, sc, states, scal, keys)."""
+    states, scal, keys = {}, {}, {}
+    for r in D.RUNG_IDS:
+        ch, nd = A["ch" + r], A["nd" + r]
+        d = ch["level"] - nd["level"]
+        se = sigma_used * math.sqrt(1.0 / ch["n"] + 1.0 / nd["n"])
+        states[r] = rung_state(d, se, ch["range"] > DIVERGED or nd["range"] > DIVERGED,
+                               ch["level"] >= HEALTH_MIN and nd["level"] >= HEALTH_MIN,
+                               ch["boxfree"] and nd["boxfree"])
+        keys["D_" + r] = (d, se)
+        keys["DTRAIN_" + r] = ch["train"] - nd["train"]
+        k, L = A["k01" + r], A["kL" + r]
+        for g in ("ch", "nd"):
+            x = A[g + r]
+            keys["T%s_%s" % (g, r)] = (k["level"] - x["level"], sigma_used * math.sqrt(1.0 / k["n"] + 1.0 / x["n"]))
+        keys["G_" + r] = (L["level"] - k["level"], sigma_used * math.sqrt(1.0 / k["n"] + 1.0 / L["n"]))
+        cmp_ok = (ch["level"] >= HEALTH_MIN and nd["level"] >= HEALTH_MIN and ch["range"] <= DIVERGED
+                  and nd["range"] <= DIVERGED)
+        scal[r] = scalar_of(k["level"], k["range"] > DIVERGED, cmp_ok, keys["Tch_" + r][0], keys["Tnd_" + r][0],
+                            keys["Tch_" + r][1])
+    primary = primary_of(states["I5"], states["I4"])
+    sc = sc_of(scal["I5"], scal["I4"])
+    d5, se5 = keys["D_I5"]
+    d4, se4 = keys["D_I4"]
+    keys["DD"] = (d4 - d5, math.sqrt(se5 ** 2 + se4 ** 2))
+    return primary, sc, states, scal, keys
+
+
+# =====================================================================================================================
+# READING THE RUNS
+# =====================================================================================================================
+def parse_args_line(line):
+    """-> (pairs in order, repeated flags).  argparse semantics for this harness: every value is ONE token."""
+    toks = shlex.split(line[len("ARGS:"):])
+    pairs, seen, rep, i = [], set(), [], 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("--"):
+            return None, ["stray token %r" % t]
+        if i + 1 >= len(toks) or toks[i + 1].startswith("--"):
+            return None, ["flag %s has no value" % t]
+        f = t[2:]
+        if f in seen:
+            rep.append(f)
+        seen.add(f)
+        pairs.append((f, toks[i + 1]))
+        i += 2
+    return pairs, rep
+
+
+def read_out(path):
+    L = open(path, errors="replace").read().splitlines()
+    info = dict(path=path, args=None, env=None, gpu=None, done=False, eps={}, eps_dup=[], kinds_on=[], node=None,
+                pt=False, dr=[])
+    for ln in L:
+        if ln.startswith("ARGS:") and info["args"] is None:
+            info["args"] = ln
+        elif ln.startswith("ENV:") and info["env"] is None:
+            info["env"] = ln
+        elif ln.startswith("NODE=") and info["node"] is None:
+            info["node"] = ln.split("|")[0].strip()
+        elif ln.startswith("NVIDIA") and info["gpu"] is None:
+            info["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            info["done"] = True
+        elif ln.startswith("PROBE_TENSOR:"):
+            info["pt"] = True
+        elif ln.startswith("DECAY_ROUTE"):
+            info["dr"].append(ln.rstrip())
+        else:
+            m = EPTR_RE.search(ln)
+            if m:
+                e = int(m.group(1))
+                if e in info["eps"]:
+                    info["eps_dup"].append(e)      # cgw1's latent RULE 16 defect F1 (296.6), closed here: a gate
+                info["eps"][e] = (float(m.group(2)), float(m.group(3)))
+            k = KIND_ON_RE.match(ln)
+            if k:
+                info["kinds_on"].append(ln.strip())
+    info["complete"] = info["done"] and all(e in info["eps"] for e in range(D.EPOCHS))
+    return info
+
+
+def find_outs(runsdir):
+    out = []
+    for base in (runsdir, os.path.join(runsdir, PREFIX)):
+        out += glob.glob(os.path.join(base, "%s-*.out" % PREFIX))
+    return sorted(set(os.path.realpath(p) for p in out))
+
+
+def probe_path(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, D.probe_dir_name(arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+PROBE_KEYS = ("step", "n_beta", "beta_true_min", "beta_true_max", "n_at_lo", "n_at_hi", "beta", "dr_mode", "dr_lam",
+              "dr_n", "dr_shrink_meas", "dr_shrink_applied", "dr_trace_decay")
+
+
+def read_probe(path):
+    recs = []
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            recs.append(None)
+            continue
+        recs.append({k: r.get(k) for k in PROBE_KEYS} if isinstance(r, dict) else None)
+    return recs
+
+
+def probe_struct(recs, m_want):
+    """cgw1's G-STRUCT (10,000 records at steps 0,5,..; n_beta == the arm's m) + box occupancy.  -> (ok, why, occ)."""
+    if recs is None:
+        return False, "no probe.jsonl", None
+    if len(recs) != D.N_RECORDS:
+        return False, "%d records, want %d" % (len(recs), D.N_RECORDS), None
+    if any(r is None for r in recs):
+        return False, "an unreadable record", None
+    steps = [r["step"] for r in recs]
+    if steps != list(range(0, D.N_RECORDS * D.PROBE, D.PROBE)):
+        return False, "record steps are not 0,5,...,%d" % ((D.N_RECORDS - 1) * D.PROBE), None
+    nb = set(r["n_beta"] for r in recs)
+    if nb != {m_want}:
+        return False, "n_beta %s != the arm's registered m %d (the grain is not what ARGS says)" % (sorted(nb)[:3], m_want), None
+    mins = [r["beta_true_min"] for r in recs]
+    maxs = [r["beta_true_max"] for r in recs]
+    if not (max(maxs) - min(mins) > 1e-9):
+        return False, "beta never moved", None
+    T = len(recs)
+    rec_lo = sum(1 for x in mins if x <= D.LO + BOX_EPS) / float(T)
+    rec_hi = sum(1 for x in maxs if x >= D.HI - BOX_EPS) / float(T)
+    win = [r for r in recs if r["step"] >= WIN_STEP]
+    tot = float(sum(r["n_beta"] for r in win))
+    have = all(r.get("n_at_lo") is not None and r.get("n_at_hi") is not None for r in win)
+    a_win = []
+    for r in win:
+        b = r.get("beta")
+        if isinstance(b, list) and b:
+            a_win.append(median([math.exp(x) for x in b]))
+    occ = dict(rec_lo=rec_lo, rec_hi=rec_hi,
+               coord_lo_win=(sum(r["n_at_lo"] for r in win) / tot) if have else None,
+               coord_hi_win=(sum(r["n_at_hi"] for r in win) / tot) if have else None,
+               boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX),
+               a_plateau=median(a_win) if a_win else None)
+    return True, "", occ
+
+
+def probe_decay(recs, lam):
+    """G-SHRINK: every record is an alpha_indep record at THIS rung's LAMBDA, and the decay MEASURABLY bit.
+    -> (ok, why, stats)."""
+    devs = []
+    for r in recs:
+        if r.get("dr_mode") != "alpha_indep":
+            return False, "step %s: dr_mode %r, want 'alpha_indep' (no DECAY_ROUTE record: the unpatched tree?)" % (
+                r.get("step"), r.get("dr_mode")), None
+        if r.get("dr_lam") != lam:
+            return False, "step %s: dr_lam %r != this rung's LAMBDA %r" % (r.get("step"), r.get("dr_lam"), lam), None
+        if r.get("dr_n") != r["step"] + 2:
+            return False, "step %s: dr_n %r != step + 2" % (r["step"], r.get("dr_n")), None
+        sm, sa, tdc = r.get("dr_shrink_meas"), r.get("dr_shrink_applied"), r.get("dr_trace_decay")
+        if sm is None or sa is None or tdc is None:
+            return False, "step %s: a null dr_shrink_* / dr_trace_decay" % r["step"], None
+        if abs(sa / lam - 1.0) > APPLIED_TOL or abs(tdc - (1.0 - lam)) > TRACE_TOL:
+            return False, "step %s: dr_shrink_applied %r / dr_trace_decay %r are not LAMBDA / 1 - LAMBDA" % (r["step"], sa, tdc), None
+        dv = sm / lam - 1.0
+        if abs(dv) > SHRINK_TOL:
+            return False, "step %s: MEASURED shrink %r is %.2e relative from LAMBDA %r (> %g): the decay did not bite as registered" % (
+                r["step"], sm, dv, lam, SHRINK_TOL), None
+        devs.append(dv)
+    return True, "", dict(max_rel_dev=max(abs(x) for x in devs), median_meas=lam * (1.0 + median(devs)))
+
+
+def read_corpus_disclosure(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions as ce
+    finally:
+        sys.path.pop(0)
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return len(ce.filter_rows(rows))
+
+
+def resolve_prov(runsdir):
+    for p in (os.path.join(runsdir, PREFIX, "PROVENANCE.txt"), os.path.join(runsdir, "PROVENANCE.txt")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# =====================================================================================================================
+# SCORE
+# =====================================================================================================================
+def score(runsdir, csvpath=DEFAULT_CSV, out=print):
+    P = out
+    P("=" * 110)
+    P("cai1 -- THE COUNT-MATCHED AUDIT UNDER ALPHA-INDEPENDENT DECAY  (CORRECTIONS 306; ICML-PLAN 1.6, DECOUPLED-NOT-TESTED)")
+    P("scorer sha256 %s   design sha256 %s" % (file_sha(os.path.abspath(__file__)), file_sha(os.path.join(HERE, "cai1_design.py"))))
+    P("runsdir %s" % runsdir)
+    P("=" * 110)
+    harness = []
+
+    def hfail(msg):
+        harness.append(msg)
+        P("  !!! HARNESS %s" % msg)
+
+    found = {}
+    for p in find_outs(runsdir):
+        m = OUT_RE.match(os.path.basename(p))
+        if not m:
+            hfail("unparseable file name %s" % os.path.basename(p))
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        if arm not in D.ARMS or seed not in D.SEEDS[arm]:
+            hfail("a %s .out that is not a registered run: %s" % (PREFIX, os.path.basename(p)))
+            continue
+        found.setdefault((arm, seed), []).append((jid, p))
+    runs, missing, ignored = {}, [], []
+    for (arm, seed) in D.RUNS:
+        cands = [(jid, p, read_out(p)) for jid, p in sorted(found.get((arm, seed), []))]
+        comp = [c for c in cands if c[2]["complete"]]
+        ignored += [os.path.basename(c[1]) for c in cands if not c[2]["complete"]]
+        if not comp:
+            missing.append(D.run_name(arm, seed))
+        elif len(comp) > 1:
+            hfail("%s has %d COMPLETE .out files (%s) -- ambiguous" % (D.run_name(arm, seed), len(comp),
+                  ", ".join(os.path.basename(c[1]) for c in comp)))
+        else:
+            runs[(arm, seed)] = comp[0]
+    P("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(runs), D.NJOBS))
+    if ignored:
+        P("  ignored (incomplete, a complete twin or none): %s" % ", ".join(sorted(ignored)))
+    if missing:
+        P("  MISSING / INCOMPLETE: %s" % ", ".join(missing))
+
+    prov = resolve_prov(runsdir)
+    if prov is None:
+        hfail("G-PROV: no PROVENANCE.txt under %s/%s" % (runsdir, PREFIX))
+    else:
+        kv = dict(ln.split(" ", 1) for ln in open(prov).read().splitlines() if " " in ln)
+        want = {"SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+                "DESIGN_SHA256": file_sha(os.path.join(HERE, "cai1_design.py")),
+                "HF_SHA256": D.HF_POST_SHA}
+        for k, v in sorted(want.items()):
+            if kv.get(k, "").strip() != v:
+                hfail("G-PROV: %s in %s is %r, the registered / running file is %s" % (k, prov, kv.get(k), v[:16]))
+        P("G-PROV  %s  MODE %s  SCORER %s  DESIGN %s  HF %s" % (prov, kv.get("MODE", "?"), kv.get("SCORER_SHA256", "?")[:16],
+          kv.get("DESIGN_SHA256", "?")[:16], kv.get("HF_SHA256", "?")[:16]))
+
+    per = {}
+    gpus = {}
+    save_dirs = set()
+    for (arm, seed), (jid, path, info) in sorted(runs.items()):
+        rn = D.run_name(arm, seed)
+        r = D.RUNG_OF[arm]
+        if info["eps_dup"]:
+            hfail("G-EPOCH %s: epoch line(s) %s printed more than once" % (rn, sorted(set(info["eps_dup"]))[:5]))
+            continue
+        if info["args"] is None:
+            hfail("G-ARGS %s: no ARGS line" % rn)
+            continue
+        pairs, rep = parse_args_line(info["args"])
+        if pairs is None or rep:
+            hfail("G-ARGS %s: %s" % (rn, rep))
+            continue
+        sd_ = dict(pairs).get("save-directory", "")
+        save_dirs.add(sd_)
+        want = D.expected_args(arm, seed, sd_)
+        if pairs != want:
+            diff = [(f, v, dict(want).get(f)) for f, v in pairs if dict(want).get(f) != v]
+            miss = [f for f, _v in want if f not in dict(pairs)]
+            hfail("G-ARGS %s: %d flags differ from the registered line %s missing %s" % (rn, len(diff), diff[:4], miss[:4]))
+            continue
+        pdir = os.path.join(sd_, D.probe_dir_name(arm, seed))
+        if info["env"] != D.ENV_TEMPLATE.replace("<P>", pdir):
+            hfail("G-ENV %s: ENV line is not the registered one (%r)" % (rn, (info["env"] or "")[:160]))
+            continue
+        if info["dr"] != [D.witness_on(r)]:
+            hfail("G-WITNESS %s: DECAY_ROUTE lines %r, want exactly ONE: %r" % (rn, [x[:110] for x in info["dr"]][:2], D.witness_on(r)))
+            continue
+        other = [k for k in info["kinds_on"] if not k.startswith("DECAY_ROUTE")]
+        if other or info["pt"]:
+            hfail("G-KIND %s: prints another patch witness %s" % (rn, (other or ["PROBE_TENSOR"])[:2]))
+            continue
+        pp = probe_path(runsdir, arm, seed)
+        recs = read_probe(pp) if pp else None
+        ok, why, occ = probe_struct(recs, D.M_OF_ARM[arm])
+        if not ok:
+            hfail("G-STRUCT %s: %s" % (rn, why))
+            continue
+        ok, why, dst = probe_decay(recs, D.LAM_OF_ARM[arm])
+        if not ok:
+            hfail("G-SHRINK %s: %s" % (rn, why))
+            continue
+        eps = info["eps"]
+        per[(arm, seed)] = dict(level=mean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+                                train=mean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]), occ=occ, dst=dst, jid=jid)
+        gpus[info["gpu"]] = gpus.get(info["gpu"], 0) + 1
+    if len(save_dirs) > 1:
+        hfail("G-ARGS: the runs name %d different save directories %s" % (len(save_dirs), sorted(save_dirs)))
+    P("G-ARGS / G-ENV / G-WITNESS / G-KIND / G-STRUCT / G-SHRINK  %d of %d complete runs pass (20 flags each, wd 0, the "
+      "registered ENV line, ONE own-rung DECAY_ROUTE witness, no other patch witness, 10,000 probe records with n_beta == "
+      "m, every record's measured shrink within %g of its LAMBDA)" % (len(per), len(runs), SHRINK_TOL))
+    P("G-HW (DISCLOSURE ONLY, never a gate): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    n_corp = read_corpus_disclosure(csvpath)
+    P("corpus: %s  (DISCLOSURE ONLY -- enters no bar, sigma, level, state, contrast or stamp)"
+      % ("not readable" if n_corp is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (n_corp, PREFIX)))
+    if harness:
+        P("\nFINAL HARNESS-FAIL | %d harness failure(s); nothing is read" % len(harness))
+        return 3
+    if missing:
+        P("\nFINAL INCOMPLETE | %d of %d runs missing or incomplete; nothing is read" % (len(missing), D.NJOBS))
+        return 2
+
+    A = {}
+    ss, df = 0.0, 0
+    P("\nARMS  plateau5 = mean TEST over epochs %d-%d from each run's OWN .out; box occupancy, measured shrink and learned"
+      " step size from its OWN probe.jsonl" % (PL_LO, PL_HI))
+    P("  %-6s %-4s %-7s %-9s %2s %9s %7s %7s %9s  %-5s %7s %7s %12s %10s %12s %9s" % (
+        "arm", "rung", "LAMBDA", "grain", "n", "plateau5", "sd", "range", "train5", "box", "rec_lo", "rec_hi",
+        "shrink_meas", "maxreldev", "a_plateau", "LAM/a"))
+    for a in D.ARMS:
+        xs = [per[(a, s)]["level"] for s in D.SEEDS[a]]
+        tr = [per[(a, s)]["train"] for s in D.SEEDS[a]]
+        occs = [per[(a, s)]["occ"] for s in D.SEEDS[a]]
+        dsts = [per[(a, s)]["dst"] for s in D.SEEDS[a]]
+        bf = all(o["boxfree"] for o in occs)
+        m_ = mean(xs)
+        ss += sum((x - m_) ** 2 for x in xs)
+        df += len(xs) - 1
+        A[a] = dict(level=m_, train=mean(tr), range=max(xs) - min(xs), n=len(xs), boxfree=bf, sd=sd(xs), seeds=xs)
+        ap = [o["a_plateau"] for o in occs if o["a_plateau"] is not None]
+        apm = median(ap) if ap else None
+        P("  %-6s %-4s %-7s %-9s %2d %9.4f %7.3f %7.3f %9.4f  %-5s %7.4f %7.4f %12.6e %10.2e %12s %9s" % (
+            a, D.RUNG_OF[a], D.LAM_TEXT[D.RUNG_OF[a]], D.SPEC[a], len(xs), m_, A[a]["sd"], A[a]["range"], A[a]["train"],
+            "free" if bf else "BOUND", max(o["rec_lo"] for o in occs), max(o["rec_hi"] for o in occs),
+            median([x["median_meas"] for x in dsts]), max(x["max_rel_dev"] for x in dsts),
+            "na" if apm is None else "%.6e" % apm, "na" if apm is None else "%.3g" % (D.LAM_OF_ARM[a] / apm)))
+    P("  (shrink_meas / a_plateau / LAM/a are DESCRIPTIVE: a_plateau = median over the epoch-95+ records of the median over"
+      " the record's stored step sizes of exp(beta); for chunk777 / nodewise the probe stores 62 per-tensor MEANS of log"
+      " step size, not the per-group values -- APPROXIMATE, as 296.4)")
+    sig_in = math.sqrt(ss / df) if df else 0.0
+    sig, which = compose_sigma(sig_in)
+    P("\nSIGMA  O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    P("  SIGMA_PRIOR_frozen   %.6f  (df %d, filtered, literal)" % (SIGMA_PRIOR, SIGMA_PRIOR_DF))
+    P("  SIGMA_INBATCH        %.6f  (df %d, pooled within the 8 arms)" % (sig_in, df))
+    P("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+
+    primary, sc, states, scal, K = decide(A, sig)
+    P("\nCONTRASTS (every one WITHIN a LAMBDA rung, IN BATCH; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    for r in D.RUNG_IDS:
+        d, se = K["D_" + r]
+        P("  D_%s  = ch%s - nd%s = %+.4f pp = %+.2f SE (SE %.6f)  [%+.4f, %+.4f]  TRAIN %+.4f   state %s"
+          % (r, r, r, d, d / se, se, d - RES * se, d + RES * se, K["DTRAIN_" + r], states[r]))
+    v, se = K["DD"]
+    P("  DD   = D_I4 - D_I5 = %+.4f pp = %+.2f SE (SE %.6f)   DESCRIPTIVE" % (v, v / se, se))
+    for r in D.RUNG_IDS:
+        for g in ("ch", "nd"):
+            v, se = K["T%s_%s" % (g, r)]
+            P("  T%s_%s = k01%s - %s%s = %+.4f pp = %+.2f SE" % (g, r, r, g, r, v, v / se))
+        P("    scalar reading at %s: %s" % (r, scal[r]))
+    for r in D.RUNG_IDS:
+        v, se = K["G_" + r]
+        P("  G_%s  = kL%s - k01%s = %+.4f pp = %+.2f SE   DESCRIPTIVE (layerwise vs scalar in this cell)" % (r, r, r, v, v / se))
+    P("\nLADDERS (LEVELS, not effects; this cell only)")
+    for g in D.GRAIN_IDS:
+        P("  %-9s %s" % (D.SPEC_OF_GRAIN[g], " | ".join("LAMBDA %s %.4f" % (D.LAM_TEXT[r], A[g + r]["level"]) for r in D.RUNG_IDS)))
+    P("\nREFERENCE (between batch, never pooled; cgw1 296.3, alpha-scaled): D_W1 %+.4f %s, D_W2 %+.4f %s, D_W4 %+.4f %s; "
+      "scalar at W4 %s" % (D.CGW1_D["W1"], D.CGW1_STATES["W1"], D.CGW1_D["W2"], D.CGW1_STATES["W2"], D.CGW1_D["W4"],
+                           D.CGW1_STATES["W4"], D.CGW1_STATES["SCALAR_W4"]))
+
+    stamps = list(BOUNDS)
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    for r in D.RUNG_IDS:
+        stamps.append("%s-VS-CGW1-W1-%s" % (r, "SAME" if states[r] == D.CGW1_STATES["W1"] else "DIFFERS"))
+        if states[r] in ("SURVIVES", "REVERSES"):
+            stamps.append("TRAIN-%s-%s" % ("AGREES" if (K["DTRAIN_" + r] > 0) == (K["D_" + r][0] > 0) else "DISAGREES", r))
+        g_, gse = K["G_" + r]
+        if g_ <= -SURV and g_ < -RES * gse:
+            stamps.append("LAYERWISE-BELOW-SCALAR-%s" % r)
+        elif g_ >= SURV and g_ > RES * gse:
+            stamps.append("LAYERWISE-ABOVE-SCALAR-%s" % r)
+        for g in ("k01", "kL"):
+            if not A[g + r]["boxfree"]:
+                stamps.append("BOX-BOUND-%s%s" % (g, r))
+    for a in D.ARMS:
+        if A[a]["range"] > DIVERGED:
+            stamps.append("DIVERGED-%s" % a)
+        if A[a]["level"] < HEALTH_MIN:
+            stamps.append("UNHEALTHY-%s" % a)
+    stateword = "+".join("%s-%s" % (r, states[r]) for r in D.RUNG_IDS)
+    scalword = "+".join("%s-%s" % (r, scal[r]) for r in D.RUNG_IDS)
+    P("\nLICENCE (primary)  %s" % LICENCE[primary])
+    P("LICENCE (scalar)   %s" % SC_LICENCE[sc])
+    P("\nFINAL %s | %s | %s | %s | %s" % (primary, sc, stateword, scalword, " ".join(stamps)))
+    return 0
+
+
+# =====================================================================================================================
+# SELFTEST
+# =====================================================================================================================
+RESULTS = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label):
+    RESULTS["PASS" if cond else "FAIL"] += 1
+    print("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def skip(label):
+    RESULTS["SKIP"] += 1
+    print("  SKIP %s" % label)
+
+
+def _curve(level):
+    return [min(99.0, level * (1 - math.exp(-(e + 1) / 12.0))) for e in range(D.EPOCHS)]
+
+
+def _write_out(d, arm, seed, jid, level, save_dir, args_over=None, env_over=None, extra_line=None, done=True,
+               n_ep=D.EPOCHS, gpu="NVIDIA L4, 23034 MiB", witness=None, dup_epoch=False):
+    rn = D.run_name(arm, seed)
+    pairs = D.expected_args(arm, seed, save_dir)
+    if args_over:
+        pairs = args_over(pairs)
+    args = "ARGS: " + " ".join("--%s %s" % kv for kv in pairs)
+    env = D.ENV_TEMPLATE.replace("<P>", os.path.join(save_dir, D.probe_dir_name(arm, seed)))
+    if env_over:
+        env = env_over(env)
+    c = _curve(level)
+    L = ["NODE=[HOST_2f2f29d9e1] | JOB=%s %d | AUGMENT=1" % (rn, jid), args, env, gpu, "",
+         "args_base includes unnecessary attributes {'normalizer_param'} "]
+    wl = [D.witness_on(D.RUNG_OF[arm])] if witness is None else witness
+    L += wl
+    L.append("")
+    if extra_line:
+        L.append(extra_line)
+    for e in range(n_ep):
+        te = level if e >= PL_LO - 5 else c[e]
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.99, te + 5.0), te))
+        if dup_epoch and e == 97:
+            L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, 50.0, 50.0))
+    L.append("%d  minutes" % 50)
+    if done:
+        L.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(L) + "\n")
+
+
+def _write_probe(pdir, m, lam, lo=-8.0, hi=-5.0, n=D.N_RECORDS, nb=None, hi_frac=0.0, lam_rec=None, meas_mult=1.0,
+                 no_dr=False, applied=None, dr_n_off=0):
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "probe.jsonl"), "w") as fh:
+        for i in range(n):
+            bmax = D.HI if i >= n * (1 - hi_frac) else hi + 1e-4 * (i % 7)
+            s = '{"step": %d, "beta": [%.6f], "beta_true_min": %.6f, "beta_true_max": %.6f, "n_beta": %d, "n_at_lo": 0, ' \
+                '"n_at_hi": %d' % (i * D.PROBE, 0.5 * (lo + hi), lo - 1e-4 * (i % 5), bmax, nb if nb is not None else m,
+                                   1 if bmax >= D.HI else 0)
+            if not no_dr:
+                L_ = lam if lam_rec is None else lam_rec
+                s += (', "dr_mode": "alpha_indep", "dr_lam": %r, "dr_n": %d, "dr_shrink_meas": %r, "dr_shrink_applied": %r, '
+                      '"dr_trace_decay": %r' % (L_, i * D.PROBE + 2 + dr_n_off,
+                                                L_ * meas_mult * (1.0 + 2e-4 * ((i % 3) - 1)),
+                                                L_ if applied is None else applied, 1.0 - L_))
+            fh.write(s + "}\n")
+
+
+JIT = (0.02, 0.03, -0.03, -0.02)   # zero-mean over 4 seeds
+
+
+def _build(root, template, levels, save_dir="/SAVE/runs/cai1", over=None, drop=(), extra=None, probe_over=None,
+           prov_over=None, jit=None):
+    os.makedirs(os.path.join(root, PREFIX), exist_ok=True)
+    jid = 7000000
+    for (arm, seed) in D.RUNS:
+        jid += 1
+        if (arm, seed) in drop:
+            continue
+        i = D.SEEDS[arm].index(seed)
+        lv = levels[arm] + (JIT[i] if jit is None else jit(arm, i))
+        kw = dict((over or {}).get((arm, seed), {}))
+        _write_out(os.path.join(root, PREFIX), arm, seed, jid, lv, save_dir, **kw)
+        dst = os.path.join(root, PREFIX, D.probe_dir_name(arm, seed))
+        if probe_over and (arm, seed) in probe_over:
+            _write_probe(dst, D.M_OF_ARM[arm], D.LAM_OF_ARM[arm], **probe_over[(arm, seed)])
+        else:
+            os.symlink(os.path.join(template, D.probe_dir_name(arm, seed)), dst)
+    for f in (extra or []):
+        f(os.path.join(root, PREFIX))
+    kv = {"MODE": "submit", "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+          "DESIGN_SHA256": file_sha(os.path.join(HERE, "cai1_design.py")), "HF_SHA256": D.HF_POST_SHA}
+    kv.update(prov_over or {})
+    open(os.path.join(root, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+    return root
+
+
+def _run(root, csvpath=None):
+    lines = []
+    rc = score(root, csvpath, out=lines.append)
+    lines = [x for ln in lines for x in ln.split("\n")]
+    fin = [ln for ln in lines if ln.startswith("FINAL ")]
+    return rc, (fin[0] if fin else ""), lines
+
+
+def _levels(i5=(92.50, 92.00, 92.10, 92.60), i4=(91.00, 90.50, 90.60, 91.10)):
+    L = {}
+    for r, v in (("I5", i5), ("I4", i4)):
+        for g, x in zip(D.GRAIN_IDS, v):
+            L[g + r] = x
+    return L
+
+
+def selftest(csvpath, runsdir):
+    print("cai1 SELFTEST -- the design, the frozen floor through corpus_exclusions.filter_rows, the decision tables with")
+    print("exhaustive reachability, and the REAL score() on synthetic runs (every account, every gate, the harness breaks).")
+    src = open(os.path.abspath(__file__)).read()
+    # ---- A: design --------------------------------------------------------------------------------------------------
+    print("\nA  DESIGN")
+    chk(D.NJOBS == 32 and len(D.ARMS) == 8, "A 8 arms, 32 runs (16 at I5, 16 at I4)")
+    chk(all(D.SEEDS[a] == (192, 193, 194, 195) for a in D.ARMS), "A every arm runs seeds {192..195} (Track F2's block, all used)")
+    chk(D.LAM == {"I5": 5e-05, "I4": 5e-04} and D.LAM_TEXT == {"I5": "5e-5", "I4": "5e-4"},
+        "A the two LAMBDAs are 5e-5 (lr*wd) and 5e-4 (lr*wd/(1-0.9)) of SGD 0.1 / 5e-4 / 0.9")
+    chk(abs(0.1 * 5e-4 - D.LAM["I5"]) < 1e-18 and abs(0.1 * 5e-4 / (1 - 0.9) - D.LAM["I4"]) < 1e-15,
+        "A LAMBDA arithmetic: 0.1 x 5e-4 = 5e-5; 0.1 x 5e-4 / 0.1 = 5e-4")
+    chk(all(dict(D.expected_args(a, s, "/x"))["weight-decay-base"] == "0" for a, s in D.RUNS),
+        "A every arm runs --weight-decay-base 0 (alpha_indep REPLACES the alpha-scaled decay; the patch refuses any other)")
+    chk(D.route_value("I5") == "alpha_indep:5e-5" and D.route_value("I4") == "alpha_indep:5e-4",
+        "A the --export values are alpha_indep:5e-5 / alpha_indep:5e-4")
+    rx = re.compile(r'(shrink_only|trace_only)|alpha_indep:([0-9]+(?:\.[0-9]+)?(?:e-?[0-9]+)?)')
+    chk(all(rx.fullmatch(D.route_value(r)) and float(rx.fullmatch(D.route_value(r)).group(2)) == D.LAM[r] for r in D.RUNG_IDS)
+        and all(re.fullmatch(r"[a-z0-9_.:-]+", D.route_value(r)) for r in D.RUNG_IDS),
+        "A each value is a FULL match of the patch's registered regex, parses to its LAMBDA, and is one --export token")
+    chk(D.witness_on("I5") == "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=5e-05 "
+        "lambda_f32=4.999999873689376e-05 gamma=1.0",
+        "A the I5 witness is BYTE-IDENTICAL to the line the proof job's real run printed at alpha_indep:5e-05, wd 0 (305.5)")
+    chk(D.witness_on("I4") == "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=0.0005 "
+        "lambda_f32=0.0005000000237487257 gamma=1.0", "A the I4 witness (the patch's format at LAMBDA 0.0005)")
+    chk(D.witness_on("I5") != D.witness_on("I4"), "A the two rungs' witnesses differ (they are the rung separation)")
+    chk(D.M_OF_GRAIN == {"ch": 14421, "nd": 14420, "k01": 1, "kL": 62}, "A registered group counts 14421/14420/1/62")
+    chk(all(len(D.expected_args(a, s, "/x")) == 20 for a, s in D.RUNS), "A every expected ARGS line has 20 flags")
+    chk(all(" " not in v for a, s in D.RUNS for _f, v in D.expected_args(a, s, "/x")), "A every ARGS value is one token")
+    chk(all([kv for kv in D.expected_args("ch" + "I5", s, "/x") if kv[0] != "run-name"]
+            == [kv for kv in D.expected_args("ch" + "I4", s, "/x") if kv[0] != "run-name"] for s in D.SEED_BLOCK),
+        "A the two rungs' ARGS lines are identical but for --run-name (so G-WITNESS / G-SHRINK carry the rung)")
+    chk(abs(SIGMA_PRIOR * math.sqrt(0.5) - SE4) < 1e-6, "A SE4 = SIGMA_PRIOR * sqrt(2/4)")
+    chk((SURV, NULLBAR, POOL_EXCLUDE, RES, HEALTH_MIN, DIVERGED, BOXFREE_MAX, MATCH) == (0.30, 0.15, 0.5556, 2.0, 85.0, 2.0, 0.05, 0.50),
+        "A the frozen bars are cgw1's verbatim: SURV 0.30 NULL 0.15 POOL 0.5556 RES 2.0 HEALTH 85 DIVERGED 2.0 BOX 0.05 MATCH 0.50")
+    chk(POOL_EXCLUDE == D.SGDM_POOL_D, "A POOL_EXCLUDE is the landed SGDm pool literal")
+    chk((SHRINK_TOL, APPLIED_TOL, TRACE_TOL) == (0.01, 1e-9, 1e-12), "A the frozen decay gates: 1 % / 1e-9 / 1e-12")
+    chk(all(compose_sigma(s)[0] == max(SIGMA_PRIOR, s) for s in (0.0, 0.1, SIGMA_PRIOR, 0.3, 2.0)),
+        "A SIGMA_USED == max(frozen floor, in-batch)")
+    cg = open(os.path.join(HERE, "cGW1_auditwd_score.py")).read() if os.path.exists(os.path.join(HERE, "cGW1_auditwd_score.py")) else ""
+
+    def _fn(s, name):
+        i = s.find("def %s(" % name)
+        j = s.find("\ndef ", i + 1)
+        body = s[i:j]
+        return "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith('"""'))
+    chk(bool(cg) and _fn(cg, "rung_state") == _fn(src, "rung_state") and _fn(cg, "scalar_of") == _fn(src, "scalar_of"),
+        "A rung_state and scalar_of are cgw1's registered functions VERBATIM (docstring lines aside; read from cGW1_auditwd_score.py)")
+    dec_src = src[src.index("def rung_state("):src.index("# READING THE RUNS")]
+    chk("CGW1" not in dec_src and "SGDM_POOL" not in dec_src and "corpus" not in dec_src,
+        "A no cgw1 landed value, design-module pool value or corpus figure enters the decision functions (O2)")
+    sc_src = src[src.index("def score("):src.index("# SELFTEST")]
+    chk(sc_src.count("CGW1_STATES[\"W1\"]") == 2 and "CGW1_D" in sc_src and "decide(" in sc_src,
+        "A cgw1's landed readings are read in score() only for the REFERENCE line and the non-gating VS-CGW1 stamps")
+    chk(all(t in LICENCE for t in PRIMARY_TOKENS) and all(t in SC_LICENCE for t in SC_TOKENS), "A every token has a licence sentence")
+    chk("ARTEFACT" in LICENCE["AI-ARTEFACT-VANISHES"] and "ROTATIONAL-EQUILIBRIUM-CONFOUND" in LICENCE["AI-ARTEFACT-VANISHES"],
+        "A the artefact licence names the artefact AND carries the rotational-equilibrium bound")
+    chk(D.ENV_TEMPLATE.count("<P>") == 1 and "PROBE=5 " in D.ENV_TEMPLATE and "SCHED=none" in D.ENV_TEMPLATE,
+        "A ENV template: PROBE=5, SCHED=none (the patch's constant-schedule premise), one PROBE_DIR slot")
+
+    # ---- B: the floor ---------------------------------------------------------------------------------------------
+    print("\nB  THE FROZEN FLOOR, RE-DERIVED THROUGH corpus_exclusions.filter_rows")
+    if csvpath and os.path.exists(csvpath):
+        sys.path.insert(0, HERE)
+        import corpus_exclusions as ce
+        sys.path.pop(0)
+        rows = [r for r in csv.DictReader(open(csvpath)) if not r["run"].startswith(PREFIX + "-")]
+        CK = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+              "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+        def pooled(R):
+            cells = {}
+            for r in R:
+                if (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                        and (r.get("plateau5") or "").strip() and r["network"] == D.NET and r["dataset"] == D.DSET
+                        and r["meta_stepsize"] == D.MST and r["alpha0"] in (D.A0, "0.001") and r["beta_clip"] == D.CLIP
+                        and r["epochs_requested"] == str(D.EPOCHS) and r["augment"] == D.AUG
+                        and r["batch_size"] == str(D.BATCH)):
+                    cells.setdefault(tuple(r[k] for k in CK), []).append(float(r["plateau5"]))
+            s2, df_, nc = 0.0, 0, 0
+            for v in cells.values():
+                if len(v) > 1:
+                    mm = mean(v)
+                    s2 += sum((x - mm) ** 2 for x in v)
+                    df_ += len(v) - 1
+                    nc += 1
+            return math.sqrt(s2 / df_), df_, nc
+        filt = ce.filter_rows(rows)
+        sF, dF, nF = pooled(filt)
+        sN, _dN, _ = pooled(rows)
+        chk(abs(sF - SIGMA_PRIOR) < 1e-12 and dF == SIGMA_PRIOR_DF and nF == 34,
+            "B SIGMA_PRIOR: the FROZEN literal %r IS the FILTERED value (df %d, %d cells) on this corpus (%d rows)"
+            % (SIGMA_PRIOR, dF, nF, len(rows)))
+        chk(abs(sN - SIGMA_PRIOR_NAIVE) < 5e-7 and sN > 3 * sF,
+            "B the UNFILTERED value %.6f differs (cgw1's wd-deviating rows) -- the filter is load-bearing; disclosure" % sN)
+        dm = ce._pooled(filt, "ResNet18_c100")
+        print("  NOTE the corpus_exclusions noise-floor DEMONSTRATION (SIGMA_R18ALL, filtered) on this corpus is %.6f (df %d);"
+              " quoted at registration as %.6f (df 274) -- no bar reads it" % (dm[0], dm[1], DEMO_R18ALL_AT_REG))
+    else:
+        skip("B no corpus at %s" % csvpath)
+
+    # ---- C: decision tables ------------------------------------------------------------------------------------------
+    print("\nC  THE DECISION, AT ITS BARS AND EXHAUSTIVELY")
+    se = SE4
+    chk(rung_state(0.30 + 1e-9, se, False, True, True) == "SURVIVES", "C D = +0.30 (> 2 SE) -> SURVIVES")
+    chk(rung_state(0.30 - 1e-9, se, False, True, True) == "UNDECIDED", "C D just below +0.30 -> UNDECIDED")
+    chk(rung_state(0.15, se, False, True, True) == "VANISHES", "C D = +0.15 exactly -> VANISHES (at or below the bar)")
+    chk(rung_state(0.15 + 1e-9, se, False, True, True) == "UNDECIDED", "C D just above +0.15 -> UNDECIDED")
+    chk(rung_state(-0.15, 0.05, False, True, True) == "REVERSES", "C D = -0.15 with 2 SE < 0.15 -> REVERSES")
+    chk(rung_state(-0.20, 0.15, False, True, True) == "VANISHES", "C D -0.20 not resolved -> VANISHES, not REVERSES")
+    chk(rung_state(0.10, 0.2276, False, True, True) == "VANISHES" and rung_state(0.10, 0.2279, False, True, True) == "UNDECIDED",
+        "C VANISHES needs D + 2 SE < +0.5556 (cgw1's 291.6 clause)")
+    chk(rung_state(0.9, se, True, True, True) == "DIVERGED" and rung_state(0.9, se, False, False, True) == "UNHEALTHY"
+        and rung_state(0.9, se, False, True, False) == "BOXBOUND", "C DIVERGED > UNHEALTHY > BOXBOUND > the D bands")
+    got = {}
+    for s5 in RUNG_STATES:
+        for s4 in RUNG_STATES:
+            got.setdefault(primary_of(s5, s4), []).append((s5, s4))
+    chk(set(got) == set(PRIMARY_TOKENS), "C EXHAUSTIVE: all 49 (I5, I4) state pairs map onto exactly the 11 registered primary tokens")
+    chk(all(primary_of(a, b) == primary_of(b, a) for a in RUNG_STATES for b in RUNG_STATES),
+        "C the primary is SYMMETRIC in the two LAMBDA rungs (neither is privileged)")
+    chk(primary_of("VANISHES", "VANISHES") == "AI-ARTEFACT-VANISHES" and primary_of("VANISHES", "REVERSES") == "AI-ARTEFACT-REVERSES"
+        and primary_of("REVERSES", "REVERSES") == "AI-ARTEFACT-REVERSES",
+        "C 'the audit effect is an artefact of alpha-scaled decay' is REACHABLE: absent at both LAMBDAs")
+    chk(primary_of("SURVIVES", "SURVIVES") == "AI-SURVIVES" and primary_of("SURVIVES", "VANISHES") == "AI-LAMBDA-DEPENDENT"
+        and primary_of("UNDECIDED", "SURVIVES") == "AI-SURVIVES-ONE-LAMBDA" and primary_of("REVERSES", "UNDECIDED") == "AI-ABSENT-ONE-LAMBDA"
+        and primary_of("UNDECIDED", "UNDECIDED") == "AI-UNDECIDED", "C the readable pairs")
+    chk(primary_of("UNHEALTHY", "VANISHES") == "AI-ONE-RUNG-ABSENT" and primary_of("SURVIVES", "BOXBOUND") == "AI-ONE-RUNG-SURVIVES"
+        and primary_of("DIVERGED", "UNDECIDED") == "AI-ONE-RUNG-UNDECIDED" and primary_of("UNHEALTHY", "DIVERGED") == "AI-UNREADABLE",
+        "C one or two unreadable rungs; an ABSENT beside an unreadable rung is NOT the artefact token")
+    chk(scalar_of(92.0, False, True, 0.31, 0.9, 0.1) == "SCALAR-BEATS-BEST" and scalar_of(92.0, False, True, -0.5, 0.2, 0.1) == "SCALAR-BELOW-BEST"
+        and scalar_of(92.0, False, True, 0.1, 0.9, 0.1) == "SCALAR-TIES-BEST", "C cgw1's scalar_of at its bars")
+    gs = set()
+    for a in SCALAR_TOKENS:
+        for b in SCALAR_TOKENS:
+            gs.add(sc_of(a, b))
+    chk(gs == set(SC_TOKENS), "C EXHAUSTIVE: all 49 scalar pairs map onto exactly the 6 combined SC tokens")
+    chk(all(sc_of(a, b) == sc_of(b, a) for a in SCALAR_TOKENS for b in SCALAR_TOKENS), "C the combined scalar word is symmetric")
+    chk(sc_of("SCALAR-BELOW-BEST", "SCALAR-BELOW-BEST") == "SC-BELOW-BOTH" and sc_of("SCALAR-TIES-BEST", "SCALAR-BEATS-BEST") == "SC-TIES-OR-BEATS-BOTH"
+        and sc_of("SCALAR-BEATS-BEST", "SCALAR-BELOW-BEST") == "SC-LAMBDA-DEPENDENT" and sc_of("SCALAR-COLLAPSED", "SCALAR-BEATS-BEST") == "SC-PARTIAL"
+        and sc_of("SCALAR-COLLAPSED", "SCALAR-DIVERGED") == "SC-UNREADABLE", "C the combined scalar word at each branch")
+    rng = random.Random(306)
+    reach = set()
+    for _ in range(20000):
+        t1, t2, s_ = rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5), rng.choice((0.02, 0.11, 0.3))
+        reach.add(scalar_of(rng.choice((70.0, 92.0, 92.0, 92.0)), rng.random() < 0.05, rng.random() > 0.05, t1, t2, s_))
+    chk(reach == set(SCALAR_TOKENS), "C every per-rung scalar token is reachable (20,000 draws)")
+    tot = set()
+    for _ in range(4000):
+        A = {}
+        for a in D.ARMS:
+            A[a] = dict(level=rng.choice((rng.uniform(88, 94), rng.uniform(50, 94))), train=rng.uniform(90, 100),
+                        range=rng.choice((0.1, 0.3, 2.5)) if rng.random() < 0.1 else 0.2, n=4, boxfree=rng.random() > 0.05)
+        p, s_, _st, _sc, _k = decide(A, rng.choice((SIGMA_PRIOR, 0.3)))
+        tot.add((p in PRIMARY_TOKENS) and (s_ in SC_TOKENS))
+    chk(tot == {True}, "C TOTALITY: decide() returns a registered (primary, scalar) pair on 4,000 random arm tables")
+
+    # ---- D: the decay gate on its own ------------------------------------------------------------------------------
+    print("\nD  G-SHRINK, the decay gate, at its tolerances")
+
+    def _recs(lam, mult=1.0, n=50, **kw):
+        out = []
+        for i in range(n):
+            r = dict(step=i * 5, dr_mode="alpha_indep", dr_lam=lam, dr_n=i * 5 + 2, dr_shrink_meas=lam * mult,
+                     dr_shrink_applied=lam, dr_trace_decay=1.0 - lam)
+            r.update(kw)
+            out.append(r)
+        return out
+    chk(probe_decay(_recs(5e-5), 5e-5)[0] and probe_decay(_recs(5e-4, 1.0099), 5e-4)[0], "D exact and +0.99 % measured shrink PASS")
+    chk(not probe_decay(_recs(5e-4, 1.0101), 5e-4)[0] and not probe_decay(_recs(5e-5, 0.98), 5e-5)[0], "D +1.01 % / -2 % FAIL")
+    chk(not probe_decay(_recs(5e-5), 5e-4)[0], "D an I5 run's records read at I4's LAMBDA FAIL (rung separation)")
+    chk(not probe_decay(_recs(5e-5, dr_mode=None), 5e-5)[0], "D records without a DECAY_ROUTE key (the unpatched tree) FAIL")
+    chk(not probe_decay(_recs(5e-5, dr_shrink_meas=None), 5e-5)[0], "D a null measured shrink FAILS")
+    chk(not probe_decay(_recs(5e-5, dr_trace_decay=1.0), 5e-5)[0], "D a trace factor of 1 (the decay NOT in the trace) FAILS")
+    chk(not probe_decay(_recs(5e-5, dr_shrink_meas=0.0), 5e-5)[0], "D a measured shrink of 0 (trace_only-like, undecayed weights) FAILS")
+
+    # ---- E: the REAL score() on synthetic runs ------------------------------------------------------------------
+    print("\nE  THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="cai1_selftest_")
+    try:
+        template = os.path.join(tmp, "template")
+        for (arm, seed) in D.RUNS:
+            _write_probe(os.path.join(template, D.probe_dir_name(arm, seed)), D.M_OF_ARM[arm], D.LAM_OF_ARM[arm])
+        n = [0]
+
+        def case(label, levels, want_rc, want, **kw):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, levels, **kw)
+            rc, fin, lines = _run(root, kw.get("csv"))
+            ok = rc == want_rc and all(w in fin for w in want) if want_rc == 0 else rc == want_rc
+            if want_rc != 0:
+                ok = ok and any(all(w in ln for w in want) for ln in lines)
+            if not chk(ok, "E %s -> rc %d %s" % (label, rc, fin[:170] if fin else [l for l in lines if "HARNESS" in l or "FINAL" in l][:1])):
+                print("\n".join("      | " + x for x in lines[-30:]))
+            return rc, fin, lines
+
+        base = _levels()
+        case("SURVIVES at both (D +0.50 / +0.50)", base, 0, ["FINAL AI-SURVIVES | SC-BELOW-BOTH", "I5-SURVIVES+I4-SURVIVES",
+             "I5-VS-CGW1-W1-SAME", "ROTATIONAL-EQUILIBRIUM-CONFOUND", "TRAIN-AGREES-I5"])
+        case("ARTEFACT-VANISHES (D +0.05 / +0.05)", _levels(i5=(92.05, 92.00, 92.10, 92.60), i4=(90.55, 90.50, 90.60, 91.10)), 0,
+             ["FINAL AI-ARTEFACT-VANISHES", "I5-VANISHES+I4-VANISHES", "I5-VS-CGW1-W1-DIFFERS"])
+        case("ARTEFACT-REVERSES (D -0.50 / +0.05)", _levels(i5=(91.50, 92.00, 92.10, 92.60), i4=(90.55, 90.50, 90.60, 91.10)), 0,
+             ["FINAL AI-ARTEFACT-REVERSES", "I5-REVERSES+I4-VANISHES"])
+        case("LAMBDA-DEPENDENT (D +0.50 / +0.05)", _levels(i4=(90.55, 90.50, 90.60, 91.10)), 0, ["FINAL AI-LAMBDA-DEPENDENT"])
+        case("SURVIVES-ONE-LAMBDA (D +0.50 / +0.22)", _levels(i4=(90.72, 90.50, 90.60, 91.10)), 0, ["FINAL AI-SURVIVES-ONE-LAMBDA"])
+        case("ABSENT-ONE-LAMBDA (D +0.05 / +0.22)", _levels(i5=(92.05, 92.00, 92.10, 92.60), i4=(90.72, 90.50, 90.60, 91.10)), 0,
+             ["FINAL AI-ABSENT-ONE-LAMBDA"])
+        case("UNDECIDED (D +0.22 / +0.22)", _levels(i5=(92.22, 92.00, 92.10, 92.60), i4=(90.72, 90.50, 90.60, 91.10)), 0,
+             ["FINAL AI-UNDECIDED"])
+        case("near-bar I4 D = +0.31 -> SURVIVES", _levels(i4=(90.81, 90.50, 90.60, 91.10)), 0, ["FINAL AI-SURVIVES"])
+        case("near-bar I4 D = +0.29 -> UNDECIDED", _levels(i4=(90.79, 90.50, 90.60, 91.10)), 0, ["FINAL AI-SURVIVES-ONE-LAMBDA"])
+        case("near-bar I4 D = +0.14 -> VANISHES", _levels(i4=(90.64, 90.50, 90.60, 91.10)), 0, ["FINAL AI-LAMBDA-DEPENDENT"])
+        case("near-bar I5 D = -0.26 -> REVERSES (< -2 SE = -0.252), I4 +0.05", _levels(i5=(91.74, 92.00, 92.10, 92.60),
+             i4=(90.55, 90.50, 90.60, 91.10)), 0, ["FINAL AI-ARTEFACT-REVERSES"])
+        case("near-bar I5 D = -0.24 -> VANISHES, I4 +0.05", _levels(i5=(91.76, 92.00, 92.10, 92.60),
+             i4=(90.55, 90.50, 90.60, 91.10)), 0, ["FINAL AI-ARTEFACT-VANISHES"])
+        case("NOISY: D +0.05 both but in-batch sigma ~0.46 -> never VANISHES", _levels(i5=(92.05, 92.00, 92.10, 92.60),
+             i4=(90.55, 90.50, 90.60, 91.10)), 0, ["FINAL AI-UNDECIDED", "SIGMA-INBATCH"], jit=lambda arm, i: (0.4, -0.4, 0.4, -0.4)[i])
+        case("ONE-RUNG-SURVIVES (ndI4 unhealthy 80)", _levels(i4=(91.00, 80.0, 90.60, 91.10)), 0,
+             ["FINAL AI-ONE-RUNG-SURVIVES", "I4-UNHEALTHY", "UNHEALTHY-ndI4"])
+        case("ONE-RUNG-ABSENT (chI5 unhealthy; I4 +0.05)", _levels(i5=(80.0, 92.00, 92.10, 92.60), i4=(90.55, 90.50, 90.60, 91.10)), 0,
+             ["FINAL AI-ONE-RUNG-ABSENT"])
+        case("ONE-RUNG-UNDECIDED (I4 diverged; I5 +0.22)", _levels(i5=(92.22, 92.00, 92.10, 92.60)), 0, ["FINAL AI-ONE-RUNG-UNDECIDED", "DIVERGED-chI4"],
+             jit=lambda arm, i: (3.0 if (arm == "chI4" and i == 0) else JIT[i]))
+        case("UNREADABLE (partitions unhealthy at both)", _levels(i5=(80.0, 80.0, 92.10, 92.60), i4=(80.0, 80.0, 90.60, 91.10)), 0,
+             ["FINAL AI-UNREADABLE", "SC-UNREADABLE"])
+        case("I4 BOXBOUND (chI4 s195 at the ceiling on 10 % of records)", base, 0, ["FINAL AI-ONE-RUNG-SURVIVES", "I4-BOXBOUND"],
+             probe_over={("chI4", 195): dict(hi_frac=0.10)})
+        case("box at 4 % of records is still FREE", base, 0, ["FINAL AI-SURVIVES"], probe_over={("chI4", 195): dict(hi_frac=0.04)})
+        # the scalar accounts
+        case("SC-BEATS-BOTH (+0.5 over both at both)", _levels(i5=(92.50, 92.00, 93.00, 92.60), i4=(91.00, 90.50, 91.50, 91.10)), 0,
+             ["| SC-BEATS-BOTH |", "I5-SCALAR-BEATS-BEST+I4-SCALAR-BEATS-BEST"])
+        case("SC-TIES-OR-BEATS-BOTH", _levels(i5=(92.50, 92.00, 92.50, 92.60), i4=(91.00, 90.50, 91.50, 91.10)), 0, ["| SC-TIES-OR-BEATS-BOTH |"])
+        case("SC-LAMBDA-DEPENDENT", _levels(i4=(91.00, 90.50, 91.50, 91.10)), 0, ["| SC-LAMBDA-DEPENDENT |"])
+        case("SC-PARTIAL (I5 unresolved -0.2)", _levels(i5=(92.50, 92.00, 92.30, 92.60)), 0, ["| SC-PARTIAL |", "I5-SCALAR-UNRESOLVED"])
+        case("SC-UNREADABLE (scalar collapsed at both)", _levels(i5=(92.50, 92.00, 30.0, 92.60), i4=(91.00, 90.50, 30.0, 91.10)), 0,
+             ["FINAL AI-SURVIVES | SC-UNREADABLE", "UNHEALTHY-k01I5"])
+        case("LAYERWISE-ABOVE-SCALAR stamp (kL +0.5 over k01)", base, 0, ["LAYERWISE-ABOVE-SCALAR-I5", "LAYERWISE-ABOVE-SCALAR-I4"])
+        case("scalar box-bound is a STAMP, not a gate", base, 0, ["FINAL AI-SURVIVES", "BOX-BOUND-k01I4"],
+             probe_over={("k01I4", 192): dict(hi_frac=0.5)})
+        # harness breaks
+        case("HARNESS: chI4 s192 ran wd 0.1 (the alpha-scaled anchor)", base, 3, ["G-ARGS", "cai1-chI4-s192"],
+             over={("chI4", 192): dict(args_over=lambda p: [(f, "0.1" if f == "weight-decay-base" else v) for f, v in p])})
+        case("HARNESS: ndI5 s193 ran chunk777 (wrong grain)", base, 3, ["G-ARGS", "cai1-ndI5-s193"],
+             over={("ndI5", 193): dict(args_over=lambda p: [(f, "chunk777" if f == "stepsize-groups" else v) for f, v in p])})
+        case("HARNESS: a repeated --alg-meta", base, 3, ["G-ARGS", "alg-meta"],
+             over={("chI5", 192): dict(args_over=lambda p: p + [("alg-meta", "Lion")])})
+        case("HARNESS: ENV with SCHED=cosine", base, 3, ["G-ENV", "cai1-kLI5-s194"],
+             over={("kLI5", 194): dict(env_over=lambda e: e.replace("SCHED=none SCHED_TOTAL", "SCHED=cosine SCHED_TOTAL"))})
+        case("HARNESS: an I4 run printing I5's witness (the rung swapped)", base, 3, ["G-WITNESS", "cai1-k01I4-s193"],
+             over={("k01I4", 193): dict(witness=[D.witness_on("I5")])})
+        case("HARNESS: `DECAY_ROUTE: off` (the patch never turned on)", base, 3, ["G-WITNESS", "cai1-chI5-s195"],
+             over={("chI5", 195): dict(witness=["DECAY_ROUTE: off"])})
+        case("HARNESS: no DECAY_ROUTE line (the unpatched tree)", base, 3, ["G-WITNESS", "cai1-ndI4-s192"],
+             over={("ndI4", 192): dict(witness=[])})
+        case("HARNESS: two witness lines", base, 3, ["G-WITNESS"], over={("kLI4", 195): dict(witness=[D.witness_on("I4")] * 2)})
+        case("HARNESS: a DECAY_MASK: on witness", base, 3, ["G-KIND", "cai1-chI5-s194"],
+             over={("chI5", 194): dict(extra_line="DECAY_MASK: on base=SGDm wd=0.0 spec=x")})
+        case("HARNESS: a PROBE_TENSOR line", base, 3, ["G-KIND"], over={("chI5", 193): dict(extra_line="PROBE_TENSOR: on every=5 type=chunkwise")})
+        case("HARNESS: probe dr_lam 5e-5 on an I4 run", base, 3, ["G-SHRINK", "cai1-chI4-s193", "dr_lam"],
+             probe_over={("chI4", 193): dict(lam_rec=5e-05)})
+        case("HARNESS: measured shrink 5 % above LAMBDA", base, 3, ["G-SHRINK", "MEASURED shrink"],
+             probe_over={("ndI5", 192): dict(meas_mult=1.05)})
+        case("HARNESS: probe records without dr_* keys (the unpatched tree)", base, 3, ["G-SHRINK", "dr_mode"],
+             probe_over={("kLI5", 193): dict(no_dr=True)})
+        case("HARNESS: dr_n off by one", base, 3, ["G-SHRINK", "dr_n"], probe_over={("k01I5", 195): dict(dr_n_off=1)})
+        case("HARNESS: n_beta 14420 on a chunk777 run", base, 3, ["G-STRUCT", "cai1-chI5-s193", "n_beta"],
+             probe_over={("chI5", 193): dict(nb=14420)})
+        case("HARNESS: 9,999 probe records", base, 3, ["G-STRUCT", "records"], probe_over={("kLI4", 192): dict(n=9999)})
+        case("HARNESS: a duplicated epoch line (cgw1's latent F1, now a gate)", base, 3, ["G-EPOCH", "cai1-ndI4-s194"],
+             over={("ndI4", 194): dict(dup_epoch=True)})
+        case("HARNESS: provenance names another scorer", base, 3, ["G-PROV", "SCORER_SHA256"], prov_over={"SCORER_SHA256": "0" * 64})
+        case("HARNESS: provenance names the UNPATCHED HF (cgw1's 4732b74a)", base, 3, ["G-PROV", "HF_SHA256"],
+             prov_over={"HF_SHA256": D.HF_PRE_SHA})
+        case("HARNESS: an unregistered seed 196", base, 3, ["not a registered run"],
+             extra=[lambda d: _write_out(d, "chI5", 196, 8000001, 92.5, "/SAVE/runs/cai1")])
+        case("HARNESS: two COMPLETE .out files for one run", base, 3, ["COMPLETE .out files"],
+             extra=[lambda d: _write_out(d, "ndI4", 194, 8000002, 91.2, "/SAVE/runs/cai1")])
+        case("a TRUNCATED resubmission is ignored", base, 0, ["FINAL AI-SURVIVES"],
+             extra=[lambda d: _write_out(d, "ndI4", 194, 8000003, 50.0, "/SAVE/runs/cai1", n_ep=40, done=False)])
+        case("INCOMPLETE: one run dropped", base, 2, ["FINAL INCOMPLETE"], drop=(("kLI5", 192),))
+        case("INCOMPLETE: no RUN_DONE on one run", base, 2, ["FINAL INCOMPLETE"], over={("k01I4", 193): dict(done=False)})
+        # O2
+        fins = set()
+        for label, cp in (("real corpus", csvpath), ("no corpus", None), ("missing path", "/nonexistent.csv")):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            rc, fin, _l = _run(root, cp)
+            fins.add((rc, fin))
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for i in range(6):
+                    r = dict(rows[0])
+                    r.update(run="zzinv-%d" % i, job_id=str(9900000 + i), network=D.NET, dataset=D.DSET, granularity="chunk777",
+                             base="SGDm", meta="Lion", meta_stepsize=D.MST, alpha0=D.A0, gamma="1", augment="1",
+                             beta_clip=D.CLIP, batch_size="100", epochs_requested="100", hier="", lam="na",
+                             eta_ratio="na", superseded="0", collapsed="0", complete="1", plateau5=str(80 + 4 * i))
+                    w.writerow(r)
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            fins.add(_run(root, inv)[:2])
+            chk(len(fins) == 1 and list(fins)[0][1].startswith("FINAL AI-SURVIVES"),
+                "E O2: FINAL byte-identical on the real corpus, no corpus, a missing path and a corpus with invented rows "
+                "at this cell (%s)" % list(fins)[0][1][:60])
+        else:
+            skip("E O2 invariance: no real corpus on this host")
+        n[0] += 1
+        root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), root], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL AI-SURVIVES" in p.stdout and p.stdout.rstrip().splitlines()[-1].startswith("FINAL "),
+            "E the DOCUMENTED one-argument invocation `cAI1_alphaindep_score.py <runsdir>` reaches FINAL, as its LAST line")
+        fin_line = p.stdout.rstrip().splitlines()[-1]
+        chk(all(b in fin_line for b in BOUNDS), "E the FINAL line carries every one of the %d bounds" % len(BOUNDS))
+        os.unlink(os.path.join(root, PREFIX, D.probe_dir_name("chI5", 192)))
+        chk(_run(root, None)[0] == 3, "E a missing probe directory -> HARNESS-FAIL rc 3")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- F: real landed records ---------------------------------------------------------------------------------
+    print("\nF  THE PROBE AUDIT ON REAL LANDED RECORDS OF THIS CELL (gn1's BatchNorm arms, alpha-scaled 0.1, UNPATCHED tree)")
+    got_real = False
+    for base_ in ([runsdir] if runsdir else []) + ["/cluster/account_b/metaopt/runs"]:
+        pc = os.path.join(base_, "gn1", "probe_bn-ch_gn1_s0", "probe.jsonl")
+        pn = os.path.join(base_, "gn1", "probe_bn-node_gn1_s0", "probe.jsonl")
+        if os.path.exists(pc) and os.path.exists(pn):
+            got_real = True
+            rc_, rn_ = read_probe(pc), read_probe(pn)
+            okc, whyc, oc = probe_struct(rc_, 14421)
+            okn, whyn, on = probe_struct(rn_, 14420)
+            chk(okc and okn and oc["boxfree"] and on["boxfree"] and oc["a_plateau"] is not None,
+                "F landed gn1 bn-ch s0 (m 14421) and bn-node s0 (m 14420) pass G-STRUCT, box-free, a_plateau readable (%s %s)"
+                % (whyc, whyn))
+            okd, whyd, _x = probe_decay(rc_, 5e-05)
+            chk(not okd and "dr_mode" in whyd, "F the same records FAIL this batch's G-SHRINK (no DECAY_ROUTE record: %s)" % whyd[:60])
+            ok2, why2, _o = probe_struct(rc_, 14420)
+            chk(not ok2 and "n_beta" in why2, "F the chunk777 records FAIL G-STRUCT when read as nodewise")
+            break
+    if not got_real:
+        skip("F no landed gn1 probe records on this host")
+
+    # ---- G: the floor gate (164.6) on the registered predictions -----------------------------------------------
+    print("\nG  THE FLOOR GATE (164.6): every predicted arm level against chance, HEALTH_MIN and the ceiling")
+    below = []
+    for a in D.ARMS:
+        lo, hi = D.PRED[a]
+        print("    %-6s predicted [%.1f, %.1f]: %+.1f over chance %.0f, %+.1f over HEALTH_MIN, %.1f below 100"
+              % (a, lo, hi, lo - D.CHANCE, D.CHANCE, lo - HEALTH_MIN, 100.0 - hi))
+        if lo < HEALTH_MIN:
+            below.append(a)
+    chk(all(D.PRED[a][0] - D.CHANCE >= 70 and 100.0 - D.PRED[a][1] >= 7.0 for a in D.ARMS),
+        "G every predicted level is >= 70 pp above chance and >= 7 pp below 100: no predicted contrast is floor- or ceiling-bounded")
+    chk(tuple(below) == D.PRED_LO_BELOW_HEALTH,
+        "G DISCLOSED: the I4 arms' predicted low edge (84.0) is below HEALTH_MIN 85 -- UNHEALTHY at I4 is a registered, "
+        "reachable outcome, not a hidden one (%s)" % ",".join(below))
+    chk(D.PRED_D["SURVIVES"][0] >= SURV and D.PRED_D["VANISHES"] == (-NULLBAR, NULLBAR) and D.PRED_D["REVERSES"][1] <= -NULLBAR,
+        "G the predicted D bands are the scorer's own bars")
+    chk(abs(sum(D.PRIOR_P.values()) - 1.0) < 1e-9 and abs(sum(D.PRIOR_SC.values()) - 1.0) < 1e-9,
+        "G the primary priors and the scalar priors each sum to 1")
+    chk(set(D.PRIOR_SC) == set(SC_TOKENS) and set(k for k in D.PRIOR_P if k != "AI-ONE-RUNG-OR-UNREADABLE")
+        <= set(PRIMARY_TOKENS), "G every prior names a registered token (the one-rung / unreadable tokens share one prior)")
+
+    print("\nSELFTEST %d PASS / %d FAIL / %d SKIP" % (RESULTS["PASS"], RESULTS["FAIL"], RESULTS["SKIP"]))
+    return 0 if RESULTS["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    raise SystemExit(score(a.runsdir, a.csv))
+
+
+if __name__ == "__main__":
+    main()
