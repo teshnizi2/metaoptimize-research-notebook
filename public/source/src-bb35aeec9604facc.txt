@@ -1,0 +1,284 @@
+"""Structure, split semantics, loudness and witness of PATCH_VALSPLIT (`VAL_SPLIT=<n_val>:<split_seed>`).  CORRECTIONS 302.
+Written BEFORE patches/patch_valsplit.py (tests first); it applies the patch to a COPY of the pinned pre files.
+
+  V0  STRUCTURE (no torch).  --pre-dir holds the UNPATCHED load_data.py (b52b58a3...) and train.py (3fea309e...), the bytes
+      of the cgw1 tree.  The patch is applied to a temporary copy; PATCH_VALSPLIT is absent from the pre files and present
+      in the post files; each registered region appears exactly once at its anchor; DELETING the regions from the post
+      files reproduces the pre files BYTE FOR BYTE (additive only: no existing line edited); a second application prints
+      ALREADY_PATCHED and changes nothing; a file whose anchor is missing is REFUSED (exit 2, nothing written).
+  V1  THE SPLIT (numpy only; the helper block is exec'd out of the PATCHED load_data.py, so it is the code a run executes).
+      On a synthetic 10-class, 50,000-label target vector: 5,000 held out, EXACTLY 500 per class, train and val DISJOINT,
+      their union is 0..49,999, both sorted; the split is a function of (targets, n_val, split_seed) ONLY -- identical
+      after the global numpy RNG is re-seeded with any run seed and after torch-free "run seeds" 184..191 are drawn
+      through np.random; a DIFFERENT split seed gives a different split (non-vacuity); the val sha is stable.
+  V2  LOUDNESS: malformed values and every refused premise RAISE ValueError (n_val not a multiple of the class count,
+      n_val >= N, n_val 0, a non-integer token, a class with too few images, a dataset the split is not defined for).
+  V3  (only with torch AND --cifar-dir: the cluster_b Slurm job) the PATCHED load_data('CIFAR10', 100, seed) on the REAL
+      CIFAR-10 train set, CPU, no forward pass: OFF (unset AND empty) -> the train loader's dataset is the full 50,000-
+      image CIFAR10 object, VAL_LOADER is None, one `VAL_SPLIT: off` line; ON (5000:302) -> 45,000 train / 5,000 val,
+      500 per class by the REAL labels, disjoint, the val subset uses the TEST transform (no RandomCrop / Flip, so two
+      reads of one val image are equal) while the train subset keeps AUGMENT's; witness line == the one the patch's
+      own formatter gives; IDENTICAL split (val and train sha) for run seeds 184 and 191; split seed 303 differs.
+  V4  RULE 20: the registered value `5000:302` is ONE token of [0-9:], no comma.
+
+  python3 tests/test_valsplit.py --pre-dir <dir with pristine load_data.py + train.py> [--cifar-dir <cifar10 dir>]
+"""
+import argparse
+import contextlib
+import hashlib
+import importlib.util
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+PATCH = os.path.join(REPO, "patches", "patch_valsplit.py")
+FAILED = []
+LOADDATA_PRE_SHA = "b52b58a35dcecd80ce6d8f8033b09c20dad9f4827b808f4ea2a828ce88138c46"
+TRAIN_PRE_SHA = "3fea309e172609c1ee1be143d5f1847404426df31869a63c4cefbb1ebddfcab7"
+REGISTERED_VALUE = "5000:302"
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if not cond:
+        FAILED.append(label)
+    return bool(cond)
+
+
+def sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def load_patch_module():
+    spec = importlib.util.spec_from_file_location("patch_valsplit", PATCH)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)          # importing does NOT patch (the patch only writes under __main__)
+    return m
+
+
+def apply(tree):
+    p = subprocess.run([sys.executable, PATCH], env=dict(os.environ, VS_TREE=tree), stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, universal_newlines=True)
+    return p.returncode, p.stdout
+
+
+def helper_ns(post_load_src):
+    """exec the PATCH_VALSPLIT module block (numpy-only at module level) out of the PATCHED load_data.py."""
+    PM = load_patch_module()
+    i = post_load_src.index(PM.L_BLOCK_HEAD)
+    j = post_load_src.index(PM.L_BLOCK_TAIL) + len(PM.L_BLOCK_TAIL)
+    ns = {}
+    exec(compile(post_load_src[i:j], "load_data.py[PATCH_VALSPLIT]", "exec"), ns)
+    return ns
+
+
+def v0(pre_dir, tmp):
+    print("=" * 78)
+    print("V0  STRUCTURE")
+    lpre = open(os.path.join(pre_dir, "load_data.py"), "rb").read()
+    tpre = open(os.path.join(pre_dir, "train.py"), "rb").read()
+    chk(sha(lpre) == LOADDATA_PRE_SHA and sha(tpre) == TRAIN_PRE_SHA,
+        "--pre-dir holds the PINNED pre bytes (load_data b52b58a3..., train 3fea309e...)")
+    chk(b"PATCH_VALSPLIT" not in lpre + tpre and b"VAL_SPLIT" not in lpre + tpre and b"_vs_" not in lpre + tpre,
+        "the pre files carry no PATCH_VALSPLIT marker, no VAL_SPLIT and no _vs_ name")
+    tree = os.path.join(tmp, "tree")
+    os.makedirs(tree)
+    shutil.copy(os.path.join(pre_dir, "load_data.py"), tree)
+    shutil.copy(os.path.join(pre_dir, "train.py"), tree)
+    rc, out = apply(tree)
+    chk(rc == 0 and "PATCHED PATCH_VALSPLIT" in out, "the patch applies to a copy of the pre files (rc %d)" % rc, out.strip()[-120:])
+    if not os.path.exists(os.path.join(tree, "load_data.py.pre_valsplit")):
+        chk(False, "backups written")
+        return None
+    PM = load_patch_module()
+    lpost = open(os.path.join(tree, "load_data.py")).read()
+    tpost = open(os.path.join(tree, "train.py")).read()
+    chk(open(os.path.join(tree, "load_data.py.pre_valsplit"), "rb").read() == lpre
+        and open(os.path.join(tree, "train.py.pre_valsplit"), "rb").read() == tpre,
+        "the .pre_valsplit backups are BYTE-IDENTICAL to the pre files")
+    chk("PATCH_VALSPLIT" in lpost and "PATCH_VALSPLIT" in tpost, "both post files carry the marker")
+    chk(lpost.count(PM.L_CALL) == 1 and lpost.count(PM.L_ANCHOR_CALL + PM.L_CALL + PM.L_ANCHOR_LOADER) == 1,
+        "load_data region 1: ONE _vs_apply call, between the dataset branches' `else: 0/0` and the train DataLoader")
+    chk(lpost.count(PM.L_BLOCK) == 1 and lpost.endswith(PM.L_BLOCK),
+        "load_data region 2: ONE module block (VAL_LOADER + helpers), APPENDED after compute_test_accuracy")
+    chk(tpost.count(PM.T_IMPORT) == 1 and tpost.count(PM.T_ANCHOR_IMPORT + PM.T_IMPORT) == 1,
+        "train region 1: ONE `import load_data as _vs_ld`, right after the `from load_data import` line")
+    chk(tpost.count(PM.T_VAL) == 1 and tpost.count(PM.T_ANCHOR_EPOCH + PM.T_VAL) == 1,
+        "train region 2: ONE guarded VAL evaluation, right after the per-epoch `Epoch %d, ... Test Accuracy` print")
+    back_l = lpost.replace(PM.L_CALL, "", 1).replace(PM.L_BLOCK, "", 1).encode()
+    back_t = tpost.replace(PM.T_IMPORT, "", 1).replace(PM.T_VAL, "", 1).encode()
+    chk(back_l == lpre, "DELETING the two load_data regions reproduces the pre load_data.py BYTE FOR BYTE (additive only)")
+    chk(back_t == tpre, "DELETING the two train regions reproduces the pre train.py BYTE FOR BYTE (additive only)")
+    chk("Epoch %d, Train Accuracy" not in PM.T_VAL and "Test Accuracy" not in PM.T_VAL and "Test Accuracy" not in PM.L_BLOCK,
+        "the VAL line cannot match any corpus / scorer reader of `Test Accuracy: ` or `Epoch N, Train Accuracy`")
+    compile(lpost, "load_data.py", "exec")
+    compile(tpost, "train.py", "exec")
+    chk(True, "both post files COMPILE")
+    before = (open(os.path.join(tree, "load_data.py"), "rb").read(), open(os.path.join(tree, "train.py"), "rb").read())
+    rc2, out2 = apply(tree)
+    after = (open(os.path.join(tree, "load_data.py"), "rb").read(), open(os.path.join(tree, "train.py"), "rb").read())
+    chk(rc2 == 0 and "ALREADY_PATCHED" in out2 and before == after, "a second application prints ALREADY_PATCHED and changes nothing")
+    bad = os.path.join(tmp, "bad")
+    os.makedirs(bad)
+    open(os.path.join(bad, "load_data.py"), "w").write(lpre.decode().replace("    else: 0/0 # return error\n", "    else: raise\n"))
+    shutil.copy(os.path.join(pre_dir, "train.py"), bad)
+    rc3, out3 = apply(bad)
+    chk(rc3 != 0 and not os.path.exists(os.path.join(bad, "load_data.py.pre_valsplit"))
+        and open(os.path.join(bad, "train.py"), "rb").read() == tpre,
+        "a load_data.py whose anchor is missing is REFUSED: non-zero exit, no backup, train.py untouched", out3.strip()[-90:])
+    return lpost, tpost
+
+
+def v1_v2(lpost):
+    import numpy as np
+    print("=" * 78)
+    print("V1  THE SPLIT (the helper exec'd out of the patched load_data.py; numpy %s)" % np.__version__)
+    ns = helper_ns(lpost)
+    split, parse = ns["_vs_split"], ns["_vs_parse"]
+    rs = np.random.RandomState(12345)
+    targets = rs.permutation(np.repeat(np.arange(10), 5000)).tolist()
+    tr, va = split(targets, 5000, 302)
+    T = np.asarray(targets)
+    chk(len(va) == 5000 and len(tr) == 45000, "5,000 held out, 45,000 kept")
+    chk(all(int((T[va] == c).sum()) == 500 for c in range(10)), "EXACTLY 500 per class in the held-out split")
+    chk(len(np.intersect1d(tr, va)) == 0 and np.array_equal(np.union1d(tr, va), np.arange(50000)),
+        "train and val are DISJOINT and their union is 0..49,999")
+    chk(np.all(np.diff(tr) > 0) and np.all(np.diff(va) > 0), "both index lists are strictly increasing (sorted)")
+    shas = set()
+    for run_seed in range(184, 192):
+        np.random.seed(run_seed)
+        np.random.rand(7)
+        t2, v2 = split(targets, 5000, 302)
+        shas.add((sha(np.asarray(v2, dtype="<i8").tobytes()), sha(np.asarray(t2, dtype="<i8").tobytes())))
+    chk(len(shas) == 1 and list(shas)[0][0] == sha(np.asarray(va, dtype="<i8").tobytes()),
+        "IDENTICAL split after re-seeding the global numpy RNG with every run seed 184..191 (independent of the run seed)")
+    g_before = np.random.get_state()[1].copy()
+    split(targets, 5000, 302)
+    chk(np.array_equal(np.random.get_state()[1], g_before), "the split does NOT consume the global numpy RNG")
+    _t3, v3 = split(targets, 5000, 303)
+    chk(not np.array_equal(v3, va), "a DIFFERENT split seed (303) gives a different split (non-vacuity)")
+    print("  NOTE synthetic val sha %s" % sha(np.asarray(va, dtype="<i8").tobytes())[:16])
+    chk(parse(REGISTERED_VALUE) == (5000, 302) and parse("") is None, "parse: `5000:302` -> (5000, 302); empty -> OFF")
+
+    print("=" * 78)
+    print("V2  LOUDNESS")
+    for v in ("5000", "5000:", ":302", "5000:x", "5e3:302", "5000:302:1", " 5000:302", "5000,302", "-5000:302", "0:302", "5000:302\n"):
+        try:
+            parse(v)
+            chk(False, "VAL_SPLIT=%r raises" % v)
+        except ValueError:
+            chk(True, "VAL_SPLIT=%r raises ValueError" % v)
+    for args, lab in (((targets, 5001, 302), "n_val not a multiple of 10 classes"),
+                      ((targets, 50000, 302), "n_val >= N"),
+                      ((targets[:1000] + [0] * 10, 1000, 302), "a class with too few images")):
+        try:
+            split(*args)
+            chk(False, "%s raises" % lab)
+        except ValueError:
+            chk(True, "%s raises ValueError" % lab)
+
+
+def v3(tree, cifar_dir):
+    print("=" * 78)
+    print("V3  THE REAL CIFAR-10 TRAIN SET THROUGH THE PATCHED load_data (CPU, no forward pass)")
+    try:
+        import numpy as np
+        import torch  # noqa: F401
+    except ImportError:
+        print("  SKIP V3 (no torch on this host)")
+        return
+    cwd = os.getcwd()
+    os.chdir(cifar_dir)                       # ./data resolves through the tree's data symlink
+    sys.path.insert(0, tree)
+    try:
+        spec = importlib.util.spec_from_file_location("load_data", os.path.join(tree, "load_data.py"))
+        LD = importlib.util.module_from_spec(spec)
+        sys.modules["load_data"] = LD
+        spec.loader.exec_module(LD)
+        os.environ["AUGMENT"] = "1"
+        for val, lab in ((None, "unset"), ("", "empty")):
+            os.environ.pop("VAL_SPLIT", None)
+            if val is not None:
+                os.environ["VAL_SPLIT"] = val
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                trl, _tel = LD.load_data("CIFAR10", 100, 184)
+            vs = [ln for ln in buf.getvalue().splitlines() if ln.startswith("VAL_SPLIT")]
+            chk(type(trl.dataset).__name__ == "CIFAR10" and len(trl.dataset) == 50000 and LD.VAL_LOADER is None
+                and vs == ["VAL_SPLIT: off"],
+                "OFF (%s): the train loader's dataset IS the full 50,000-image CIFAR10 object; VAL_LOADER None; `VAL_SPLIT: off`" % lab)
+        got = {}
+        for run_seed, value in ((184, REGISTERED_VALUE), (191, REGISTERED_VALUE), (184, "5000:303")):
+            os.environ["VAL_SPLIT"] = value
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                trl, _tel = LD.load_data("CIFAR10", 100, run_seed)
+            vs = [ln for ln in buf.getvalue().splitlines() if ln.startswith("VAL_SPLIT")]
+            val = LD.VAL_LOADER.dataset
+            tri, vai = np.asarray(trl.dataset.indices), np.asarray(val.indices)
+            T = np.asarray(trl.dataset.dataset.targets)
+            got[(run_seed, value)] = (vs, sha(np.asarray(vai, dtype="<i8").tobytes()), sha(np.asarray(tri, dtype="<i8").tobytes()))
+            if value != REGISTERED_VALUE:
+                continue
+            chk(len(trl.dataset) == 45000 and len(val) == 5000, "ON seed %d: 45,000 train / 5,000 val" % run_seed)
+            chk(all(int((T[vai] == c).sum()) == 500 for c in range(10)) and len(np.intersect1d(tri, vai)) == 0
+                and np.array_equal(np.union1d(tri, vai), np.arange(50000)),
+                "ON seed %d: 500 per class by the REAL labels, disjoint, union = the whole train set" % run_seed)
+            tt = [type(t).__name__ for t in val.dataset.transform.transforms]
+            ta = [type(t).__name__ for t in trl.dataset.dataset.transform.transforms]
+            chk(tt == ["ToTensor", "Normalize"] and ta[:2] == ["RandomCrop", "RandomHorizontalFlip"],
+                "ON seed %d: val subset uses the TEST transform %s; train subset keeps AUGMENT's %s" % (run_seed, tt, ta[:2]))
+            x1, x2 = val[0][0], val[0][0]
+            chk(bool((x1 == x2).all()), "ON seed %d: two reads of val image 0 are EQUAL (no augmentation on val)" % run_seed)
+            chk(len(vs) == 1 and vs[0] == LD._vs_witness("CIFAR10", 5000, 302, 45000, 5000, 10, 500, tri, vai),
+                "ON seed %d: ONE witness line == the patch's own formatter" % run_seed, vs[0][:110] if vs else "")
+        a, b, c = got[(184, REGISTERED_VALUE)], got[(191, REGISTERED_VALUE)], got[(184, "5000:303")]
+        chk(a[1] == b[1] and a[2] == b[2] and a[0] == b[0],
+            "the split is IDENTICAL for run seeds 184 and 191 (val sha %s, train sha %s, same witness)" % (a[1][:16], a[2][:16]))
+        chk(c[1] != a[1], "split seed 303 gives a DIFFERENT val set (non-vacuity)")
+        print("  NOTE REAL CIFAR-10 val sha (5000:302) %s" % a[1])
+    finally:
+        os.environ.pop("VAL_SPLIT", None)
+        sys.path.remove(tree)
+        os.chdir(cwd)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pre-dir", required=True)
+    ap.add_argument("--cifar-dir", default=None, help="a tree dir whose ./data holds cifar-10-batches-py (V3)")
+    a = ap.parse_args()
+    print("TEST_SHA256 %s" % sha(open(os.path.abspath(__file__), "rb").read()))
+    print("PATCH_SHA256 %s" % (sha(open(PATCH, "rb").read()) if os.path.exists(PATCH) else "MISSING"))
+    tmp = tempfile.mkdtemp(prefix="valsplit_test_")
+    try:
+        if not os.path.exists(PATCH):
+            chk(False, "patches/patch_valsplit.py exists")
+        else:
+            r = v0(os.path.abspath(a.pre_dir), tmp)
+            if r:
+                v1_v2(r[0])
+                if a.cifar_dir:
+                    tree = os.path.join(tmp, "tree")
+                    os.symlink(os.path.join(os.path.abspath(a.cifar_dir), "data"), os.path.join(tree, "data"))
+                    v3(tree, tree)
+                else:
+                    print("  SKIP V3 (no --cifar-dir)")
+        print("=" * 78)
+        print("V4  RULE 20")
+        chk(re.match(r"^[0-9:]+$", REGISTERED_VALUE) is not None and "," not in REGISTERED_VALUE,
+            "the registered value %r is ONE token of [0-9:], no comma (one --export item)" % REGISTERED_VALUE)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("\n%s" % ("ALL PASS" if not FAILED else "FAILURES (%d): %r" % (len(FAILED), FAILED)))
+    raise SystemExit(1 if FAILED else 0)
+
+
+if __name__ == "__main__":
+    main()

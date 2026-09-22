@@ -61,14 +61,15 @@ test('the published register is fully represented in the general review', async 
   const data = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8')) as ResearchData;
   const rows = areaOutcomeCounts(data.experiments, data.areas);
   assert.equal(rows.length, 10);
-  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 161);
+  assert.equal(rows.reduce((sum, row) => sum + row.total, 0), 162);
   assert.equal(rows.reduce((sum, row) => sum + row.methodChecks, 0), 18);
   for (const row of rows) {
     assert.equal(Object.values(row.counts).reduce((sum, count) => sum + count, 0), row.total);
     assert.equal(row.total + row.methodChecks, data.experiments.filter(e => e.area === row.label).length);
   }
   const audit = rows.find(row => row.label === 'Count-matched partition audit')!;
-  assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [36, { success: 12, fail: 5, mixed: 5, unresolved: 14 }, 3]);
+  assert.deepEqual([audit.total, audit.counts, audit.methodChecks], [37, { success: 12, fail: 5, mixed: 5, unresolved: 15 }, 3]);
+  // MASTER-TABLE line 243 (cvl1, Open) is the audit area's thirty-seventh research question (tests/mech9-landing.test.ts).
   // MASTER-TABLE lines 212-217: five mechanism rows and one baseline row (cuc1); line 218 (cvt1, Mixed) is a sixth mechanism row, line 219 (cgn3, Goal met) a seventh, lines 220-221 (cvt3, cvt2, both Mixed) the eighth and ninth, lines 222-223 (cvt4, cvt5, both Goal met) the tenth and eleventh, lines 224-225 (cvt6 Mixed, cvt7 Goal met) the twelfth and thirteenth, and lines 226-227 (cvt8, cvt9, both Mixed) the fourteenth and fifteenth, and lines 228-231 (cmo1 Mixed, cst1 Mixed since CORRECTIONS 273, cct1 Goal met, cmg1 Mixed) the sixteenth to nineteenth, and lines 232-235 (cvt10, cwd1, csv1, cwd2, all four Goal met) the twentieth to twenty-third, and lines 236-239 (cwd3 Goal met; cwd4, cwd5 and caw2 Mixed) the twenty-fourth to twenty-seventh. Line 240 (cgw1, Open) is a count-matched partition audit row, and so is line 241 (crt1, Mixed); line 242 (csh1, Mixed) is the twenty-eighth mechanism row.
   assert.deepEqual([rows.find(row => row.label === 'Mechanism and isolation')!.total, rows.find(row => row.label === 'Mechanism and isolation')!.counts], [63, { success: 22, fail: 12, mixed: 21, unresolved: 8 }]);
   assert.deepEqual([rows.find(row => row.label === 'Baseline comparisons')!.total, rows.find(row => row.label === 'Baseline comparisons')!.counts], [8, { success: 7, fail: 1, mixed: 0, unresolved: 0 }], 'MT019 moved from Open to Goal met at CORRECTIONS 229');

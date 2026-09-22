@@ -35,8 +35,8 @@ const CWD5_FINAL = ['THRESHOLD-W1-W2', 'W1-COLLAPSE+W2-NOGAP+W3-NOGAP+W4-NOGAP+C
 test('MT237 and MT238 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
   assert.equal(CWD4_FINAL.length, 21);
   assert.equal(CWD5_FINAL.length, 21);
-  assert.deepEqual(data.experiments.slice(-6, -4).map(e => e.id), ['MT237', 'MT238'], 'appended in line order, before the later caw2, cgw1, crt1 and csh1 rows');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [179, 161, 18, 3437]);
+  assert.deepEqual(data.experiments.slice(-7, -5).map(e => e.id), ['MT237', 'MT238'], 'appended in line order, before the later caw2, cgw1, crt1, csh1 and cvl1 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [180, 162, 18, 3469]);
   // Two research questions, both Mixed; neither corrects an earlier published claim, so neither carries a Corrected badge.
   assert.deepEqual([cwd4.section, cwd4.area, cwd4.kind, cwd4.outcome, cwd4.corrected, cwd4.batches],
     [9, 'Mechanism and isolation', 'research', 'mixed', false, ['cwd4']]);
@@ -128,11 +128,11 @@ test('the cwd5 warning names the ARGS-value kind and the first two-axis rows in 
   assert.match(warning.detail, /The six anchor runs at the standard 0\.1 deviate on nothing and own no row/);
   assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 91fcd57; CORRECTIONS 263, 281, 284 and 285\.$/);
   // At this landing exactly two records carried the ARGS-value mark, cmo1's and cwd5's; caw2 and cgw1 later added theirs.
-  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation']);
+  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation', 'warning-MT243-args-deviation']);
 });
 
 test('the 48 runs link to their records with sanitized logs, and exactly the listed rows are marked', () => {
-  assert.equal(runs.length, 3437);
+  assert.equal(runs.length, 3469);
   for (const [eid, batch, seeds, marked] of [['MT237', 'cwd4', ['143', '144', '145'], 18], ['MT238', 'cwd5', ['146', '147', '148'], 21]] as const) {
     const linked = runs.filter(run => run.batch === batch);
     assert.equal(linked.length, batch === 'cwd4' ? 21 : 27);
@@ -172,14 +172,15 @@ test('the 48 runs link to their records with sanitized logs, and exactly the lis
     }
     assert.equal(linked.filter(run => run.parameters.intervention || run.parameters.argsDeviation).length, marked);
   }
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 183, 'the 165 earlier patch interventions plus cwd3 and cwd4');
-  assert.equal(runs.filter(run => !['caw2', 'cgw1', 'crt1', 'csh1'].includes(run.batch) && run.parameters.argsDeviation).length, 39, "cmo1's 18 plus cwd5's 21");
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.intervention).length, 183, 'the 165 earlier patch interventions plus cwd3 and cwd4');
+  assert.equal(runs.filter(run => !['caw2', 'cgw1', 'crt1', 'csh1', 'cvl1'].includes(run.batch) && run.parameters.argsDeviation).length, 39, "cmo1's 18 plus cwd5's 21");
   // caw2 and cgw1 later added 18 and 28 of their own (tests/mech7-landing.test.ts), crt1 and csh1 36 and 18 (tests/mech8-landing.test.ts).
-  assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 139);
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.argsDeviation).length, 139);
 });
 
 test("cwd5's CARW2 rows are the corpus's first two-axis rows and are witnessed on both axes", () => {
-  const twoAxis = runs.filter(run => run.parameters.argsDeviationAxes);
+  // cvl1's 16 W4 runs (VAL_SPLIT, CORRECTIONS 312) are the only later two-axis rows (tests/mech9-landing.test.ts).
+  const twoAxis = runs.filter(run => run.batch !== 'cvl1' && run.parameters.argsDeviationAxes);
   assert.deepEqual(twoAxis.map(run => run.parameters.runLabel), ['cwd5-CARW2-s146', 'cwd5-CARW2-s147', 'cwd5-CARW2-s148']);
   for (const run of twoAxis) {
     assert.equal(run.parameters.argsDeviation,
@@ -237,7 +238,8 @@ test('phase-13 and phase-14 are their own documented phases and carry one record
   // phase-12 keeps its one record; the new phases take none of the earlier ones.
   assert.deepEqual(data.activity.find(e => e.id === 'phase-12')!.experimentIds, ['MT236']);
   // phase-15 and phase-16 were added later with caw2 and cgw1 (tests/mech7-landing.test.ts), phase-17 and phase-18 with crt1 and csh1.
-  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 18);
+  // phase-19 was added later with cvl1 (tests/mech9-landing.test.ts).
+  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 19);
 });
 
 test('the two landings link the scorers, parsers, patch, runner and audit tools they cite', () => {

@@ -31,8 +31,8 @@ const CSH1_FINAL = ['HORIZON-DOES-NOT-REPRODUCE', 'A-NOGAP+M-NOGAP+P-NOGAP', 'DE
   'TRAIN-AGREES (branch', 'cell states', '17 stamps; the 13 registered bounds in the next column)'];
 
 test('MT241 and MT242 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-2).map(e => e.id), ['MT241', 'MT242'], 'appended after every existing record');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [179, 161, 18, 3437]);
+  assert.deepEqual(data.experiments.slice(-3, -1).map(e => e.id), ['MT241', 'MT242'], 'appended in line order, before the later cvl1 row');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [180, 162, 18, 3469]);
   // crt1 belongs to the count-matched partition audit, csh1 to the mechanism area; both Mixed, and neither corrects an
   // earlier published claim, so neither carries a Corrected badge.
   assert.deepEqual([crt1.section, crt1.area, crt1.kind, crt1.outcome, crt1.corrected, crt1.batches],
@@ -98,11 +98,11 @@ test('the two warnings name the ARGS-value kind, and every row of both batches i
   assert.match(w242.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 5db62be; CORRECTIONS 263, 301 and 310\.$/);
   assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id),
     ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation',
-      'warning-MT241-args-deviation', 'warning-MT242-args-deviation']);
+      'warning-MT241-args-deviation', 'warning-MT242-args-deviation', 'warning-MT243-args-deviation']);
 });
 
 test('the 54 runs link to their records with sanitized logs, and every one carries its ARGS-value mark', () => {
-  assert.equal(runs.length, 3437);
+  assert.equal(runs.length, 3469);
   const cases = [['MT241', 'crt1', ['176', '177', '178'], 36, 'ResNet18', 'CIFAR10'],
     ['MT242', 'csh1', ['180', '181', '182'], 18, 'ResNet18_c100', 'CIFAR100']] as const;
   for (const [eid, batch, seeds, count, architecture, dataset] of cases) {
@@ -129,8 +129,8 @@ test('the 54 runs link to their records with sanitized logs, and every one carri
       assert.equal(run.parameters.argsDeviationAxes, undefined, `${run.id} carries no patch axis`);
     }
   }
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 183, 'no patch intervention was added');
-  assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 139, "cmo1's 18, cwd5's 21, caw2's 18, cgw1's 28, crt1's 36 and csh1's 18");
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.intervention).length, 183, 'no patch intervention was added');
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.argsDeviation).length, 139, "cmo1's 18, cwd5's 21, caw2's 18, cgw1's 28, crt1's 36 and csh1's 18");
 });
 
 test('the published arm means reproduce every level the two rows read', () => {
@@ -165,7 +165,8 @@ test('phase-17 and phase-18 are their own documented phases and carry one record
   assert.match(phase17.title, /Does the scalar reading survive re-tuning/);
   assert.match(phase18.title, /Does a short meta-horizon alone cause the collapse/);
   assert.deepEqual(data.activity.find(e => e.id === 'phase-16')!.experimentIds, ['MT240']);
-  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 18);
+  // phase-19 was added later with cvl1 (tests/mech9-landing.test.ts).
+  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 19);
 });
 
 test('the two landings link the scorers, parsers and audit tools they cite', () => {

@@ -18,7 +18,7 @@ async function main(){
   const match=/^MT(\d+)$/.exec(experiment.id);
   return Boolean(match&&Number(match[1])>=175);
  });
- console.log(`Experiment copy check passed: ${ids.length} editorial records; all ${required.length} required MASTER-TABLE records (MT175–MT242) are covered.`);
+ console.log(`Experiment copy check passed: ${ids.length} editorial records; all ${required.length} required MASTER-TABLE records (MT175–MT243) are covered.`);
  // The curated later-evidence cross-links (content/later-evidence.json) quote the published CORRECTIONS copy.
  const corrections=research.sources.find(source=>source.path==='docs/CORRECTIONS.md');
  if(!corrections)throw new Error('Later evidence check failed: docs/CORRECTIONS.md is not a published source.');

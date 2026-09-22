@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""cai1_rule20_envaudit.py <runsdir> -- CORRECTIONS 306: RULE 20's SEPARATE ENV half for `cai1`.
+
+A copy of analysis/cvl1_rule20_envaudit.py with `cai1`'s table.  Its one batch-specific check: the run's own
+`DECAY_ROUTE: on ...` witness line (printed by PATCH_DECAYROUTE at construction, since the runner's ENV line cannot carry
+DECAY_ROUTE) must be EXACTLY the one registered for the run's OWN LAMBDA rung (I5: lambda=5e-05, I4: lambda=0.0005).
+The two rungs' ARGS lines are identical but for --run-name, so THIS line is the rung separation RULE 20 can read.
+**Every expectation below is a RE-TYPED literal, NOT imported from analysis/cai1_design.py**: this file audits what the
+runs printed and must not share a source with the design it audits.
+
+**WHAT THIS HALF CAN AND CANNOT DISCRIMINATE, DECLARED AT REGISTRATION.**  The runner's `ENV:` line carries AUGMENT,
+BETA_CLIP, HIER, LAM, ETA_RATIO, COS_*, SCHED_*, PROBE, PROBE_DIR, EB_RHO and EB_LOG -- NO weight decay, NO grain and NO
+LAMBDA.  The grain and wd are the ARGS half's job (bin/cAI1_rule20.sh pins every run to --weight-decay-base 0 and its OWN
+--stepsize-groups); the LAMBDA is this half's, through the witness line.  What this half ALSO discriminates: (a) the ENV
+line is the single registered one (PROBE=5, the box, AUGMENT=1, SCHED=none); (b) no OTHER hold / mask witness prints
+ON; (c) the NODE header names the run and job; (d) the device is disclosed.
+
+READ-ONLY.  It looks ONLY at lines starting with `NODE=`, `ENV:`, `PROBE_TENSOR:`, a witness prefix, or a GPU name line;
+no accuracy number is touched.
+    python3 analysis/cai1_rule20_envaudit.py $WS/runs
+"""
+import collections
+import glob
+import os
+import re
+import sys
+
+WS = "/cluster/account_b/metaopt"
+PREFIX = "cai1"
+# RE-TYPED, not imported
+SEEDS = {"I5": [192, 193, 194, 195], "I4": [192, 193, 194, 195]}
+ARMS = ["%s%s" % (g, r) for r in ("I5", "I4") for g in ("ch", "nd", "k01", "kL")]
+N_EXP = 32
+DR_WITNESS = {
+    "I5": "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=5e-05 lambda_f32=4.999999873689376e-05 gamma=1.0",
+    "I4": "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=0.0005 lambda_f32=0.0005000000237487257 gamma=1.0",
+}
+COMMON = {"AUGMENT": "1", "BETA_CLIP": "-15:-2.3026", "HIER": "none", "LAM": "na",
+          "ETA_RATIO": "na", "COS_TOTAL": "default", "COS_WARMUP": "default",
+          "SCHED": "none", "SCHED_TOTAL": "none", "SCHED_WARMUP": "none",
+          "SCHED_MIN": "none", "PROBE": "5", "EB_RHO": "na", "EB_LOG": "0"}
+KINDS = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK", "SHADOW_VOTE", "VAL_SPLIT")
+
+
+def main():
+    runsdir = sys.argv[1]
+    pat = re.compile(r"^%s-(%s)-s(\d+)-(\d+)\.out$" % (PREFIX, "|".join(ARMS)))
+    found = collections.defaultdict(list)
+    for p in sorted(glob.glob(os.path.join(runsdir, PREFIX + "-*.out"))):
+        m = pat.match(os.path.basename(p))
+        if m and int(m.group(2)) in SEEDS[m.group(1)[-2:]]:
+            found[(m.group(1), int(m.group(2)))].append((m.group(3), p))
+        else:
+            print("  VIOLATION unregistered file %s" % os.path.basename(p))
+            found[("?", os.path.basename(p))] = []
+    bad = sum(1 for k in found if k[0] == "?")
+    distinct = collections.Counter()
+    gpu_seen = collections.Counter()
+    off_seen = collections.Counter()
+    vs_seen = collections.Counter()
+    for key in sorted(k for k in found if k[0] != "?"):
+        arm, seed = key
+        if len(found[key]) > 1:
+            print("  NOTE %d .out files for %s-s%d" % (len(found[key]), arm, seed))
+        for jid, p in found[key]:
+            rn = "%s-%s-s%d" % (PREFIX, arm, seed)
+            node, env, pt, gpu, wit, vs = [], [], [], [], [], []
+            with open(p, errors="replace") as fh:
+                for ln in fh:
+                    ln = ln.rstrip("\n")
+                    if ln.startswith("NODE="):
+                        node.append(ln)
+                    elif ln.startswith("ENV:"):
+                        env.append(ln)
+                    elif ln.startswith("PROBE_TENSOR:"):
+                        pt.append(ln)
+                    elif ln.startswith("DECAY_ROUTE"):
+                        vs.append(ln)
+                    elif ln.endswith(" MiB") and ", " in ln:
+                        gpu.append(ln)
+                    elif any(ln.startswith(k + ":") for k in KINDS):
+                        wit.append(ln)
+            errs = []
+            if len(env) != 1:
+                errs.append("%d ENV lines" % len(env))
+            else:
+                toks = env[0][len("ENV:"):].split()
+                kv = dict(t.split("=", 1) for t in toks if "=" in t)
+                want = dict(COMMON)
+                want["PROBE_DIR"] = "%s/runs/%s/probe_%s" % (WS, PREFIX, rn)
+                if len(toks) != len(kv) or set(kv) != set(want):
+                    errs.append("ENV keys %s differ from the runner's 15" % sorted(set(kv) ^ set(want)))
+                for k, w in want.items():
+                    if kv.get(k) != w:
+                        errs.append("ENV %s=%s want %s" % (k, kv.get(k), w))
+                distinct[re.sub(r" PROBE_DIR=\S+", "", env[0])] += 1
+            if pt:
+                errs.append("a PROBE_TENSOR line (cai1 runs without PROBE_TENSOR): %s" % pt[0][:100])
+            if vs != [DR_WITNESS[arm[-2:]]]:
+                errs.append("DECAY_ROUTE witness %r is not exactly ONE line, the one registered for rung %s" % ([v[:120] for v in vs][:2], arm[-2:]))
+            else:
+                vs_seen[vs[0]] += 1
+            for w in wit:
+                if re.match(r"^[A-Z_]+: off$", w):
+                    off_seen[w] += 1
+                else:
+                    errs.append("witness not OFF: %s" % w[:140])
+            if len(node) != 1:
+                errs.append("%d NODE lines" % len(node))
+            else:
+                mm = re.match(r"^NODE=(\S+) \| JOB=(\S+) (\d+) \| AUGMENT=(\S+)$", node[0])
+                if not mm:
+                    errs.append("NODE header unparseable")
+                elif (mm.group(2), mm.group(3), mm.group(4)) != (rn, jid, "1"):
+                    errs.append("NODE header JOB=%s %s AUGMENT=%s, want %s %s 1" % (mm.group(2), mm.group(3), mm.group(4), rn, jid))
+            if gpu:
+                gpu_seen[gpu[0].split(",")[0].strip()] += 1
+            if errs:
+                bad += 1
+                print("  VIOLATION %s: %s" % (os.path.basename(p), "; ".join(errs)))
+    n = len([k for k in found if k[0] != "?"])
+    print("  DECLARED: the ENV line carries NO weight decay and NO grain; the ARGS half (bin/cAI1_rule20.sh) pins wd 0 and the grain;"
+          " the DECAY_ROUTE witness below carries the LAMBDA rung.")
+    print("  DECAY_ROUTE witness lines (every run must print exactly its OWN rung's registered one):")
+    for line, c in sorted(vs_seen.items()):
+        print("    x%d  %s" % (c, line))
+    print("  distinct ENV lines (PROBE_DIR stripped): %d" % len(distinct))
+    for line, c in distinct.items():
+        print("    x%d  %s" % (c, line))
+    print("  hold / mask witness lines seen (every one must be ': off'):")
+    for line, c in sorted(off_seen.items()):
+        print("    x%d  %s" % (c, line))
+    print("  GPU devices named by the runs' own nvidia-smi lines (DISCLOSURE; --constraint=L4 was requested):")
+    for line, c in sorted(gpu_seen.items()):
+        print("    x%d  %s" % (c, line))
+    if len(distinct) > 1:
+        bad += 1
+        print("  VIOLATION more than one distinct ENV line")
+    if any(k != "NVIDIA L4" for k in gpu_seen):
+        bad += 1
+        print("  VIOLATION a run reports a device other than NVIDIA L4 despite --constraint=L4")
+    print("  coverage %d/%d runs with an .out, %d violations" % (n, N_EXP, bad))
+    verdict = "FAIL" if bad else ("PASS" if n == N_EXP else "UNVERIFIED (%d/%d present)" % (n, N_EXP))
+    print("ENV AUDIT VERDICT %s: %s" % (PREFIX, verdict))
+    sys.exit(1 if bad else 0)
+
+
+main()

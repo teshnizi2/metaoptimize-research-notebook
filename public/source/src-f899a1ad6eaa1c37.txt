@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""crt2_live_check.py -- `crt2` (CORRECTIONS 313): the spec strings, group counts, meta step sizes, alpha0 and weight decay
+RE-DERIVED ON THE LIVE MODEL.  A copy of crt1_live_check.py (300.4) with crt2's table.
+
+Run on cluster_b (CPU ONLY -- model and optimizer CONSTRUCTION, no forward pass, no GPU) from the launcher's guard 4:
+    python3 analysis/crt2_live_check.py <tree cifar10 dir> <out manifest path> <cwd1 tree HF.py>
+For every one of the 15 arms (3 grains x 5 tuning configs) it parses the arm's OWN registered ARGS tokens with the tree's OWN `train.parse_args`,
+builds the network with the tree's OWN `build_network` and the optimizer with the tree's OWN `build_optimizer`, and
+reads back: the stepsize type, the group count m = sum(numel(beta)), the weight decay, the META STEP SIZE and the
+INITIAL step size alpha0 the optimizer holds (every beta == ln(alpha0) at construction), the bound base update, the tensor count and the parameter count.  It then writes the LIVE manifest in the design's own format
+and exits 1 unless it is BYTE-IDENTICAL to crt2_design.manifest_text().
+
+guard 4e (cgw1's, 291.3): the SOURCE TEXT of `SGDm_base_update` in the tree's HF.py is compared, by AST source
+segment and without importing it, with the same method in harness_cwd1's HF.py -- the file whose real-GPU bite log
+(cwd5, RW2) proved the passed weight decay reaches the update bitwise at 0.1 / 1e-2 / 1e-3 / 5e-4.  That identity is
+what lets this batch inherit the premise without a proof job of its own.
+"""
+import importlib.util
+import math
+import os
+import sys
+
+tree, out, cwd1_hf = sys.argv[1], sys.argv[2], sys.argv[3]
+HERE = os.path.dirname(os.path.abspath(__file__))
+spec = importlib.util.spec_from_file_location("crt2_design", os.path.join(HERE, "crt2_design.py"))
+D = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(D)
+
+os.chdir(tree)
+sys.path.insert(0, tree)
+import torch  # noqa: E402
+import argparse  # noqa: E402
+import ast  # noqa: E402
+# train.py runs code at module level after its __main__ block, so it is NOT imported: its OWN `parse_args` function
+# is lifted out of the file by the AST, byte for byte, and executed in a namespace holding argparse.
+_src = open(os.path.join(tree, "train.py")).read()
+_fn = [n for n in ast.parse(_src).body if isinstance(n, ast.FunctionDef) and n.name == "parse_args"][0]
+_ns = {"argparse": argparse}
+exec(compile(ast.Module(body=[_fn], type_ignores=[]), os.path.join(tree, "train.py"), "exec"), _ns)
+
+
+class train:  # noqa: N801
+    parse_args = staticmethod(_ns["parse_args"])
+
+
+from build_network import build_network  # noqa: E402
+from Optimizers.build_optimizer import build_optimizer  # noqa: E402
+
+bad = 0
+
+
+def _method_src(path, cls, meth):
+    src = open(path).read()
+    for n in ast.parse(src).body:
+        if isinstance(n, ast.ClassDef) and n.name == cls:
+            for f in n.body:
+                if isinstance(f, ast.FunctionDef) and f.name == meth:
+                    return ast.get_source_segment(src, f)
+    return None
+
+
+_a = _method_src(os.path.join(tree, "Optimizers", "HF.py"), "HF", "SGDm_base_update")
+_b = _method_src(cwd1_hf, "HF", "SGDm_base_update")
+if _a is None or _a != _b:
+    print("!!! guard 4e: SGDm_base_update in %s is NOT the source text of %s's" % (tree, cwd1_hf))
+    bad += 1
+else:
+    print("guard 4e: SGDm_base_update source text (%d chars, sha256 %s) is IDENTICAL in this tree and in %s"
+          % (len(_a), D.hashlib.sha256(_a.encode()).hexdigest()[:16], cwd1_hf))
+    print("          ('delta = a * (self.momentum_base[i] + self.args_base['weight_decay']*w.data)' present: %s)"
+          % ("self.args_base['weight_decay']*w.data" in _a))
+live_m, ntens, totpar, live_cfg, live_tok = {}, set(), set(), {}, {}
+# the manifest's ms / alpha0 tokens are the ones the tree's parse_args ACCEPTED, re-printed from the parsed float only when
+# it equals the registered value (so a token the tree read differently cannot print the registered string)
+for a in D.ARMS:
+    toks = []
+    for k, v in D.expected_args(a, D.SEEDS[a][0], "/tmp/crt2_livecheck"):
+        toks += ["--" + k, v]
+    sys.argv = ["train.py"] + toks
+    args = train.parse_args()
+    args.device = torch.device("cpu")
+    torch.manual_seed(0)
+    net = build_network(args.NN_name, args.device)
+    opt = build_optimizer(net, args, None)
+    m = sum(int(b.numel()) for b in opt.beta)
+    nt = len(list(net.parameters()))
+    tp = sum(p.numel() for p in net.parameters())
+    wd = opt.args_base["weight_decay"]
+    bu = getattr(opt.base_update, "__name__", "?")
+    _bv = [float(x) for bb in opt.beta for x in bb.detach().flatten().tolist()]
+    b0 = [min(_bv), max(_bv)]
+    ok = (m == D.M_OF_ARM[a] and abs(wd - D.WD_VALUE) == 0.0 and bu == "SGDm_base_update"
+          and args.stepsize_groups == D.SPEC[a] and args.weight_decay_base == D.WD_VALUE
+          and opt.args_meta["meta_stepsize"] == D.MSF[a] and float(args.alpha0) == D.A0F[a]
+          and abs(b0[0] - math.log(D.A0F[a])) < 1e-5 and abs(b0[1] - math.log(D.A0F[a])) < 1e-5)
+    print("guard 4: %-6s spec %-9s type %-10s m %6d (registered %6d)  wd %r  ms %r (registered %r)  alpha0 %r -> beta0 [min,max] %s "
+          "(registered ln %.6f)  base_update %s  %s"
+          % (a, args.stepsize_groups, opt.stepsize_type, m, D.M_OF_ARM[a], wd, opt.args_meta["meta_stepsize"], D.MSF[a],
+             float(args.alpha0), b0[:2], math.log(D.A0F[a]), bu, "OK" if ok else "!!! MISMATCH"))
+    bad += not ok
+    live_m.setdefault(D.GRAIN_OF[a], set()).add(m)
+    tok = (D.MS[a] if opt.args_meta["meta_stepsize"] == D.MSF[a] else repr(opt.args_meta["meta_stepsize"]),
+           D.A0[a] if float(args.alpha0) == D.A0F[a] else repr(float(args.alpha0)))
+    live_tok[a] = tok
+    live_cfg.setdefault(D.CONFIG_OF[a], tok)
+    ntens.add(nt)
+    totpar.add(tp)
+if len(ntens) != 1 or len(totpar) != 1:
+    print("!!! guard 4: tensor / parameter counts differ across arms: %s %s" % (ntens, totpar))
+    bad += 1
+nt, tp = ntens.pop(), totpar.pop()
+L = ["BATCH %s" % D.PREFIX, "NETWORK %s" % D.NET, "DATASET %s" % D.DSET, "NUM_PARAM_TENSORS %d" % nt,
+     "TOTAL_PARAMS %d" % tp, "CLIP_C %s" % D.CLIP, "WD %s" % D.WD_TOKEN, "EPOCHS %d" % D.EPOCHS,
+     "META_STEPS %d" % (D.EPOCHS * D.STEPS_PER_EPOCH), "PROBE %d N_RECORDS %d" % (D.PROBE, D.N_RECORDS),
+     "GRID %s" % ",".join("%s=ms%s/a0%s" % (c, live_cfg[c][0], live_cfg[c][1]) for c in D.CONFIG_IDS)]
+for g, spec_, _m in D.GRAINS:
+    ms = sorted(live_m[g])
+    L.append("GRAIN %s SPEC %s M %s" % (g, spec_, ",".join(str(x) for x in ms)))
+for a in D.ARMS:
+    L.append("ARM %s CONFIG %s MS %s ALPHA0 %s SPEC %s M %s SEEDS %s" % (a, D.CONFIG_OF[a], live_tok[a][0], live_tok[a][1],
+             D.SPEC[a], ",".join(str(x) for x in sorted(live_m[D.GRAIN_OF[a]])), ",".join(str(s) for s in D.SEEDS[a])))
+L.append("NJOBS %d" % D.NJOBS)
+txt = "\n".join(L) + "\n"
+if txt != D.manifest_text():
+    a_, b_ = txt.splitlines(), D.manifest_text().splitlines()
+    for k in range(max(len(a_), len(b_))):
+        if k >= len(a_) or k >= len(b_) or a_[k] != b_[k]:
+            print("!!! guard 4d: live manifest differs at line %d:\n    live      %s\n    design    %s"
+                  % (k + 1, a_[k] if k < len(a_) else "", b_[k] if k < len(b_) else ""))
+            break
+    bad += 1
+else:
+    print("guard 4d: live %s: %d tensors, %d parameters; the LIVE manifest is BYTE-IDENTICAL to "
+          "crt2_design.manifest_text() (%d bytes)" % (D.NET, nt, tp, len(txt)))
+if bad:
+    raise SystemExit(1)
+open(out, "w").write(txt)

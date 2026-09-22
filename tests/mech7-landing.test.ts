@@ -32,8 +32,8 @@ const CGW1_FINAL = ['AUDIT-UNDECIDED', 'SCALAR-BEATS-BEST', 'W1-SURVIVES+W2-SURV
   'LAYERWISE-BELOW-SCALAR-W4 (three branch words', '7 stamps)'];
 
 test('MT239 and MT240 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-4, -2).map(e => e.id), ['MT239', 'MT240'], 'appended in line order, before the later crt1 and csh1 rows');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [179, 161, 18, 3437]);
+  assert.deepEqual(data.experiments.slice(-5, -3).map(e => e.id), ['MT239', 'MT240'], 'appended in line order, before the later crt1, csh1 and cvl1 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [180, 162, 18, 3469]);
   // caw2 is a mechanism-scope record, Mixed; cgw1 belongs to the count-matched partition audit, Open. Neither corrects an
   // earlier published claim, so neither carries a Corrected badge.
   assert.deepEqual([caw2.section, caw2.area, caw2.kind, caw2.outcome, caw2.corrected, caw2.batches],
@@ -100,11 +100,11 @@ test('the two warnings name their ARGS-value kinds and the corpus\'s first TWO-A
   assert.match(w240.detail, /The twelve anchor runs at the standard 0\.1 deviate on nothing and own no row/);
   assert.match(w240.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 477a853; CORRECTIONS 263, 291 and 296\.$/);
   assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id),
-    ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation']);
+    ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation', 'warning-MT243-args-deviation']);
 });
 
 test('the 67 runs link to their records with sanitized logs, and exactly the 46 listed rows are marked', () => {
-  assert.equal(runs.length, 3437);
+  assert.equal(runs.length, 3469);
   const cases = [['MT239', 'caw2', ['160', '161', '162'], 27, 18, 'ResNet18_c100', 'CIFAR100'],
     ['MT240', 'cgw1', ['152', '153', '154', '155'], 40, 28, 'ResNet18', 'CIFAR10']] as const;
   for (const [eid, batch, seeds, count, marked, architecture, dataset] of cases) {
@@ -136,10 +136,10 @@ test('the 67 runs link to their records with sanitized logs, and exactly the 46 
     }
     assert.equal(linked.filter(run => run.parameters.argsDeviation).length, marked);
   }
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 183, 'no patch intervention was added');
-  assert.equal(runs.filter(run => !['crt1', 'csh1'].includes(run.batch) && run.parameters.argsDeviation).length, 85, "cmo1's 18, cwd5's 21, caw2's 18 and cgw1's 28");
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.intervention).length, 183, 'no patch intervention was added');
+  assert.equal(runs.filter(run => !['crt1', 'csh1', 'cvl1'].includes(run.batch) && run.parameters.argsDeviation).length, 85, "cmo1's 18, cwd5's 21, caw2's 18 and cgw1's 28");
   // crt1 and csh1 later added 36 and 18 of their own (tests/mech8-landing.test.ts).
-  assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 139);
+  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.argsDeviation).length, 139);
 });
 
 test("caw2's XS and XL rows are the corpus's first TWO-ARGS rows and are witnessed on both ARGS kinds", () => {
@@ -161,7 +161,7 @@ test("caw2's XS and XL rows are the corpus's first TWO-ARGS rows and are witness
   }
   // The single-kind AdamW rows and CORRECTIONS 284's two-AXIS rows keep their own shapes.
   assert.equal(runs.filter(run => run.batch === 'caw2' && run.parameters.argsDeviationKind === 'ARGS_MOMENTUM_BASE').length, 12);
-  assert.deepEqual(runs.filter(run => run.parameters.argsDeviationAxes).map(run => run.parameters.runLabel), ['cwd5-CARW2-s146', 'cwd5-CARW2-s147', 'cwd5-CARW2-s148']);
+  assert.deepEqual(runs.filter(run => run.batch !== 'cvl1' && run.parameters.argsDeviationAxes).map(run => run.parameters.runLabel), ['cwd5-CARW2-s146', 'cwd5-CARW2-s147', 'cwd5-CARW2-s148']);
 });
 
 test('the published arm means reproduce every level the two rows read', () => {
@@ -199,7 +199,8 @@ test('phase-15 and phase-16 are their own documented phases and carry one record
   assert.match(phase16.title, /Does the partition audit survive standard weight decay/);
   assert.deepEqual(data.activity.find(e => e.id === 'phase-14')!.experimentIds, ['MT238']);
   // phase-17 and phase-18 were added later with crt1 and csh1 (tests/mech8-landing.test.ts).
-  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 18);
+  // phase-19 was added later with cvl1 (tests/mech9-landing.test.ts).
+  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 19);
 });
 
 test('the two landings link the scorers, parsers and audit tools they cite', () => {

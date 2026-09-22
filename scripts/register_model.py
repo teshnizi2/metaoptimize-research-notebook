@@ -369,6 +369,18 @@ ADDED_PHASES = [{
     # MECH8_LAST_ROW is 242; it is defined further down the file, so the ID is written out.
     "experimentIds": ["MT242"],
     "source": "docs/CORRECTIONS.md 310 at a53bce1",
+}, {
+    # cvl1, ICML-PLAN row 1.14 (validation-split reporting): the PATCH_VALSPLIT loader patch proved on 22 Sep (CORRECTIONS
+    # 302), registered at 14e63ba (CORRECTIONS 303), submitted at 07:27 UTC, scored at f69b491, ingested at 5545d88 and written
+    # up at a3d422a (CORRECTIONS 312). A separate phase from phase-16: that phase read the audit's cell on the test set; this
+    # one re-reads the same cell's rankings on data nobody selected on.
+    "id": "phase-19", "date": "2026-09-22", "period": "22 Sep", "title": "Do the audit's rankings hold on a held-out validation split",
+    "test": "cgw1's cell at weight decay 0.1 and 5e-4 with all four grains, four fresh seeds each, every model trained on 45,000 images with 5,000 training images held out and read beside the test set from the same runs",
+    "observed_result": "The two partition readings change state between the test set and the held-out split, but neither change is larger than the noise of reading the same runs twice, so no sentence either way is licensed; plain scalar's lead at 5e-4 is in the same state on both, and choosing the best configuration on the held-out split picks the same one as the test set; the meta step size, the one setting chosen on the test set, was not re-chosen",
+    "next_question": "Whether re-choosing the meta step size on the held-out split changes any audit reading",
+    # MECH9_FIRST_ROW is 243; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT243"],
+    "source": "docs/CORRECTIONS.md 312 at a3d422a",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -505,7 +517,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
                              (MECH6_CWD4_INGEST_COMMIT, MECH6_CWD4_INTERVENTIONS_TSV_SHA256),
                              (MECH6_INGEST_COMMIT, MECH6_INTERVENTIONS_TSV_SHA256),
                              (MECH7_INGEST_COMMIT, MECH7_INTERVENTIONS_TSV_SHA256),
-                             (MECH8_INGEST_COMMIT, MECH8_INTERVENTIONS_TSV_SHA256)]:
+                             (MECH8_INGEST_COMMIT, MECH8_INTERVENTIONS_TSV_SHA256),
+                             (MECH9_INGEST_COMMIT, MECH9_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -516,7 +529,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
     for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS,
-                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS, **MECH6_INTERVENTIONS}.items():
+                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS, **MECH6_INTERVENTIONS, **MECH9_INTERVENTIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as a patch intervention with an ARGS-value witness")
@@ -524,7 +537,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
             runs[row["job_id"]] = {**row, "experimentId": eid, "argsDeviation": False}
     # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
     # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
-    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS}.items():
+    for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS, **MECH9_ARGS_DEVIATIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if not is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
@@ -549,6 +562,10 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
 def listed_rows(rows: list[dict], eid: str, spec: dict) -> list[dict]:
     """The exclusion rows of one record's batch, with the registered arm counts checked."""
     mine = [row for row in rows if row["batch"] == spec["batch"]]
+    if spec.get("shared_batch"):
+        # One batch whose rows are of two kinds (cvl1, CORRECTIONS 312: VAL_SPLIT rows at W1, two-axis ARGS rows at W4) is
+        # described by two specs, each naming its own arms; intervened_runs() still refuses any row no spec lists.
+        mine = [row for row in mine if row["arm"] in spec["arms"]]
     arms = {arm: sum(row["arm"] == arm for row in mine) for arm in spec["arms"]}
     if arms != spec["arms"] or len(mine) != sum(spec["arms"].values()):
         raise ValueError(f"{INTERVENTIONS_TSV} does not list the registered intervened arms of {eid}: {arms}")
@@ -566,7 +583,9 @@ def listed_rows(rows: list[dict], eid: str, spec: dict) -> list[dict]:
 # meta-gradient sum (<vote>:<applied>:<name>).
 INTERVENTION_KINDS = {"VOTE_W": "vote-weight", "BETA_HOLD": "step-size hold", "COMP_HOLD": "complement step-size hold",
                       "GROUP_HOLD": "group step-size hold", "REST_HOLD": "rest-group step-size hold", "WINDOW_HOLD": "update-window hold",
-                      "DECAY_MASK": "coupled weight-decay mask", "SHADOW_VOTE": "shadow-vote"}
+                      "DECAY_MASK": "coupled weight-decay mask", "SHADOW_VOTE": "shadow-vote",
+                      # CORRECTIONS 304's ninth line kind (cvl1, 312): <n_val>:<split_seed>, a held-out validation split.
+                      "VAL_SPLIT": "held-out validation split"}
 
 
 def intervention_kinds(intervention: str) -> list[tuple[str, str]]:
@@ -612,6 +631,14 @@ def additional_witness(lines: list[str], patch: str, value: str) -> str:
         raise ValueError(f"A run log must print exactly one '{patch}: on' line; found {len(found)}")
     mode = value.rsplit(":", 2)
     window = re.fullmatch(r"(\d+):(\d+|end)", value)
+    if patch == "VAL_SPLIT":
+        # The split names its size and seed, which the log echoes as n_val=<n> and split_seed=<s> beside the index hashes.
+        split = re.fullmatch(r"(\d+):(\d+)", value)
+        if not split:
+            raise ValueError(f"Unreadable {patch} value: {value!r}")
+        if f" n_val={split[1]} " not in found[0] + " " or f" split_seed={split[2]} " not in found[0] + " ":
+            raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
+        return found[0]
     if patch == "DECAY_MASK":
         # The mask names its tensor set, which the log echoes as spec=<value> beside the count it resolved to.
         if not value or ":" in value or " " in value:
@@ -2469,6 +2496,109 @@ def mech8_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 19. The cvl1 landing (CORRECTIONS 312): one appended row.
+# ---------------------------------------------------------------------------
+# Campaign commit a3d422a (cycle 164; CORRECTIONS 312, the cvl1 landing, written over its reserved stub; its text entered the
+# campaign's history inside the crt2 track's commit e445db3 from the shared working tree, byte-identical, and a3d422a adds the
+# provenance note at 312.11) appended the cvl1 landing as MASTER-TABLE line 243 and recounted header line 3. It amended no
+# earlier row, did not touch line 5, and no line moved. The ingest 5545d88 touched results/ alone. CORRECTIONS 311 (an audit
+# addendum) and 313 (the crt2 registration) own no row.
+#
+# MT243 (cvl1) is OPEN, as MT240 (cgw1) and MT183 (bn1). Its PRIMARY returned VAL-DIFFERS-UNRESOLVED: the two partition claims
+# change state between the test and validation readers (W1 UNDECIDED -> SURVIVES, W4 UNDECIDED -> VANISHES) but neither paired
+# gap is resolved, and the registered licence is "report both states and the paired intervals; no sentence that the ranking
+# does or does not hold on validation". The co-reported selection reading IS resolved (SELECT-SAME: validation picks the same
+# configuration as test, among the 8) and is carried in the reason, as MT240 carries SCALAR-BEATS-BEST. The registration's
+# modal outcome was this token (prior 0.45) and every TEST level landed in its registered band, which is scope, not a verdict.
+# The row does not correct an earlier PUBLISHED notebook claim, so it carries no Corrected badge.
+MECH9_COMMIT = "a3d422aaca7dbc9d31455c00d6fb20884d18d2bc"
+MECH9_MASTER_TABLE_SHA256 = "9a075bb82327f10d132e86ddd1b22482c1f53673601723b14315a8a8bb1c1f39"
+MECH9_FIRST_ROW, MECH9_LAST_ROW = 243, 243
+MECH9_EDITED_LINES = {3}  # the run / GPU-hour header and the tally, recounted in place; no row amended, line 5 untouched.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH9_ROWS = {
+    243: ("open", 10, ["cvl1"], ["page-8"], None, "VAL-DIFFERS-UNRESOLVED: the primary is undecided -- the audit's core cell (ResNet18 / CIFAR-10, SGDm 0.99 + Lion, ms 1e-4, alpha0 1e-3) at weight decay 0.1 (W1) and 5e-4 (W4), four grains, four fresh seeds, trained on 45,000 images and read on the test set AND on 5,000 held-out training images from the SAME runs. The two partition claims change state between the readers but not resolvably: W1 D = chunk777 - nodewise is +0.2590 pp (+1.48 SE) UNDECIDED on test and +0.4330 pp (+2.40 SE) SURVIVES on validation, paired gap +0.1740 pp [-0.2284, +0.5764]; W4 D is +0.1660 pp UNDECIDED on test and -0.0920 pp VANISHES (a bound) on validation, paired gap -0.2580 pp [-0.6604, +0.1444]; neither gap reaches the 0.30 bar or 2 paired SE (0.4024). The registered licence: the change is not distinguishable from reader noise at this seed count; report both states and the paired intervals; no sentence that the ranking does or does not hold on validation. The scalar-over-partition claim at 5e-4 is in the SAME state on both readers (SCALAR-BEATS-BEST, test +2.8095 / +2.9755 pp, validation +3.1540 / +3.0620 pp over chunk777 / nodewise, 16-17 SE each), with an unresolved paired gap (+0.2525 pp). The co-reported selection IS resolved: test and validation both pick layerwise at 0.1 (92.3140 / 92.2580), a test regret of +0.0000, and the same best grain per rung (SELECT-SAME), licensed as registered: selecting on validation would have picked the same one, among these 8. Every gate passes, every test level lands in its registered band, the registered scorer exits 0 UNEDITED on both hosts and again post-ingest, and an independent parser passes 40 of 40 checks, byte-identical on both hosts. Bounded, and led with: one cell, two rungs; the meta step size and alpha0 were NOT re-selected on validation, and the meta step size is the one core-cell hyperparameter known to have been chosen on the test set, so this re-reads rankings and does not redo tuning; 45,000 training images, so the in-batch test levels are 0.31-1.08 pp below cgw1's and the in-batch test W1 reading is UNDECIDED where cgw1's is SURVIVES (non-gating, never pooled); one split; the primary hangs on one seed (dropping s187 gives VAL-AGREES) and the validation argmax margin is only +0.0940 pp; the token was the registered modal outcome and licenses no sentence either way; alpha-independent decay not tested; every VANISHES is a bound. A refute pass could not refute the verdict and applied three licence-overreach fixes and three precision fixes; no RULE 16 defect."),
+}
+# Earlier records this row bears on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH9_BEARS_ON = {
+    243: ["MT240", "MT175", "MT241"],  # cgw1's cell and readings, re-read on validation; the audit headline; crt1's untuned M2 configuration
+}
+# The 32 exclusion rows of the ingest 5545d88 (CORRECTIONS 312.9) are of TWO kinds in ONE batch, so each record spec below
+# names only its own arms ("shared_batch"): the 16 W1 runs are one-kind VAL_SPLIT patch rows (CORRECTIONS 304's ninth line
+# kind), the 16 W4 runs TWO-AXIS ARGS rows (CORRECTIONS 284's rule: listed by ARGS_WD_BASE, the VAL_SPLIT clause held beside it
+# and read back from the run's own log). Together they cover the batch; intervened_runs() refuses an unlisted row.
+MECH9_INGEST_COMMIT = "5545d8801516a074632a78e88b58bb4d09a1eac9"
+MECH9_INTERVENTIONS_TSV_SHA256 = "4b60b4a9f90d9b1adb162b7743d7a8b3405b28806a9e0e002d102fec6753573b"
+MECH9_INTERVENTIONS = {
+    "MT243": {
+        "batch": "cvl1", "arms": {f"{grain}W1": 4 for grain in ("ch", "nd", "k01", "kL")}, "shared_batch": True,
+        "title": "Every cvl1 run trains on 45,000 of the 50,000 training images, holding out a fixed validation split",
+        "source": f"{INTERVENTIONS_TSV} at {MECH9_INGEST_COMMIT[:7]}; CORRECTIONS 302, 303, 304 and 312",
+        "note": "cvl1 re-reads the audit's core cell on a held-out split: every one of its 32 runs ran PATCH_VALSPLIT with VAL_SPLIT=5000:302, which holds out 5,000 class-stratified training images (500 per class, chosen by a split seed independent of the run seed), trains on the other 45,000 and reads the held-out images on the test transform every epoch. results/all_runs.csv has no column for the training-set size, so every run carries the plain cell key of its grain and is NOT a measurement of the 50,000-image cell. The 16 runs at the standard weight decay 0.1 are listed under the VAL_SPLIT witness kind added at CORRECTIONS 304, each by its own VAL_SPLIT: on line, which names the split's size, seed and the hashes of both index sets. The 16 runs at 5e-4 also deviate on the base weight-decay flag and are listed as TWO-AXIS rows (see the ARGS-value note). Drop every listed row before pooling runs by cell.",
+    },
+}
+MECH9_ARGS_DEVIATIONS = {
+    "MT243": {
+        "batch": "cvl1", "arms": {f"{grain}W4": 4 for grain in ("ch", "nd", "k01", "kL")}, "shared_batch": True,
+        "title": "cvl1's 5e-4 rung differs from the audit cell in the base weight-decay flag AND its training set",
+        "source": f"{INTERVENTIONS_TSV} at {MECH9_INGEST_COMMIT[:7]}; CORRECTIONS 263, 284, 304 and 312",
+        "note": "cvl1 runs cgw1's cell at two weight decays: 0.1 and 5e-4. The corpus has no column for a base-optimiser CLI flag, so the 16 runs at --weight-decay-base 5e-4 carry the plain 0.1 cell key of their grain. They are TWO-AXIS rows (CORRECTIONS 284): they also trained on 45,000 images with a held-out validation split, which one witness column cannot describe alongside the flag, so each is listed with the ARGS witness ARGS_WD_BASE (read from the run's OWN ARGS: line with argparse last-wins semantics) and its VAL_SPLIT clause is held beside it and read back from the run's own log. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md at the landing is the crt1 / csh1 landing's file with every line above its closing trailer unchanged and
+# entries 311-313 below it. The file is closed by the RESERVATION commit's trailer (36d9441), "Next free number after the
+# reservations: **314**.", not by the usual "Next free number: " form, and that is the only trailer form this step accepts.
+MECH9_CORRECTIONS_SHA256 = "b62969e407cba3587082bb399b30949012b80aa4c3c8dd2c4cae96c27f510df7"
+MECH9_ENTRIES = (311, 312, 313)
+MECH9_TRAILER = "Next free number after the reservations: "
+
+
+def mech9_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the cvl1 landing; ONE step that edits header line 3 and appends ONE row, and nothing else."""
+    before = mech8_master_table(repo)
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH9_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH9_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH9_COMMIT[:12]} does not match the pinned cvl1-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH9_LAST_ROW or len(before) != MECH9_FIRST_ROW - 1 or changed != MECH9_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH9_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH9_EDITED_LINES)}: {sorted(changed)}")
+    mech9_corrections(repo)  # the landing amends no row, so the append-only CORRECTIONS check rides here
+    return lines
+
+
+def mech9_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the cvl1 landing; append-only below the crt1 / csh1 landing's closing trailer."""
+    older = mech8_corrections(repo)[0]
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH9_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH9_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH9_COMMIT[:12]} does not match the pinned bytes")
+    later = raw.decode("utf-8").splitlines()
+    if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MECH9_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH9_COMMIT[:7]} does not append entries below the previous closing trailer")
+    if later[:len(older) - 1] != older[:-1]:
+        changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH9_COMMIT[:7]} changed an earlier line: {changed[:8]}")
+    appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MECH9_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH9_COMMIT[:7]} does not append exactly entries {MECH9_ENTRIES}: {appended[:4]}")
+    if any(".  RESERVED" in line or line.split(" — ")[0].endswith("RESERVED") for line in appended):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH9_COMMIT[:7]} still carries a reserved stub")
+    return later, older
+
+
+def mech9_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE line 243 (cvl1) and attach BOTH its exclusion notes (VAL_SPLIT rows and two-axis ARGS rows)."""
+    rows = with_interventions(appended_rows(lines, MECH9_ROWS, MECH9_FIRST_ROW, MECH9_LAST_ROW, MECH9_COMMIT), MECH9_INTERVENTIONS)
+    for row in rows:
+        spec = MECH9_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
     """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
     lines, before = mech4_master_table(repo), must_master_table(repo)
@@ -2801,7 +2931,8 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + mech5_rows(mech5_master_table(Path(repo)))
              + mech6_rows(mech6_master_table(Path(repo)))
              + mech7_rows(mech7_master_table(Path(repo)))
-             + mech8_rows(mech8_master_table(Path(repo))))
+             + mech8_rows(mech8_master_table(Path(repo)))
+             + mech9_rows(mech9_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)
