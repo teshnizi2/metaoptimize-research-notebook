@@ -71,6 +71,12 @@ Every imported MASTER-TABLE record from MT175 onward (MT175-MT242 today) needs a
 
 Run `npm run copy:check` after every evidence import. The check rejects missing or stale IDs, blank required fields, oversized summaries, and visible scorer/formula notation. `npm run build` runs this check first, so a newly imported row cannot be published until its reader-facing copy is complete.
 
+## Maintain later-evidence cross-links
+
+A later batch can weaken, supersede, refute, replicate or qualify an earlier record. MASTER-TABLE lines are pinned and the importer lets only header line 3 differ between pins, so the earlier row cannot be edited to point forward. `content/later-evidence.json` records the relation as data instead: one object per pair with `earlier`, `later`, `relation` (exactly one of `weakens`, `supersedes`, `refutes`, `replicates`, `qualifies`), `source` (`CORRECTIONS <n>` or `CORRECTIONS <n>.<m>`), `quote` and a one-line `reason`. The earlier record's page shows a **Later evidence** note and the later record's page a **Bears on** note; neither record's registered text, outcome or badge changes.
+
+Seed a pair only from a CORRECTIONS entry that says, in its own words, that the later batch weakens, supersedes, refutes, replicates or qualifies the earlier one, and quote those words verbatim (Markdown marks removed, spaces collapsed). Never infer a relation. A registered licence is quoted exactly as registered, with its "at this cell" wording. CORRECTIONS 229 names amended rows by MASTER-TABLE line number (162 is MT163, 163 is MT164, 166 is MT020); map them by batch and say so in the reason. `validateLaterEvidence()` in `src/lib/later-evidence.ts`, run by `npm run copy:check` before every build and by `tests/later-evidence.test.ts`, rejects unknown records, self-links, relations outside the vocabulary, duplicates, multi-line or missing reasons, a source entry that is absent from the published CORRECTIONS copy (`docs/CORRECTIONS.md` in `public/data/source-index.json`), and a quote that is not in the cited entry or subsection. Relations the campaign states in other words (for example "strengthened", "supported", "transfers") are not in the vocabulary and are left out rather than relabelled.
+
 ## Outcome model and the partition audit
 
 `scripts/register_model.py` is the single, reviewable place where register rows become published outcomes. Both exporters import it.

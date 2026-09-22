@@ -32,6 +32,7 @@ class NotebookPackageTests(unittest.TestCase):
             "content/journal.json": "[]\n", "public/data/journal.json": "[]\n",
             "content/artifact-dates.json": "{}\n", "public/data/artifact-dates.json": "{}\n",
             "content/experiment-copy.json": "{}\n",
+            "content/later-evidence.json": "[]\n",
             "public/data/research.json": json.dumps({"meta": {"snapshotId": "test-snapshot"}, "experiments": [{"id": "CVK2"}]}),
             "public/data/runs.json": "[]", "public/source/example.txt": "Scientific evidence\n",
             "public/assets/notebook-source.zip": "old recursive archive",
@@ -54,6 +55,7 @@ class NotebookPackageTests(unittest.TestCase):
         self.assertEqual(payloads["docs/MAINTENANCE.md"], b"Portable maintenance\n")
         self.assertIn("public/source/example.txt", payloads)
         self.assertIn("content/journal.json", payloads)
+        self.assertIn("content/later-evidence.json", payloads, "the curated later-evidence list ships with the source")
         self.assertIn("tests/fixtures/register-ids.json", payloads, "JavaScript tests read their JSON fixtures")
         self.assertEqual(meta["snapshotId"], "test-snapshot")
         forbidden = ["node_modules/", "dist/", ".vercel/", "export_research", "test_private", "superpowers/", "notebook-source.zip", ".DS_Store"]

@@ -8,6 +8,8 @@ The homepage summarizes the whole register through research outcomes, an area-by
 
 The research JSON preserves the exact register wording for audit. The website's concise questions, results, explanations, comparisons, and rationales are maintained separately in `content/experiment-copy.json`; experiment pages expose the original fields under **Exact registered record**. `npm run copy:check`, which also runs before every build, prevents a newly imported MASTER-TABLE row from publishing without complete reader-facing copy.
 
+Some earlier records have later evidence: a later batch weakens, supersedes, refutes, replicates or qualifies them. MASTER-TABLE rows are pinned, so the earlier row is never edited; instead `content/later-evidence.json` lists each reviewed pair with its relation, the campaign's CORRECTIONS entry and that entry's own words. The earlier record shows a **Later evidence** note and the later record a **Bears on** note. `npm run copy:check` rejects a pair whose records do not exist, whose relation is outside that closed vocabulary, or whose quote is not in the cited entry of the published CORRECTIONS copy.
+
 ## Repositories and access
 
 - [Notebook website and versioned log](https://github.com/teshnizi2/metaoptimize-research-notebook)

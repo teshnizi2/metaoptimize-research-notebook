@@ -116,6 +116,7 @@ def collect_payloads(root=PORTAL):
     add("content/journal.json")
     add("content/artifact-dates.json")
     add("content/experiment-copy.json")
+    add("content/later-evidence.json")
     for name in SCRIPTS:
         add("scripts/" + name)
     for folder in ["src", "public"]:
