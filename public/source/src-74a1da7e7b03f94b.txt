@@ -1,0 +1,1081 @@
+#!/usr/bin/env python3
+# =============================================================================
+# c289_step0_zero_gpu.py -- CORRECTIONS 289 (ICML-PLAN Phase 0 / the area chair's Step 0).  ZERO GPU.
+#
+# DESCRIPTIVE ONLY.  Registers nothing, gates nothing, moves no registered level, bar, state or stamp.
+# Reads ONLY committed/mirrored run artefacts: the raw `.out` files and the `probe.jsonl` records under
+# ../runs_cluster_b (and ../runs).  Never reads results/all_runs.csv, so no noise floor is computed here.
+#
+# Stdlib only.  Imports ONE repo module, analysis/cCV0_carrier_vote_core.py (itself stdlib-only), for the
+# REGISTERED carrier-vote statistic DOM_C (CORRECTIONS 256.3) so the lead-lag reads exactly the statistic
+# that was registered and calibrated; the core's sha256 is printed and a selftest re-derives the registered
+# calibration values (256.3, 265) from the same records before anything else is printed.
+#
+# (A) THE REALISED PER-STEP SHRINK.  The harness's base update (patches/HF_patched.py SGDm_base_update,
+#     AdamW_base_update) is  delta = a*(m + wd*w);  w <- w - delta,  so the multiplicative weight shrink it
+#     applies on one step is  a*wd  with a = exp(beta) the LEARNED step size of the tensor's group (0 on a
+#     tensor whose decay is masked by PATCH_DECAYMASK).  This is alpha-scaled decay (CORRECTIONS 292/293): wd sits
+#     OUTSIDE the momentum buffer -- the same PLACEMENT as Loshchilov & Hutter's decoupled decay (arXiv:1711.05101),
+#     so there is no 1/(1-mu) amplification -- but NOT their scaling: theirs is multiplied by the schedule multiplier
+#     eta_t only, while the harness's shrink a*wd moves with the LEARNED a (the lr*wd form of torch.optim.AdamW).
+#     Per record, shrink_g = wd*exp(beta_g); summarised per epoch window.
+# (B) LEAD-LAG between the registered DOM_C (carriers {50,53,59} alone fix the sign of the shared vote) and
+#     the shared beta's departure from its early regime, on every SCALAR ResNet18/ResNet18_c100 run with
+#     per-tensor records.  Events are defined in the printed header of section B.  B0 discloses that DOM_C
+#     STRUCTURALLY cannot lead the turn (its sign clause is false on every late-ascent record); B1 is the FAIR
+#     event (same-seed TEST divergence from a healthy partner, at stated pp thresholds, with a healthy-vs-healthy
+#     null); B1b is SHARE_C's pre-turn trajectory; B2 decomposes the vote around the turn.  The earlier B1 event
+#     'FALL' (TEST < 0.9 * max) is dropped: it is undefined on every collapsed run (they never fall).
+# (C) N_eff = 1 / sum_i p_i^2,  p_i = |L_i| / sum_j |L_j|,  L_i = b2*m_i + (1-b2)*z_i (the per-tensor term of
+#     the quantity whose sign Lion_meta_update applies; cCV0 record_L), per record; secondary on |z_i|.
+#
+# Usage:  python3 analysis/c289_step0_zero_gpu.py [RUNS_cluster_b_DIR [RUNS_DIR]]  > results/c289_step0_zero_gpu.txt
+# =============================================================================
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import cCV0_carrier_vote_core as core  # noqa: E402  (stdlib-only registered core, CORRECTIONS 256.3)
+
+RUNS_A2 = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(os.path.dirname(REPO), "runs_cluster_b")
+RUNS_1 = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.join(os.path.dirname(REPO), "runs")
+
+BETA_LO = -15.0
+TRAIN_SET = {"CIFAR10": 50000, "CIFAR100": 50000}
+FOREIGN = core.FOREIGN_PREFIXES
+
+# batches read by each section
+SHRINK_BATCHES = ("cwd5", "cwd1", "cwd3", "cwd4", "cmo1", "ctd1", "cct1", "cau1")
+RESNET_PT_BATCHES = ("ctd1", "cct1", "cdep1", "ciso1", "ciso2", "cst1", "cmo1", "cvt7", "cvt8", "cvt10",
+                     "cwd1", "cwd3", "cwd4", "cwd5")
+NEFF_EXTRA_BATCHES = ("cgn1", "cgn2", "cgn3", "cpl1", "cpl2", "cvg1", "cvh1", "cvi1", "cvt1", "cvt2", "cvt3",
+                      "cvt4", "cvt5", "cvt6", "cvt9", "cwd2", "csv1", "cmg1")
+
+# epoch windows (0-based epoch index = step // steps_per_epoch), half-open
+WIN_A = ((0, 1), (1, 5), (5, 10), (10, 15), (15, 20), (20, 30), (30, 50), (50, 100))
+WIN_C = ((0, 1), (1, 5), (5, 10), (10, 15), (15, 20), (20, 40), (40, 100))
+EARLY = (1, 5)
+NOT_QUOTABLE = ("cst1",)  # CORRECTIONS 265: no verdict, descriptive section not quotable
+
+# ---- standard recipes' per-step shrink (each source VERIFIED for this entry; see CORRECTIONS 289.2) ----
+# (label, lr, wd, momentum-amplification factor or None, source)
+RECIPES = (
+    ("PyTorch AdamW defaults (torch 2.0.1 on cluster_b: lr=1e-3, weight_decay=1e-2; param.mul_(1 - lr*wd))",
+     1e-3, 1e-2, None, "torch/optim/adamw.py L16,L19,L386 in the cluster_b venv"),
+    ("AdamW lr 1e-3, wd 0.1 (upper end of the brief's 0.01-0.1 AdamW band; same torch rule)",
+     1e-3, 1e-1, None, "same torch rule; the band is the brief's"),
+    ("DeiT-tiny ImageNet-1k AdamW lr 5e-4, wd 0.05 (Kosson et al. arXiv:2305.17212 Table 4)",
+     5e-4, 5e-2, None, "local text ~/.arxiv-mcp-server/papers/2305.17212.md ~L3560-3600"),
+    ("ResNet-50 ImageNet SGD lr 0.1 (per 256), wd 1e-4, mu 0.9 (Goyal et al. arXiv:1706.02677; Kosson Table 4)",
+     1e-1, 1e-4, 0.9, "local text 1706.02677.md L690-724; 2305.17212.md Table 4"),
+    ("ResNet-20 CIFAR-10 SGD lr 0.5, wd 1e-4, bs 128 (Kosson et al. arXiv:2305.17212 Table 4)",
+     5e-1, 1e-4, 0.9, "local text 2305.17212.md Table 4; column parse of the extracted table and mu 0.9 UNSURE"),
+    ("LARGE-BATCH: ResNet-50 ImageNet SGD bs 8192, lr 0.1*8192/256 = 3.2, wd 1e-4, mu 0.9 (Goyal et al. "
+     "arXiv:1706.02677, linear scaling rule; peak lr after warm-up)",
+     3.2, 1e-4, 0.9, "local text 1706.02677.md L4,L86 (8192), L716 (eta = 0.1*kn/256), L700 (wd 1e-4)"),
+    ("LARGE-BATCH: ResNet-20 CIFAR-10 SGD bs 2048, lr 4.8, wd 1e-4 (Kosson et al. arXiv:2305.17212 Table 4)",
+     4.8, 1e-4, 0.9, "local text 2305.17212.md Table 4 (lr=4.8 printed twice); mu 0.9 UNSURE"),
+    ("CIFAR SGD lr 0.1, wd 5e-4, mu 0.9 (wd 5e-4: Wilson et al. via Choi et al. arXiv:1910.05446 App. D.5; "
+     "LARS arXiv:1708.03888; lr 0.1 = the Goyal/He reference lr)",
+     1e-1, 5e-4, 0.9, "local text 1910.05446.md ~L1769; 1708.03888.md L128,L376"),
+)
+
+
+# =============================================================================
+def sha_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def med(v):
+    return statistics.median(v) if v else None
+
+
+def e(x, nd=2):
+    return "n/a" if x is None else ("%.*e" % (nd, x))
+
+
+def f(x, nd=3):
+    return "n/a" if x is None else ("%.*f" % (nd, x))
+
+
+ARG_RE = re.compile(r"--([A-Za-z0-9-]+) (\S+)")
+
+
+def find_out(run):
+    """The .out for a run name: <run>-<job>.out in RUNS_A2 or RUNS_1 root; the highest-job COMPLETE one."""
+    cands = []
+    for root in (RUNS_A2, RUNS_1):
+        for d in (root, os.path.join(root, run.split("-")[0])):
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if fn.startswith(run + "-") and fn.endswith(".out") and fn[len(run) + 1:-4].isdigit():
+                    cands.append(os.path.join(d, fn))
+    if not cands:
+        return None
+    parsed = [(core.parse_out(p), p) for p in cands]
+    comp = [x for x in parsed if x[0]["complete"]]
+    pick = max(comp or parsed, key=lambda x: int(os.path.basename(x[1])[len(run) + 1:-4]))
+    return pick
+
+
+def run_info(run, pdir):
+    got = find_out(run)
+    info = {"run": run, "batch": run.split("-")[0], "pdir": pdir, "out": None}
+    m = re.match(r"^(.*)-s(\d+)$", run[len(info["batch"]) + 1:])
+    info["arm"], info["seed"] = (m.group(1), int(m.group(2))) if m else (run, -1)
+    if got is None:
+        return info
+    rec, path = got
+    info["out"] = path
+    args = dict(ARG_RE.findall(rec["args"][0])) if rec["args"] else {}
+    info.update({"wd": float(args.get("weight-decay-base", "nan")), "wd_tok": args.get("weight-decay-base"),
+                 "mom": args.get("momentum-param-base"), "base": args.get("alg-base"), "meta": args.get("alg-meta"),
+                 "net": args.get("NN-name"), "dset": args.get("dataset"), "ms": args.get("meta-stepsize"),
+                 "a0": args.get("alpha0"), "grain": args.get("stepsize-groups"),
+                 "bs": int(args.get("batch-size", "0") or 0), "p5": rec["p5"], "t5": rec["t5"],
+                 "complete": rec["complete"], "n_ep": rec["n_ep"]})
+    info["spe"] = TRAIN_SET.get(info["dset"], 0) // info["bs"] if info["bs"] else None
+    lines = open(path, errors="replace").read().splitlines()
+    fl = [l for l in lines if l.startswith(FOREIGN)]
+    info["foreign_on"] = sorted({l.split(":")[0] for l in fl if re.search(r":\s*on\b", l)})
+    info["mask_idx"] = []
+    for l in fl:
+        if l.startswith("DECAY_MASK") and re.search(r":\s*on\b", l):
+            mi = re.search(r"\bidx=(\S+)", l)
+            if mi:
+                info["mask_idx"] = [int(x) for x in mi.group(1).split(",") if x.isdigit()]
+    return info
+
+
+KEEP = ("step", "beta", "z_tensor", "m_tensor", "pt_b2", "z_agg", "mom_pre", "n_at_lo", "beta_pre")
+
+
+def read_records(pdir):
+    pj = os.path.join(pdir, "probe.jsonl")
+    out = []
+    with open(pj, errors="replace") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            out.append({k: r[k] for k in KEEP if k in r})
+    return out
+
+
+def discover(batches):
+    runs = []
+    for root in (RUNS_A2,):
+        for b in batches:
+            bd = os.path.join(root, b)
+            if not os.path.isdir(bd):
+                continue
+            for d in sorted(os.listdir(bd)):
+                if d.startswith("probe_") and os.path.isfile(os.path.join(bd, d, "probe.jsonl")):
+                    runs.append((d[6:], os.path.join(bd, d)))
+    return runs
+
+
+def arm_key(i):
+    return "%s/%s" % (i["batch"], i["arm"])
+
+
+def state_of(i):
+    """DESCRIPTIVE collapse label, reference-free: the collapsed runs of this campaign 'never learn' (285.3:
+    23.17 % TRAIN vs 97.9-99.8 % elsewhere), so COLLAPSED iff the run's own final-5-epoch TRAIN mean < 50 %."""
+    if i.get("t5") is None:
+        return "?"
+    return "COLLAPSED" if i["t5"] < 50.0 else "healthy"
+
+
+# =============================================================================
+# SELFTEST: the registered DOM_C, re-derived from the same records through the same core
+# =============================================================================
+def selftest(cache):
+    print("=" * 110)
+    print("SELFTEST -- the registered carrier-vote statistic, re-derived through cCV0 on the committed records")
+    print("=" * 110)
+    ok = True
+    calib = [("ctd1", "sc", (18, 19, 20)), ("ciso1", "k01", (21, 22, 23)), ("cdep1", "k01", (24, 25, 26))]
+    want = [0.820, 0.784, 0.810, 0.806, 0.786, 0.806, 0.814, 0.816, 0.820]
+    got, pooled = [], []
+    for b, a, seeds in calib:
+        for s in seeds:
+            recs = cache["%s-%s-s%d" % (b, a, s)]
+            got.append(core.vote_stats(recs)["DOM_C"])
+            pooled += recs
+    pv = core.vote_stats(pooled)["DOM_C"]
+    c1 = all(abs(g - w) < 5e-4 for g, w in zip(got, want)) and abs(pv - 0.8069) < 5e-5
+    print("  %s 256.3 calibration DOM_C per run %s pooled %.4f (registered 0.820/.../0.820, pooled 0.8069)"
+          % ("PASS" if c1 else "FAIL", " ".join("%.3f" % g for g in got), pv))
+    ct = []
+    for s in (116, 117, 118):
+        ct += cache["cct1-k01-s%d" % s]
+    st = core.vote_stats(ct)
+    c2 = st["DOM_C"] == 0.0 and abs(st["TOP3_C"] - 0.6940) < 5e-5
+    print("  %s 265 cct1 k01 pooled DOM_C %.4f TOP3_C %.4f (registered 0.0000 / 0.6940)"
+          % ("PASS" if c2 else "FAIL", st["DOM_C"], st["TOP3_C"]))
+    # N_eff arithmetic on synthetic vectors
+    c3 = abs(neff([1.0] * 62) - 62.0) < 1e-9 and abs(neff([1.0] + [0.0] * 61) - 1.0) < 1e-12 \
+        and abs(neff([1.0, 1.0, 0.0]) - 2.0) < 1e-12
+    print("  %s N_eff(uniform 62)=62, N_eff(one-hot)=1, N_eff(two equal)=2" % ("PASS" if c3 else "FAIL"))
+    ok = c1 and c2 and c3
+    print("  SELFTEST %s" % ("PASS" if ok else "FAIL"))
+    return ok
+
+
+def neff(v):
+    a = [abs(x) for x in v]
+    t = sum(a)
+    if t <= 0:
+        return None
+    return 1.0 / sum((x / t) ** 2 for x in a)
+
+
+# =============================================================================
+# (A) realised per-step shrink
+# =============================================================================
+def shrink_rows(i, recs):
+    """per record: (epoch, s_max, s_med, s_car) with s = wd*exp(beta_g) over UNMASKED coordinates.
+    Masked tensors get 0 (reported separately); for scalar runs every unmasked tensor gets the one value."""
+    spe = i["spe"]
+    wd = i["wd"]
+    out = []
+    for r in recs:
+        b = r.get("beta")
+        if not b:
+            continue
+        a = [math.exp(x) for x in b]
+        s = [wd * x for x in a]
+        car = None
+        if len(b) == 62:
+            car = statistics.mean(s[k] for k in core.C_IDX0)
+        out.append((r["step"] // spe, max(s), statistics.median(s), car, a))
+    return out
+
+
+def section_A(infos, cache):
+    print()
+    print("=" * 110)
+    print("(A) THE REALISED PER-STEP SHRINK  a*wd  (a = exp(beta), the LEARNED step size; per step, NOT amplified by "
+          "momentum)")
+    print("=" * 110)
+    print("  Rule: HF_patched SGDm_base_update / AdamW_base_update: delta = a*(m + wd*w); w <- w - delta. One step "
+          "multiplies w by (1 - a*wd).")
+    print("  Per record (every 100 steps; cau1 every 5), s_g = wd*exp(beta_g).  Scalar: one value.  Layerwise: 62; "
+          "reported as MAX and MEDIAN over tensors, and the carriers' (50,53,59) mean.")
+    print("  Masked tensors (PATCH_DECAYMASK) receive NO shrink; the values below are for the UNMASKED tensors.")
+    print("  Window cells: median [min, max] over every record of every seed of the arm in that epoch window.")
+    print("  D = integrated shrink = sum over steps of s (nats of multiplicative weight shrink from decay alone), "
+          "rectangle rule on the probe grid; D_pk = up to the run's own peak shrink.")
+    arms = {}
+    for i in infos:
+        if i["batch"] in SHRINK_BATCHES and i.get("out"):
+            arms.setdefault(arm_key(i), []).append(i)
+    summary = {}
+    for k in sorted(arms, key=lambda k: (SHRINK_BATCHES.index(k.split("/")[0]), k)):
+        runs = sorted(arms[k], key=lambda i: i["seed"])
+        i0 = runs[0]
+        rows_all = []
+        peaks, Ds, Dpks, pk_ep = [], [], [], []
+        for i in runs:
+            rows = shrink_rows(i, cache[i["run"]])
+            rows_all += rows
+            if not rows:
+                continue
+            j = max(range(len(rows)), key=lambda q: rows[q][1])
+            peaks.append(rows[j][1])
+            pk_ep.append(cache[i["run"]][j]["step"] / i["spe"])
+            steps = [r["step"] for r in cache[i["run"]] if r.get("beta")]
+            dt = [(steps[q + 1] - steps[q]) if q + 1 < len(steps) else (steps[q] - steps[q - 1]) for q in
+                  range(len(steps))]
+            Ds.append(sum(rows[q][1] * dt[q] for q in range(len(rows))))
+            Dpks.append(sum(rows[q][1] * dt[q] for q in range(j + 1)))
+        lab = "%-18s wd %-6s mom %-4s %-5s %-5s grain %-10s mask %-10s p5 %s  t5 %s  %s" % (
+            k, i0["wd_tok"], i0["mom"], i0["base"], i0["meta"], (i0["grain"] or "")[:10],
+            (",".join(str(x) for x in i0["mask_idx"]) or "-")[:10],
+            "/".join(f(i["p5"], 2) for i in runs), "/".join(f(i["t5"], 1) for i in runs),
+            "/".join(sorted({state_of(i) for i in runs})))
+        print()
+        print("  " + lab)
+        print("    peak s_max per seed %s at epoch %s;  D %s;  D_pk %s" % (
+            " / ".join(e(x) for x in peaks), " / ".join(f(x, 1) for x in pk_ep),
+            " / ".join(f(x, 3) for x in Ds), " / ".join(f(x, 3) for x in Dpks)))
+        cells = []
+        for lo, hi in WIN_A:
+            v = [r[1] for r in rows_all if lo <= r[0] < hi]
+            vm = [r[2] for r in rows_all if lo <= r[0] < hi]
+            vc = [r[3] for r in rows_all if lo <= r[0] < hi and r[3] is not None]
+            if not v:
+                cells.append("ep%d-%d n/a" % (lo, hi))
+                continue
+            if len(rows_all[0][4]) == 1:
+                cells.append("ep%d-%d %s [%s,%s]" % (lo, hi, e(med(v)), e(min(v)), e(max(v))))
+            else:
+                cells.append("ep%d-%d max %s [%s,%s] med %s car %s" % (lo, hi, e(med(v)), e(min(v)), e(max(v)),
+                                                                     e(med(vm)), e(med(vc)) if vc else "n/a"))
+        for c in cells:
+            print("    " + c)
+        summary[k] = {"peak": peaks, "pk_ep": pk_ep, "D": Ds, "Dpk": Dpks, "rows": rows_all, "runs": runs}
+    # ---- the comparison the area chair asked for ----
+    print()
+    print("  STANDARD RECIPES' per-step shrink lr*wd (peak lr; a cosine/step schedule only lowers it).  For SGD with "
+          "momentum the decay enters the momentum buffer (torch/optim/sgd.py L249,L258), so the steady-state "
+          "per-step shrink is lr*wd/(1-mu) -- printed as 'amplified'.  The harness has NO such amplification.")
+    std_raw, std_amp = [], []
+    for lab, lr, wd, mu, src in RECIPES:
+        raw = lr * wd
+        amp = raw / (1 - mu) if mu else None
+        std_raw.append(raw)
+        std_amp.append(amp if amp else raw)
+        print("    %-9s raw  %s   amplified %s   %s   [%s]" % ("", e(raw), e(amp) if amp else "   (none)  ", lab, src))
+    sb = [k for k, r in enumerate(RECIPES) if not r[0].startswith("LARGE-BATCH")]
+    mx_raw, mx_amp = max(std_raw[k] for k in sb), max(std_amp[k] for k in sb)
+    print("    max over the SMALL-BATCH recipes (bs <= 1024): raw %s, momentum-amplified %s;  over ALL incl. "
+          "large-batch: raw %s, amplified %s" % (e(mx_raw), e(mx_amp), e(max(std_raw)), e(max(std_amp))))
+    print("    NOTE: per-step shrink is NOT batch-size invariant (the linear scaling rule raises lr with the batch); "
+          "the harness runs batch 100, so the small-batch rows are the like-for-like comparison.")
+    print()
+    print("  THE COLLAPSE'S DOSE vs THE RECIPES (log10 ratio; + = the campaign applies MORE shrink per step):")
+    for k in ("cwd5/k01W1", "cwd5/k01W2", "cwd5/k01W3", "cwd5/k01W4", "cwd5/kLW1", "cwd5/kLW4", "cmo1/k01",
+              "cmo1/M9k01", "cmo1/W0k01", "cct1/k01", "ctd1/sc", "cau1/m6", "cau1/m6t"):
+        if k not in summary:
+            continue
+        pk = med(summary[k]["peak"])
+        if pk is None or pk <= 0:
+            print("    %-12s peak shrink %s (no decay)" % (k, e(pk)))
+            continue
+        print("    %-12s peak %s | log10 vs AdamW-default %+.2f | vs small-batch max raw %+.2f | vs small-batch max "
+              "amplified %+.2f | vs large-batch max amplified %+.2f | %s" % (
+                  k, e(pk), math.log10(pk / 1e-5), math.log10(pk / mx_raw), math.log10(pk / mx_amp),
+                  math.log10(pk / max(std_amp)), "/".join(sorted({state_of(i) for i in summary[k]["runs"]}))))
+    # time-matched: the four scalar rungs share seeds and (until the ascent ends) the SAME beta trajectory
+    print()
+    print("  TIME-MATCHED (same seed, same record): shrink of each scalar rung at the step where k01W1 peaks")
+    for s in (146, 147, 148):
+        w1 = "cwd5-k01W1-s%d" % s
+        rows1 = [r for r in cache[w1] if r.get("beta")]
+        j = max(range(len(rows1)), key=lambda q: rows1[q]["beta"][0])
+        step = rows1[j]["step"]
+        vals = []
+        for tag, wd in (("W1", 0.1), ("W2", 1e-2), ("W3", 1e-3), ("W4", 5e-4)):
+            rr = {r["step"]: r for r in cache["cwd5-k01%s-s%d" % (tag, s)]}
+            b = rr[step]["beta"][0]
+            vals.append("%s beta %.3f shrink %s" % (tag, b, e(wd * math.exp(b))))
+        print("    s%d step %d (epoch %.1f): %s" % (s, step, step / 500.0, " | ".join(vals)))
+    return summary
+
+
+# =============================================================================
+# (B) lead-lag
+# =============================================================================
+def dom_series(recs):
+    out = []
+    for r in recs:
+        try:
+            L, b2 = core.record_L(r)
+            s = core.shared_sign(r, L, b2)
+        except (KeyError, IndexError, TypeError, ValueError):
+            out.append(None)
+            continue
+        if len(L) != 62 or s == 0:
+            out.append(None)
+            continue
+        out.append(1 if core.fixes_sign(L, core.C_IDX0, s) else 0)
+    return out
+
+
+def first_window(dom, w, mode, bar=0.5):
+    n = len(dom)
+    h = w // 2
+    for k in range(n):
+        if mode == "centred":
+            lo, hi = max(0, k - h), min(n, k + h + 1)
+        elif mode == "forward":
+            lo, hi = k, min(n, k + w)
+        else:
+            lo, hi = max(0, k - w + 1), k + 1
+        v = [x for x in dom[lo:hi] if x is not None]
+        if v and sum(v) / len(v) >= bar:
+            return k
+    return None
+
+
+def beta_events(i, recs, ms):
+    b = [r["beta"][0] for r in recs]
+    steps = [r["step"] for r in recs]
+    b0 = recs[0]["beta_pre"][0][0] if recs[0].get("beta_pre") else b[0] - ms
+    dev = [b0 + ms * (steps[k] + 1) - b[k] for k in range(len(b))]
+    ev = {}
+    for d in (0.02, 0.1):
+        ev["exit%.2f" % d] = next((k for k in range(len(b)) if dev[k] > d), None)
+    ev["peak"] = max(range(len(b)), key=lambda k: b[k])
+    pk = ev["peak"]
+    ev["desc1"] = next((k for k in range(pk, len(b)) if b[k] <= b[pk] - 1.0), None)
+    ev["floor"] = next((k for k in range(len(b)) if b[k] <= BETA_LO + 1e-3), None)
+    ev["noise_pre"] = max(abs(dev[k]) for k in range(min(40, len(dev))))
+    return ev, b, steps
+
+
+def section_B(infos, cache):
+    print()
+    print("=" * 110)
+    print("(B) LEAD-LAG: does the registered DOM_C cross its bar BEFORE or AFTER the shared beta leaves its early regime?")
+    print("=" * 110)
+    print("""  EVENT DEFINITIONS (record index k; records every 100 steps; step/500 = epoch):
+    The early regime, measured rather than assumed: on EVERY scalar run below the shared beta does not sit on a
+    plateau -- it climbs at the saturated Lion rate, beta(t) = beta0 + ms*(t+1) (every vote +1), from step 0 to
+    about step 8,500-9,700.  'Leaving the early regime' is therefore the end of that saturated ascent:
+      EXIT(d)  first record with beta0 + ms*(step+1) - beta > d nats, d in {0.02, 0.1} (0.1 = 50 net down-votes);
+               the float32 drift of the ascent on the first 40 records is printed as noise_pre;
+      PEAK     the record of maximum beta;  DESC1  first record after PEAK with beta <= beta_peak - 1 nat;
+      FLOOR    first record with beta at the lower clip -15 (the pinned, collapsed state).
+    DOM_C(r) = cCV0.fixes_sign(L, C, s) with s the harness's own shared sign (256.3), per record.  Its BAR is the
+    registered 0.50 (256.3 NOMINATED / 257 CARRIERS-DOMINATE).  Crossing events:
+      D1       first single record with DOM_C;
+      Dc       first record whose CENTRED 11-record window (+-500 steps) has DOM_C share >= 0.50;
+      Df / Db  the same with a FORWARD / BACKWARD 11-record window (earliest / latest possible reading).
+    STRUCTURAL WARNING (verifier V1; counts in B0): DOM_C needs the carriers' sum to carry the APPLIED sign, and
+    through the ascent the applied sign is -1 while the carriers push +1, so DOM_C cannot be true before the turn.
+    The LAG column below is therefore biased toward 'lag' BY CONSTRUCTION and is NOT a test of cause; B1 is.
+    LAG = Dc - EXIT(0.1) in steps (negative = dominance FIRST).  'pre-EXIT DOM_C' = DOM_C share on records before
+    EXIT(0.1).  DIV = first record where beta differs by > 0.1 nat from the SAME-SEED healthy partner (cwd5 W1 vs
+    W4; cmo1 k01 vs W0k01) -- the step the collapsing trajectory starts to differ from a healthy one.""")
+    sel = [i for i in infos if i["batch"] in RESNET_PT_BATCHES and i.get("out") and i.get("net") in
+           ("ResNet18", "ResNet18_c100") and cache[i["run"]] and len(cache[i["run"]][0].get("beta", [])) == 1
+           and "z_tensor" in cache[i["run"]][0]]
+    sel.sort(key=lambda i: (RESNET_PT_BATCHES.index(i["batch"]), i["arm"], i["seed"]))
+    hdr = ("  %-20s %-8s %-4s %-9s %-6s %6s %6s %6s %6s %6s | %6s %6s %6s %6s | %7s %6s %7s %s" %
+           ("run", "wd", "mom", "state", "flags", "EXIT02", "EXIT.1", "PEAK", "DESC1", "FLOOR", "D1", "Dc", "Df",
+            "Db", "LAG", "preDOM", "DOMall", "noise_pre"))
+    print(hdr)
+    res = []
+    for i in sel:
+        recs = cache[i["run"]]
+        ms = float(i["ms"])
+        ev, b, steps = beta_events(i, recs, ms)
+        dom = dom_series(recs)
+        D1 = next((k for k, x in enumerate(dom) if x), None)
+        Dc = first_window(dom, 11, "centred")
+        Df = first_window(dom, 11, "forward")
+        Db = first_window(dom, 11, "backward")
+        ex = ev["exit0.10"]
+        pre = [x for x in dom[:ex] if x is not None] if ex is not None else []
+        alld = [x for x in dom if x is not None]
+
+        def st(k):
+            return "-" if k is None else str(steps[k])
+        lag = (steps[Dc] - steps[ex]) if (Dc is not None and ex is not None) else None
+        flags = ("M" if i["mask_idx"] else "") + ("F" if [x for x in i["foreign_on"] if x != "DECAY_MASK"] else "") \
+            + ("X" if i["batch"] in NOT_QUOTABLE else "")
+        print("  %-20s %-8s %-4s %-9s %-6s %6s %6s %6s %6s %6s | %6s %6s %6s %6s | %7s %6s %7s %.1e" % (
+            i["run"], i["wd_tok"], i["mom"], state_of(i), flags or "-", st(ev["exit0.02"]), st(ex), st(ev["peak"]),
+            st(ev["desc1"]), st(ev["floor"]), st(D1), st(Dc), st(Df), st(Db),
+            "-" if lag is None else "%+d" % lag, f(sum(pre) / len(pre), 3) if pre else "n/a",
+            f(sum(alld) / len(alld), 3) if alld else "n/a", ev["noise_pre"]))
+        res.append({"i": i, "ev": ev, "steps": steps, "b": b, "D1": D1, "Dc": Dc, "Df": Df, "Db": Db, "lag": lag,
+                    "pre": (sum(pre) / len(pre)) if pre else None, "all": (sum(alld) / len(alld)) if alld else None})
+    # pair divergence
+    print()
+    print("  DIV -- same-seed divergence from a healthy partner, and where DOM_C sits relative to it:")
+    byrun = {r["i"]["run"]: r for r in res}
+    pairs = [("cwd5-k01W1-s%d" % s, "cwd5-k01W%d-s%d" % (w, s)) for s in (146, 147, 148) for w in (2, 4)]
+    pairs += [("cmo1-k01-s%d" % s, "cmo1-W0k01-s%d" % s) for s in (108, 109, 110)]
+    for a, h in pairs:
+        if a not in byrun or h not in byrun:
+            continue
+        ra, rh = byrun[a], byrun[h]
+        ma = dict(zip(ra["steps"], ra["b"]))
+        mh = dict(zip(rh["steps"], rh["b"]))
+        common = sorted(set(ma) & set(mh))
+        div = next((t for t in common if abs(ma[t] - mh[t]) > 0.1), None)
+        dc = ra["steps"][ra["Dc"]] if ra["Dc"] is not None else None
+        d1 = ra["steps"][ra["D1"]] if ra["D1"] is not None else None
+        pa = ra["steps"][ra["ev"]["peak"]]
+        ph = rh["steps"][rh["ev"]["peak"]]
+        print("    %-18s vs %-18s DIV step %s | collapsing PEAK %s, partner PEAK %s | D1 %s, Dc %s | Dc - DIV %s" % (
+            a, h, div, pa, ph, d1, dc, "-" if (dc is None or div is None) else "%+d" % (dc - div)))
+    # summary over the plain collapsing runs
+    print()
+    print("  flags: M = decay mask on; F = another intervention line on; X = batch with NO quotable result "
+          "(cst1: CORRECTIONS 265 -- G-DECOMP, 'nothing in its descriptive section may be quoted'); X runs are "
+          "printed for completeness and EXCLUDED from every pooled line below.")
+    col = [r for r in res if state_of(r["i"]) == "COLLAPSED" and not r["i"]["mask_idx"]
+           and r["i"]["batch"] not in NOT_QUOTABLE]
+    hea = [r for r in res if state_of(r["i"]) == "healthy" and r["i"]["batch"] not in NOT_QUOTABLE]
+
+    def rel(r, a, b):
+        ka, kb = r[a] if isinstance(a, str) and a in r else r["ev"][a], r["ev"][b]
+        return None if (ka is None or kb is None) else r["steps"][ka] - r["steps"][kb]
+    d1_ex02 = [rel(r, "D1", "exit0.02") for r in col if r["D1"] is not None]
+    d1_ex10 = [rel(r, "D1", "exit0.10") for r in col if r["D1"] is not None]
+    d1_pk = [rel(r, "D1", "peak") for r in col if r["D1"] is not None]
+    dc_pk = [rel(r, "Dc", "peak") for r in col if r["Dc"] is not None]
+    dc_ds = [rel(r, "Dc", "desc1") for r in col if r["Dc"] is not None and r["ev"]["desc1"] is not None]
+    print("  SUMMARY, unmasked COLLAPSED scalar runs (every batch above except X): n=%d" % len(col))
+    print("    pre-EXIT(0.1) DOM_C share: max over runs %s  (0 = not ONE sampled record before the ascent ended; "
+          "STRUCTURALLY FORCED, see B0 -- not evidence that capture lags)"
+          % f(max(r["pre"] for r in col if r["pre"] is not None), 3))
+    print("    D1 - EXIT(0.02) steps: min %s median %s max %s   (first SINGLE dominance record vs the first 10 net "
+          "down-votes)" % (min(d1_ex02), med(d1_ex02), max(d1_ex02)))
+    print("    D1 - EXIT(0.1)  steps: min %s median %s max %s" % (min(d1_ex10), med(d1_ex10), max(d1_ex10)))
+    print("    D1 - PEAK       steps: min %s median %s max %s" % (min(d1_pk), med(d1_pk), max(d1_pk)))
+    print("    Dc - PEAK       steps: min %s median %s max %s" % (min(dc_pk), med(dc_pk), max(dc_pk)))
+    print("    Dc - DESC1      steps: min %s median %s max %s   (negative = the bar is crossed before beta has "
+          "fallen 1 nat)" % (min(dc_ds), med(dc_ds), max(dc_ds)))
+    print("    (Df/Db columns are window-placement bounds only: a forward window is credited at its START, up to "
+          "1,000 steps before its first dominance record, so Df < EXIT is NOT evidence of lead; D1 is the "
+          "sampled lead indicator.)")
+    print("  HEALTHY scalar runs: n=%d; EXIT(0.1) steps %s..%s; DOM_C share on ANY record: max %s; runs with Dc: %d"
+          % (len(hea), min(r["steps"][r["ev"]["exit0.10"]] for r in hea),
+             max(r["steps"][r["ev"]["exit0.10"]] for r in hea),
+             f(max(r["all"] for r in hea if r["all"] is not None), 3), sum(1 for r in hea if r["Dc"] is not None)))
+    # ---- B0: the STRUCTURAL property of the lead-lag test (verifier finding V1) ----
+    print()
+    print("""  B0 -- WHY 'pre-EXIT DOM_C = 0' ABOVE IS NOT EVIDENCE OF LAG: THE REGISTERED DOM_C CANNOT LEAD THIS TURN.
+    DOM_C(r) requires sign(sum_C L) == s, the APPLIED shared sign.  Through the saturated ascent s = -1 (the vote
+    pushes beta UP) on every record, while from ~5,000-7,000 steps on the carriers' summed term is POSITIVE (they
+    push beta DOWN: B2's Cdn).  On such a record DOM_C is false by definition, whatever the carriers' magnitude.
+    So the registered statistic can only become true AFTER s flips, i.e. after the turn it is being tested against;
+    'DOM_C onset lags the turn' is near-guaranteed by construction and says nothing about cause.  Counts below, per
+    record before TURN = the first record with s = +1 (the first record on which the shared vote pushes beta DOWN).
+    ADMISSIBLE = a pre-TURN record on which DOM_C COULD be true (sign(sum_C L) == s != 0).  MAG_C = the sign-FREE
+    analogue |sum_C L| > sum_rest |L| (DESCRIPTIVE, NOT registered, reported only to show what the sign clause hides).""")
+
+    def turn_idx(recs):
+        for k, rec in enumerate(recs):
+            try:
+                L, b2 = core.record_L(rec)
+                if len(L) == 62 and core.shared_sign(rec, L, b2) > 0:
+                    return k
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return None
+
+    def struct_counts(recs, upto):
+        n = neg = opp = adm = dom = mag = 0
+        last_adm = first_opp_run = None
+        for rec in recs[:upto]:
+            try:
+                L, b2 = core.record_L(rec)
+                s = core.shared_sign(rec, L, b2)
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+            if len(L) != 62:
+                continue
+            sc = sum(L[k] for k in core.C_IDX0)
+            rest = sum(abs(L[k]) for k in range(62) if k not in core.C_IDX0)
+            n += 1
+            neg += s < 0
+            opp += s != 0 and core.sgn(sc) != s
+            if s != 0 and core.sgn(sc) == s:
+                adm += 1
+                last_adm = rec["step"]
+            dom += core.fixes_sign(L, core.C_IDX0, s)
+            mag += abs(sc) > rest
+        # the step from which the carriers oppose s on EVERY remaining pre-TURN record
+        k = upto
+        while k > 0:
+            rec = recs[k - 1]
+            L, b2 = core.record_L(rec)
+            s = core.shared_sign(rec, L, b2)
+            if not (s != 0 and core.sgn(sum(L[q] for q in core.C_IDX0)) != s):
+                break
+            k -= 1
+        first_opp_run = recs[k]["step"] if k < upto else None
+        return n, neg, opp, adm, dom, mag, last_adm, first_opp_run
+
+    for gl, grp in (("unmasked COLLAPSED (every quotable batch)", col), ("healthy (every quotable batch)", hea)):
+        tot = [0] * 6
+        las, fos, tus = [], [], []
+        for r in grp:
+            recs = cache[r["i"]["run"]]
+            t = turn_idx(recs)
+            if t is None:
+                continue
+            tus.append(recs[t]["step"])
+            c = struct_counts(recs, t)
+            for q in range(6):
+                tot[q] += c[q]
+            if c[6] is not None:
+                las.append(c[6])
+            if c[7] is not None:
+                fos.append(c[7])
+        print("    %-42s runs %d; pre-TURN records %d: s=-1 on %d; carriers OPPOSE s on %d; ADMISSIBLE %d; DOM_C true "
+              "%d; MAG_C true %d" % (gl, len(tus), tot[0], tot[1], tot[2], tot[3], tot[4], tot[5]))
+        if tus:
+            print("      TURN step %d..%d (median %g); last ADMISSIBLE record step %s..%s; carriers oppose s on EVERY "
+                  "record from step %s..%s to the TURN" % (
+                      min(tus), max(tus), med(tus), min(las) if las else "-", max(las) if las else "-",
+                      min(fos) if fos else "-", max(fos) if fos else "-"))
+    # MAG_C onset vs TURN on the collapsing runs
+    mg = []
+    for r in col:
+        recs = cache[r["i"]["run"]]
+        t = turn_idx(recs)
+        k = next((q for q, rec in enumerate(recs) if len(rec.get("z_tensor", [])) == 62 and
+                  (lambda L: abs(sum(L[x] for x in core.C_IDX0)) >
+                   sum(abs(L[x]) for x in range(62) if x not in core.C_IDX0))(core.record_L(rec)[0])), None)
+        if t is not None and k is not None:
+            mg.append(recs[k]["step"] - recs[t]["step"])
+    if mg:
+        print("    first MAG_C record - TURN (steps), unmasked COLLAPSED: min %+d median %+g max %+d  (n=%d; negative = "
+              "the carriers' magnitude exceeds the rest's BEFORE the turn)" % (min(mg), med(mg), max(mg), len(mg)))
+
+    # ---- B1: the FAIR accuracy event (verifier finding V1): same-seed divergence from a healthy partner ----
+    print()
+    print("""  B1 -- THE FAIR ACCURACY EVENT: SAME-SEED TEST DIVERGENCE FROM A HEALTHY PARTNER, vs the beta turn and DOM_C.
+    WHY: the previous B1 event 'FALL' (first epoch after the epoch-0..49 TEST maximum with TEST < 0.9*max) is
+    undefined on the collapsed runs -- they never fall; they climb slowly and plateau near 23 %% (count printed below).
+    The collapse is a failure to LEARN, so its accuracy onset is the step at which the collapsing arm starts to trail
+    a same-seed arm that differs only in the decay (or the decay mask) while beta is still identical in both.
+    GAP(e) = TEST_partner(e) - TEST_collapsing(e), same seed, epoch e (ends at step 500*(e+1)).  For t in
+    {0.5, 1, 2, 5} pp:  G_t = first epoch with GAP >= t that STAYS >= t through epoch 49 (sustained); g_t = first
+    epoch with GAP >= t (touch).  Compared, in steps (epoch-end step), with the COLLAPSING run's own
+      TURN   first record with shared s = +1;  BDIV  first record with |beta_A - beta_B| > 1e-3 nat (one net vote)
+             beyond the pair's step-0 offset;
+      D1     first single DOM_C record.   Negative (G_t end-step - X) = the accuracy gap opens BEFORE X.
+    Shrink at G_t = wd*exp(beta) of the collapsing arm on the record at that epoch's end (the realised dose then).
+    NULL: the same statistic on same-seed pairs of two HEALTHY arms (max |GAP| over epochs 0-16 and 0-19, and G_t).""")
+    nfall = 0
+    for r in col:
+        te = core.parse_out(r["i"]["out"])["test"]
+        e50 = [q for q in range(50) if q in te]
+        pk = max(e50, key=lambda q: te[q])
+        if next((q for q in range(pk + 1, 100) if q in te and te[q] < 0.9 * te[pk]), None) is None:
+            nfall += 1
+    print("    old FALL event undefined (None) on %d / %d unmasked COLLAPSED runs -- DROPPED." % (nfall, len(col)))
+    THR = (0.5, 1.0, 2.0, 5.0)
+    PAIRS_F = [("cwd5 wd 0.1 vs 5e-4", "cwd5-k01W1-s%d", "cwd5-k01W4-s%d", (146, 147, 148)),
+               ("cwd5 wd 0.1 vs 1e-3", "cwd5-k01W1-s%d", "cwd5-k01W3-s%d", (146, 147, 148)),
+               ("cwd5 wd 0.1 vs 1e-2", "cwd5-k01W1-s%d", "cwd5-k01W2-s%d", (146, 147, 148)),
+               ("cmo1 wd 0.1 vs wd 0", "cmo1-k01-s%d", "cmo1-W0k01-s%d", (108, 109, 110)),
+               ("cwd3 unmasked vs carriers' decay masked", "cwd3-k01-s%d", "cwd3-CARWD0-s%d", (140, 141, 142)),
+               ("cwd3 unmasked vs all-BN-scale decay masked", "cwd3-k01-s%d", "cwd3-NWD-s%d", (140, 141, 142)),
+               ("cwd4 unmasked vs carriers' decay masked", "cwd4-k01-s%d", "cwd4-CARWD0-s%d", (143, 144, 145)),
+               ("cwd1 unmasked vs all-BN-scale decay masked", "cwd1-k01-s%d", "cwd1-k01NWD-s%d", (128, 129, 130))]
+    NULL_F = [("NULL cwd5 1e-2 vs 5e-4", "cwd5-k01W2-s%d", "cwd5-k01W4-s%d", (146, 147, 148)),
+              ("NULL cwd5 1e-3 vs 5e-4", "cwd5-k01W3-s%d", "cwd5-k01W4-s%d", (146, 147, 148)),
+              ("NULL cwd3 CARWD0 vs NWD", "cwd3-CARWD0-s%d", "cwd3-NWD-s%d", (140, 141, 142)),
+              ("NULL cwd4 CARWD0 vs TWOWD0", "cwd4-CARWD0-s%d", "cwd4-TWOWD0-s%d", (143, 144, 145))]
+    # pooled: ONE partner per collapsing run, so no collapsing run is counted twice (cwd5 W1 -> W4; cwd3 k01 -> CARWD0)
+    POOL_F = ("cwd5 wd 0.1 vs 5e-4", "cmo1 wd 0.1 vs wd 0", "cwd3 unmasked vs carriers' decay masked",
+              "cwd4 unmasked vs carriers' decay masked", "cwd1 unmasked vs all-BN-scale decay masked")
+    byinfo = {i["run"]: i for i in infos}
+
+    def gap_events(ra, rb):
+        ta = core.parse_out(byinfo[ra]["out"])["test"]
+        tb = core.parse_out(byinfo[rb]["out"])["test"]
+        eps = [q for q in range(50) if q in ta and q in tb]
+        gap = {q: tb[q] - ta[q] for q in eps}
+        G, g = {}, {}
+        for t in THR:
+            g[t] = next((q for q in eps if gap[q] >= t), None)
+            G[t] = next((q for q in eps if all(gap[x] >= t for x in eps if x >= q)), None)
+        return gap, G, g
+
+    fair = {t: [] for t in THR}
+    offsets = []
+    print("    %-44s %-5s %6s %6s %6s | %-23s | %-23s | %s" % (
+        "pair (collapsing A vs partner B)", "seed", "TURN", "BDIV", "D1", "G_0.5/1/2/5 (epoch)",
+        "g_0.5/1/2/5 (epoch)", "G_t end-step - TURN / BDIV / D1 ; shrink_A at G_t"))
+    for lab, pa, pb, seeds in PAIRS_F:
+        for s in seeds:
+            ra, rb = pa % s, pb % s
+            if ra not in cache or rb not in cache or ra not in byinfo or rb not in byinfo:
+                print("    %-44s s%d  (records missing)" % (lab, s))
+                continue
+            gap, G, g = gap_events(ra, rb)
+            ca, cb = cache[ra], cache[rb]
+            t = turn_idx(ca)
+            turn = ca[t]["step"] if t is not None else None
+            mb = {rec["step"]: rec["beta"][0] for rec in cb if rec.get("beta")}
+            # offset-corrected: cmo1 W0k01 sits a constant 1.0e-3 nat (one ascent step) off its partner from step 0
+            common = [rec for rec in ca if rec.get("beta") and rec["step"] in mb]
+            off0 = common[0]["beta"][0] - mb[common[0]["step"]] if common else 0.0
+            if abs(off0) > 1e-5:
+                offsets.append("%s: %.4e" % (lab + " s%d" % s, off0))
+            bdiv = next((rec["step"] for rec in common
+                         if abs(rec["beta"][0] - mb[rec["step"]] - off0) > 1e-3), None)
+            dom = dom_series(ca)
+            d1 = next((ca[k]["step"] for k, x in enumerate(dom) if x), None)
+            ba = {rec["step"]: rec["beta"][0] for rec in ca if rec.get("beta")}
+            wd = byinfo[ra]["wd"]
+            rel = []
+            for tt in THR:
+                if G[tt] is None:
+                    rel.append("-")
+                    continue
+                es = 500 * (G[tt] + 1)
+                sh = wd * math.exp(ba[es]) if es in ba else None
+                rel.append("%s/%s/%s;%s" % tuple(["-" if x is None else "%+d" % (es - x) for x in (turn, bdiv, d1)]
+                                                 + [e(sh)]))
+                if lab in POOL_F:
+                    fair[tt].append((lab, s, es, turn, bdiv, d1))
+            print("    %-44s s%-4d %6s %6s %6s | %-23s | %-23s | %s" % (
+                lab, s, turn, bdiv, d1, "/".join("-" if G[x] is None else str(G[x]) for x in THR),
+                "/".join("-" if g[x] is None else str(g[x]) for x in THR), "  ".join(rel)))
+            print("    %-44s       GAP pp at epochs 10-20: %s" % ("", " ".join(
+                "%+.1f" % gap[q] if q in gap else "-" for q in range(10, 21))))
+    for lab, pa, pb, seeds in NULL_F:
+        for s in seeds:
+            ra, rb = pa % s, pb % s
+            if ra not in byinfo or rb not in byinfo:
+                print("    %-44s s%d  (runs missing)" % (lab, s))
+                continue
+            gap, G, g = gap_events(ra, rb)
+            print("    %-44s s%-4d max|GAP| ep0-16 (every epoch ending before any TURN) %.2f pp, ep0-19 %.2f pp; "
+                  "G_0.5/1/2/5 %s; GAP pp at epochs 10-20: %s" % (
+                lab, s, max(abs(gap[q]) for q in range(17) if q in gap), max(abs(gap[q]) for q in range(20) if q in gap),
+                "/".join("-" if G[x] is None else str(G[x]) for x in THR),
+                " ".join("%+.1f" % gap[q] if q in gap else "-" for q in range(10, 21))))
+    print("    BDIV is OFFSET-CORRECTED: |(beta_A - beta_B) - (beta_A - beta_B)[step 0]| > 1e-3.  Non-zero step-0 "
+          "offsets: %s" % ("; ".join(offsets) or "none"))
+    print("    POOLED over ONE partner per collapsing run (%s; the cwd5 W1-vs-W3/W2 and cwd3-vs-NWD rows are shown but "
+          "not pooled, so no collapsing run is counted twice):" % "; ".join(POOL_F))
+    for tt in THR:
+        v = fair[tt]
+        if not v:
+            print("      t=%.1f pp: no sustained crossing" % tt)
+            continue
+        dt = [x[2] - x[3] for x in v if x[3] is not None]
+        db = [x[2] - x[4] for x in v if x[4] is not None]
+        dd = [x[2] - x[5] for x in v if x[5] is not None]
+        print("      t=%.1f pp: n=%d pairs; G_t end-step %d..%d; G_t-TURN %+d..%+d (before TURN on %d/%d); G_t-BDIV "
+              "%+d..%+d (before on %d/%d); G_t-D1 %+d..%+d (before on %d/%d)" % (
+                  tt, len(v), min(x[2] for x in v), max(x[2] for x in v), min(dt), max(dt),
+                  sum(1 for x in dt if x < 0), len(dt), min(db), max(db), sum(1 for x in db if x < 0), len(db),
+                  min(dd), max(dd), sum(1 for x in dd if x < 0), len(dd)))
+
+    # ---- B1b: SHARE_C's pre-turn trajectory, collapsing arm vs partner ----
+    print()
+    print("""  B1b -- SHARE_C = sum_C|L| / sum|L| BEFORE THE TURN, per pair (run medians over 500-step windows; min..max over
+    the 3 seeds).  CAVEAT (as in C): in these pairs the carriers' term is largely their decay term, so A > B is close
+    to true by construction; what matters is WHEN A's share grows relative to the accuracy gap above.""")
+    wins2 = [(lo, lo + 500) for lo in range(5000, 9500, 500)]
+    print("    %-44s %s" % ("pair (steps, k)", " ".join("%11s" % ("%.1f-%.1fk" % (lo / 1000.0, hi / 1000.0))
+                                                           for lo, hi in wins2)))
+
+    def share_med(run, lo, hi):
+        v = []
+        for rec in cache[run]:
+            if lo <= rec["step"] < hi and len(rec.get("z_tensor", [])) == 62:
+                L, b2 = core.record_L(rec)
+                tot = sum(abs(x) for x in L)
+                if tot > 0:
+                    v.append(sum(abs(L[k]) for k in core.C_IDX0) / tot)
+        return med(v)
+    for lab, pa, pb, seeds in PAIRS_F:
+        for tag, pat in (("A", pa), ("B", pb)):
+            cells = []
+            for lo, hi in wins2:
+                v = [share_med(pat % s, lo, hi) for s in seeds if (pat % s) in cache]
+                v = [x for x in v if x is not None]
+                cells.append("%.3f-%.3f" % (min(v), max(v)) if v else "   n/a   ")
+            print("    %-44s %s" % ((lab if tag == "A" else "") + " " + tag, " ".join("%11s" % c for c in cells)))
+        first = []
+        for s in seeds:
+            if (pa % s) not in cache:
+                continue
+            row = []
+            for thr in (0.05, 0.1, 0.25, 0.5):
+                k = next((rec["step"] for rec in cache[pa % s] if rec["step"] >= 1000 and
+                          len(rec.get("z_tensor", [])) == 62 and
+                          (lambda L: sum(abs(x) for x in L) > 0 and sum(abs(L[q]) for q in core.C_IDX0) /
+                           sum(abs(x) for x in L) >= thr)(core.record_L(rec)[0])), None)
+                row.append("-" if k is None else str(k))
+            first.append("s%d %s" % (s, "/".join(row)))
+        print("    %-44s   A's first record at step >= 1,000 (momentum warm-up excluded) with SHARE_C >= 0.05/0.10/0.25/0.50: %s" % ("", "; ".join(first)))
+
+    # ---- B2: what the carriers were doing around the turn ----
+    print()
+    print("""  B2 -- THE VOTE AROUND THE TURN, decomposed into the carriers C and the other 59 tensors ('rest').
+    SIGN CONVENTION (Lion_meta_update: beta <- beta - ms*sign(b2*mom + (1-b2)*z)): a POSITIVE term pushes beta
+    DOWN.  So during the saturated ascent s = -1 on every record, and the turn is s becoming +1.
+    Per record: SHARE_C = sum_C|L|/sum|L|; Cdn = sum_C L > 0 (the carriers push beta DOWN); Rdn = sum_rest L > 0;
+    sdn = s > 0 (the shared vote pushes beta DOWN); PIV = sign(sum_C L) == s != sign(sum_rest L) (the carriers set
+    the shared sign AGAINST the rest's NET sum -- weaker than DOM_C, which needs them to beat the rest's ABSOLUTE
+    mass); DOM = the registered DOM_C.  Windows are in ABSOLUTE steps, the same for every group: every scalar
+    run at ms 1e-3 climbs the identical saturated ascent to ~8,600 steps, so same-step windows compare like with
+    like.  cst1 (ms 3e-4) is excluded here.""")
+    ms3 = [r for r in res if r["i"]["ms"] == "1e-3"]
+    colm = [r for r in ms3 if state_of(r["i"]) == "COLLAPSED" and not r["i"]["mask_idx"]]
+    groups = [("COLLAPSED, unmasked, wd 0.1", colm),
+              ("healthy cwd5 W2 (wd 1e-2)", [r for r in ms3 if r["i"]["run"].startswith("cwd5-k01W2")]),
+              ("healthy cwd5 W3 (wd 1e-3)", [r for r in ms3 if r["i"]["run"].startswith("cwd5-k01W3")]),
+              ("healthy cwd5 W4 (wd 5e-4)", [r for r in ms3 if r["i"]["run"].startswith("cwd5-k01W4")]),
+              ("healthy cmo1 W0k01 (wd 0)", [r for r in ms3 if r["i"]["arm"] == "W0k01"]),
+              ("healthy cct1 k01 (CIFAR-10, wd 0.1)", [r for r in ms3 if r["i"]["batch"] == "cct1"]),
+              ("healthy, carriers' decay masked (cwd3/cwd4 CARWD0, wd 0.1)",
+               [r for r in ms3 if r["i"]["arm"] == "CARWD0"]),
+              ("healthy, all BN scales' decay masked (cwd1 k01NWD, cwd3 NWD)",
+               [r for r in ms3 if r["i"]["arm"] in ("k01NWD", "NWD")])]
+    wins = ((2000, 5000), (5000, 7000), (7000, 8000), (8000, 8500), (8500, 9000), (9000, 9500), (9500, 10000),
+            (10000, 11000), (11000, 13000), (13000, 20000))
+    print("    %-58s %-13s %5s %7s %5s %5s %5s %5s %5s" % ("group", "steps", "n", "SHARE_C", "Cdn", "Rdn", "sdn",
+                                                           "PIV", "DOM"))
+    for gl, grp in groups:
+        if not grp:
+            continue
+        for lo, hi in wins:
+            sh, cn, rn, sn, pv, dm, n = [], 0, 0, 0, 0, 0, 0
+            for r in grp:
+                for rec in cache[r["i"]["run"]]:
+                    if not (lo <= rec["step"] < hi):
+                        continue
+                    L, b2 = core.record_L(rec)
+                    sg = core.shared_sign(rec, L, b2)
+                    if sg == 0 or len(L) != 62:
+                        continue
+                    sc = sum(L[k] for k in core.C_IDX0)
+                    sr = sum(L[k] for k in range(62) if k not in core.C_IDX0)
+                    tot = sum(abs(x) for x in L)
+                    sh.append(sum(abs(L[k]) for k in core.C_IDX0) / tot if tot else 0.0)
+                    cn += sc > 0
+                    rn += sr > 0
+                    sn += sg > 0
+                    pv += core.sgn(sc) == sg and core.sgn(sr) != sg
+                    dm += core.fixes_sign(L, core.C_IDX0, sg)
+                    n += 1
+            if n:
+                print("    %-58s %5d-%-7d %5d %7.3f %5.3f %5.3f %5.3f %5.3f %5.3f" % (
+                    gl + " (%d runs)" % len(grp), lo, hi, n, med(sh), cn / n, rn / n, sn / n, pv / n, dm / n))
+        print()
+    return res
+
+
+# =============================================================================
+# (C) N_eff
+# =============================================================================
+def neff_rows(i, recs):
+    spe = i["spe"]
+    out = []
+    for r in recs:
+        if "z_tensor" not in r or "m_tensor" not in r:
+            continue
+        b2 = float(r.get("pt_b2", core.B2_REG))
+        L = [b2 * m + (1.0 - b2) * z for m, z in zip(r["m_tensor"], r["z_tensor"])]
+        out.append((r["step"] / spe, neff(L), neff(r["z_tensor"])))
+    return out
+
+
+def section_C(infos, cache):
+    print()
+    print("=" * 110)
+    print("(C) N_eff = 1/sum p_i^2, p_i = |L_i|/sum|L_j|, L_i = b2*m_i + (1-b2)*z_i  (DESCRIPTIVE; a candidate for "
+          "pre-registration, NOT a claim)")
+    print("=" * 110)
+    print("  Range 1 (one tensor carries the whole vote) .. n_tensors (all equal).  Run value in a window = median over "
+          "its records; 'z' = the same on |z_i| alone.  Epoch windows are half-open, 0-based epochs.")
+    print("  The early window is epochs [1,5) = steps 500..2,499 (epoch 0 excluded: the momentum buffer is warming up).")
+    per_run = {}
+    for i in infos:
+        if not i.get("out"):
+            continue
+        recs = cache.get(i["run"])
+        if not recs or "z_tensor" not in recs[0]:
+            continue
+        rows = neff_rows(i, recs)
+        if not rows:
+            continue
+        w = {}
+        for lo, hi in WIN_C:
+            v = [x[1] for x in rows if lo <= x[0] < hi and x[1] is not None]
+            vz = [x[2] for x in rows if lo <= x[0] < hi and x[2] is not None]
+            w[(lo, hi)] = (med(v), med(vz))
+        per_run[i["run"]] = (i, w, len(recs[0]["z_tensor"]))
+    # per-arm table
+    arms = {}
+    for run, (i, w, nt) in per_run.items():
+        arms.setdefault(arm_key(i), []).append((i, w, nt))
+    print()
+    print("  %-18s %-3s %-8s %-5s %-10s %-3s  %s" % ("arm", "nT", "wd", "mom", "grain", "st",
+                                                   "  ".join("ep%d-%d" % x for x in WIN_C)))
+    order = list(RESNET_PT_BATCHES) + list(NEFF_EXTRA_BATCHES)
+    for k in sorted(arms, key=lambda k: (order.index(k.split("/")[0]) if k.split("/")[0] in order else 99, k)):
+        rs = sorted(arms[k], key=lambda x: x[0]["seed"])
+        i0 = rs[0][0]
+        sts = "".join("C" if state_of(x[0]) == "COLLAPSED" else "h" for x in rs)
+        cells = []
+        for win in WIN_C:
+            v = [x[1][win][0] for x in rs if x[1][win][0] is not None]
+            cells.append("%5.2f-%-5.2f" % (min(v), max(v)) if v else "   n/a     ")
+        flags = ("M" if i0["mask_idx"] else "") + ("F" if [x for x in i0["foreign_on"] if x != "DECAY_MASK"] else "")
+        print("  %-18s %-3d %-8s %-5s %-10s %-3s  %s %s" % (k, rs[0][2], i0["wd_tok"], i0["mom"],
+                                                         (i0["grain"] or "")[:10], sts, " ".join(cells), flags))
+    # paired cells
+    print()
+    print("  PAIRED CELLS -- early N_eff (epochs [1,5), run medians), collapsing arm vs healthy arm:")
+    P = [
+        ("P1 cwd5 wd 0.1 vs 5e-4 (scalar)", ["cwd5/k01W1"], ["cwd5/k01W4"]),
+        ("P1b cwd5 wd 0.1 vs 1e-2 (scalar)", ["cwd5/k01W1"], ["cwd5/k01W2"]),
+        ("P1c cwd5 wd 0.1 vs 1e-3 (scalar)", ["cwd5/k01W1"], ["cwd5/k01W3"]),
+        ("P1d cwd5 wd 0.1 vs {1e-2,1e-3,5e-4} (scalar)", ["cwd5/k01W1"], ["cwd5/k01W2", "cwd5/k01W3", "cwd5/k01W4"]),
+        ("P2 CIFAR-100 anchors (every plain scalar wd-0.1 ResNet18_c100 arm, ms 1e-3) vs cct1 CIFAR-10",
+         ["ctd1/sc", "ciso1/k01", "cdep1/k01", "cmo1/k01", "cwd1/k01", "cwd3/k01", "cwd4/k01", "cwd5/k01W1",
+          "cvt7/k01", "cvt8/k01", "cvt10/k01"], ["cct1/k01"]),
+        ("P3 cmo1 wd 0.1 vs wd 0 (W0) (scalar)", ["cmo1/k01"], ["cmo1/W0k01"]),
+        ("P3b cmo1 mom 0.9 wd 0.1 vs wd 0 (scalar)", ["cmo1/M9k01"], ["cmo1/W0k01"]),
+        ("P4 cwd3 carriers' decay masked vs unmasked (scalar, wd 0.1)", ["cwd3/k01"], ["cwd3/CARWD0"]),
+        ("P4b cwd4 carriers' decay masked vs unmasked", ["cwd4/k01"], ["cwd4/CARWD0"]),
+        ("P4c cwd1 all-BN-scale decay masked vs unmasked", ["cwd1/k01"], ["cwd1/k01NWD"]),
+    ]
+    out_pairs = []
+    for lab, A, B in P:
+        va, vb = [], []
+        for run, (i, w, nt) in per_run.items():
+            k = arm_key(i)
+            x = w[EARLY][0]
+            if x is None:
+                continue
+            if k in A:
+                va.append((x, state_of(i), run))
+            elif k in B:
+                vb.append((x, state_of(i), run))
+        if not va or not vb:
+            print("    %-70s  (records missing)" % lab)
+            continue
+        a = [x[0] for x in va]
+        b = [x[0] for x in vb]
+        sa = "".join("C" if x[1] == "COLLAPSED" else "h" for x in va)
+        sb = "".join("C" if x[1] == "COLLAPSED" else "h" for x in vb)
+        sep = "SEPARATES (A below B)" if max(a) < min(b) else ("SEPARATES (A above B)" if min(a) > max(b)
+                                                                else "OVERLAPS")
+        # per later windows too
+        later = []
+        for win in WIN_C[2:5]:
+            aa = [per_run[x[2]][1][win][0] for x in va if per_run[x[2]][1][win][0] is not None]
+            bb = [per_run[x[2]][1][win][0] for x in vb if per_run[x[2]][1][win][0] is not None]
+            if aa and bb:
+                later.append("ep%d-%d A %.2f-%.2f B %.2f-%.2f %s" % (
+                    win[0], win[1], min(aa), max(aa), min(bb), max(bb),
+                    "sep" if (max(aa) < min(bb) or min(aa) > max(bb)) else "ovl"))
+        print("    %s" % lab)
+        print("       A n=%d [%s] %.2f..%.2f (median %.2f)   B n=%d [%s] %.2f..%.2f (median %.2f)   -> %s" % (
+            len(a), sa, min(a), max(a), med(a), len(b), sb, min(b), max(b), med(b), sep))
+        print("       per run: A %s | B %s" % (" ".join("%s %.2f" % (x[2], x[0]) for x in sorted(va, key=lambda x: x[2])),
+                                                 " ".join("%s %.2f" % (x[2], x[0]) for x in sorted(vb, key=lambda x: x[2]))))
+        print("       later windows: %s" % " | ".join(later))
+        out_pairs.append((lab, sep, a, b))
+    # a pre-turn carrier-share alternative, same pairs (ResNet only: C is defined for the 62-tensor ResNets)
+    print()
+    print("  ALTERNATIVE, ALSO DESCRIPTIVE: the carriers' share SHARE_C = sum_C|L|/sum|L|, run median over steps "
+          "[7000,8500) -- after the momentum warm-up, BEFORE any run's ascent ends (earliest EXIT(0.02) = 8,400).")
+    print("  CAVEAT: in the wd and mask pairs the carriers' term IS (mostly) the decay term, so a share gap there is "
+          "close to true by construction; only P2 (same wd, different dataset) is a non-trivial test.")
+    shr = {}
+    for run, (i, w, nt) in per_run.items():
+        if nt != 62 or i.get("ms") != "1e-3":
+            continue
+        v = []
+        for rec in cache[run]:
+            if 7000 <= rec["step"] < 8500:
+                L, b2 = core.record_L(rec)
+                tot = sum(abs(x) for x in L)
+                if tot > 0:
+                    v.append(sum(abs(L[k]) for k in core.C_IDX0) / tot)
+        if v:
+            shr[run] = med(v)
+    for lab, A, B in P:
+        a = [shr[r] for r, (i, w, nt) in per_run.items() if r in shr and arm_key(i) in A]
+        b = [shr[r] for r, (i, w, nt) in per_run.items() if r in shr and arm_key(i) in B]
+        if a and b:
+            sep = "SEPARATES (A above B)" if min(a) > max(b) else ("SEPARATES (A below B)" if max(a) < min(b)
+                                                                   else "OVERLAPS")
+            print("    %-70s A %.3f..%.3f  B %.3f..%.3f  -> %s" % (lab[:70], min(a), max(a), min(b), max(b), sep))
+    # a single threshold over every scalar run with records
+    print()
+    print("  EVERY SCALAR RUN WITH PER-TENSOR RECORDS (any network, masks and interventions included; cst1 excluded), "
+          "early N_eff vs the TRAIN-based state (epochs 95-99 TRAIN; the 250-430-epoch batches are read at epoch 100):")
+    pts = []
+    for run, (i, w, nt) in per_run.items():
+        if len(cache[run][0].get("beta", [])) != 1 or i["batch"] in NOT_QUOTABLE:
+            continue
+        x = w[EARLY][0]
+        if x is None or state_of(i) == "?":
+            continue
+        pts.append((x, state_of(i) == "COLLAPSED", run, i.get("net"), nt))
+    for net in sorted({p[3] for p in pts}):
+        pp = [p for p in pts if p[3] == net]
+        c = sorted(p[0] for p in pp if p[1])
+        h = sorted(p[0] for p in pp if not p[1])
+        best = best_threshold(pp) if (c and h) else "one class only -- no cut is informative"
+        print("    %-18s n=%3d  COLLAPSED n=%3d %s   healthy n=%3d %s   best single cut: %s" % (
+            net, len(pp), len(c), ("%.2f..%.2f" % (c[0], c[-1])) if c else "-", len(h),
+            ("%.2f..%.2f" % (h[0], h[-1])) if h else "-", best))
+    best = best_threshold(pts)
+    ncol = sum(1 for p in pts if p[1])
+    print("    %-18s n=%3d  best single cut over ALL networks: %s  (base rate: calling every run COLLAPSED "
+          "misclassifies %d/%d)" % ("ALL", len(pts), best, len(pts) - ncol, len(pts)))
+    return per_run, out_pairs
+
+
+def best_threshold(pts):
+    xs = sorted({p[0] for p in pts})
+    if not xs:
+        return "n/a"
+    best = None
+    cands = [xs[0] - 1e-9] + [(xs[k] + xs[k + 1]) / 2 for k in range(len(xs) - 1)] + [xs[-1] + 1e-9]
+    for t in cands:
+        for dirn in (1, -1):  # 1: collapsed iff N_eff < t
+            err = sum(1 for p in pts if ((p[0] < t) if dirn == 1 else (p[0] > t)) != p[1])
+            if best is None or err < best[0]:
+                best = (err, t, dirn)
+    return "%d/%d misclassified at N_eff %s %.2f => COLLAPSED" % (best[0], len(pts), "<" if best[2] == 1 else ">",
+                                                                  best[1])
+
+
+# =============================================================================
+def main():
+    print("c289_step0_zero_gpu.py -- CORRECTIONS 289, ZERO GPU, DESCRIPTIVE ONLY")
+    print("script sha256 %s" % sha_file(os.path.abspath(__file__)))
+    print("cCV0 core sha256 %s (the registered DOM_C definition, CORRECTIONS 256.3)" % core.core_sha())
+    print("runs roots: %s ; %s" % (RUNS_A2, RUNS_1))
+    batches = tuple(dict.fromkeys(SHRINK_BATCHES + RESNET_PT_BATCHES + NEFF_EXTRA_BATCHES))
+    found = discover(batches)
+    infos, cache = [], {}
+    h = hashlib.sha256()
+    for run, pdir in found:
+        i = run_info(run, pdir)
+        if not i.get("out"):
+            print("  NOTE no .out for %s -- skipped" % run)
+            continue
+        cache[run] = read_records(pdir)
+        h.update(run.encode())
+        h.update(sha_file(os.path.join(pdir, "probe.jsonl")).encode())
+        infos.append(i)
+    print("probe runs read: %d (records %d); combined sha256 of (run name, probe.jsonl sha) in read order: %s" % (
+        len(infos), sum(len(v) for v in cache.values()), h.hexdigest()))
+    bad = [i["run"] for i in infos if not i["complete"]]
+    print("incomplete .out files among them: %d %s" % (len(bad), bad[:10]))
+    spe = sorted({i["spe"] for i in infos})
+    print("steps per epoch (50,000 / batch size) over all runs read: %s" % spe)
+    if not selftest(cache):
+        print("SELFTEST FAILED -- stopping")
+        sys.exit(1)
+    section_A(infos, cache)
+    section_B(infos, cache)
+    section_C(infos, cache)
+    print()
+    print("END (descriptive; nothing registered, nothing gated)")
+
+
+if __name__ == "__main__":
+    main()

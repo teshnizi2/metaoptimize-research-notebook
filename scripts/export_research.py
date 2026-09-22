@@ -53,6 +53,7 @@ MUST_IDS = [register_model.partition_id(line) for line in range(register_model.M
 MECH4_IDS = [register_model.partition_id(line) for line in range(register_model.MECH4_FIRST_ROW, register_model.MECH4_LAST_ROW + 1)]
 MECH5_IDS = [register_model.partition_id(line) for line in range(register_model.MECH5_FIRST_ROW, register_model.MECH5_LAST_ROW + 1)]
 MECH6_IDS = [register_model.partition_id(line) for line in range(register_model.MECH6_FIRST_ROW, register_model.MECH6_LAST_ROW + 1)]
+MECH7_IDS = [register_model.partition_id(line) for line in range(register_model.MECH7_FIRST_ROW, register_model.MECH7_LAST_ROW + 1)]
 REGISTER_CSV = "complete_experiment_register.csv"
 RUN_INVENTORY_CSV = "complete_run_inventory.csv"
 # Summary tables derived from the register are regenerated from it, like the register table.
@@ -102,7 +103,7 @@ PHASE_LINKS = [
     ["MT162", "MT163", "MT165"], ["MT019", "MT020", "MT164", "MT166"], ["CVK2"],
 ]
 PHASE_STARTS = ["2026-08-18", "2026-08-20", "2026-08-24", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-14"]
-EXPECTED_STATS = {"experiments": 175, "researchQuestions": 157, "methodChecks": 18, "runs": 3316, "figures": 54, "areas": 10}
+EXPECTED_STATS = {"experiments": 177, "researchQuestions": 159, "methodChecks": 18, "runs": 3383, "figures": 54, "areas": 10}
 CVK2_RUNS = 27
 
 
@@ -585,6 +586,15 @@ def make_runs(inventory, experiments, evidence, public, workspace, intervened=No
                 params["argsDeviationNote"] += (f" TWO-AXIS: this run ALSO ran the "
                                                 f"{register_model.intervention_phrase(' '.join(f'{patch}={patch_value}' for patch, patch_value in axes))}, "
                                                 f"whose own ON line is read back from the run's log; both axes must be dropped together.")
+            extra_args = register_model.args_extra_args(listed["intervention"], listed["witness"])
+            if extra_args:
+                # A TWO-ARGS row (CORRECTIONS 294): the run deviates on two ARGS kinds and is listed once, by one of them. The
+                # further kinds are named here and each is checked against the run's own ARGS line below.
+                params["argsDeviationAdditionalArgs"] = " + ".join(f"{other}: {other_flag}={other_value}" for other, other_flag, other_value in extra_args)
+                params["argsDeviationNote"] += (" TWO-ARGS: this run ALSO deviates on the "
+                                                + "; ".join(f"{register_model.args_phrase(other)}, set to {other_value} against the standard {register_model.ARGS_KINDS[other][1]}"
+                                                            for other, _other_flag, other_value in extra_args)
+                                                + ", read back from the run's own ARGS line; it is listed once, by the witness above, under CORRECTIONS 294's rule, and every axis must be dropped together.")
         elif job_id in intervened:
             # The inventory's cell key hides this run's harness intervention (results/CORPUS-EXCLUSIONS.tsv).
             listed = intervened[job_id]
@@ -624,6 +634,11 @@ def make_runs(inventory, experiments, evidence, public, workspace, intervened=No
             kind, flag, value, standard = register_model.args_deviation(listed["intervention"], listed["witness"])
             log_lines = Path(source).read_text(encoding="utf-8", errors="replace").splitlines()
             params["argsDeviationArgsWitness"] = register_model.args_witness_line(log_lines, flag, value, standard)
+            extra_args = register_model.args_extra_args(listed["intervention"], listed["witness"])
+            if extra_args:
+                params["argsDeviationAdditionalArgsWitness"] = " | ".join(
+                    register_model.args_witness_line(log_lines, other_flag, other_value, register_model.ARGS_KINDS[other][1])
+                    for other, other_flag, other_value in extra_args)
         if listed and listed["argsDeviation"]:
             # CORRECTIONS 284's TWO-AXIS row: the witness column carries the ARGS witness, so every PATCH axis is read back
             # from the run's own log (cwd5's CARW2 is the first such run: --weight-decay-base 1e-2 AND a DECAY_MASK).
@@ -668,7 +683,7 @@ def make_activity(timeline, snapshot_date, experiments, run_count):
         })
     activity.extend([
         {"id": "cvk2-completed-20260914", "date": "2026-09-14", "kind": "completed-experiment", "title": "CVK2 completed and independently checked", "detail": "All 27 registered runs completed. Validity gates and independent verification passed. Observed best cut 19; cuts 16, 19, 22 share the registered peak set. The carrier-cut prediction remains unresolved.", "experimentIds": ["CVK2"]},
-        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}, the {len(CVT45_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT45_FIRST_ROW}-{register_model.CVT45_LAST_ROW} at {register_model.CVT45_COMMIT[:7]} with the in-place row amendments of CORRECTIONS 244 at {register_model.C244_COMMIT[:7]}, the {len(CVT67_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT67_FIRST_ROW}-{register_model.CVT67_LAST_ROW} at {register_model.CVT67_COMMIT[:7]}, the {len(CVT89_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT89_FIRST_ROW}-{register_model.CVT89_LAST_ROW} at {register_model.CVT89_COMMIT[:7]} with the in-place row amendment of CORRECTIONS 253.15 at {register_model.CVT89_AUDIT_COMMIT[:7]}, the {len(MUST_IDS)} rows appended at MASTER-TABLE lines {register_model.MUST_FIRST_ROW}-{register_model.MUST_LAST_ROW} at {register_model.MUST_COMMIT[:7]}, which amended no earlier row, and the {len(MECH4_IDS)} rows appended at MASTER-TABLE lines {register_model.MECH4_FIRST_ROW}-{register_model.MECH4_LAST_ROW} with the in-place row amendment of CORRECTIONS 273 at {register_model.MECH4_COMMIT[:7]}, the {len(MECH5_IDS)} row appended at MASTER-TABLE line {register_model.MECH5_FIRST_ROW} at {register_model.MECH5_COMMIT[:7]}, which amended no earlier row, and the {len(MECH6_IDS)} rows appended at MASTER-TABLE lines {register_model.MECH6_FIRST_ROW}-{register_model.MECH6_LAST_ROW} in two steps, at {register_model.MECH6_STEP_COMMIT[:7]} and {register_model.MECH6_COMMIT[:7]}, neither of which amended an earlier row), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
+        {"id": "publication-snapshot-" + snapshot_date.replace("-", ""), "date": snapshot_date, "kind": "publication-snapshot", "title": "Linked research publication snapshot", "detail": f"Public snapshot assembled from the {len(experiments)}-record register ({sum(e['kind'] == 'research' for e in experiments)} research questions and {sum(e['kind'] == 'method-check' for e in experiments)} method checks, including the {len(PARTITION_IDS)}-row count-matched partition audit from MASTER-TABLE section 10 at {register_model.PARTITION_AUDIT_COMMIT[:7]} and the {len(APPENDED_IDS)} rows appended at MASTER-TABLE lines {register_model.APPENDED_FIRST_ROW}-{register_model.APPENDED_LAST_ROW} at {register_model.APPENDED_COMMIT[:7]}, with the in-place row amendments of CORRECTIONS 229 at {register_model.AMENDMENT_COMMIT[:7]} the {len(LANDED_IDS)} row appended at MASTER-TABLE line {register_model.LANDED_FIRST_ROW} at {register_model.LANDED_COMMIT[:7]}, the {len(CGN3_IDS)} row appended at MASTER-TABLE line {register_model.CGN3_FIRST_ROW} with the in-place row amendments of CORRECTIONS 231 at {register_model.CGN3_COMMIT[:7]}, the {len(CVT23_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT23_FIRST_ROW}-{register_model.CVT23_LAST_ROW} with the in-place row amendments of CORRECTIONS 234 and 236 at {register_model.CVT23_COMMIT[:7]}, the {len(CVT45_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT45_FIRST_ROW}-{register_model.CVT45_LAST_ROW} at {register_model.CVT45_COMMIT[:7]} with the in-place row amendments of CORRECTIONS 244 at {register_model.C244_COMMIT[:7]}, the {len(CVT67_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT67_FIRST_ROW}-{register_model.CVT67_LAST_ROW} at {register_model.CVT67_COMMIT[:7]}, the {len(CVT89_IDS)} rows appended at MASTER-TABLE lines {register_model.CVT89_FIRST_ROW}-{register_model.CVT89_LAST_ROW} at {register_model.CVT89_COMMIT[:7]} with the in-place row amendment of CORRECTIONS 253.15 at {register_model.CVT89_AUDIT_COMMIT[:7]}, the {len(MUST_IDS)} rows appended at MASTER-TABLE lines {register_model.MUST_FIRST_ROW}-{register_model.MUST_LAST_ROW} at {register_model.MUST_COMMIT[:7]}, which amended no earlier row, and the {len(MECH4_IDS)} rows appended at MASTER-TABLE lines {register_model.MECH4_FIRST_ROW}-{register_model.MECH4_LAST_ROW} with the in-place row amendment of CORRECTIONS 273 at {register_model.MECH4_COMMIT[:7]}, the {len(MECH5_IDS)} row appended at MASTER-TABLE line {register_model.MECH5_FIRST_ROW} at {register_model.MECH5_COMMIT[:7]}, which amended no earlier row, and the {len(MECH6_IDS)} rows appended at MASTER-TABLE lines {register_model.MECH6_FIRST_ROW}-{register_model.MECH6_LAST_ROW} in two steps, at {register_model.MECH6_STEP_COMMIT[:7]} and {register_model.MECH6_COMMIT[:7]}, neither of which amended an earlier row, and the {len(MECH7_IDS)} rows appended at MASTER-TABLE lines {register_model.MECH7_FIRST_ROW}-{register_model.MECH7_LAST_ROW} at {register_model.MECH7_COMMIT[:7]}, which amended no earlier row), the {run_count:,}-run inventory, 54 report pages, and complete numeric tables. This is a publication event, not a new experiment or inferred run date.", "experimentIds": []},
     ])
     return activity
 
@@ -902,6 +917,28 @@ def validate(data, runs, public):
     for run in two_axis:
         verify(run["parameters"]["argsDeviationAxes"].startswith("DECAY_MASK=") and "TWO-AXIS" in run["parameters"]["argsDeviationNote"], f"Two-axis row does not name its patch axis: {run['id']}")
         verify(run["parameters"]["interventionAdditionalWitness"].startswith("DECAY_MASK: on "), f"Two-axis row does not witness its patch axis from its own log: {run['id']}")
+    for line, (rule, section, batches, figures, _, _) in register_model.MECH7_ROWS.items():
+        eid = register_model.partition_id(line)
+        row = by_id.get(eid, {})
+        verify(row.get("section") == section and row.get("area") == register_model.AREAS[section] and row.get("outcome") == register_model.RULE_OUTCOME[rule], f"caw2/cgw1 MASTER-TABLE row missing or remapped: line {line}")
+        verify(row.get("batches") == batches and set(figures) <= set(row.get("figureIds", [])), f"caw2/cgw1 row links: line {line}")
+        verify(any(e["kind"] == "research-phase" and eid in e["experimentIds"] for e in data["activity"]), f"caw2/cgw1 row has no research phase: line {line}")
+        verify(not row.get("corrected"), f"caw2/cgw1 row must carry no Corrected badge: line {line}")
+        linked = [run for run in runs if eid in run["experimentIds"]]
+        verify(bool(linked) and {run["batch"] for run in linked} == set(batches), f"caw2/cgw1 row runs not linked: {eid}")
+    # Neither landing amended a row of its own or anybody else's, and neither corrected any registration text.
+    verify(not any(w["id"].startswith(tuple(f"warning-{eid}-registration" for eid in MECH7_IDS)) for w in data["warnings"]), "The caw2/cgw1 landings corrected no registration text")
+    verify(not any(w["id"].startswith(tuple(f"warning-{eid}-amendment" for eid in MECH7_IDS)) for w in data["warnings"]), "The caw2/cgw1 landings amended none of their own rows")
+    verify(not any(w["id"].endswith(("-amendment-295", "-amendment-296", "-amendment-297")) for w in data["warnings"]), "The caw2/cgw1 landings amended no earlier row either")
+    # Both own ARGS-value rows and no patch-intervention row; caw2's six dose-arm rows are the corpus's first TWO-ARGS rows
+    # (CORRECTIONS 294), each with its further ARGS kind read back from its own ARGS line.
+    verify(set(register_model.MECH7_ARGS_DEVIATIONS) == set(MECH7_IDS) and not register_model.MECH7_INTERVENTIONS, "The caw2 and cgw1 rows are ARGS-value deviations only")
+    two_args = [run for run in runs if run["parameters"].get("argsDeviationAdditionalArgs")]
+    verify(sorted(run["parameters"]["runLabel"] for run in two_args) == sorted(f"caw2-{arm}-s{seed}" for arm in ("XS", "XL") for seed in (160, 161, 162)), "caw2's XS / XL runs are the corpus's only two-ARGS rows")
+    for run in two_args:
+        verify(run["parameters"]["argsDeviationAdditionalArgs"] == "ARGS_MOMENTUM_BASE: momentum-param-base=0.9" and "TWO-ARGS" in run["parameters"]["argsDeviationNote"], f"Two-ARGS row does not name its further kind: {run['id']}")
+        verify(run["parameters"]["argsDeviationAdditionalArgsWitness"] == f"{register_model.ARGS_LINE_PREFIX} --momentum-param-base 0.9", f"Two-ARGS row does not witness its further kind from its own ARGS line: {run['id']}")
+        verify(run["parameters"]["argsDeviationWitness"] == "ARGS_WD_BASE: weight-decay-base=1.0" and not run["parameters"].get("argsDeviationAxes"), f"Two-ARGS row is not listed by its dose weight decay alone: {run['id']}")
     for eid, spec in register_model.MECH4_AMENDMENTS.items():
         # CORRECTIONS 273 amended MASTER-TABLE row 229 in place and MOVED its outcome; the badge stays off, because an
         # outcome moved by later data is not a corrected earlier claim, and the superseded verdict is kept in the record.
@@ -947,7 +984,7 @@ def validate(data, runs, public):
         verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []), f"Intervention warning missing: {eid}")
         marked = [run for run in runs if run["batch"] == spec["batch"] and "intervention" in run["parameters"]]
         verify(sorted(run["parameters"]["intervention"].split(":")[0] for run in marked) == sorted(arm for arm, n in spec["arms"].items() for _ in range(n)), f"Intervened runs not marked: {eid}")
-    for eid, spec in {**register_model.MUST_ARGS_DEVIATIONS, **register_model.MECH6_ARGS_DEVIATIONS}.items():
+    for eid, spec in {**register_model.MUST_ARGS_DEVIATIONS, **register_model.MECH6_ARGS_DEVIATIONS, **register_model.MECH7_ARGS_DEVIATIONS}.items():
         # The ARGS-value rows carry their own mark, so the patch-intervention count above is unchanged by this landing.
         warning = next((w for w in data["warnings"] if w["id"] == f"warning-{eid}-args-deviation"), {})
         verify(warning.get("experimentId") == eid and warning.get("id") in by_id.get(eid, {}).get("warningIds", []), f"ARGS-value deviation warning missing: {eid}")

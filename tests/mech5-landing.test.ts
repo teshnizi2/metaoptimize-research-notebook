@@ -23,8 +23,8 @@ const CWD3_FINAL = ['CARRIER-DECAY-SUFFICES', 'CAR-REC+CTL-NULL+CTL2-NULL', 'HAR
 
 test('MT236 carries the outcome the documented rules give it, with every FINAL token quoted', () => {
   assert.equal(CWD3_FINAL.length, 17);
-  assert.deepEqual(data.experiments.slice(-3, -2).map(e => e.id), ['MT236'], 'appended before the later cwd4 and cwd5 rows');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [175, 157, 18, 3316]);
+  assert.deepEqual(data.experiments.slice(-5, -4).map(e => e.id), ['MT236'], 'appended before the later cwd4, cwd5, caw2 and cgw1 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [177, 159, 18, 3383]);
   // A research question, Goal met; it corrects no earlier published claim, so it carries no Corrected badge.
   assert.deepEqual([record.section, record.area, record.kind, record.outcome, record.corrected, record.batches],
     [9, 'Mechanism and isolation', 'research', 'success', false, ['cwd3']]);
@@ -76,11 +76,11 @@ test('the intervention warning names the four arms, the patch and the single exc
   assert.match(warning.detail, /The three k01 runs print DECAY_MASK: off/);
   assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 97eb049; CORRECTIONS 269, 275 and 278\.$/);
   // No base-optimiser flag deviates in cwd3, so this landing added no ARGS-value mark; cwd5 later added its own.
-  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation']);
+  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation']);
 });
 
 test('the 15 runs link to MT236 with sanitized logs, and exactly the 12 masked runs are marked', () => {
-  assert.equal(runs.length, 3316);
+  assert.equal(runs.length, 3383);
   const linked = runs.filter(run => run.batch === 'cwd3');
   assert.equal(linked.length, 15);
   assert.deepEqual([...record.runIds].sort(), linked.map(run => run.id).sort());

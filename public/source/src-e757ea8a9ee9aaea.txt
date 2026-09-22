@@ -1,0 +1,1056 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cAW1_stdrecipe_score.py -- THE REGISTERED SCORER FOR `caw1` (CORRECTIONS 290): THE STANDARD-RECIPE GATE.
+#   DOES THE SHARED-STEP-SIZE COLLAPSE APPEAR UNDER A STANDARD RECIPE -- AN AdamW BASE (+ Adam meta, the parent's
+#   headline pairing) AT ITS USUAL ALPHA-SCALED DECAYS 0.1 AND 1e-2 -- OR IS IT A CORNER CASE OF SGDm(0.99) AT 0.1?
+#   ONE SUBMISSION, 15 JOBS (5 arms x 3 seeds), 100 EPOCHS, SEEDS {149,150,151}, ResNet18_c100 / CIFAR-100, PROBE=100,
+#   PROBE_TENSOR=1 ON EVERY ARM, --constraint=L4 ON EVERY JOB, cwd1's tree and runner UNCHANGED, every patch OFF.
+#
+# Committed and pushed BEFORE any caw1 run exists (STANDING RULE 21).  RUN IT UNEDITED (RULE 16).
+#     python3 analysis/cAW1_stdrecipe_score.py <runsdir>
+# --manifest and --csv are OPTIONAL and DEFAULTED.
+#
+# NAMING (CORRECTIONS 292, binding): the harness's decay is delta = a*(m_hat + wd*w), h <- gamma*(1 - wd*a)*h - delta:
+# it is multiplied by the LEARNED step size, i.e. DECOUPLED / AdamW-style decay in Loshchilov & Hutter's vocabulary
+# (arXiv:1711.05101).  This file calls it ALPHA-SCALED decay; the untested control is ALPHA-INDEPENDENT decay.
+#
+# THE ARMS (analysis/caw1_design.py)
+#   cell A1  AS1 scalar | AL1 layerwise   AdamW(0.9,0.999) + Adam(0.9,0.999)  wd 0.1   the parent's pairing and decay
+#   cell A2  AS2 scalar | AL2 layerwise   AdamW(0.9,0.999) + Adam(0.9,0.999)  wd 1e-2  torch.optim.AdamW's default
+#   control  K01 scalar                   SGDm(0.99) + Lion(0.99,0.9)          wd 0.1   the mechanism cell (landed 4x
+#                                                                                        at 22.79 / 22.99 / 22.82 / 23.22)
+#
+# PER-CELL STATE, WITHIN the cell only (scalar vs its OWN in-batch layerwise arm):
+#   UNREADABLE iff layerwise mean < REF_MIN (55) or the layerwise seed range > DIVERGED (5 pp)
+#   SPLIT      iff 1 or 2 of the 3 scalar seeds are <= R50 x layerwise mean (seed-bimodal collapse)
+#   COLLAPSE   iff scalar mean <= R50 (0.50) x layerwise mean        -- LIMITS-PREP 2.2's primary definition
+#   NOGAP      iff layerwise - scalar < GAP_BAR (10 pp)              -- a BOUND, never "the grains are equal"
+#   PARTIAL    otherwise
+#
+# BRANCH (first match wins): INCOMPLETE -> HARNESS-UNSOUND (any harness gate, incl. the HARNESS-NULL gates G-ARGS /
+#   G-PT / G-PROBE-GRAIN) -> CONTROL-NOT-COLLAPSED (K01 > K01_MAX 30: the batch did not reproduce the mechanism cell, so
+#   it cannot testify to the presence OR absence of a collapse) -> UNRESOLVED-REFERENCE-A1 -> COLLAPSE-UNDER-STANDARD-
+#   RECIPE (any cell COLLAPSE) -> PARTIAL (any cell SPLIT or PARTIAL) -> UNRESOLVED-REFERENCE-A2 -> NO-COLLAPSE (both
+#   cells NOGAP).  The state word A1-<s>+A2-<s>+K-<s> is printed beside it.
+# GATE WORD (the ICML plan's Step-1 rule, its DOM_C half; CORRECTIONS 292 / ICML-PLAN §4): read ONLY on a collapsed
+#   cell's scalar arm.  L_i = the per-tensor term of the applied meta momentum (Adam: b1/(1-b1)*m_tensor_i + z_i; Lion:
+#   b2*m_tensor_i + (1-b2)*z_i); s = the harness's own applied sign; DOM_C <=> sign(sum_C L_i) = s and
+#   |sum_C L_i| > sum_{i not in C} |L_i|.  C IS FIXED BEFORE THE REST ARE READ: the top-3 tensors by signed contribution
+#   sum_r s_r*L_i,r on seed 149's records; DOM_C is then scored on seeds 150 and 151 only.  Calibrated on landed records
+#   (selftest B): cwd5 k01W1 -> C = {50,53,59}, DOM_C 0.809; the non-collapsed cwd5 scalar arms 0.09-0.17.  The in-batch
+#   K01 is the DOM_C code's positive control: if it does not reach DOM_BAR the gate word is GATE-UNREADABLE-DOMC-CONTROL.
+#   GATE-FIRES-<cells> iff a COLLAPSE cell's scalar arm has DOM_C >= DOM_BAR (0.50); GATE-COLLAPSE-WITHOUT-DOMINANCE if
+#   none does; GATE-DOES-NOT-FIRE on PARTIAL / NO-COLLAPSE; GATE-UNREADABLE otherwise.  This is the Step-1 HALF of the
+#   gate only: the plan's rule also needs Step 0's lead-lag, which is another track's.
+# CO-PRIMARY: G_A1 = AL1 - AS1.  KEYS: G_A2, R_A1, R_A2, K01's level, DOM_C per scalar arm (fitted C and the declared
+#   carriers {50,53,59}).  DESCRIPTIVE (labelled, boundaries defined): the realised per-step shrink a*wd of every arm.
+#
+# WHAT THIS BATCH CANNOT DO, STAMPED UNCONDITIONALLY: ALPHA-INDEPENDENT-NOT-TESTED, ONE-NETWORK-RESNET18,
+#   ONE-CELL-OTHERWISE, HORIZON-100-ONLY, THREE-SEEDS, TWO-DECAYS-ONLY, LION-BASE-NOT-RUN, HARNESS-ADAMW-M-UNNORMALISED
+#   (the harness's first moment is b1*m + g, so its gradient step is up to 10x torch.optim.AdamW's at the same a),
+#   FLOOR-READINGS-ARE-BOUNDS.
+# =============================================================================
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import importlib.util
+import io
+import json
+import math
+import os
+import random
+import shutil
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("caw1_design", os.path.join(HERE, "caw1_design.py"))
+C = _load("cwd_common", os.path.join(HERE, "cwd_common.py"))
+mean, sd, fmt = C.mean, C.sd, C.fmt
+
+PREFIX = D.PREFIX
+ARMS = D.ARMS
+SEEDS = D.SEEDS
+EPOCHS = D.EPOCHS
+NTENS = D.NTENS
+N_RECORDS = D.N_RECORDS
+
+# ---- FROZEN LITERALS (O2) --------------------------------------------------------------------------------------------
+SIGMA_R18ALL = 0.6415731883291765          # ResNet18_c100 std cell, FILTERED (corpus_exclusions.filter_rows), df 267, 51 cells
+SIGMA_R18ALL_DF = 267
+SIGMA_R18ALL_NAIVE = 14.810433569421692    # UNFILTERED -- disclosure only (the OPERATIONS 36 trap), df 380
+SIGMA_PRIOR = SIGMA_R18ALL
+SE_PRIOR = 0.523842                        # SIGMA_PRIOR * sqrt(2/3), 6 d.p.
+REG_CORPUS_ROWS = 3316
+REG_CORPUS_SHA = "d07266bdb8e257792923ba9dad4427374370b6f3a529b43c3a7e6ee581d95046"
+REG_EXCL_SHA = "4e6d938745fade2eb02dbbda79bc1bc096d5f077c9092b5dd4ef2b10cfbfc7db"
+R50 = 0.50
+GAP_BAR = 10.0
+REF_MIN = 55.0
+DIVERGED_BAR = 5.0
+K01_MAX = 30.0
+DOM_BAR = 0.50
+DECOMP_TOL = 1e-3
+FLOOR_MIN = 15.0
+CEIL_MAX = 90.0
+FIT_SEED = 149
+SCORE_SEEDS = (150, 151)
+CARRIER_IDX0 = D.CARRIER_IDX0
+BETA_HI = -2.3026
+K01_LANDED = {"cmo1 k01": 22.7887, "cwd3 k01": 22.9853, "cwd4 k01WD": 22.8213, "cwd5 k01W1": 23.2240}
+
+# ---- predicted levels per account (UNSURE bands, registered before any run) -----------------------------------------
+FREE_PL = (55.0, 78.0)       # a healthy arm, either grain, either pairing
+COLL_PL = (1.0, 30.0)        # a collapsed scalar arm (chance 1 % to the landed K01 ~23)
+PART_PL = (36.0, 52.0)       # a degraded scalar arm above its R50 bar (layerwise ~70 -> bar ~35) but >= 10 pp below it
+K01_PL = (18.0, 28.0)        # the control, landed 22.79-23.22
+ACCOUNTS = {  # arm -> predicted band
+    "COLLAPSE-UNDER-STANDARD-RECIPE": {"AS1": COLL_PL, "AL1": FREE_PL, "AS2": FREE_PL, "AL2": FREE_PL, "K01": K01_PL},
+    "PARTIAL": {"AS1": PART_PL, "AL1": FREE_PL, "AS2": FREE_PL, "AL2": FREE_PL, "K01": K01_PL},
+    "NO-COLLAPSE": {"AS1": FREE_PL, "AL1": FREE_PL, "AS2": FREE_PL, "AL2": FREE_PL, "K01": K01_PL},
+}
+ACCOUNT_TOKENS = ["COLLAPSE-UNDER-STANDARD-RECIPE", "PARTIAL", "NO-COLLAPSE"]
+TOKENS = ["INCOMPLETE", "HARNESS-UNSOUND", "CONTROL-NOT-COLLAPSED", "UNRESOLVED-REFERENCE-A1",
+          "UNRESOLVED-REFERENCE-A2"] + ACCOUNT_TOKENS
+STATES = ("UNREADABLE", "SPLIT", "COLLAPSE", "NOGAP", "PARTIAL")
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def compose_sigma(sigma_in):
+    cands = [("SIGMA_PRIOR_frozen", SIGMA_PRIOR), ("SIGMA_INBATCH", sigma_in)]
+    which, v = max(cands, key=lambda kv: kv[1])
+    return which, v, cands
+
+
+def resolve(runsdir, explicit, base):
+    if explicit:
+        return explicit, "explicit"
+    for c, how in ((os.path.join(runsdir, PREFIX, base), "<runsdir>/%s/" % PREFIX),
+                   (os.path.join(runsdir, "%s-%s" % (PREFIX, base)), "<runsdir>/%s-" % PREFIX)):
+        if os.path.exists(c):
+            return c, how
+    return None, "not found"
+
+
+def resolve_manifest(runsdir, explicit):
+    return resolve(runsdir, explicit, "PARTITION-MANIFEST.txt")
+
+
+def read_kv(path):
+    if not path or not os.path.exists(path):
+        return None
+    d = {}
+    for ln in open(path):
+        p = ln.split()
+        if len(p) >= 2:
+            d.setdefault(p[0], " ".join(p[1:]))
+    return d
+
+
+def _exclusions():
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions
+    finally:
+        sys.path.pop(0)
+    return corpus_exclusions
+
+
+def read_corpus(csvpath, filtered=True):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return _exclusions().filter_rows(rows) if filtered else rows
+
+
+def gpu_of(path):
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if ln.endswith(" MiB") and ", " in ln and not ln.startswith(("ARGS:", "ENV:", "Epoch")):
+            return ln.split(",")[0].strip()
+    return None
+
+
+def _fin(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+# =============================================================================
+# THE VOTE: per-tensor terms of the applied meta momentum, the decomposition check, DOM_C
+# =============================================================================
+def vote_terms(r, meta_alg):
+    """-> (L list, applied scalar) for ONE scalar-arm record, or None if the record lacks the keys or is non-finite."""
+    try:
+        mp, b2 = float(r["pt_mp"]), float(r["pt_b2"])
+        z, m = r["z_tensor"], r["m_tensor"]
+        mom, za = float(r["mom_pre"][0][0]), float(r["z_agg"][0][0])
+    except (KeyError, TypeError, IndexError, ValueError):
+        return None
+    if len(z) != NTENS or len(m) != NTENS or not all(_fin(x) for x in z) or not all(_fin(x) for x in m):
+        return None
+    if meta_alg == "Adam":
+        L = [mp / (1.0 - mp) * mi + zi for mi, zi in zip(m, z)]
+        app = mp * mom + za
+    else:
+        L = [b2 * mi + (1.0 - b2) * zi for mi, zi in zip(m, z)]
+        app = b2 * mom + (1.0 - b2) * za
+    if not (_fin(app) and all(_fin(x) for x in L)):
+        return None
+    return L, app
+
+
+def _sg(x):
+    return (x > 0) - (x < 0)
+
+
+def decomposition(recs, meta_alg):
+    """-> (n_usable, n_bad_sum, n_bad_sign, n_nonfinite).  sum_i L_i must equal the harness's applied term."""
+    n = bad = bads = nonf = 0
+    for r in recs or []:
+        v = vote_terms(r, meta_alg) if isinstance(r, dict) else None
+        if v is None:
+            nonf += 1
+            continue
+        L, app = v
+        s = sum(L)
+        scale = sum(abs(x) for x in L)
+        n += 1
+        # SCALE-relative: the tolerance is DECOMP_TOL of the vote's total mass sum_i |L_i|, not of the (possibly
+        # near-cancelling) net term.  Landed cwd5 scalar records: worst |sum - applied| / sum|L| = 8.5e-7.
+        bad += not (abs(s - app) <= DECOMP_TOL * scale or abs(s - app) <= 1e-30)
+        bads += _sg(s) != _sg(app) and abs(app) > DECOMP_TOL * scale
+    return n, bad, bads, nonf
+
+
+def fit_carriers(recs, meta_alg, k=3):
+    """top-k tensors by signed contribution sum_r s_r * L_i,r (s_r = the applied sign), on the FIT records only."""
+    acc = [0.0] * NTENS
+    for r in recs or []:
+        v = vote_terms(r, meta_alg) if isinstance(r, dict) else None
+        if v is None:
+            continue
+        L, app = v
+        s = _sg(app)
+        for i, x in enumerate(L):
+            acc[i] += s * x
+    return tuple(sorted(sorted(range(NTENS), key=lambda i: (-acc[i], i))[:k]))
+
+
+def dom_c(recs, meta_alg, Cset):
+    """-> (share, n): share of usable records on which C alone fixes the applied sign."""
+    n = d = 0
+    for r in recs or []:
+        v = vote_terms(r, meta_alg) if isinstance(r, dict) else None
+        if v is None:
+            continue
+        L, app = v
+        s = _sg(app)
+        sc = sum(L[i] for i in Cset)
+        rest = sum(abs(L[i]) for i in range(NTENS) if i not in Cset)
+        n += 1
+        d += (s != 0 and _sg(sc) == s and abs(sc) > rest)
+    return (d / n if n else float("nan")), n
+
+
+def dom_reading(recs_by_seed, meta_alg):
+    """C fitted on FIT_SEED's records, DOM_C scored on SCORE_SEEDS only; plus the DECLARED carriers on all seeds."""
+    Cx = fit_carriers(recs_by_seed.get(FIT_SEED), meta_alg)
+    held = [r for s in SCORE_SEEDS for r in (recs_by_seed.get(s) or [])]
+    share, n = dom_c(held, meta_alg, Cx)
+    alls = [r for s in SEEDS for r in (recs_by_seed.get(s) or [])]
+    dshare, dn = dom_c(alls, meta_alg, CARRIER_IDX0)
+    return {"C": Cx, "dom": share, "n": n, "decl_dom": dshare, "decl_n": dn}
+
+
+# =============================================================================
+# THE STATES AND THE BRANCH
+# =============================================================================
+def cell_state(Lseeds, kseeds):
+    L, k = mean(Lseeds), mean(kseeds)
+    if L < REF_MIN or (max(Lseeds) - min(Lseeds)) > DIVERGED_BAR:
+        return "UNREADABLE"
+    ncol = sum(1 for x in kseeds if x <= R50 * L)
+    if 1 <= ncol <= len(kseeds) - 1:
+        return "SPLIT"
+    if k <= R50 * L:
+        return "COLLAPSE"
+    if L - k < GAP_BAR:
+        return "NOGAP"
+    return "PARTIAL"
+
+
+def decide(states, k01_mean):
+    """states: {"A1": s, "A2": s}.  -> branch token.  Pure function."""
+    if k01_mean > K01_MAX:
+        return "CONTROL-NOT-COLLAPSED"
+    if states["A1"] == "UNREADABLE":
+        return "UNRESOLVED-REFERENCE-A1"
+    vals = [states[c] for c in D.CELLS]
+    if "COLLAPSE" in vals:
+        return "COLLAPSE-UNDER-STANDARD-RECIPE"
+    if "SPLIT" in vals or "PARTIAL" in vals:
+        return "PARTIAL"
+    if states["A2"] == "UNREADABLE":
+        return "UNRESOLVED-REFERENCE-A2"
+    return "NO-COLLAPSE"
+
+
+def gate_word(branch, states, doms):
+    """doms: {arm: dom_reading} for the scalar arms incl. K01 (None if unreadable)."""
+    if branch in ("PARTIAL", "NO-COLLAPSE"):
+        return "GATE-DOES-NOT-FIRE"
+    if branch != "COLLAPSE-UNDER-STANDARD-RECIPE":
+        return "GATE-UNREADABLE"
+    kc = doms.get(D.CONTROL)
+    if kc is None or not (kc["dom"] >= DOM_BAR):
+        return "GATE-UNREADABLE-DOMC-CONTROL"
+    fired = [c for c in D.CELLS if states[c] == "COLLAPSE" and doms.get(D.SCALAR_OF[c]) is not None
+             and doms[D.SCALAR_OF[c]]["dom"] >= DOM_BAR]
+    if fired:
+        return "GATE-FIRES-%s" % "+".join(fired)
+    return "GATE-COLLAPSE-WITHOUT-DOMINANCE"
+
+
+BOUND_NOTE = ("Every COLLAPSE and NOGAP state is a BOUND, never a point effect (164.6; FLOOR-READINGS-ARE-BOUNDS): a "
+              "collapsed arm's gap is a LOCATION, and NOGAP means 'below the 10 pp bar', never 'the grains are equal'.")
+NOT_ELSE = ("Not licensed: any other network, dataset, meta step size, alpha0, horizon, grouping, base optimiser "
+            "(a Lion base was NOT run), or any decay other than the two run; nothing about ALPHA-INDEPENDENT decay "
+            "(not tested); nothing about the parent paper's own cells.")
+LICENSE = {
+    "INCOMPLETE": ["Not every run finished.  No branch is taken and NO NUMBER HERE IS QUOTABLE."],
+    "HARNESS-UNSOUND": ["A harness gate failed -- INCLUDING THE HARNESS-NULL GATES: a run's own ARGS line, its "
+                        "PROBE_TENSOR witness (the META alg and the grain) or its probe records (the step-size count, "
+                        "the vote decomposition) do not say what the design registers.  The batch is NOT what it "
+                        "claims to be and NO level, state or contrast may be quoted."],
+    "CONTROL-NOT-COLLAPSED": ["The in-batch positive control K01 (the campaign's mechanism cell) did NOT reproduce its "
+                              "landed collapse (> %.0f).  A batch that cannot show the known collapse can testify "
+                              "neither to its presence nor to its absence under AdamW: NO account is read, and the "
+                              "levels are printed as levels only." % K01_MAX],
+    "UNRESOLVED-REFERENCE-A1": ["The AdamW wd-0.1 layerwise reference is unhealthy (< %.0f or seed range > %.0f pp): "
+                                "a collapse cannot be defined at the parent's decay.  That is itself a fact about the "
+                                "AdamW configuration on CIFAR-100 and is reported as such; nothing about the scalar "
+                                "arm is read." % (REF_MIN, DIVERGED_BAR)],
+    "UNRESOLVED-REFERENCE-A2": ["A1 is NOGAP but the wd-1e-2 layerwise reference is unhealthy, so the NO-COLLAPSE "
+                                "account is not reached.  Only A1's state may be quoted, as a bound."],
+    "COLLAPSE-UNDER-STANDARD-RECIPE": [
+        "\"At this cell (ResNet18_c100 / CIFAR-100, 100 epochs, meta step 1e-3, alpha0 1e-6), a MetaOptimize scalar step "
+        "size with an AdamW base and Adam meta -- the parent's headline pairing -- collapses to at most half its "
+        "in-batch layerwise level at alpha-scaled weight decay <the collapsed cell's value>, a value in standard AdamW "
+        "use.\"  C1's premise LIVES: the collapse is not only a corner case of SGDm(0.99) at 0.1.  Whether C1's gate "
+        "fires also needs the GATE WORD (DOM_C) and Step 0's lead-lag (another track).",
+        BOUND_NOTE, NOT_ELSE],
+    "PARTIAL": [
+        "\"Under AdamW + Adam at <the cell's decay> the scalar arm is degraded (or collapses on some seeds only) but "
+        "does not meet the registered collapse definition.\"  Not a collapse and NOT a clean null: C1's gate does not "
+        "fire on this batch, and the SPLIT / PARTIAL cell is the one to replicate with more seeds before anything "
+        "general is said.", BOUND_NOTE, NOT_ELSE],
+    "NO-COLLAPSE": [
+        "\"At this cell, with the parent's AdamW + Adam pairing, the scalar and layerwise step sizes do not differ by "
+        "the 10 pp bar at alpha-scaled weight decay 0.1 or 1e-2, while the campaign's SGDm(0.99) + Lion cell collapses "
+        "IN THE SAME BATCH.\"  C1's GENERAL claim DIES at this cell: the collapse is not a hazard of the standard AdamW "
+        "recipe here, and the plan's TMLR path (C2 + C4) is the one to write.  The in-batch control is what makes "
+        "this a reading and not a harness null.", BOUND_NOTE, NOT_ELSE],
+}
+
+
+# =============================================================================
+# SCORE
+# =============================================================================
+def score(runsdir, csvpath, manifest_path=""):
+    """-> (rc, FINAL line).  rc 0 branch taken, 1 harness-unsound, 2 incomplete."""
+    print("=" * 78)
+    print(" caw1 -- THE STANDARD-RECIPE GATE.  Does the shared-step-size collapse appear with an AdamW base + Adam")
+    print("         meta (the parent's pairing) at alpha-scaled decay 0.1 and 1e-2, or is it an SGDm(0.99) corner case?")
+    print(" %s / %s   %d epochs   seeds %s   AUGMENT=%s  BETA_CLIP=%s  PROBE=%d  PROBE_TENSOR=1"
+          % (D.NET, D.DSET, EPOCHS, ",".join(str(s) for s in SEEDS), D.AUG, D.CLIP, D.PROBE))
+    for a in ARMS:
+        print("   %-4s %-2s %-9s wd %-5s  %s" % (a, D.PAIR_OF[a], D.SPEC[a], D.WD[a], dict((r[0], r[6]) for r in D.ARM_TABLE)[a]))
+    print(" CO-PRIMARY: G_A1 = AL1 - AS1.  Every state is WITHIN its cell.  plateau5 = mean TEST over epochs %d..%d."
+          % (EPOCHS - 5, EPOCHS - 1))
+    print(" BARS ARE FROZEN LITERALS (O2).  ALPHA-INDEPENDENT DECAY IS NOT TESTED.")
+    print("=" * 78)
+    try:
+        rows = read_corpus(csvpath)
+        disc = "not readable" if rows is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (len(rows), PREFIX)
+    except Exception as ex:
+        disc = "not readable (%s)" % type(ex).__name__
+    print("corpus: %s  (DISCLOSURE ONLY -- no bar, sigma, branch or stamp reads it)" % disc)
+
+    runs, rnotes = C.read_runs(runsdir, PREFIX, ARMS, EPOCHS)
+    print("\nCOMPLETE  %d runs, epochs 0..%d, RUN_DONE, no traceback, finite plateau5" % (len(ARMS) * len(SEEDS), EPOCHS - 1))
+    for n_ in rnotes:
+        print("  NOTE %s" % n_)
+    missing = []
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs.get((a, s))
+            ok = r is not None and r["complete"]
+            print("  %-4s %s-%s-s%d  %s" % ("OK" if ok else "MISS", PREFIX, a, s,
+                  "absent" if r is None else "%d epoch lines, RUN_DONE=%s, traceback=%s, plateau5 %s (train %s)"
+                  % (r["n_epochs"], r["run_done"], r["traceback"], fmt(r["plateau5"]), fmt(r["train5"]))))
+            if not ok:
+                missing.append("%s-s%d" % (a, s))
+    if missing:
+        final = "FINAL: INCOMPLETE | %d/%d | missing %s" % (len(ARMS) * len(SEEDS) - len(missing), len(ARMS) * len(SEEDS),
+                                                            ",".join(missing))
+        print("\n" + final)
+        for ln in LICENSE["INCOMPLETE"]:
+            print("  " + ln)
+        return 2, final
+
+    harness = []
+
+    def hchk(cond, label, extra=""):
+        print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+        if not cond:
+            harness.append(label)
+        return bool(cond)
+
+    print("\nG-ARGS    [HARNESS-NULL] every run's OWN ARGS line == its arm's registered flags (pairing, decay, grain)")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            if len(r["args"]) != 1:
+                hchk(False, "G-ARGS %s-s%d exactly one ARGS line" % (a, s), str(len(r["args"])))
+                continue
+            f = C.parse_args_line(r["args"][0])
+            dup = [k for k, v in f.items() if len(v) > 1]
+            want = dict(D.args_pairs(a, s, "<save>"))
+            bad = [k for k, v in want.items() if k != "save-directory" and f.get(k, [None])[-1] != v]
+            extra = sorted(set(f) - set(want))
+            sv = f.get("save-directory", [""])[-1] or ""
+            ok = not dup and not bad and not extra and sv.rstrip("/").endswith("/" + PREFIX)
+            hchk(ok, "G-ARGS %s-s%d (%s %s wd %s)" % (a, s, D.PAIR_OF[a], D.SPEC[a], D.WD[a]),
+                 "" if ok else "repeated %s; wrong %s; unregistered %s; save %s"
+                 % (dup, ["%s=%s" % (k, f.get(k, [None])[-1]) for k in bad], extra, sv))
+
+    print("\nG-ENV     the environment rode the ENV line on every run")
+    envs = sorted(set(" ".join(t for t in ln.split() if not t.startswith("PROBE_DIR=")) for r in runs.values() for ln in r["env"]))
+    hchk(len(envs) == 1 and all(len(r["env"]) == 1 for r in runs.values()),
+         "G-ENV one distinct ENV line (PROBE_DIR stripped), one per run", "%d distinct" % len(envs))
+    hchk(envs == [D.ENV_EXPECTED], "G-ENV the ENV line is cvt1 ... cwd5's, byte for byte (PROBE_DIR stripped)")
+
+    print("\nG-PT      [HARNESS-NULL] ONE PROBE_TENSOR line per run == its arm's witness (grain, 62 tensors, META alg)")
+    for s in SEEDS:
+        for a in ARMS:
+            pt = runs[(a, s)]["pt"]
+            ok = len(pt) == 1 and pt[0].startswith(D.pt_witness_prefix(a) + " dir=")
+            hchk(ok, "G-PT %s-s%d" % (a, s), "" if ok else "got %r" % ([x[:150] for x in pt],))
+
+    print("\nG-WITNESS the five `off` lines once each; no COMP_HOLD / WINDOW_HOLD line")
+    for s in SEEDS:
+        for a in ARMS:
+            r = runs[(a, s)]
+            ok = all(r[k.split(":")[0]] == [k] for k in D.OFF_LINES) and not r["COMP_HOLD"] and not r["WINDOW_HOLD"]
+            hchk(ok, "G-WITNESS %s-s%d" % (a, s), "" if ok else str(dict((k, r[k]) for k in C.KINDS if r[k])))
+
+    print("\nG-STRUCT  the batch's own PARTITION-MANIFEST.txt == caw1_design.manifest_text(), byte for byte")
+    mp, how = resolve_manifest(runsdir, manifest_path)
+    if not mp:
+        hchk(False, "G-STRUCT manifest present", how)
+    else:
+        print("  manifest: %s (%s)" % (mp, how))
+        hchk(open(mp).read() == D.manifest_text(), "G-STRUCT byte-identical")
+
+    print("\nG-PROV    PROVENANCE.txt")
+    pp, phow = resolve(runsdir, "", "PROVENANCE.txt")
+    prov = read_kv(pp)
+    if prov is None:
+        hchk(False, "G-PROV PROVENANCE.txt present", phow)
+    else:
+        print("  provenance: %s (%s)" % (pp, phow))
+        me = file_sha(os.path.abspath(__file__))
+        for key, want, lab in (("MODE", "submit", "MODE submit"),
+                               ("BUILD_NETWORK_SHA256", D.BN_SHA, "build_network.py == cvt8's"),
+                               ("HF_SHA256", D.HF_SHA, "HF.py == cwd1's tree, UNCHANGED"),
+                               ("RUNNER_SHA256", D.RUNNER_SHA, "runner == run_cifar_cwd1.sh, UNCHANGED"),
+                               ("SCORER_SHA256", me, "SCORER == this file"),
+                               ("DESIGN_SHA256", file_sha(D.__file__), "DESIGN == the caw1_design.py this scorer loaded"),
+                               ("CWD_DESIGN_SHA256", file_sha(D.W.__file__), "the reused cwd_design.py this scorer loaded"),
+                               ("COMMON_SHA256", file_sha(C.__file__), "COMMON == the cwd_common.py this scorer loaded")):
+            hchk(prov.get(key) == want, "G-PROV %s" % lab, "%s=%s" % (key, str(prov.get(key))[:16]))
+
+    print("\nG-PROBE   [HARNESS-NULL] %d records per run; the step-size count is the GRAIN's (1 or %d); on the scalar"
+          " arms the per-tensor vote sums to the harness's applied term (within %g of the vote's mass sum|L_i|) with its sign" % (N_RECORDS, NTENS, DECOMP_TOL))
+    recs_all, nonfin = {}, {}
+    for s in SEEDS:
+        for a in ARMS:
+            recs = C.load_probe(runsdir, PREFIX, a, s)
+            recs_all[(a, s)] = recs
+            if recs is None:
+                hchk(False, "G-PROBE %s-s%d probe.jsonl present" % (a, s))
+                continue
+            want_nb = 1 if D.SPEC[a] == "scalar" else NTENS
+            badrec = sum(1 for r in recs if not (isinstance(r, dict) and isinstance(r.get("step"), int)
+                                                   and isinstance(r.get("beta"), list) and len(r["beta"]) == want_nb
+                                                   and isinstance(r.get("z_tensor"), list) and len(r["z_tensor"]) == NTENS))
+            line = "%d records, %d malformed / wrong step-size count" % (len(recs), badrec)
+            ok = len(recs) == N_RECORDS and badrec == 0
+            if D.SPEC[a] == "scalar":
+                n, bsum, bsign, nf = C_decomp = decomposition(recs, D.META_ALG[D.PAIR_OF[a]])
+                nonfin[(a, s)] = nf
+                line += "; decomposition: %d usable, %d off, %d wrong sign, %d non-finite (disclosed)" % (n, bsum, bsign, nf)
+                ok = ok and bsum == 0 and bsign == 0 and n > 0
+            hchk(ok, "G-PROBE %s-s%d (%s, %d step size(s))" % (a, s, D.SPEC[a], want_nb), line)
+
+    arm_v = dict((a, [runs[(a, s)]["plateau5"] for s in SEEDS]) for a in ARMS)
+    arm_t = dict((a, [runs[(a, s)]["train5"] for s in SEEDS]) for a in ARMS)
+    M = dict((a, mean(arm_v[a])) for a in ARMS)
+    T = dict((a, mean(arm_t[a])) for a in ARMS)
+    print("\nG-FLOOR / G-CEIL")
+    hi = max(M.values())
+    hchk(hi >= FLOOR_MIN, "G-FLOOR max arm mean >= %.2f pp" % FLOOR_MIN, "max %.4f" % hi)
+    hchk(hi <= CEIL_MAX, "G-CEIL max arm mean <= %.2f pp" % CEIL_MAX, "max %.4f" % hi)
+
+    if harness:
+        final = "FINAL: HARNESS-UNSOUND | %d harness gate(s) failed: %s" % (
+            len(harness), "; ".join(sorted(set(h.split()[0] for h in harness))))
+        print("\n" + "=" * 78)
+        print(final)
+        print("=" * 78)
+        for h in harness:
+            print("   FAILED  %s" % h)
+        for ln in LICENSE["HARNESS-UNSOUND"]:
+            print("  " + ln)
+        return 1, final
+
+    print("\nLEVELS    plateau5 (TEST) and TRAIN, IN BATCH; tail slope = TEST OLS over epochs 80-99 (descriptive)")
+    for a in ARMS:
+        v, t = arm_v[a], arm_t[a]
+        sl = [C.tail_slope(runs[(a, s)]["eps"]) for s in SEEDS]
+        print("  %-4s %-2s %-9s wd %-5s TEST %.4f  sd %s  range %.4f   TRAIN %.4f   tail slope %s pp/ep"
+              % (a, D.PAIR_OF[a], D.SPEC[a], D.WD[a], M[a], fmt(sd(v), 4), max(v) - min(v), T[a],
+                 "/".join(fmt(x, 3) for x in sl)))
+        print("           seeds: %s" % ", ".join("s%d %.4f (train %.4f)" % (s, x, y) for s, x, y in zip(SEEDS, v, t)))
+
+    print("\nG-HW      DISCLOSURE ONLY: the GPU each run's own nvidia-smi line names -- NO gate reads it")
+    hw = dict(((a, s), gpu_of(os.path.join(runsdir, runs[(a, s)]["file"]))) for s in SEEDS for a in ARMS)
+    hwset = sorted(set(str(v) for v in hw.values()))
+    print("  distinct devices: %s" % hwset)
+
+    print("\nSIGMA     O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    ss = sum(sum((x - M[a]) ** 2 for x in arm_v[a]) for a in ARMS)
+    df = sum(len(arm_v[a]) - 1 for a in ARMS)
+    sigma_in = math.sqrt(ss / df)
+    which, sigma_used, cands = compose_sigma(sigma_in)
+    for nm, v in cands:
+        print("  %-20s %.6f" % (nm, v))
+    se = sigma_used * math.sqrt(2.0 / len(SEEDS))
+    print("  SIGMA_USED %.6f (= %s); SE_ARM_DIFF %.6f; 2 SE %.6f is the HALF-WIDTH of a +/-2 SE interval, NOT a"
+          " bound on any effect (278.6 C1)" % (sigma_used, which, se, 2 * se))
+
+    print("\nTHE CELLS (every contrast WITHIN its cell)")
+    states, CP = {}, {}
+    for c in D.CELLS:
+        k, L = D.SCALAR_OF[c], D.LAYER_OF[c]
+        st = cell_state(arm_v[L], arm_v[k])
+        states[c] = st
+        g = M[L] - M[k]
+        CP["G_" + c] = (g, T[L] - T[k])
+        ncol = sum(1 for x in arm_v[k] if x <= R50 * M[L])
+        print("  %-2s wd %-5s  scalar %7.4f  layerwise %7.4f   G_%s = %+.4f pp = %+.2f SE   R_%s = %.4f   -> %s"
+              % (c, D.WD[k], M[k], M[L], c, g, g / se, c, M[k] / M[L] if M[L] else float("nan"), st))
+        print("           +/-2 SE [%+.4f, %+.4f]   TRAIN gap %+.4f   seeds %s   scalar seeds at/below the bar: %d/3"
+              % (g - 2 * se, g + 2 * se, T[L] - T[k],
+                 " / ".join("%+.3f" % (runs[(L, s)]["plateau5"] - runs[(k, s)]["plateau5"]) for s in SEEDS), ncol))
+        print("           bars: COLLAPSE iff scalar <= %.4f (%.2f x layerwise); NOGAP iff G < %.1f pp; reference healthy"
+              " iff layerwise >= %.1f and its seed range <= %.1f" % (R50 * M[L], R50, GAP_BAR, REF_MIN, DIVERGED_BAR))
+    kst = "COLLAPSED" if M[D.CONTROL] <= K01_MAX else "NOT-COLLAPSED"
+    print("  CONTROL K01 (SGDm 0.99 + Lion, wd 0.1, scalar) %.4f  -> %s (bar <= %.1f)" % (M[D.CONTROL], kst, K01_MAX))
+    print("  CO-PRIMARY G_A1 = %+.4f pp = %+.2f SE" % (CP["G_A1"][0], CP["G_A1"][0] / se))
+
+    print("\nTHE VOTE    DOM_C per scalar arm: C fitted on seed %d (top-3 by signed contribution), scored on seeds %s;"
+          % (FIT_SEED, "/".join(str(s) for s in SCORE_SEEDS)))
+    print("            and the DECLARED carriers {50,53,59} on all seeds (KEY, descriptive)")
+    doms = {}
+    for a in D.SCALAR_ARMS:
+        rb = dict((s, recs_all[(a, s)]) for s in SEEDS)
+        dr = dom_reading(rb, D.META_ALG[D.PAIR_OF[a]])
+        doms[a] = dr
+        print("  %-4s meta %-4s  C_fit = {%s}  DOM_C %.4f (n %d)   declared {50,53,59} DOM %.4f (n %d)"
+              % (a, D.META_ALG[D.PAIR_OF[a]], ",".join("%d" % (i + 1) for i in dr["C"]), dr["dom"], dr["n"],
+                 dr["decl_dom"], dr["decl_n"]))
+
+    print("\nDESCRIPTIVE  the realised per-step shrink a*wd (Step 0's 1.5a quantity), median over records with step >= %d"
+          % (4 * N_RECORDS * D.PROBE // 5))
+    for a in ARMS:
+        vals = []
+        for s in SEEDS:
+            for r in recs_all[(a, s)] or []:
+                if isinstance(r, dict) and isinstance(r.get("step"), int) and r["step"] >= 4 * N_RECORDS * D.PROBE // 5:
+                    b = r.get("beta") or []
+                    vals += [math.exp(x) * D.WDF[a] for x in b if _fin(x)]
+        vals.sort()
+        med = vals[len(vals) // 2] if vals else float("nan")
+        print("  %-4s %-9s wd %-5s  median a*wd %.3e  (%d values; LEVEL, not an effect)" % (a, D.SPEC[a], D.WD[a], med, len(vals)))
+
+    branch = decide(states, M[D.CONTROL])
+    word = "A1-%s+A2-%s+K-%s" % (states["A1"], states["A2"], kst)
+    gw = gate_word(branch, states, doms)
+    stamps = [word, gw, "HARNESS-CLEAN", "BOTH-GRAINS-IN-BATCH", "CONTROL-IN-BATCH", "ALPHA-SCALED-DECAY-ONLY",
+              "ALPHA-INDEPENDENT-NOT-TESTED", "HARNESS-ADAMW-M-UNNORMALISED", "ONE-NETWORK-RESNET18",
+              "ONE-CELL-OTHERWISE", "HORIZON-100-ONLY", "THREE-SEEDS", "TWO-DECAYS-ONLY", "LION-BASE-NOT-RUN",
+              "STEP1-HALF-OF-GATE-ONLY", "FLOOR-READINGS-ARE-BOUNDS",
+              "SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH"]
+    div = [a for a in ARMS if max(arm_v[a]) - min(arm_v[a]) > DIVERGED_BAR]
+    if div:
+        stamps.append("DIVERGED-%s" % "-".join(div))
+    if states["A1"] == "NOGAP" and states["A2"] in ("COLLAPSE", "SPLIT", "PARTIAL"):
+        stamps.append("NON-MONOTONE-ADAMW")
+    for c in D.CELLS:
+        if CP["G_" + c][0] <= -2 * se and states[c] == "NOGAP":
+            stamps.append("SCALAR-AHEAD-%s-DESCRIPTIVE" % c)
+    for a in D.SCALAR_ARMS:
+        if any(nonfin.get((a, s)) for s in SEEDS):
+            stamps.append("NONFINITE-RECORDS-%s" % a)
+    stamps.append(("HW-UNIFORM-%s" % hwset[0].replace(" ", "_")) if len(hwset) == 1 else "HW-MIXED")
+    agree = all((t > 0) == (p > 0) for p, t in CP.values() if abs(p) >= GAP_BAR)
+    stamps.append("TRAIN-AGREES" if agree else "TRAIN-DISAGREES")
+    final = "FINAL: %s | %s" % (branch, " | ".join(stamps))
+    print("\n" + "=" * 78)
+    print(final)
+    print("=" * 78)
+    print("\nBETWEEN-BATCH, NON-GATING (frozen literals): the control's landed levels %s; caw1 K01 %.4f"
+          % (", ".join("%s %.4f" % kv for kv in K01_LANDED.items()), M[D.CONTROL]))
+    print("\nWHAT THIS DECIDES -- as registered, before any run existed:")
+    for ln in LICENSE[branch]:
+        print("  " + ln)
+    print("\nTHE GATE WORD %s: the Step-1 HALF of the ICML plan's gate only (collapse R <= 0.50 AND DOM_C >= 0.50 on the"
+          " collapsed scalar arm, C fixed on seed %d).  Step 0's lead-lag is another track's and is NOT read here." % (gw, FIT_SEED))
+    print("\nOWED AT LANDING: CORPUS-EXCLUSIONS rows -- AS1/AL1 ARGS_MOMENTUM_BASE (momentum-param-base 0.9); AS2/AL2 deviate"
+          " on TWO ARGS kinds (0.9 and 1e-2), which corpus_exclusions.py cannot list today (CORRECTIONS 290.9, reported,"
+          " not fixed); K01 none.")
+    return 0, final
+
+
+# =============================================================================
+# SELFTEST HELPERS: synthetic harness-format runs for the REAL score().  EVERY NUMBER IS INVENTED.
+# =============================================================================
+_E_SAVE = "/x/runs/caw1"
+_E_ENV = D.ENV_EXPECTED.replace(" PROBE=100 ", " PROBE=100 PROBE_DIR=/x/probe ")
+_E_BASE = {"AS1": 22.0, "AL1": 68.0, "AS2": 67.0, "AL2": 68.5, "K01": 23.0}   # COLLAPSE at A1
+
+
+def _e_curve(level):
+    return [level if e >= EPOCHS - 5 else level * (1 - math.exp(-(e + 1) / 12.0)) for e in range(EPOCHS)]
+
+
+def _e_write(d, arm, s, jid, level, n_ep=EPOCHS, run_done=True, env=_E_ENV, args=None, pt=None, offs=None):
+    lines = ["NODE=[HOST_2f2f29d9e1] | JOB=%s-%s-s%d %d | AUGMENT=1" % (PREFIX, arm, s, jid),
+             "ARGS: %s" % (args if args is not None else D.args_string(arm, s, _E_SAVE)), env, "NVIDIA L4, 23034 MiB"]
+    lines += list(offs if offs is not None else D.OFF_LINES)
+    lines.append(pt if pt is not None else "%s dir=/x/probe_%s-%s-s%d" % (D.pt_witness_prefix(arm), PREFIX, arm, s))
+    for e, v in enumerate(_e_curve(level)[:n_ep]):
+        lines.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(v + 20, 99.9), v))
+    if run_done:
+        lines.append("RUN_DONE")
+    open(os.path.join(d, "%s-%s-s%d-%d.out" % (PREFIX, arm, s, jid)), "w").write("\n".join(lines) + "\n")
+
+
+def _e_records(arm, seed, dominate=False, nb=None, decomp_break=False, rng=None):
+    """500 synthetic PROBE_TENSOR records.  dominate: the three declared carriers carry the applied sign and outweigh
+    the rest.  Terms are built so that z_i = L_i and m_i = 0 -> the decomposition is exact."""
+    rng = rng or random.Random(seed * 7 + len(arm))
+    pair = D.PAIR_OF[arm]
+    mp, b2 = (0.9, 1.0) if pair == "AW" else (0.99, 0.9)
+    nb = nb if nb is not None else (1 if D.SPEC[arm] == "scalar" else NTENS)
+    out = []
+    for k in range(N_RECORDS):
+        L = [rng.gauss(0, 1e-6) for _ in range(NTENS)]
+        if dominate:
+            for i in CARRIER_IDX0:
+                L[i] = 1e-4
+        if pair == "AW":
+            z = list(L)
+            m = [0.0] * NTENS
+            za = sum(L)
+        else:
+            z = [x / (1 - b2) for x in L]
+            m = [0.0] * NTENS
+            za = sum(z)
+        if decomp_break:
+            za = -za
+        out.append({"step": k * D.PROBE, "beta": [-13.8] * nb, "z_tensor": z, "m_tensor": m, "mom_pre": [[0.0]],
+                    "z_agg": [[za]], "pt_mp": mp, "pt_b2": b2, "beta_pre": [[-13.8] * nb]})
+    return out
+
+
+def _e_probe_templates(root):
+    """write every (variant) record file ONCE; scenarios copy them."""
+    t = {}
+    os.makedirs(root, exist_ok=True)
+    for a in ARMS:
+        for s in SEEDS:
+            for dom in (False, True):
+                p = os.path.join(root, "tpl_%s_%d_%d.jsonl" % (a, s, dom))
+                with open(p, "w") as fh:
+                    for r in _e_records(a, s, dominate=dom):
+                        fh.write(json.dumps(r) + "\n")
+                t[(a, s, dom)] = p
+    return t
+
+
+def _e_build(d, tpl, levels=None, jit=(0.0, 0.2, -0.2), over=None, drop=None, dom=(), prov_over=None, man_break=False,
+             rec_over=None):
+    """a complete synthetic runsdir.  levels: arm -> level; over: (arm, seed) -> dict of _e_write kwargs;
+    dom: arms whose records are dominated by the carriers; rec_over: (arm, seed) -> list of records."""
+    os.makedirs(os.path.join(d, PREFIX), exist_ok=True)
+    lv = dict(_E_BASE)
+    lv.update(levels or {})
+    jid = 7000000
+    for s, j in zip(SEEDS, jit):
+        for a in ARMS:
+            jid += 1
+            if drop == (a, s):
+                continue
+            L = lv[a] if not isinstance(lv[a], (list, tuple)) else lv[a][SEEDS.index(s)]
+            kw = dict((over or {}).get((a, s), {}))
+            _e_write(d, a, s, jid, L + (0 if isinstance(lv[a], (list, tuple)) else j), **kw)
+            pd = os.path.join(d, PREFIX, "probe_%s-%s-s%d" % (PREFIX, a, s))
+            os.makedirs(pd, exist_ok=True)
+            if rec_over and (a, s) in rec_over:
+                with open(os.path.join(pd, "probe.jsonl"), "w") as fh:
+                    for r in rec_over[(a, s)]:
+                        fh.write(json.dumps(r) + "\n")
+            else:
+                os.symlink(tpl[(a, s, a in dom)], os.path.join(pd, "probe.jsonl"))
+    man = D.manifest_text() + ("X\n" if man_break else "")
+    open(os.path.join(d, PREFIX, "PARTITION-MANIFEST.txt"), "w").write(man)
+    prov = {"MODE": "submit", "BUILD_NETWORK_SHA256": D.BN_SHA, "HF_SHA256": D.HF_SHA, "RUNNER_SHA256": D.RUNNER_SHA,
+            "SCORER_SHA256": file_sha(os.path.abspath(__file__)), "DESIGN_SHA256": file_sha(D.__file__),
+            "CWD_DESIGN_SHA256": file_sha(D.W.__file__), "COMMON_SHA256": file_sha(C.__file__)}
+    prov.update(prov_over or {})
+    open(os.path.join(d, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % kv for kv in prov.items()))
+
+
+def _e_score(d, csvpath):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc, final = score(d, csvpath)
+    return rc, final, buf.getvalue()
+
+
+def _mid(pl):
+    return (pl[0] + pl[1]) / 2.0
+
+
+# =============================================================================
+# SELFTEST
+# =============================================================================
+RES = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    RES["PASS" if cond else "FAIL"] += 1
+    return bool(cond)
+
+
+def skip(label, extra=""):
+    print("  SKIP %s%s" % (label, ("   " + extra) if extra else ""))
+    RES["SKIP"] += 1
+
+
+def _find_out(runsdir, name_prefix):
+    if not runsdir or not os.path.isdir(runsdir):
+        return None
+    for fn in sorted(os.listdir(runsdir)):
+        if fn.startswith(name_prefix) and fn.endswith(".out"):
+            return os.path.join(runsdir, fn)
+    return None
+
+
+def selftest(csvpath, runsdir):
+    print("caw1 scorer SELFTEST  (scorer sha %s)" % file_sha(os.path.abspath(__file__)))
+
+    print("\nA  design, literals, reused files")
+    chk(file_sha(D.W.__file__) == D.CWD_DESIGN_SHA, "A analysis/cwd_design.py is the registered file (RULE 16)")
+    chk(file_sha(C.__file__) == D.CWD_COMMON_SHA, "A analysis/cwd_common.py is the registered file (RULE 16)")
+    chk(ARMS == ("AS1", "AL1", "AS2", "AL2", "K01") and SEEDS == (149, 150, 151), "A five arms, seeds 149/150/151")
+    chk(len(D.TENSORS) == NTENS and sum(t[1] for t in D.TENSORS) == D.TOTPAR, "A 62 tensors / 11,220,132 parameters")
+    chk(tuple(i + 1 for i in CARRIER_IDX0) == (50, 53, 59), "A the declared carriers are idx 50 / 53 / 59")
+    chk(all(D.WD[D.SCALAR_OF[c]] == D.WD[D.LAYER_OF[c]] and D.SPEC[D.SCALAR_OF[c]] == "scalar"
+            and D.SPEC[D.LAYER_OF[c]] == "layerwise" for c in D.CELLS), "A both grains in every cell on the SAME decay")
+    chk([D.WD[D.SCALAR_OF[c]] for c in D.CELLS] == ["0.1", "1e-2"], "A the two AdamW decays are 0.1 and 1e-2")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE_PRIOR) < 1e-6 and SIGMA_PRIOR == SIGMA_R18ALL,
+        "A SE_PRIOR = SIGMA_PRIOR*sqrt(2/3); SIGMA_PRIOR = SIGMA_R18ALL")
+    chk(D.args_deviating_kinds("AS1") == ("ARGS_MOMENTUM_BASE",) and D.args_deviating_kinds("AS2")
+        == ("ARGS_MOMENTUM_BASE", "ARGS_WD_BASE") and D.args_deviating_kinds("K01") == (),
+        "A the exclusion kinds owed: AS1/AL1 momentum; AS2/AL2 momentum AND wd (two ARGS axes); K01 none")
+    src = open(os.path.abspath(__file__)).read()
+    body = src[src.index("def score("):src.index("# SELFTEST HELPERS")]
+    chk("read_corpus(" in body and "_pooled" not in body and "SIGMA_R18ALL" not in body and "all_runs" not in body,
+        "A O2: score() reads the corpus only for its disclosure line and never the floor's derivation")
+    # the ARGS strings against LANDED runs' own ARGS lines
+    ko = _find_out(runsdir, "cwd5-k01W1-s146-")
+    if ko:
+        f = C.parse_args_line([ln for ln in open(ko) if ln.startswith("ARGS:")][0])
+        want = dict(D.args_pairs("K01", 146, "x"))
+        diff = sorted(k for k in set(f) | set(want) if k not in ("seed", "save-directory", "run-name")
+                      and f.get(k, [None])[-1] != want.get(k))
+        chk(not diff and set(f) == set(want), "A K01's flags == the landed cwd5 k01W1's ARGS line, flag for flag (seed / save /"
+            " run-name aside): the control IS the mechanism cell", str(diff))
+    else:
+        skip("A K01 vs the landed cwd5 k01W1 ARGS line", "no cwd5-k01W1-s146 .out under %s" % runsdir)
+    ao = _find_out(runsdir, "a0-scal-1e6-s0-")
+    if ao:
+        f = C.parse_args_line([ln for ln in open(ao) if ln.startswith("ARGS:")][0])
+        want = dict(D.args_pairs("AS1", 0, "x"))
+        same = [k for k in ("alg-base", "normalizer-param-base", "momentum-param-base", "weight-decay-base", "alg-meta",
+                            "normalizer-param-meta", "momentum-param-meta", "weight-decay-meta", "meta-stepsize",
+                            "alpha0", "gamma", "batch-size", "num-epochs", "stepsize-groups")
+                if f.get(k, [None])[-1] != want[k]]
+        chk(not same and f["dataset"][-1] == "CIFAR10" and f["NN-name"][-1] == "ResNet18",
+            "A AS1's optimiser flags == the campaign's landed CIFAR-10 AdamW+Adam scalar run (a0-scal-1e6-s0), flag for"
+            " flag; only the dataset / network (and seed) differ", str(same))
+    else:
+        skip("A AS1 vs the landed a0-scal-1e6-s0 ARGS line", "not under %s" % runsdir)
+
+    print("\nB  DOM_C and the decomposition ON LANDED RECORDS (cwd5, Lion meta): the calibration")
+    got = {}
+    for arm in ("k01W1", "k01W2", "k01W3", "k01W4"):
+        rb = dict((s, C.load_probe(runsdir, "cwd5", arm, s)) for s in (146, 147, 148))
+        if any(v is None for v in rb.values()):
+            skip("B cwd5 %s probes" % arm, "not under %s" % runsdir)
+            continue
+        n, bsum, bsign, nf = decomposition([r for v in rb.values() for r in v], "Lion")
+        chk(n == 3 * N_RECORDS and bsum == 0 and bsign == 0,
+            "B the Lion decomposition holds on every landed cwd5 %s record" % arm, "%d usable, %d off, %d sign, %d nonfinite"
+            % (n, bsum, bsign, nf))
+        Cx = fit_carriers(rb[146], "Lion")
+        share, nn = dom_c(rb[147] + rb[148], "Lion", Cx)
+        dsh, _dn = dom_c([r for v in rb.values() for r in v], "Lion", CARRIER_IDX0)
+        got[arm] = (Cx, share, dsh)
+        print("       %s  C_fit(s146) = {%s}  DOM_C(s147+s148) %.4f   declared DOM %.4f" %
+              (arm, ",".join("%d" % (i + 1) for i in Cx), share, dsh))
+    if "k01W1" in got:
+        chk(tuple(i + 1 for i in got["k01W1"][0]) == (50, 53, 59) and got["k01W1"][1] >= DOM_BAR,
+            "B CALIBRATION: on the landed COLLAPSED arm (cwd5 k01W1) the cross-seed fit recovers {50,53,59} and DOM_C"
+            " >= %.2f" % DOM_BAR, "%.4f" % got["k01W1"][1])
+        chk(got["k01W1"][2] >= DOM_BAR, "B the declared carriers dominate the collapsed arm's vote (%.4f)" % got["k01W1"][2])
+    for arm in ("k01W2", "k01W3", "k01W4"):
+        if arm in got:
+            chk(got[arm][1] < DOM_BAR, "B the landed NON-collapsed %s does not reach DOM_BAR with its own fit (%.4f)"
+                % (arm, got[arm][1]))
+    # the Adam decomposition on synthetic records + a broken one
+    recs = _e_records("AS1", 149)
+    chk(decomposition(recs, "Adam")[1:3] == (0, 0), "B the Adam decomposition passes on consistent synthetic records")
+    chk(decomposition(_e_records("AS1", 149, decomp_break=True), "Adam")[2] > 0,
+        "B ... and FAILS when the applied term is not the sum of the per-tensor terms (the vote-null)")
+    Cx = fit_carriers(_e_records("AS1", 149, dominate=True), "Adam")
+    chk(Cx == CARRIER_IDX0 and dom_c(_e_records("AS1", 150, dominate=True), "Adam", Cx)[0] == 1.0,
+        "B on synthetic dominated Adam records the fit recovers the carriers and DOM_C = 1")
+    chk(dom_c(_e_records("AS1", 150), "Adam", CARRIER_IDX0)[0] < 0.5, "B on undominated synthetic records DOM_C < 0.5")
+
+    print("\nC  the floor, freshness")
+    if csvpath and os.path.exists(csvpath):
+        ce = _exclusions()
+        rows = list(csv.DictReader(open(csvpath)))
+        sR = ce._pooled(ce.filter_rows(rows), "ResNet18_c100")
+        nR = ce._pooled(rows, "ResNet18_c100")
+        if file_sha(csvpath) == REG_CORPUS_SHA:
+            chk(abs(sR[0] - SIGMA_R18ALL) < 1e-12 and sR[1] == SIGMA_R18ALL_DF,
+                "C SIGMA_R18ALL: the FROZEN literal %r IS the FILTERED value (df %d) on the registration corpus"
+                % (SIGMA_R18ALL, SIGMA_R18ALL_DF))
+            chk(abs(nR[0] - SIGMA_R18ALL_NAIVE) < 1e-12 and nR[0] > 5 * SIGMA_R18ALL,
+                "C the NAIVE (unfiltered) value is the disclosed trap, not the literal")
+        else:
+            print("       corpus moved since registration (%s); the frozen literal stands (O2): filtered now %.6f" %
+                  (file_sha(csvpath)[:12], sR[0]))
+            chk(True, "C the corpus moved; the FROZEN floor is not re-read (O2)")
+        chk(not any(r.get("run", "").startswith(PREFIX + "-") for r in rows) or file_sha(csvpath) != REG_CORPUS_SHA,
+            "C ZERO corpus rows carry the caw1- prefix (at registration)")
+        chk(not any(r.get("seed") in ("149", "150", "151") for r in rows if not r.get("run", "").startswith(PREFIX + "-")),
+            "C ZERO corpus rows OUTSIDE caw1 carry seed 149, 150 or 151")
+    else:
+        skip("C the floor", "no corpus")
+
+    print("\nD  the branch function: reachability, bars, predicted levels")
+    reach = set()
+    for s1 in STATES:
+        for s2 in STATES:
+            for k in (20.0, 40.0):
+                reach.add(decide({"A1": s1, "A2": s2}, k))
+    chk(reach == set(TOKENS) - {"INCOMPLETE", "HARNESS-UNSOUND"},
+        "D every registered branch is reachable over all 5x5 cell-state vectors x the control", str(sorted(reach)))
+    chk(cell_state([70.0, 70.0, 70.0], [35.0, 35.0, 35.0]) == "COLLAPSE" and
+        cell_state([70.0, 70.0, 70.0], [35.001, 35.001, 35.001]) == "PARTIAL", "D the R50 bar is inclusive, exact")
+    chk(cell_state([70.0] * 3, [60.0001] * 3) == "NOGAP" and cell_state([70.0] * 3, [60.0] * 3) == "PARTIAL",
+        "D the GAP_BAR is strict (< 10 pp)")
+    chk(cell_state([54.99] * 3, [20.0] * 3) == "UNREADABLE" and cell_state([60.0, 66.0, 63.0], [20.0] * 3) == "UNREADABLE",
+        "D REF_MIN and the reference's seed range gate the cell")
+    chk(cell_state([70.0] * 3, [20.0, 20.0, 60.0]) == "SPLIT" and cell_state([70.0] * 3, [60.0, 62.0, 30.0]) == "SPLIT",
+        "D one or two collapsed seeds -> SPLIT, whatever the mean")
+    chk(decide({"A1": "COLLAPSE", "A2": "COLLAPSE"}, 30.0) == "COLLAPSE-UNDER-STANDARD-RECIPE" and
+        decide({"A1": "COLLAPSE", "A2": "COLLAPSE"}, 30.0001) == "CONTROL-NOT-COLLAPSED", "D K01_MAX is inclusive")
+    for tok, pl in ACCOUNTS.items():
+        lv = dict((a, _mid(b)) for a, b in pl.items())
+        st = {"A1": cell_state([lv["AL1"]] * 3, [lv["AS1"]] * 3), "A2": cell_state([lv["AL2"]] * 3, [lv["AS2"]] * 3)}
+        chk(decide(st, lv["K01"]) == tok, "D the midpoints of %s's predicted bands -> %s" % (tok, tok), str(st))
+    chk(gate_word("NO-COLLAPSE", {}, {}) == "GATE-DOES-NOT-FIRE" and gate_word("PARTIAL", {}, {}) == "GATE-DOES-NOT-FIRE"
+        and gate_word("CONTROL-NOT-COLLAPSED", {}, {}) == "GATE-UNREADABLE", "D gate word off the collapse branch")
+    good = {"dom": 0.8}
+    chk(gate_word("COLLAPSE-UNDER-STANDARD-RECIPE", {"A1": "COLLAPSE", "A2": "NOGAP"}, {"K01": good, "AS1": {"dom": 0.5}})
+        == "GATE-FIRES-A1" and gate_word("COLLAPSE-UNDER-STANDARD-RECIPE", {"A1": "COLLAPSE", "A2": "NOGAP"},
+                                          {"K01": good, "AS1": {"dom": 0.4999}}) == "GATE-COLLAPSE-WITHOUT-DOMINANCE"
+        and gate_word("COLLAPSE-UNDER-STANDARD-RECIPE", {"A1": "COLLAPSE", "A2": "NOGAP"},
+                      {"K01": {"dom": 0.3}, "AS1": good}) == "GATE-UNREADABLE-DOMC-CONTROL",
+        "D DOM_BAR is inclusive; the K01 control gates the gate word")
+
+    print("\nE  the REAL score() on synthetic runs (every number invented)")
+    tmp = tempfile.mkdtemp(prefix="caw1_selftest_")
+    try:
+        tpl = _e_probe_templates(os.path.join(tmp, "tpl"))
+        cases = [
+            ("collapse at A1, dominated", dict(dom=("AS1", "K01")), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", ["GATE-FIRES-A1", "A1-COLLAPSE+A2-NOGAP+K-COLLAPSED"]),
+            ("collapse at A1, NOT dominated", dict(dom=("K01",)), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", ["GATE-COLLAPSE-WITHOUT-DOMINANCE"]),
+            ("collapse at A1, control's vote not dominated", dict(dom=("AS1",)), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", ["GATE-UNREADABLE-DOMC-CONTROL"]),
+            ("collapse at both", dict(levels={"AS2": 20.0}, dom=("AS1", "AS2", "K01")), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", ["GATE-FIRES-A1+A2"]),
+            ("collapse at A2 only", dict(levels={"AS1": 67.0, "AS2": 20.0}, dom=("AS2", "K01")), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", ["NON-MONOTONE-ADAMW", "GATE-FIRES-A2"]),
+            ("no collapse", dict(levels={"AS1": 67.5}), 0, "NO-COLLAPSE", ["GATE-DOES-NOT-FIRE", "A1-NOGAP+A2-NOGAP"]),
+            ("no collapse, scalar ahead", dict(levels={"AS1": 72.0, "AS2": 72.0}), 0, "NO-COLLAPSE", ["SCALAR-AHEAD-A1-DESCRIPTIVE"]),
+            ("partial", dict(levels={"AS1": 45.0}), 0, "PARTIAL", ["A1-PARTIAL"]),
+            ("split", dict(levels={"AS1": (20.0, 21.0, 66.0)}), 0, "PARTIAL", ["A1-SPLIT", "DIVERGED-AS1"]),
+            ("A1 reference unhealthy", dict(levels={"AL1": 50.0, "AS1": 49.0}), 0, "UNRESOLVED-REFERENCE-A1", []),
+            ("A2 reference unhealthy", dict(levels={"AS1": 67.5, "AL2": 50.0, "AS2": 49.0}), 0, "UNRESOLVED-REFERENCE-A2", []),
+            ("control did not collapse", dict(levels={"K01": 60.0}), 0, "CONTROL-NOT-COLLAPSED", ["GATE-UNREADABLE"]),
+            ("near-bar: scalar exactly at R50", dict(levels={"AS1": 34.0, "AL1": 68.0}, jit=(0.0, 0.0, 0.0), dom=("AS1", "K01")), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", []),
+            ("near-bar: just above R50", dict(levels={"AS1": 34.01, "AL1": 68.0}, jit=(0.0, 0.0, 0.0)), 0, "PARTIAL", []),
+            ("near-bar: gap 9.99", dict(levels={"AS1": 58.01, "AL1": 68.0}, jit=(0.0, 0.0, 0.0)), 0, "NO-COLLAPSE", []),
+            ("near-bar: control at 30", dict(levels={"K01": 30.0}, jit=(0.0, 0.0, 0.0), dom=("AS1", "K01")), 0, "COLLAPSE-UNDER-STANDARD-RECIPE", []),
+            ("near-bar: control at 30.01", dict(levels={"K01": 30.01}, jit=(0.0, 0.0, 0.0)), 0, "CONTROL-NOT-COLLAPSED", []),
+        ]
+        wrong = D.args_string("AS1", 150, _E_SAVE)
+        breaks = [
+            ("HARNESS-NULL: AS1 ran an SGDm base", {("AS1", 150): {"args": wrong.replace("--alg-base AdamW", "--alg-base SGDm")}}),
+            ("HARNESS-NULL: AS1 ran a Lion meta", {("AS1", 150): {"args": wrong.replace("--alg-meta Adam", "--alg-meta Lion")}}),
+            ("HARNESS-NULL: AS1 at the wrong decay", {("AS1", 150): {"args": wrong.replace("--weight-decay-base 0.1", "--weight-decay-base 1e-2")}}),
+            ("HARNESS-NULL: AS1 ran layerwise", {("AS1", 150): {"args": wrong.replace("--stepsize-groups scalar", "--stepsize-groups layerwise")}}),
+            ("a repeated flag", {("AS1", 150): {"args": wrong + " --alg-meta Lion"}}),
+            ("an unregistered flag", {("AS1", 150): {"args": wrong + " --Lion-beta2-base 0.9"}}),
+            ("AL2 at 0.1", {("AL2", 149): {"args": D.args_string("AL2", 149, _E_SAVE).replace("--weight-decay-base 1e-2", "--weight-decay-base 0.1")}}),
+            ("K01 as AdamW", {("K01", 151): {"args": D.args_string("AS1", 151, _E_SAVE).replace("caw1-AS1-s151", "caw1-K01-s151")}}),
+            ("HARNESS-NULL: PT says meta Lion on an Adam arm", {("AS1", 149): {"pt": D.pt_witness_prefix("AS1").replace("meta_alg=Adam", "meta_alg=Lion") + " dir=/x"}}),
+            ("HARNESS-NULL: PT says scalar on a layerwise arm", {("AL1", 149): {"pt": D.pt_witness_prefix("AL1").replace("type=layerwise", "type=scalar") + " dir=/x"}}),
+            ("no PT line", {("AS2", 149): {"pt": "PROBE_TENSOR: requested but PROBE=0 PROBE_DIR='' -- OFF"}}),
+            ("ENV break", {("AL1", 151): {"env": _E_ENV.replace("AUGMENT=1", "AUGMENT=0")}}),
+            ("a hold witness ON", {("AS1", 151): {"offs": ("VOTE_W: on x",) + D.OFF_LINES[1:]}}),
+        ]
+        for lab, kw, rcw, tok, must in cases:
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, **kw)
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == rcw and final.startswith("FINAL: %s |" % tok) and all(m in final for m in must),
+                "E %-44s -> %s %s" % (lab, tok, " ".join(must)), "" if final.startswith("FINAL: %s |" % tok) else final[:200])
+        for lab, over in breaks:
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, over=over, dom=("AS1", "K01"))
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and final.startswith("FINAL: HARNESS-UNSOUND"), "E break: %-46s -> HARNESS-UNSOUND" % lab, final[:120])
+        # probe-level harness nulls
+        for lab, ro in (("HARNESS-NULL: a scalar arm's records carry 62 step sizes (it ran layerwise)",
+                         {("AS1", 149): _e_records("AS1", 149, nb=NTENS)}),
+                        ("HARNESS-NULL: a layerwise arm's records carry 1 step size",
+                         {("AL1", 150): _e_records("AL1", 150, nb=1)}),
+                        ("the vote decomposition broken on a scalar arm", {("AS2", 151): _e_records("AS2", 151, decomp_break=True)}),
+                        ("a truncated probe file", {("K01", 149): _e_records("K01", 149)[:400]})):
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, rec_over=ro, dom=("AS1", "K01"))
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and final.startswith("FINAL: HARNESS-UNSOUND") and "G-PROBE" in final,
+                "E break: %-62s -> HARNESS-UNSOUND (G-PROBE)" % lab, final[:120])
+        for lab, kw in (("manifest", dict(man_break=True)), ("provenance: wrong scorer", dict(prov_over={"SCORER_SHA256": "0" * 64})),
+                        ("provenance: dry-run mode", dict(prov_over={"MODE": "dry-run"}))):
+            d = os.path.join(tmp, "case_%d" % len(os.listdir(tmp)))
+            _e_build(d, tpl, dom=("AS1", "K01"), **kw)
+            rc, final, out = _e_score(d, csvpath)
+            chk(rc == 1 and final.startswith("FINAL: HARNESS-UNSOUND"), "E break: %-46s -> HARNESS-UNSOUND" % lab, final[:120])
+        d = os.path.join(tmp, "case_drop")
+        _e_build(d, tpl, drop=("AL2", 150))
+        rc, final, out = _e_score(d, csvpath)
+        chk(rc == 2 and final.startswith("FINAL: INCOMPLETE") and "AL2-s150" in final, "E a dropped run -> INCOMPLETE rc 2")
+        d = os.path.join(tmp, "case_trunc")
+        _e_build(d, tpl, dom=("AS1", "K01"))
+        _e_write(d, "AS1", 149, 6999999, 60.0, n_ep=40, run_done=False)
+        rc, final, out = _e_score(d, csvpath)
+        chk(rc == 0 and final.startswith("FINAL: COLLAPSE-UNDER-STANDARD-RECIPE"),
+            "E a truncated EARLIER resubmission is ignored (the complete file is used)")
+        # the documented one-argument invocation, end to end in a subprocess
+        d = os.path.join(tmp, "case_cli")
+        _e_build(d, tpl, dom=("AS1", "K01"))
+        import subprocess
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, cwd=REPO)
+        chk(p.returncode == 0 and "FINAL: COLLAPSE-UNDER-STANDARD-RECIPE" in p.stdout,
+            "E `python3 cAW1_stdrecipe_score.py <runsdir>` exits 0 and prints FINAL")
+        shutil.rmtree(os.path.join(d, "%s" % PREFIX, "probe_%s-AL1-s149" % PREFIX))
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), d], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, cwd=REPO)
+        chk(p.returncode == 1 and "HARNESS-UNSOUND" in p.stdout, "E ... and with a probe directory missing exits 1")
+
+        print("\nF  O2: the FINAL line is invariant to the corpus (it is read for disclosure only)")
+        d = os.path.join(tmp, "case_o2")
+        _e_build(d, tpl, dom=("AS1", "K01"))
+        finals = set()
+        variants = [csvpath, None]
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            fields = list(rows[0].keys())
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=fields)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for k in range(40):
+                    r = dict(rows[0])
+                    r.update({"run": "zz-invented-%d" % k, "job_id": str(9000000 + k), "network": "ResNet18_c100",
+                              "plateau5": "%.3f" % (40 + 30 * (k % 2))})
+                    w.writerow(r)
+            variants.append(inv)
+        for v in variants:
+            rc, final, out = _e_score(d, v)
+            finals.add(final)
+        chk(len(finals) == 1, "F FINAL identical over %d corpus variants (real, none, real + 40 invented rows)" % len(variants))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\nSELFTEST: %d PASS / %d FAIL / %d SKIP" % (RES["PASS"], RES["FAIL"], RES["SKIP"]))
+    return 0 if RES["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?", default="")
+    ap.add_argument("--csv", default=os.path.join(REPO, "results", "all_runs.csv"))
+    ap.add_argument("--manifest", default="")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt", default="")
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    rc, _final = score(a.runsdir, a.csv, a.manifest)
+    raise SystemExit(rc)
+
+
+if __name__ == "__main__":
+    main()

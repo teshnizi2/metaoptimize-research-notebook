@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""caw2_rule20_envaudit.py <runsdir> -- CORRECTIONS 290: RULE 20's SEPARATE ENV half for `caw2`.
+
+A copy of cwd5_rule20_envaudit.py's logic with `caw2`'s table.  **The witness lines below are RE-TYPED literals, NOT
+imported from analysis/caw2_design.py**: this file is an INDEPENDENT audit of what the runs printed.  A kind
+registered as None must print NO line; every other kind exactly ONE line equal to the arm's registered witness (every
+one `off` in caw2).
+
+WHAT THIS HALF CAN AND CANNOT DISCRIMINATE, DECLARED AT REGISTRATION.  The runner's `ENV:` line carries no base alg and
+no weight decay, so this half CANNOT tell the base swap or the dose; the ARGS half pins those.  It DOES discriminate
+the GRAIN (`PROBE_TENSOR ... type=`) and the META alg (the `meta_alg=... momentum_param=... Lion_beta2=...` tail).
+
+READ-ONLY.  For each caw2-<arm>-s<seed>-<jobid>.out it looks ONLY at lines starting with `NODE=`, `ENV:`,
+`PROBE_TENSOR:`, the GPU line or one of the seven witness prefixes; no accuracy number is touched.
+    python3 analysis/caw2_rule20_envaudit.py $WS/runs
+"""
+import collections
+import glob
+import os
+import re
+import sys
+
+WS = "/cluster/account_b/metaopt"
+PREFIX = "caw2"
+NET_TENSORS = 62
+ARMS = ["K01", "MS", "ML", "LS", "LL", "AS", "AL", "XS", "XL"]
+SEEDS = [160, 161, 162]
+# RE-TYPED, not imported: the grain and the META alg's constants each arm must print in its PROBE_TENSOR line
+GRAIN = {"K01": "scalar", "MS": "scalar", "ML": "layerwise", "LS": "scalar", "LL": "layerwise",
+         "AS": "scalar", "AL": "layerwise", "XS": "scalar", "XL": "layerwise"}
+META_TAIL = {"K01": "meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9", "LS": "meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9",
+             "LL": "meta_alg=Lion momentum_param=0.99 Lion_beta2=0.9"}
+for _a in ("MS", "ML", "AS", "AL", "XS", "XL"):
+    META_TAIL[_a] = "meta_alg=Adam momentum_param=0.9 Lion_beta2=0.9"
+# RE-TYPED, printed for comparison with the ARGS half only (the ENV line carries neither the pairing nor the decay)
+PAIRING = {"K01": "SGDm+Lion wd 0.1", "MS": "SGDm+Adam wd 0.1", "ML": "SGDm+Adam wd 0.1", "LS": "AdamW+Lion wd 0.1",
+           "LL": "AdamW+Lion wd 0.1", "AS": "AdamW+Adam wd 0.1", "AL": "AdamW+Adam wd 0.1", "XS": "AdamW+Adam wd 1.0",
+           "XL": "AdamW+Adam wd 1.0"}
+COMMON = {"AUGMENT": "1", "BETA_CLIP": "-15:-2.3026", "HIER": "none", "LAM": "na",
+          "ETA_RATIO": "na", "COS_TOTAL": "default", "COS_WARMUP": "default",
+          "SCHED": "none", "SCHED_TOTAL": "none", "SCHED_WARMUP": "none",
+          "SCHED_MIN": "none", "PROBE": "100", "EB_RHO": "na", "EB_LOG": "0"}
+KINDS = ("VOTE_W", "BETA_HOLD", "GROUP_HOLD", "REST_HOLD", "COMP_HOLD", "WINDOW_HOLD", "DECAY_MASK")
+OFF = {"VOTE_W": "VOTE_W: off", "BETA_HOLD": "BETA_HOLD: off", "GROUP_HOLD": "GROUP_HOLD: off",
+       "REST_HOLD": "REST_HOLD: off", "COMP_HOLD": None, "WINDOW_HOLD": None}
+DM = dict((a, "DECAY_MASK: off") for a in ARMS)
+WIT = dict((a, dict(OFF, DECAY_MASK=DM[a])) for a in ARMS)
+
+
+def main():
+    runsdir = sys.argv[1]
+    pat = re.compile(r"^%s-(%s)-s(\d+)-(\d+)\.out$" % (PREFIX, "|".join(ARMS)))
+    found = collections.defaultdict(list)
+    for p in sorted(glob.glob(os.path.join(runsdir, PREFIX + "-*.out"))):
+        m = pat.match(os.path.basename(p))
+        if m:
+            found[(m.group(1), int(m.group(2)))].append((m.group(3), p))
+        else:
+            print("  NOTE unrecognised file %s" % os.path.basename(p))
+    bad = 0
+    distinct = collections.Counter()
+    pt_seen = collections.Counter()
+    gpu_seen = collections.Counter()
+    seen = dict((k, collections.Counter()) for k in KINDS)
+    n_pt_missing = 0
+    for key in sorted(found):
+        arm, seed = key
+        if len(found[key]) > 1:
+            print("  NOTE %d .out files for %s-s%d" % (len(found[key]), arm, seed))
+        for jid, p in found[key]:
+            rn = "%s-%s-s%d" % (PREFIX, arm, seed)
+            node, env, pt, gpu = [], [], [], []
+            wl = dict((k, []) for k in KINDS)
+            with open(p, errors="replace") as fh:
+                for ln in fh:
+                    if ln.startswith("NODE="):
+                        node.append(ln.rstrip("\n"))
+                    elif ln.startswith("ENV:"):
+                        env.append(ln.rstrip("\n"))
+                    elif ln.startswith("PROBE_TENSOR:"):
+                        pt.append(ln.rstrip("\n"))
+                    elif ln.rstrip("\n").endswith(" MiB") and ", " in ln:
+                        gpu.append(ln.rstrip("\n"))
+                    else:
+                        for k in KINDS:
+                            if ln.startswith(k):
+                                wl[k].append(ln.rstrip("\n"))
+            errs = []
+            if len(env) != 1:
+                errs.append("%d ENV lines" % len(env))
+            else:
+                toks = env[0][len("ENV:"):].split()
+                kv = dict(t.split("=", 1) for t in toks if "=" in t)
+                want = dict(COMMON)
+                want["PROBE_DIR"] = "%s/runs/%s/probe_%s" % (WS, PREFIX, rn)
+                if len(toks) != len(kv) or set(kv) != set(want):
+                    errs.append("ENV keys %s differ from the runner's 15" % sorted(set(kv) ^ set(want)))
+                for k, w in want.items():
+                    if kv.get(k) != w:
+                        errs.append("ENV %s=%s want %s" % (k, kv.get(k), w))
+                distinct[re.sub(r" PROBE_DIR=\S+", "", env[0])] += 1
+            for k in KINDS:
+                w = WIT[arm][k]
+                want_l = [] if w is None else [w]
+                if wl[k] != want_l:
+                    errs.append("%s lines %r want %r" % (k, [x[:140] for x in wl[k]], want_l))
+                elif w is not None:
+                    seen[k][w] += 1
+            if len(node) != 1:
+                errs.append("%d NODE lines" % len(node))
+            else:
+                mm = re.match(r"^NODE=(\S+) \| JOB=(\S+) (\d+) \| AUGMENT=(\S+)$", node[0])
+                if not mm:
+                    errs.append("NODE header unparseable")
+                elif (mm.group(2), mm.group(3), mm.group(4)) != (rn, jid, "1"):
+                    errs.append("NODE header JOB=%s %s AUGMENT=%s, want %s %s 1"
+                                % (mm.group(2), mm.group(3), mm.group(4), rn, jid))
+            if gpu:
+                gpu_seen[gpu[0].split(",")[0].strip()] += 1
+            if not pt:
+                n_pt_missing += 1
+            else:
+                if len(pt) != 1:
+                    errs.append("%d PROBE_TENSOR lines" % len(pt))
+                s = pt[0]
+                ty = re.search(r"\btype=(\S+)", s)
+                nt = re.search(r"\btensors=(\d+)", s)
+                if not ty or ty.group(1) != GRAIN[arm]:
+                    errs.append("PROBE_TENSOR type=%s want %s" % (ty.group(1) if ty else None, GRAIN[arm]))
+                if (" %s dir=" % META_TAIL[arm]) not in s:
+                    errs.append("PROBE_TENSOR meta tail is not %r" % META_TAIL[arm])
+                if not nt or int(nt.group(1)) != NET_TENSORS:
+                    errs.append("PROBE_TENSOR tensors=%s want %d" % (nt.group(1) if nt else None, NET_TENSORS))
+                if ("dir=%s/runs/%s/probe_%s" % (WS, PREFIX, rn)) not in s:
+                    errs.append("PROBE_TENSOR dir is not the run's own probe dir")
+                pt_seen[re.sub(r" dir=.*", "", s)] += 1
+            if errs:
+                bad += 1
+                print("  VIOLATION %s: %s" % (os.path.basename(p), "; ".join(errs)))
+    n_exp = len(ARMS) * len(SEEDS)
+    n = len(found)
+    print("  DECLARED: the runner's ENV line carries neither the base alg nor the weight decay, so THIS half cannot")
+    print("  discriminate the base swap or the dose -- the ARGS half (bin/cAW2_rule20.sh) pins every flag.  THIS half")
+    print("  discriminates the GRAIN (PROBE_TENSOR type) and the META alg (the PROBE_TENSOR meta_alg / momentum tail),")
+    print("  and requires every hold / mask witness `off`.  The registered pairings, re-typed for comparison:")
+    print("    %s" % "  ".join("%s=%s" % (a, PAIRING[a]) for a in ARMS))
+    print("  distinct ENV lines (PROBE_DIR stripped): %d" % len(distinct))
+    for line, c in distinct.items():
+        print("    x%d  %s" % (c, line))
+    print("  distinct PROBE_TENSOR lines (dir stripped): %d  (%d started runs have none yet)" % (len(pt_seen), n_pt_missing))
+    for line, c in sorted(pt_seen.items()):
+        print("    x%d  %s" % (c, line))
+    print("  GPU devices named by the runs' own nvidia-smi lines (DISCLOSURE, --constraint=L4 was requested):")
+    for line, c in sorted(gpu_seen.items()):
+        print("    x%d  %s" % (c, line))
+    for k in KINDS:
+        if seen[k]:
+            print("  %s witness lines (exact match to the arm's registered line):" % k)
+            for line, c in sorted(seen[k].items()):
+                print("    x%d  %s" % (c, line[:240]))
+    if len(distinct) > 1:
+        bad += 1
+        print("  VIOLATION more than one distinct ENV line")
+    print("  coverage %d/%d runs with an .out, %d violations" % (n, n_exp, bad))
+    verdict = "FAIL" if bad else ("PASS" if n == n_exp and n_pt_missing == 0 else
+                                  "UNVERIFIED (%d/%d present, %d without PROBE_TENSOR yet)" % (n, n_exp, n_pt_missing))
+    print("ENV AUDIT VERDICT %s: %s" % (PREFIX, verdict))
+    sys.exit(1 if bad else 0)
+
+
+main()

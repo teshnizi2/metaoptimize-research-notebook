@@ -24,8 +24,8 @@ WORKSPACE, REPO, DATA_AUDIT = _WORKSPACE.path, _REPO.path, _AUDIT.path
 # (export_research.py --run-inventory): the campaign inventory plus the corpus rows of landed batches.
 RUN_INVENTORY = _INVENTORY.path
 CAMPAIGN_RUN_INVENTORY = WORKSPACE / "outputs/tables/complete_run_inventory.csv"
-RUNS = 3316
-LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12, "cvt3": 15, "cvt2": 21, "cvt4": 18, "cvt5": 12, "cvt6": 21, "cvt7": 15, "cvt8": 21, "cvt9": 21, "cmo1": 27, "cst1": 9, "cct1": 6, "cmg1": 12, "cvt10": 30, "cwd1": 9, "csv1": 18, "cwd2": 15, "cwd3": 15, "cwd4": 21, "cwd5": 27}
+RUNS = 3383
+LANDED_BATCH_RUNS = {"cgn1": 6, "cpl1": 15, "cvh1": 12, "cuc1": 30, "cgn2": 15, "cpl2": 15, "cvt1": 15, "cgn3": 12, "cvt3": 15, "cvt2": 21, "cvt4": 18, "cvt5": 12, "cvt6": 21, "cvt7": 15, "cvt8": 21, "cvt9": 21, "cmo1": 27, "cst1": 9, "cct1": 6, "cmg1": 12, "cvt10": 30, "cwd1": 9, "csv1": 18, "cwd2": 15, "cwd3": 15, "cwd4": 21, "cwd5": 27, "caw2": 27, "cgw1": 40}
 PUBLIC = PORTAL / "public"
 PARTITION_IDS = [f"MT{line}" for line in range(175, 212)]
 APPENDED_IDS = [f"MT{line}" for line in range(212, 218)]
@@ -39,6 +39,7 @@ MUST_IDS = ["MT228", "MT229", "MT230", "MT231"]
 MECH4_IDS = ["MT232", "MT233", "MT234", "MT235"]
 MECH5_IDS = ["MT236"]
 MECH6_IDS = ["MT237", "MT238"]
+MECH7_IDS = ["MT239", "MT240"]
 PRIVATE = re.compile(r"/Users/|/home/|/scratch/|/data1/|teshnizi|salehkaleybars|s5014158|hmkhd2|100\.120\.248\.20|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\b(?:p-cfer-\d+|node\d{3}|nodelogin\d+|login\d+|login\.[A-Za-z0-9_.…-]+)\b", re.I)
 
 
@@ -170,17 +171,17 @@ class ResearchExportTests(unittest.TestCase):
 
     def test_complete_register_and_area_counts(self):
         data = self.research()
-        self.assertEqual(len(data["experiments"]), 175)
-        self.assertEqual(len({e["id"] for e in data["experiments"]}), 175)
+        self.assertEqual(len(data["experiments"]), 177)
+        self.assertEqual(len({e["id"] for e in data["experiments"]}), 177)
         self.assertEqual(len(data["areas"]), 10)
-        self.assertEqual(sum(a["count"] for a in data["areas"]), 175)
-        self.assertEqual(data["meta"]["stats"], {"experiments": 175, "researchQuestions": 157, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
+        self.assertEqual(sum(a["count"] for a in data["areas"]), 177)
+        self.assertEqual(data["meta"]["stats"], {"experiments": 177, "researchQuestions": 159, "methodChecks": 18, "runs": RUNS, "figures": 54, "areas": 10})
 
     @needs(_WORKSPACE)
     def test_register_ids_are_the_campaign_register_plus_the_imported_master_table_rows(self):
         data = self.research()
         original = csv_rows(WORKSPACE / "outputs/tables/complete_experiment_register.csv")
-        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS) | set(CVT23_IDS) | set(CVT45_IDS) | set(CVT67_IDS) | set(CVT89_IDS) | set(MUST_IDS) | set(MECH4_IDS) | set(MECH5_IDS) | set(MECH6_IDS))
+        self.assertEqual({e["id"] for e in data["experiments"]}, {e["id"] for e in original} | set(PARTITION_IDS) | set(APPENDED_IDS) | set(LANDED_IDS) | set(CGN3_IDS) | set(CVT23_IDS) | set(CVT45_IDS) | set(CVT67_IDS) | set(CVT89_IDS) | set(MUST_IDS) | set(MECH4_IDS) | set(MECH5_IDS) | set(MECH6_IDS) | set(MECH7_IDS))
 
     def test_published_runs_have_unique_identifiers_and_logs(self):
         runs = self.runs()
@@ -408,10 +409,10 @@ class ResearchExportTests(unittest.TestCase):
     def test_historical_phase_dates_are_not_run_start_dates(self):
         data = self.research()
         phases = [event for event in data["activity"] if event["kind"] == "research-phase"]
-        self.assertEqual(len(phases), 14)
+        self.assertEqual(len(phases), 16)
         self.assertTrue(all("Documented phase" in event["detail"] for event in phases))
         self.assertTrue(any(e["kind"] == "completed-experiment" and e["date"] == "2026-09-14" for e in data["activity"]))
-        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == data["meta"]["asOf"] == "2026-09-21" for e in data["activity"]))
+        self.assertTrue(any(e["kind"] == "publication-snapshot" and e["date"] == data["meta"]["asOf"] == "2026-09-22" for e in data["activity"]))
         self.assertTrue(all("date" not in run for run in self.runs()))
 
     def test_records_without_dated_phases_have_snapshot_import_provenance(self):
@@ -536,8 +537,8 @@ class ResearchExportTests(unittest.TestCase):
             self.assertEqual(sorted(by_id[eid]["runIds"]), sorted(r["id"] for r in linked), eid)
         for run in runs:
             if run["batch"] in LANDED_BATCH_RUNS:
-                # cct1 is the one landed batch on CIFAR-10 (MASTER-TABLE line 230); every other landed run is CIFAR-100.
-                expected_dataset = "CIFAR10" if run["batch"] == "cct1" else "CIFAR100"
+                # cct1 and cgw1 are the landed batches on CIFAR-10 (MASTER-TABLE lines 230 and 240); every other landed run is CIFAR-100.
+                expected_dataset = "CIFAR10" if run["batch"] in ("cct1", "cgw1") else "CIFAR100"
                 self.assertEqual((run["account"], run["status"], run["dataset"]), ("Account2", "completed", expected_dataset), run["id"])
                 self.assertTrue(run["parameters"]["logSourceReference"].startswith("archive/Account2/runs/"), run["id"])
                 self.assertTrue(run["logHref"].startswith("/assets/logs/" + run["batch"] + "-"), run["id"])
@@ -632,8 +633,8 @@ class ResearchExportTests(unittest.TestCase):
                 self.assertEqual(int(row[outcome]), sum(e["outcome"] == outcome for e in research), (row["area"], outcome))
             self.assertEqual(int(row["method_checks"]), len(records) - len(research))
             self.assertEqual(int(row["corrected"]), sum(e["corrected"] for e in records))
-        self.assertEqual(sum(int(r["records"]) for r in areas), 175)
-        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [56, 41, 37, 23, 18])
+        self.assertEqual(sum(int(r["records"]) for r in areas), 177)
+        self.assertEqual([sum(int(r[o]) for r in areas) for o in ["success", "fail", "mixed", "unresolved", "method_checks"]], [56, 41, 38, 24, 18])
 
     @needs(_WORKSPACE, _AUDIT)
     def test_goal_outcome_table_keeps_the_report_goals_with_current_counts(self):
@@ -674,7 +675,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_register_table_receipt_records_the_regeneration(self):
         audit = json.loads(DATA_AUDIT.read_text())
         receipt = next(r for r in audit["table_receipts"] if r["file"] == "complete_experiment_register.csv")
-        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (175, 20, "scripts/register_model.py register"))
+        self.assertEqual((receipt["rows"], receipt["columns"], receipt.get("regenerated")), (177, 20, "scripts/register_model.py register"))
 
     # ---- MASTER-TABLE line 219 and the in-place amendments of rows 213 and 218 (campaign commit e3a43da, CORRECTIONS 231: cgn3) ----
     @needs(_REPO)
@@ -806,7 +807,7 @@ class ResearchExportTests(unittest.TestCase):
                          [{"HOLDLOW": 3, "HOLDSHARED": 3, "HOLDHIGH": 3, "HOLDHEAD": 3}, {"K13": 3, "K33": 3}])
         intervened = model.intervened_runs(REPO)
         # The list has since grown by cvt6 and cvt7 (test_cvt67_rows_come_from_the_pinned_landing_commit), then cvt8 and cvt9.
-        self.assertEqual(sorted(r["batch"] for r in intervened.values() if r["batch"] not in {"cvt6", "cvt7", "cvt8", "cvt9", "cmo1", "cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5"}), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15 + ["cvt4"] * 12 + ["cvt5"] * 6))
+        self.assertEqual(sorted(r["batch"] for r in intervened.values() if r["batch"] not in {"cvt6", "cvt7", "cvt8", "cvt9", "cmo1", "cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5", "caw2", "cgw1"}), sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15 + ["cvt4"] * 12 + ["cvt5"] * 6))
         self.assertTrue(all(r["intervention"].startswith("BETA_HOLD=") for r in intervened.values() if r["batch"] == "cvt4"))
         with self.assertRaisesRegex(ValueError, "does not match the pinned cvt4/cvt5-landing bytes"):
             pinned = model.CVT45_COMMIT
@@ -840,7 +841,7 @@ class ResearchExportTests(unittest.TestCase):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
         # MT224-MT227 were appended after them.
-        self.assertEqual([r["id"] for r in register[-17:-15]], ["MT222", "MT223"])
+        self.assertEqual([r["id"] for r in register[-19:-17]], ["MT222", "MT223"])
         earlier = [r for r in register if r["id"] not in {"MT222", "MT223"}]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt4", "cvt5"} for r in earlier))
         self.assertFalse(any("CORRECTIONS 240" in r.get("sources", "") or "CORRECTIONS 241" in r.get("sources", "") for r in earlier))
@@ -943,7 +944,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual([[c["number"] for c in json.loads(r["registration_corrections"])] for r in rows], [[246], [247]])
         intervened = model.intervened_runs(REPO)
         # The list has since grown by cvt8 and cvt9 (test_cvt89_rows_come_from_the_pinned_landing_commit).
-        self.assertEqual(sorted(r["batch"] for r in intervened.values() if r["batch"] not in {"cvt8", "cvt9", "cmo1", "cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5"}),
+        self.assertEqual(sorted(r["batch"] for r in intervened.values() if r["batch"] not in {"cvt8", "cvt9", "cmo1", "cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5", "caw2", "cgw1"}),
                          sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15 + ["cvt4"] * 12 + ["cvt5"] * 6 + ["cvt6"] * 15 + ["cvt7"] * 9))
         two_kind = sorted(r["arm"] for r in intervened.values() if r["batch"] == "cvt6" and len(model.intervention_kinds(r["intervention"])) == 2)
         self.assertEqual(two_kind, sorted(["HIGHHEADPATH", "LOWMUTEPATH", "LOWHEADPATH"] * 3))
@@ -998,7 +999,7 @@ class ResearchExportTests(unittest.TestCase):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
         # MT226 and MT227 (cvt8, cvt9) were appended after them (test_cvt89_import_leaves_every_earlier_record_unchanged).
-        self.assertEqual([r["id"] for r in register[-15:-13]], ["MT224", "MT225"])
+        self.assertEqual([r["id"] for r in register[-17:-15]], ["MT224", "MT225"])
         earlier = [r for r in register if r["id"] not in {"MT224", "MT225", "MT226", "MT227"}]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt6", "cvt7"} for r in earlier))
         self.assertFalse(any("CORRECTIONS 246" in r.get("sources", "") or "CORRECTIONS 247" in r.get("sources", "") for r in earlier))
@@ -1067,7 +1068,7 @@ class ResearchExportTests(unittest.TestCase):
         intervened = model.intervened_runs(REPO)
         self.assertEqual(sorted(r["batch"] for r in intervened.values()),
                          sorted(["cvt1"] * 9 + ["cvt3"] * 9 + ["cvt2"] * 15 + ["cvt4"] * 12 + ["cvt5"] * 6 + ["cvt6"] * 15 + ["cvt7"] * 9 + ["cvt8"] * 15 + ["cvt9"] * 18 + ["cmo1"] * 18
-                                + ["cvt10"] * 15 + ["cwd1"] * 6 + ["csv1"] * 12 + ["cwd2"] * 12 + ["cwd3"] * 12 + ["cwd4"] * 18 + ["cwd5"] * 21))
+                                + ["cvt10"] * 15 + ["cwd1"] * 6 + ["csv1"] * 12 + ["cwd2"] * 12 + ["cwd3"] * 12 + ["cwd4"] * 18 + ["cwd5"] * 21 + ["caw2"] * 18 + ["cgw1"] * 28))
         holds = {r["arm"] + "/" + r["batch"]: [patch for patch, _ in model.intervention_kinds(r["intervention"])] for r in intervened.values() if r["batch"] in {"cvt8", "cvt9"}}
         self.assertEqual(holds, {"HOLDHIGH/cvt8": ["GROUP_HOLD"], "HOLDBIG/cvt8": ["GROUP_HOLD"], "HIGHISOPATH/cvt8": ["GROUP_HOLD", "REST_HOLD"],
                                  "BIGISOPATH/cvt8": ["GROUP_HOLD", "REST_HOLD"], "LOWISOPATH/cvt8": ["GROUP_HOLD", "REST_HOLD"],
@@ -1131,7 +1132,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_cvt89_import_leaves_every_earlier_record_unchanged(self):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
-        self.assertEqual([r["id"] for r in register[-13:-11]], ["MT226", "MT227"])
+        self.assertEqual([r["id"] for r in register[-15:-13]], ["MT226", "MT227"])
         earlier = [r for r in register if r["id"] not in {"MT226", "MT227"}]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt8", "cvt9"} for r in earlier))
         self.assertFalse(any("CORRECTIONS 252" in r.get("sources", "") or "CORRECTIONS 253" in r.get("sources", "") for r in earlier))
@@ -1336,12 +1337,13 @@ class ResearchExportTests(unittest.TestCase):
     def test_only_cmo1_owes_exclusion_rows_and_they_carry_the_new_args_kinds(self):
         model = self.model()
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(len(intervened), 222)
-        # cwd5 later added 21 ARGS-value rows of its own (CORRECTIONS 285); of the MUST tier, cmo1 still owns all 18.
-        args_rows = [row for row in intervened.values() if row["argsDeviation"] and row["batch"] != "cwd5"]
+        self.assertEqual(len(intervened), 268)
+        # cwd5, caw2 and cgw1 later added 21, 18 and 28 ARGS-value rows of their own (CORRECTIONS 285, 296); of the MUST tier,
+        # cmo1 still owns all 18.
+        args_rows = [row for row in intervened.values() if row["argsDeviation"] and row["batch"] not in ("cwd5", "caw2", "cgw1")]
         self.assertEqual(len(args_rows), 18)
         self.assertEqual({row["batch"] for row in args_rows}, {"cmo1"})
-        self.assertEqual({row["batch"] for row in intervened.values() if row["argsDeviation"]}, {"cmo1", "cwd5"})
+        self.assertEqual({row["batch"] for row in intervened.values() if row["argsDeviation"]}, {"cmo1", "cwd5", "caw2", "cgw1"})
         # cst1, cct1 and cmg1 own no exclusion row at all (CORRECTIONS 265.1, 266.1).
         self.assertFalse({row["batch"] for row in intervened.values()} & {"cst1", "cct1", "cmg1"})
         kinds = {row["arm"]: model.args_deviation(row["intervention"], row["witness"])[:3] for row in args_rows}
@@ -1366,13 +1368,13 @@ class ResearchExportTests(unittest.TestCase):
     def test_must_import_leaves_every_earlier_record_unchanged(self):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
-        self.assertEqual([r["id"] for r in register[-11:-7]], MUST_IDS)
+        self.assertEqual([r["id"] for r in register[-13:-9]], MUST_IDS)
         earlier = [r for r in register if r["id"] not in set(MUST_IDS)]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cmo1", "cst1", "cct1", "cmg1"} for r in earlier))
         for number in ["CORRECTIONS 264", "CORRECTIONS 265", "CORRECTIONS 266"]:
             self.assertFalse(any(number in r.get("sources", "") for r in earlier), number)
-        # cwd5 later added ARGS-value rows of its own (MT238); no record of or before the MUST tier gains any.
-        self.assertFalse(any(r.get("args_deviations") for r in earlier if r["id"] not in set(MECH6_IDS)))
+        # cwd5, caw2 and cgw1 later added ARGS-value rows of their own (MT238-MT240); no record of or before the MUST tier gains any.
+        self.assertFalse(any(r.get("args_deviations") for r in earlier if r["id"] not in set(MECH6_IDS) | set(MECH7_IDS)))
 
     # ---- MASTER-TABLE lines 232-235 (campaign commit 2972d48, CORRECTIONS 270-273: cvt10, cwd1, csv1, cwd2); row 229 amended ----
     def test_decay_mask_and_shadow_vote_are_known_kinds_and_a_three_kind_row_names_every_hold(self):
@@ -1488,7 +1490,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_the_four_batches_own_45_exclusion_rows_under_the_new_kinds(self):
         model = self.model()
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(len(intervened), 222)
+        self.assertEqual(len(intervened), 268)
         mine = [row for row in intervened.values() if row["batch"] in {"cvt10", "cwd1", "csv1", "cwd2"}]
         self.assertEqual(len(mine), 45)
         self.assertFalse(any(row["argsDeviation"] for row in mine))
@@ -1509,8 +1511,8 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual({row["arm"] for row in mine if row["intervention"].startswith("SHADOW_VOTE=")}, {"INERT", "SHADOWLOW", "NAIVELOW"})
         # The 126 rows of the earlier landings keep their marks and their count; cwd3 later added 12 of its own, cwd4 18
         # and cwd5 21. Of the ARGS-value rows, the 18 that existed at this landing are still cmo1's alone.
-        self.assertEqual(sum(row["argsDeviation"] and row["batch"] != "cwd5" for row in intervened.values()), 18)
-        self.assertEqual(sum(row["batch"] not in {"cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5"} for row in intervened.values()), 126)
+        self.assertEqual(sum(row["argsDeviation"] and row["batch"] not in ("cwd5", "caw2", "cgw1") for row in intervened.values()), 18)
+        self.assertEqual(sum(row["batch"] not in {"cvt10", "cwd1", "csv1", "cwd2", "cwd3", "cwd4", "cwd5", "caw2", "cgw1"} for row in intervened.values()), 126)
         with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
             pinned = model.MECH4_INTERVENTIONS_TSV_SHA256
             try:
@@ -1549,7 +1551,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_mech4_import_leaves_every_earlier_record_unchanged(self):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
-        self.assertEqual([r["id"] for r in register[-7:-3]], MECH4_IDS)
+        self.assertEqual([r["id"] for r in register[-9:-5]], MECH4_IDS)
         earlier = [r for r in register if r["id"] not in set(MECH4_IDS) and r["id"] != "MT229"]
         self.assertFalse(any(r.get("batches") and set(json.loads(r["batches"])) & {"cvt10", "cwd1", "csv1", "cwd2"} for r in earlier))
         for number in ["CORRECTIONS 270", "CORRECTIONS 271", "CORRECTIONS 272", "CORRECTIONS 273"]:
@@ -1609,7 +1611,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_cwd3_owns_12_decay_mask_rows_under_the_existing_kind_and_adds_no_multi_kind_row(self):
         model = self.model()
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(len(intervened), 222)
+        self.assertEqual(len(intervened), 268)
         mine = [row for row in intervened.values() if row["batch"] == "cwd3"]
         self.assertEqual(len(mine), 12)
         self.assertFalse(any(row["argsDeviation"] for row in mine))
@@ -1626,7 +1628,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertEqual(masked, {"CARWD0": "3", "CTLWD0": "3", "CTL2WD0": "2", "NWD": "20"})
         self.assertEqual(numels, {"CARWD0": "1536", "CTLWD0": "1536", "CTL2WD0": "1024", "NWD": "4800"})
         # The 210 rows of the other landings keep their count; the three k01 runs of cwd3 own no row.
-        self.assertEqual(sum(row["batch"] != "cwd3" for row in intervened.values()), 210)
+        self.assertEqual(sum(row["batch"] != "cwd3" for row in intervened.values()), 256)
         with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
             pinned = model.MECH5_INTERVENTIONS_TSV_SHA256
             try:
@@ -1639,7 +1641,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_mech5_import_leaves_every_earlier_record_unchanged_and_moves_no_outcome(self):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
-        self.assertEqual([r["id"] for r in register[-3:-2]], MECH5_IDS)
+        self.assertEqual([r["id"] for r in register[-5:-4]], MECH5_IDS)
         earlier = [r for r in register if r["id"] not in set(MECH5_IDS)]
         self.assertFalse(any(r.get("batches") and "cwd3" in set(json.loads(r["batches"])) for r in earlier))
         self.assertFalse(any("CORRECTIONS 278" in r.get("sources", "") for r in earlier))
@@ -1709,7 +1711,7 @@ class ResearchExportTests(unittest.TestCase):
     def test_cwd4_owns_18_decay_mask_rows_and_cwd5_owns_21_args_rows(self):
         model = self.model()
         intervened = model.intervened_runs(REPO)
-        self.assertEqual(len(intervened), 222)
+        self.assertEqual(len(intervened), 268)
         cwd4 = [row for row in intervened.values() if row["batch"] == "cwd4"]
         cwd5 = [row for row in intervened.values() if row["batch"] == "cwd5"]
         self.assertEqual((len(cwd4), len(cwd5)), (18, 21))
@@ -1737,7 +1739,7 @@ class ResearchExportTests(unittest.TestCase):
         self.assertTrue(all(model.args_extra_kinds(row["intervention"]) ==
                             [("DECAY_MASK", "layer4.0.bn2.weight+layer4.0.shortcut.1.weight+layer4.1.bn2.weight")] for row in two_axis))
         # The 183 rows of the earlier landings keep their count.
-        self.assertEqual(sum(row["batch"] not in ("cwd4", "cwd5") for row in intervened.values()), 183)
+        self.assertEqual(sum(row["batch"] not in ("cwd4", "cwd5", "caw2", "cgw1") for row in intervened.values()), 183)
         with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
             pinned = model.MECH6_INTERVENTIONS_TSV_SHA256
             try:
@@ -1774,12 +1776,151 @@ class ResearchExportTests(unittest.TestCase):
     def test_mech6_import_leaves_every_earlier_record_unchanged_and_moves_no_outcome(self):
         model = self.model()
         register = model.load_register(WORKSPACE, REPO)
-        self.assertEqual([r["id"] for r in register[-2:]], MECH6_IDS)
+        self.assertEqual([r["id"] for r in register[-4:-2]], MECH6_IDS)
         earlier = [r for r in register if r["id"] not in set(MECH6_IDS)]
         self.assertFalse(any(r.get("batches") and {"cwd4", "cwd5"} & set(json.loads(r["batches"])) for r in earlier))
         self.assertFalse(any("CORRECTIONS 283" in r.get("sources", "") or "CORRECTIONS 285" in r.get("sources", "") for r in earlier))
         # Neither landing amends a row, so no earlier record gains a further amendment and no outcome moves.
         self.assertFalse(any({283, 285} & {a["number"] for a in json.loads(r.get("further_amendments") or "[]")} for r in register))
+
+    # ---- CORRECTIONS 295-297 (campaign commit 8a99001): MASTER-TABLE lines 239-240, caw2 and cgw1 ----
+
+    @needs(_REPO)
+    def test_mech7_rows_come_from_the_pinned_landing_commit(self):
+        model = self.model()
+        lines, before = model.mech7_master_table(REPO), model.mech6_master_table(REPO)
+        self.assertEqual((len(before), len(lines)), (238, 240))
+        # ONE step: header line 3 recounted and two rows appended; no earlier row amended, line 5 untouched, no line moved.
+        self.assertEqual({n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}, {3})
+        rows = model.mech7_rows(lines)
+        self.assertEqual([(r["id"], r["section"], r["area"], r["outcome"], json.loads(r["batches"]), r["mapping_rule"], json.loads(r["figure_ids"]), r["corrected"]) for r in rows],
+                         [("MT239", "9", "Mechanism and isolation", "mixed", ["caw2"], "mixed", ["page-19"], ""),
+                          ("MT240", "10", "Count-matched partition audit", "unresolved", ["cgw1"], "open", ["page-8"], "")])
+        self.assertTrue(rows[0]["reason"].startswith("Verdict: NO-COLLAPSE-CONTROL-DOSE-NOT-REACHED + M-COLLAPSE+L-NOGAP+A-NOGAP+X-NOGAP+K-COLLAPSED + ATTR-BASE-PROTECTS + GATE-DOES-NOT-FIRE + "))
+        self.assertIn("(four branch words + 26 stamps) Mixed: NO-COLLAPSE-CONTROL-DOSE-NOT-REACHED: ", rows[0]["reason"])
+        self.assertTrue(rows[1]["reason"].startswith("Verdict: AUDIT-UNDECIDED + SCALAR-BEATS-BEST + W1-SURVIVES+W2-SURVIVES+W4-UNDECIDED + "))
+        self.assertIn("(three branch words + 7 stamps) Open: AUDIT-UNDECIDED: ", rows[1]["reason"])
+        # Both own ARGS-value exclusion rows and no patch-intervention row, and neither corrected any registration text.
+        self.assertEqual([bool(r.get("intervention")) for r in rows], [False, False])
+        self.assertEqual([bool(r.get("args_deviations")) for r in rows], [True, True])
+        self.assertEqual([json.loads(r.get("registration_corrections") or "[]") for r in rows], [[], []])
+        with self.assertRaisesRegex(ValueError, "does not match the pinned caw2/cgw1-landing bytes"):
+            pinned = model.MECH7_COMMIT
+            try:
+                model.MECH7_COMMIT = model.MECH6_COMMIT
+                model.mech7_master_table(REPO)
+            finally:
+                model.MECH7_COMMIT = pinned
+
+    @needs(_REPO)
+    def test_mech7_landing_appends_entries_286_to_297_below_the_cwd5_trailer(self):
+        model = self.model()
+        lines, before = model.mech7_corrections(REPO)
+        # docs/CORRECTIONS.md is append-only from the cwd5 landing's pin: every line above its closing trailer is unchanged,
+        # and entries 286-297 follow it in numeric order (289-291 were inserted before 292 while those tracks ran, which the
+        # final file shows in order). The file closes on a fresh "Next free number" trailer.
+        self.assertEqual((len(before), len(lines)), (37985, 39485))
+        self.assertEqual(lines[:len(before) - 1], before[:-1])
+        self.assertEqual(before[-1], "Next free number: **286**.")
+        self.assertEqual(lines[-1], "Next free number: **298**.")
+        self.assertEqual([line.split(".")[0] for line in lines[len(before) - 1:] if line.startswith("## ")],
+                         [f"## {n}" for n in range(286, 298)])
+        with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
+            pinned = model.MECH7_CORRECTIONS_SHA256
+            try:
+                model.MECH7_CORRECTIONS_SHA256 = model.MECH6_CORRECTIONS_SHA256
+                model.mech7_corrections(REPO)
+            finally:
+                model.MECH7_CORRECTIONS_SHA256 = pinned
+
+    @needs(_REPO)
+    def test_caw2_owns_18_args_rows_six_of_them_two_args_and_cgw1_owns_28(self):
+        model = self.model()
+        intervened = model.intervened_runs(REPO)
+        self.assertEqual(len(intervened), 268)
+        caw2 = [row for row in intervened.values() if row["batch"] == "caw2"]
+        cgw1 = [row for row in intervened.values() if row["batch"] == "cgw1"]
+        self.assertEqual((len(caw2), len(cgw1)), (18, 28))
+        self.assertTrue(all(row["argsDeviation"] for row in caw2 + cgw1))
+        # caw2: the AdamW base's own beta1 0.9 against the per-flag standard 0.99, and at the dose arm ALSO wd 1.0.
+        # The control and the meta swap (K01, MS, ML) run the standard 0.99 / 0.1 and own no row.
+        counts = {}
+        for row in caw2:
+            counts[row["arm"]] = counts.get(row["arm"], 0) + 1
+        self.assertEqual(counts, {"LS": 3, "LL": 3, "AS": 3, "AL": 3, "XS": 3, "XL": 3})
+        one = [row for row in caw2 if row["arm"][0] != "X"]
+        two = [row for row in caw2 if row["arm"][0] == "X"]
+        self.assertTrue(all(row["witness"] == "ARGS_MOMENTUM_BASE: momentum-param-base=0.9" and not model.args_extra_args(row["intervention"], row["witness"]) for row in one))
+        # The six TWO-ARGS rows (CORRECTIONS 294) are listed ONCE, by the dose arm's weight decay, with the momentum kind
+        # read from the intervention cell and registered for exactly these two arms.
+        self.assertTrue(all(row["witness"] == "ARGS_WD_BASE: weight-decay-base=1.0" for row in two))
+        self.assertTrue(all(row["intervention"] == "--momentum-param-base 0.9 + --weight-decay-base 1.0" for row in two))
+        self.assertTrue(all(model.args_extra_args(row["intervention"], row["witness"]) == [("ARGS_MOMENTUM_BASE", "momentum-param-base", "0.9")] for row in two))
+        self.assertTrue(all(model.args_extra_kinds(row["intervention"]) == [] for row in caw2))
+        self.assertEqual(sorted(model.MECH7_MULTI_ARGS), [("caw2", "XL"), ("caw2", "XS")])
+        # cgw1: one ARGS kind per run, the rung's weight decay; the twelve W1 runs at the standard 0.1 own none.
+        self.assertTrue(all(row["witness"].startswith("ARGS_WD_BASE: weight-decay-base=") for row in cgw1))
+        self.assertEqual(sorted(row["witness"].split("=")[1] for row in cgw1), ["1e-2"] * 12 + ["5e-4"] * 16)
+        self.assertFalse(any(row["arm"].endswith("W1") for row in cgw1))
+        # The 222 rows of the earlier landings keep their count.
+        self.assertEqual(sum(row["batch"] not in ("caw2", "cgw1") for row in intervened.values()), 222)
+        with self.assertRaisesRegex(ValueError, "does not match the pinned bytes"):
+            pinned = model.MECH7_INTERVENTIONS_TSV_SHA256
+            try:
+                model.MECH7_INTERVENTIONS_TSV_SHA256 = model.MECH6_INTERVENTIONS_TSV_SHA256
+                model.intervened_runs(REPO)
+            finally:
+                model.MECH7_INTERVENTIONS_TSV_SHA256 = pinned
+        # A two-ARGS row outside the registry stops the export, as CORRECTIONS 294's per-arm escape does on the campaign side.
+        registry = dict(model.MECH7_MULTI_ARGS)
+        try:
+            del model.MECH7_MULTI_ARGS[("caw2", "XL")]
+            with self.assertRaisesRegex(ValueError, "unregistered TWO-ARGS row"):
+                model.intervened_runs(REPO)
+        finally:
+            model.MECH7_MULTI_ARGS.clear()
+            model.MECH7_MULTI_ARGS.update(registry)
+
+    def test_a_two_args_row_is_read_on_both_args_axes_and_every_earlier_row_shape_is_unchanged(self):
+        model = self.model()
+        two_args = "--momentum-param-base 0.9 + --weight-decay-base 1.0"
+        by_wd = "ARGS_WD_BASE: weight-decay-base=1.0"
+        by_mom = "ARGS_MOMENTUM_BASE: momentum-param-base=0.9"
+        # Listed by either kind, the row reads its witness's kind and names the OTHER ARGS kind as a further axis.
+        self.assertEqual(model.args_deviation(two_args, by_wd), ("ARGS_WD_BASE", "weight-decay-base", "1.0", "0.1"))
+        self.assertEqual(model.args_extra_args(two_args, by_wd), [("ARGS_MOMENTUM_BASE", "momentum-param-base", "0.9")])
+        self.assertEqual(model.args_deviation(two_args, by_mom), ("ARGS_MOMENTUM_BASE", "momentum-param-base", "0.9", "0.99"))
+        self.assertEqual(model.args_extra_args(two_args, by_mom), [("ARGS_WD_BASE", "weight-decay-base", "1.0")])
+        self.assertEqual(model.args_extra_kinds(two_args), [])
+        # One-axis rows and CORRECTIONS 284's ARGS + patch rows keep exactly their earlier reading.
+        self.assertEqual(model.args_deviation("--weight-decay-base 1e-3", "ARGS_WD_BASE: weight-decay-base=1e-3"),
+                         ("ARGS_WD_BASE", "weight-decay-base", "1e-3", "0.1"))
+        self.assertEqual(model.args_extra_args("--weight-decay-base 1e-3", "ARGS_WD_BASE: weight-decay-base=1e-3"), [])
+        patch_row = "--weight-decay-base 1e-2 + DECAY_MASK=layer4.0.bn2.weight+layer4.1.bn2.weight"
+        self.assertEqual(model.args_extra_kinds(patch_row), [("DECAY_MASK", "layer4.0.bn2.weight+layer4.1.bn2.weight")])
+        self.assertEqual(model.args_extra_args(patch_row, "ARGS_WD_BASE: weight-decay-base=1e-2"), [])
+        # Malformed two-ARGS cells stop the export rather than being guessed.
+        with self.assertRaisesRegex(ValueError, "does not carry the witness's flag"):
+            model.args_deviation("--momentum-param-base 0.9 + --weight-decay-base 2.0", by_wd)
+        with self.assertRaisesRegex(ValueError, "further ARGS axis lists the standard value"):
+            model.args_deviation("--momentum-param-base 0.99 + --weight-decay-base 1.0", by_wd)
+        with self.assertRaisesRegex(ValueError, "names one ARGS flag twice"):
+            model.args_deviation("--weight-decay-base 0.5 + --weight-decay-base 1.0", by_wd)
+        with self.assertRaisesRegex(ValueError, "is not a registered ARGS-value flag"):
+            model.args_deviation("--momentum-param-meta 0.5 + --weight-decay-base 1.0", by_wd)
+        with self.assertRaisesRegex(ValueError, "must come before every patch axis"):
+            model.args_deviation("--weight-decay-base 1.0 + DECAY_MASK=a + --momentum-param-base 0.9", by_wd)
+
+    @needs(_WORKSPACE, _REPO)
+    def test_mech7_import_leaves_every_earlier_record_unchanged_and_moves_no_outcome(self):
+        model = self.model()
+        register = model.load_register(WORKSPACE, REPO)
+        self.assertEqual([r["id"] for r in register[-2:]], MECH7_IDS)
+        earlier = [r for r in register if r["id"] not in set(MECH7_IDS)]
+        self.assertFalse(any(r.get("batches") and {"caw2", "cgw1"} & set(json.loads(r["batches"])) for r in earlier))
+        self.assertFalse(any("CORRECTIONS 295" in r.get("sources", "") or "CORRECTIONS 296" in r.get("sources", "") for r in earlier))
+        # Neither landing amends a row, so no earlier record gains a further amendment and no outcome moves.
+        self.assertFalse(any({295, 296, 297} & {a["number"] for a in json.loads(r.get("further_amendments") or "[]")} for r in register))
 
 
 if __name__ == "__main__":

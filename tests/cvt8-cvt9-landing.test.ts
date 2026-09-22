@@ -25,7 +25,7 @@ const CVT9_FINAL = ['DOSE-GRADED', 'WINDOW-GRADED', 'HARNESS-CLEAN', 'PATCH-BITE
 
 test('MT226 (cvt8) and MT227 (cvt9) are both Mixed under the documented rules, with every FINAL token quoted', () => {
   assert.deepEqual(data.experiments.slice(162, 164).map(e => e.id), ['MT226', 'MT227'], 'appended in line order, before the MUST-tier rows MT228-MT231');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [175, 157, 18, 3316]);
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [177, 159, 18, 3383]);
   assert.equal(CVT8_FINAL.length, 21);
   assert.equal(CVT9_FINAL.length, 22);
   // Each reason opens with the row's returned branch words, as MT221 and MT223 did.
@@ -97,7 +97,7 @@ test('the intervention warnings name every intervened arm, every hold and the ex
 });
 
 test('the 42 runs link to MT226 / MT227 with sanitized logs; the 33 intervened runs are marked, each further hold with its own witness', () => {
-  assert.equal(runs.length, 3316);
+  assert.equal(runs.length, 3383);
   const GROUP = 'group step-size hold', REST = 'rest-group step-size hold', BETA = 'step-size hold', COMP = 'complement step-size hold', WINDOW = 'update-window hold';
   const batches: [string, string, string[], string, string, string[], Record<string, [number, string[], string[]]>][] = [
     ['cvt8', 'MT226', ['102', '103', '104'], 'ResNet18_c100', 'ISO', ['VOTE_W: off', 'BETA_HOLD: off', 'GROUP_HOLD: off', 'REST_HOLD: off'], {

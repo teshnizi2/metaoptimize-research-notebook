@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""cGW1_auditwd_score.py -- THE REGISTERED SCORER OF `cgw1` (CORRECTIONS 291; gate G3 of docs/ICML-PLAN.md).
+
+QUESTION.  Does the count-matched partition audit's headline -- uniform `chunk777` beats architecture-aligned
+`nodewise` at matched group count, SGDm pool +0.5556 +/- 0.0448 pp, every cell at alpha-scaled weight decay 0.1 --
+survive at the standard CIFAR weight decay 5e-4?  And does plain SCALAR tie the audit's best partition there?
+
+DESIGN (analysis/cgw1_design.py).  The audit's core SGDm cell verbatim (ResNet18 / CIFAR-10 / SGDm 0.99 + Lion
+0.99/0.9 / ms 1e-4 / alpha0 1e-3 / box -15:-2.3026 / 100 ep / AUGMENT=1 / PROBE=5) at three alpha-scaled weight
+decays -- W1 0.1 (the anchor, in batch), W2 1e-2, W4 5e-4 (PRIMARY) -- with FOUR grains at every rung: `ch` chunk777,
+`nd` nodewise, `k01` scalar, `kL` layerwise.  Seeds {152,153,154} at W1 and W2; {152..155} at W4.  40 runs.
+
+DOCUMENTED INVOCATION
+    python3 analysis/cGW1_auditwd_score.py <runsdir>          # runsdir = $WS/runs (or its cgw1/ subdirectory)
+    python3 analysis/cGW1_auditwd_score.py --selftest [--runsdir <dir>] [--csv <all_runs.csv>]
+EXIT  0 FINAL printed | 2 INCOMPLETE | 3 HARNESS-FAIL (a registered run is not the run the design says it is)
+
+EVERY READING IS WITHIN THIS BATCH.  Levels are plateau5 = mean TEST accuracy over epochs 95-99, read from each run's
+OWN raw `.out` epoch lines (never the CSV).  SIGMA_USED = max(the FROZEN prior, the in-batch pooled within-arm sd)
+(O2): the prior was read ONCE through corpus_exclusions.filter_rows on the 3,316-row corpus and is a literal here;
+the corpus line printed at run time is DISCLOSURE ONLY and enters no bar, sigma, level, state, contrast or stamp.
+The landed levels in cgw1_design.LANDED_W1 / SGDM_POOL_D feed ONE non-gating replication stamp and nothing else.
+
+THE REGISTERED DECISION (291.4).  Per rung r, D_r = plateau5(ch_r) - plateau5(nd_r), SE_r = SIGMA_USED *
+sqrt(1/n_ch + 1/n_nd).  Rung state, first match: DIVERGED (a ch/nd seed range > 2.0 pp) | UNHEALTHY (a ch/nd arm mean
+< 85.0) | BOXBOUND (a ch/nd run fails the published 5 % box gate, rec_lo or rec_hi >= 0.05 over its records) |
+REVERSES (D <= -0.15 and D < -2 SE) | VANISHES (D <= +0.15 AND D + 2 SE < +0.5556, i.e. the audit's own pooled effect
+is excluded -- added at 291.6 so a noisy rung cannot read VANISHES) | SURVIVES (D >= +0.30 and D > 2 SE) | UNDECIDED.
+PRIMARY FINAL, first match: ANCHOR-UNREADABLE (W1 DIVERGED/UNHEALTHY/BOXBOUND) -> ANCHOR-NOT-REPRODUCED (W1 VANISHES or
+REVERSES: the batch cannot see the audit effect at 0.1, so nothing it says at 5e-4 is about that effect) ->
+UNRESOLVED-<state>-W4 -> AUDIT-SURVIVES | AUDIT-VANISHES | AUDIT-REVERSES | AUDIT-UNDECIDED.
+SCALAR (co-reported), at W4: T_ch = k01 - ch, T_nd = k01 - nd, SE_T = SIGMA_USED * sqrt(2/4): SCALAR-DIVERGED |
+SCALAR-COLLAPSED (k01W4 < 85) | SCALAR-UNREADABLE (a comparator arm unhealthy or diverged) | SCALAR-BEATS-BEST (both
+T >= +0.30 and > 2 SE) | SCALAR-TIES-BEST (min T - 2 SE >= -0.30) | SCALAR-BELOW-BEST (min T <= -0.30 and < -2 SE) |
+SCALAR-UNRESOLVED.
+
+BOUNDS PRINTED ON EVERY FINAL: ONE-CELL, THREE-RUNGS, ALPHA-INDEPENDENT-DECAY-NOT-TESTED (the harness's decay is
+multiplied by the learned step size; nothing here is about decay that does not scale with alpha), and every
+VANISHES / TIES reading is a BOUND ("below the bar"), never a measured zero.
+"""
+import argparse
+import csv
+import glob
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import random
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+DEFAULT_CSV = os.path.join(REPO, "results", "all_runs.csv")
+
+
+def _load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+D = _load("cgw1_design", os.path.join(HERE, "cgw1_design.py"))
+PREFIX = D.PREFIX
+
+# ---- FROZEN noise floor (O2).  corpus_exclusions.filter_rows on results/all_runs.csv @ 3,316 rows (222 exclusion
+# ---- rows -> 3,094 kept); ResNet18 / CIFAR10 / 100 ep / aug 1 / clip -15:-2.3026 / ms 1e-4 / alpha0 1e-3 / bs 100,
+# ---- pooled within the 15-key cells, every granularity / base / meta at that cell. ---------------------------------
+SIGMA_PRIOR = 0.1789141365540324      # FILTERED; df 178, 34 cells, 212 rows
+SIGMA_PRIOR_DF = 178
+SIGMA_PRIOR_NAIVE = 0.1789141365540324   # UNFILTERED -- identical: no exclusion row touches this cell (disclosure)
+CORPUS_ROWS_AT_REG = 3316
+EXCL_ROWS_AT_REG = 222
+SE4 = 0.126511                        # SIGMA_PRIOR * sqrt(2/4), 6 d.p. (a 4 v 4 contrast at the prior)
+SE3 = 0.146083                        # SIGMA_PRIOR * sqrt(2/3), 6 d.p. (a 3 v 3 contrast at the prior)
+
+# ---- FROZEN bars (O2).  pp unless stated. ---------------------------------------------------------------------------
+SURV = 0.30          # the audit's own SURVIVES edge (bn1's band (+0.15, +0.30] was registered UNDECIDED, 108.6a)
+NULLBAR = 0.15       # the audit's own lower band edge; "vanishes" = at or below it -- a BOUND
+POOL_EXCLUDE = 0.5556  # VANISHES also needs D + 2 SE below the audit's SGDm pool (a frozen literal; 211.2)
+RES = 2.0            # a contrast is RESOLVED at |x| > 2 SE; 2 SE is a HALF-WIDTH, never a bound on an effect
+HEALTH_MIN = 85.0    # a ResNet18 / CIFAR-10 arm below this has failed as a run (the cell's arms sit at 91-93)
+DIVERGED = 2.0       # a seed range above this (~11 prior sigmas) is bimodal, not noise
+BOXFREE_MAX = 0.05   # the audit's PUBLISHED rec-based 5 % box gate (c97_rp1_score.BOXFREE_MAX), unchanged
+BOX_EPS = 1e-3       # c52_boxfree.EPS, unchanged
+MATCH = 0.50         # non-gating replication stamp: |D1 - pool| <= MATCH and |level - landed| <= MATCH
+PL_LO, PL_HI = 95, 99
+WIN_STEP = PL_LO * D.STEPS_PER_EPOCH      # 47,500: the plateau5 window's first meta step
+
+PRIMARY_TOKENS = ("AUDIT-SURVIVES", "AUDIT-VANISHES", "AUDIT-REVERSES", "AUDIT-UNDECIDED",
+                  "ANCHOR-UNREADABLE", "ANCHOR-NOT-REPRODUCED",
+                  "UNRESOLVED-DIVERGED-W4", "UNRESOLVED-UNHEALTHY-W4", "UNRESOLVED-BOXBOUND-W4")
+SCALAR_TOKENS = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST", "SCALAR-BELOW-BEST", "SCALAR-UNRESOLVED",
+                 "SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+RUNG_STATES = ("DIVERGED", "UNHEALTHY", "BOXBOUND", "REVERSES", "VANISHES", "SURVIVES", "UNDECIDED")
+BOUNDS = ("ONE-CELL", "THREE-RUNGS", "ALPHA-INDEPENDENT-DECAY-NOT-TESTED", "FLOOR-READINGS-ARE-BOUNDS")
+
+LICENCE = {
+    "AUDIT-SURVIVES": "at this ONE cell the uniform partition still beats the architecture-aligned one at matched count "
+                      "at alpha-scaled weight decay 5e-4 by at least the audit's own +0.30 pp bar, resolved at 2 SE: the "
+                      "headline is not an artefact of decay 0.1 HERE.  TMLR: add the 5e-4 row, keep the headline, "
+                      "disclose one cell.",
+    "AUDIT-VANISHES": "at 5e-4 the count-matched gap is at or below +0.15 pp -- a BOUND, not a measured zero -- while the "
+                      "in-batch anchor is above +0.15 at 0.1.  TMLR: the headline must be rewritten as a finding AT "
+                      "alpha-scaled decay 0.1, with this row in the same table; the pool may not be quoted without "
+                      "that qualifier.",
+    "AUDIT-REVERSES": "at 5e-4 the ALIGNED partition beats the uniform one, resolved.  TMLR: the audit's headline does not "
+                      "hold at standard decay; the paper must be reframed around the decay-dependence of the partition "
+                      "ranking (ICML-PLAN C2) and may not be submitted with its current abstract.",
+    "AUDIT-UNDECIDED": "D4 lies between the bars or is not resolved: report the interval; no seeds may be added after "
+                       "seeing it (108.6a); no survive / vanish sentence.",
+    "ANCHOR-UNREADABLE": "the in-batch anchor is diverged, unhealthy or box-bound; no rung is read.",
+    "ANCHOR-NOT-REPRODUCED": "the batch does not reproduce the audit effect at 0.1, so nothing it measures at 5e-4 is "
+                             "about that effect; report the levels only.",
+    "UNRESOLVED-DIVERGED-W4": "a primary-rung partition arm is bimodal; no reading at 5e-4.",
+    "UNRESOLVED-UNHEALTHY-W4": "a primary-rung partition arm failed as a run; itself a fact about 5e-4 in this cell.",
+    "UNRESOLVED-BOXBOUND-W4": "a primary-rung partition arm is box-bound (the gate that removed ar1 from the audit); "
+                              "the contrast is not an audit replication.  Itself a fact: at 5e-4 the step sizes reach "
+                              "the box.",
+    "SCALAR-BEATS-BEST": "plain scalar is ABOVE both audit partitions at 5e-4 by >= 0.30 pp, resolved: at standard "
+                         "decay, in this cell, no audited partition beats a single shared step size.",
+    "SCALAR-TIES-BEST": "plain scalar is at most 0.30 pp below the better audit partition at the 2 SE lower edge -- a "
+                        "BOUND: at standard decay, in this cell, the partition buys nothing a single shared step size "
+                        "does not already get; the audit's practical significance must be qualified in the draft.",
+    "SCALAR-BELOW-BEST": "plain scalar is resolved below an audit partition by >= 0.30 pp at 5e-4: partitioning still "
+                         "pays at standard decay in this cell.",
+    "SCALAR-UNRESOLVED": "the scalar comparison is not resolved against the 0.30 pp bar; report the interval.",
+    "SCALAR-DIVERGED": "the scalar arm at 5e-4 is bimodal; no scalar reading.",
+    "SCALAR-COLLAPSED": "plain scalar FAILS at 5e-4 in this cell (< 85 %) -- the opposite of cwd5's direction; report it.",
+    "SCALAR-UNREADABLE": "a comparator partition arm at 5e-4 is unhealthy or diverged; no scalar reading.",
+}
+
+EPTR_RE = re.compile(r"Epoch\s+(\d+),\s*Train Accuracy:\s*([0-9.]+|nan)\s*%,\s*Test Accuracy:\s*([0-9.]+|nan)")
+OUT_RE = re.compile(r"^%s-([A-Za-z0-9]+)-s(\d+)-(\d+)\.out$" % PREFIX)
+KIND_ON_RE = re.compile(r"^([A-Z][A-Z_]+): on\b")
+
+
+def mean(v):
+    return sum(v) / float(len(v))
+
+
+def sd(v):
+    if len(v) < 2:
+        return 0.0
+    m = mean(v)
+    return math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1))
+
+
+def file_sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+# =====================================================================================================================
+# THE DECISION (pure functions of numbers; the selftest drives them exhaustively)
+# =====================================================================================================================
+def rung_state(d, se, diverged, healthy, boxfree):
+    if diverged:
+        return "DIVERGED"
+    if not healthy:
+        return "UNHEALTHY"
+    if not boxfree:
+        return "BOXBOUND"
+    if d <= -NULLBAR and d < -RES * se:
+        return "REVERSES"
+    if d <= NULLBAR and d + RES * se < POOL_EXCLUDE:
+        return "VANISHES"
+    if d >= SURV and d > RES * se:
+        return "SURVIVES"
+    return "UNDECIDED"
+
+
+def primary_of(s1, s4):
+    if s1 in ("DIVERGED", "UNHEALTHY", "BOXBOUND"):
+        return "ANCHOR-UNREADABLE"
+    if s1 in ("VANISHES", "REVERSES"):
+        return "ANCHOR-NOT-REPRODUCED"
+    if s4 in ("DIVERGED", "UNHEALTHY", "BOXBOUND"):
+        return "UNRESOLVED-%s-W4" % s4
+    return "AUDIT-%s" % s4
+
+
+def scalar_of(k_level, k_div, cmp_ok, t_ch, t_nd, se):
+    if k_div:
+        return "SCALAR-DIVERGED"
+    if k_level < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not cmp_ok:
+        return "SCALAR-UNREADABLE"
+    tmin = min(t_ch, t_nd)
+    if t_ch >= SURV and t_nd >= SURV and t_ch > RES * se and t_nd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    if tmin - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "SCALAR-BELOW-BEST"
+    return "SCALAR-UNRESOLVED"
+
+
+def compose_sigma(sigma_in):
+    return (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sigma_in else (sigma_in, "SIGMA_INBATCH")
+
+
+def decide(A, sigma_used):
+    """A[arm] = dict(level, train, range, n, boxfree).  Returns (primary, scalar, states, keys)."""
+    states, keys = {}, {}
+    for r in D.RUNG_IDS:
+        ch, nd = A["ch" + r], A["nd" + r]
+        d = ch["level"] - nd["level"]
+        se = sigma_used * math.sqrt(1.0 / ch["n"] + 1.0 / nd["n"])
+        states[r] = rung_state(d, se, ch["range"] > DIVERGED or nd["range"] > DIVERGED,
+                               ch["level"] >= HEALTH_MIN and nd["level"] >= HEALTH_MIN,
+                               ch["boxfree"] and nd["boxfree"])
+        keys["D_" + r] = (d, se)
+        keys["DTRAIN_" + r] = ch["train"] - nd["train"]
+        k, L = A["k01" + r], A["kL" + r]
+        for g in ("ch", "nd"):
+            x = A[g + r]
+            keys["T%s_%s" % (g, r)] = (k["level"] - x["level"], sigma_used * math.sqrt(1.0 / k["n"] + 1.0 / x["n"]))
+        keys["G_" + r] = (L["level"] - k["level"], sigma_used * math.sqrt(1.0 / k["n"] + 1.0 / L["n"]))
+    primary = primary_of(states["W1"], states["W4"])
+    k4, c4, n4 = A["k01W4"], A["chW4"], A["ndW4"]
+    cmp_ok = (c4["level"] >= HEALTH_MIN and n4["level"] >= HEALTH_MIN and c4["range"] <= DIVERGED
+              and n4["range"] <= DIVERGED)
+    scal = scalar_of(k4["level"], k4["range"] > DIVERGED, cmp_ok, keys["Tch_W4"][0], keys["Tnd_W4"][0],
+                     keys["Tch_W4"][1])
+    d1, se1 = keys["D_W1"]
+    d4, se4 = keys["D_W4"]
+    keys["DD_W4"] = (d4 - d1, math.sqrt(se1 ** 2 + se4 ** 2))
+    d2, se2 = keys["D_W2"]
+    keys["DD_W2"] = (d2 - d1, math.sqrt(se1 ** 2 + se2 ** 2))
+    return primary, scal, states, keys
+
+
+# =====================================================================================================================
+# READING THE RUNS
+# =====================================================================================================================
+def parse_args_line(line):
+    """-> (pairs in order, repeated flags).  argparse semantics for this harness: every value is ONE token."""
+    toks = shlex.split(line[len("ARGS:"):])
+    pairs, seen, rep, i = [], set(), [], 0
+    while i < len(toks):
+        t = toks[i]
+        if not t.startswith("--"):
+            return None, ["stray token %r" % t]
+        if i + 1 >= len(toks) or toks[i + 1].startswith("--"):
+            return None, ["flag %s has no value" % t]
+        f = t[2:]
+        if f in seen:
+            rep.append(f)
+        seen.add(f)
+        pairs.append((f, toks[i + 1]))
+        i += 2
+    return pairs, rep
+
+
+def read_out(path):
+    L = open(path, errors="replace").read().splitlines()
+    info = dict(path=path, args=None, env=None, gpu=None, done=False, eps={}, kinds_on=[], node=None, pt=False)
+    for ln in L:
+        if ln.startswith("ARGS:") and info["args"] is None:
+            info["args"] = ln
+        elif ln.startswith("ENV:") and info["env"] is None:
+            info["env"] = ln
+        elif ln.startswith("NODE=") and info["node"] is None:
+            info["node"] = ln.split("|")[0].strip()
+        elif ln.startswith("NVIDIA") and info["gpu"] is None:
+            info["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            info["done"] = True
+        elif ln.startswith("PROBE_TENSOR:"):
+            info["pt"] = True
+        else:
+            m = EPTR_RE.search(ln)
+            if m:
+                info["eps"][int(m.group(1))] = (float(m.group(2)), float(m.group(3)))
+            k = KIND_ON_RE.match(ln)
+            if k:
+                info["kinds_on"].append(ln.strip())
+    info["complete"] = info["done"] and all(e in info["eps"] for e in range(D.EPOCHS))
+    return info
+
+
+def find_outs(runsdir):
+    out = []
+    for base in (runsdir, os.path.join(runsdir, PREFIX)):
+        out += glob.glob(os.path.join(base, "%s-*.out" % PREFIX))
+    return sorted(set(os.path.realpath(p) for p in out))
+
+
+def probe_path(runsdir, arm, seed):
+    for base in (os.path.join(runsdir, PREFIX), runsdir):
+        p = os.path.join(base, D.probe_dir_name(arm, seed), "probe.jsonl")
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def read_probe(path):
+    recs = []
+    for ln in open(path, errors="replace"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            recs.append(None)
+            continue
+        recs.append({k: r.get(k) for k in ("step", "n_beta", "beta_true_min", "beta_true_max", "n_at_lo", "n_at_hi")}
+                    if isinstance(r, dict) else None)
+    return recs
+
+
+def probe_audit(recs, m_want):
+    """-> (ok, why, occupancy dict).  G-STRUCT: 10,000 records at steps 0,5,..; n_beta == the arm's m on EVERY record."""
+    if recs is None:
+        return False, "no probe.jsonl", None
+    if len(recs) != D.N_RECORDS:
+        return False, "%d records, want %d" % (len(recs), D.N_RECORDS), None
+    if any(r is None for r in recs):
+        return False, "an unreadable record", None
+    steps = [r["step"] for r in recs]
+    if steps != list(range(0, D.N_RECORDS * D.PROBE, D.PROBE)):
+        return False, "record steps are not 0,5,...,%d" % ((D.N_RECORDS - 1) * D.PROBE), None
+    nb = set(r["n_beta"] for r in recs)
+    if nb != {m_want}:
+        return False, "n_beta %s != the arm's registered m %d (the grain is not what ARGS says)" % (sorted(nb)[:3], m_want), None
+    mins = [r["beta_true_min"] for r in recs]
+    maxs = [r["beta_true_max"] for r in recs]
+    if not (max(maxs) - min(mins) > 1e-9):
+        return False, "beta never moved", None
+    T = len(recs)
+    rec_lo = sum(1 for x in mins if x <= D.LO + BOX_EPS) / float(T)
+    rec_hi = sum(1 for x in maxs if x >= D.HI - BOX_EPS) / float(T)
+    win = [r for r in recs if r["step"] >= WIN_STEP]
+    tot = float(sum(r["n_beta"] for r in win))
+    have = all(r.get("n_at_lo") is not None and r.get("n_at_hi") is not None for r in win)
+    occ = dict(rec_lo=rec_lo, rec_hi=rec_hi,
+               coord_lo_win=(sum(r["n_at_lo"] for r in win) / tot) if have else None,
+               coord_hi_win=(sum(r["n_at_hi"] for r in win) / tot) if have else None,
+               beta_min_win=min(r["beta_true_min"] for r in win), beta_max_win=max(r["beta_true_max"] for r in win),
+               boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX))
+    return True, "", occ
+
+
+def read_corpus_disclosure(csvpath):
+    if not csvpath or not os.path.exists(csvpath):
+        return None
+    sys.path.insert(0, HERE)
+    try:
+        import corpus_exclusions as ce
+    finally:
+        sys.path.pop(0)
+    rows = [r for r in csv.DictReader(open(csvpath)) if not r.get("run", "").startswith(PREFIX + "-")]
+    return len(ce.filter_rows(rows))
+
+
+def resolve_prov(runsdir):
+    for p in (os.path.join(runsdir, PREFIX, "PROVENANCE.txt"), os.path.join(runsdir, "PROVENANCE.txt")):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+# =====================================================================================================================
+# SCORE
+# =====================================================================================================================
+def score(runsdir, csvpath=DEFAULT_CSV, out=print):
+    P = out
+    P("=" * 110)
+    P("cgw1 -- DOES THE COUNT-MATCHED PARTITION AUDIT SURVIVE AT STANDARD WEIGHT DECAY?  (CORRECTIONS 291; G3)")
+    P("scorer sha256 %s   design sha256 %s" % (file_sha(os.path.abspath(__file__)), file_sha(os.path.join(HERE, "cgw1_design.py"))))
+    P("runsdir %s" % runsdir)
+    P("=" * 110)
+    harness = []
+
+    def hfail(msg):
+        harness.append(msg)
+        P("  !!! HARNESS %s" % msg)
+
+    # ---- discover .out files --------------------------------------------------------------------------------------
+    found = {}
+    for p in find_outs(runsdir):
+        m = OUT_RE.match(os.path.basename(p))
+        if not m:
+            hfail("unparseable file name %s" % os.path.basename(p))
+            continue
+        arm, seed, jid = m.group(1), int(m.group(2)), int(m.group(3))
+        if arm not in D.ARMS or seed not in D.SEEDS[arm]:
+            hfail("a %s .out that is not a registered run: %s" % (PREFIX, os.path.basename(p)))
+            continue
+        found.setdefault((arm, seed), []).append((jid, p))
+    runs, missing, ignored = {}, [], []
+    for (arm, seed) in D.RUNS:
+        cands = [(jid, p, read_out(p)) for jid, p in sorted(found.get((arm, seed), []))]
+        comp = [c for c in cands if c[2]["complete"]]
+        ignored += [os.path.basename(c[1]) for c in cands if not c[2]["complete"]]
+        if not comp:
+            missing.append(D.run_name(arm, seed))
+        elif len(comp) > 1:
+            hfail("%s has %d COMPLETE .out files (%s) -- ambiguous" % (D.run_name(arm, seed), len(comp),
+                  ", ".join(os.path.basename(c[1]) for c in comp)))
+        else:
+            runs[(arm, seed)] = comp[0]
+    P("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(runs), D.NJOBS))
+    if ignored:
+        P("  ignored (incomplete, a complete twin or none): %s" % ", ".join(sorted(ignored)))
+    if missing:
+        P("  MISSING / INCOMPLETE: %s" % ", ".join(missing))
+
+    # ---- G-PROV --------------------------------------------------------------------------------------------------
+    prov = resolve_prov(runsdir)
+    if prov is None:
+        hfail("G-PROV: no PROVENANCE.txt under %s/%s" % (runsdir, PREFIX))
+    else:
+        kv = dict(ln.split(" ", 1) for ln in open(prov).read().splitlines() if " " in ln)
+        want = {"SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+                "DESIGN_SHA256": file_sha(os.path.join(HERE, "cgw1_design.py"))}
+        for k, v in sorted(want.items()):
+            if kv.get(k, "").strip() != v:
+                hfail("G-PROV: %s in %s is %r, the file that is running is %s" % (k, prov, kv.get(k), v[:16]))
+        P("G-PROV  %s  MODE %s  SCORER %s  DESIGN %s  HF %s" % (prov, kv.get("MODE", "?"), kv.get("SCORER_SHA256", "?")[:16],
+          kv.get("DESIGN_SHA256", "?")[:16], kv.get("HF_SHA256", "?")[:16]))
+        if kv.get("HF_SHA256", D.HF_LIVE_SHA).strip() != D.HF_LIVE_SHA:
+            hfail("G-PROV: HF_SHA256 is not the registered live HF %s" % D.HF_LIVE_SHA[:16])
+
+    # ---- per-run harness gates -----------------------------------------------------------------------------------
+    per = {}
+    gpus = {}
+    save_dirs = set()
+    for (arm, seed), (jid, path, info) in sorted(runs.items()):
+        rn = D.run_name(arm, seed)
+        if info["args"] is None:
+            hfail("G-ARGS %s: no ARGS line" % rn)
+            continue
+        pairs, rep = parse_args_line(info["args"])
+        if pairs is None or rep:
+            hfail("G-ARGS %s: %s" % (rn, rep))
+            continue
+        sd_ = dict(pairs).get("save-directory", "")
+        save_dirs.add(sd_)
+        want = D.expected_args(arm, seed, sd_)
+        if pairs != want:
+            diff = [(f, v, dict(want).get(f)) for f, v in pairs if dict(want).get(f) != v]
+            miss = [f for f, _v in want if f not in dict(pairs)]
+            hfail("G-ARGS %s: %d flags differ from the registered line %s missing %s"
+                  % (rn, len(diff), diff[:4], miss[:4]))
+            continue
+        pdir = os.path.join(sd_, D.probe_dir_name(arm, seed))
+        want_env = D.ENV_TEMPLATE.replace("<P>", pdir)
+        if info["env"] != want_env:
+            hfail("G-ENV %s: ENV line is not the registered one (%r)" % (rn, (info["env"] or "")[:160]))
+            continue
+        if info["kinds_on"] or info["pt"]:
+            hfail("G-KIND %s: prints a patch witness %s" % (rn, (info["kinds_on"] or ["PROBE_TENSOR"])[:2]))
+            continue
+        pp = probe_path(runsdir, arm, seed)
+        ok, why, occ = probe_audit(read_probe(pp) if pp else None, D.M_OF_ARM[arm])
+        if not ok:
+            hfail("G-STRUCT %s: %s" % (rn, why))
+            continue
+        eps = info["eps"]
+        per[(arm, seed)] = dict(level=mean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+                                train=mean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]), occ=occ, jid=jid)
+        gpus[info["gpu"]] = gpus.get(info["gpu"], 0) + 1
+    if len(save_dirs) > 1:
+        hfail("G-ARGS: the runs name %d different save directories %s" % (len(save_dirs), sorted(save_dirs)))
+    P("G-ARGS / G-ENV / G-KIND / G-STRUCT  %d of %d complete runs pass (20 flags each, the registered ENV line, no "
+      "patch witness, 10,000 probe records with n_beta == the arm's m)" % (len(per), len(runs)))
+    P("G-HW (DISCLOSURE ONLY, never a gate): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    n_corp = read_corpus_disclosure(csvpath)
+    P("corpus: %s  (DISCLOSURE ONLY -- enters no bar, sigma, level, state, contrast or stamp)"
+      % ("not readable" if n_corp is None else "%d rows after corpus_exclusions.filter_rows, %s- excluded" % (n_corp, PREFIX)))
+    if harness:
+        P("\nFINAL HARNESS-FAIL | %d harness failure(s); nothing is read" % len(harness))
+        return 3
+    if missing:
+        P("\nFINAL INCOMPLETE | %d of %d runs missing or incomplete; nothing is read" % (len(missing), D.NJOBS))
+        return 2
+
+    # ---- arm table --------------------------------------------------------------------------------------------------
+    A = {}
+    ss, df = 0.0, 0
+    P("\nARMS  plateau5 = mean TEST over epochs %d-%d from each run's OWN .out; box occupancy from its OWN probe.jsonl" % (PL_LO, PL_HI))
+    P("  %-6s %-4s %-6s %-9s %2s %9s %7s %7s %9s  %-8s %8s %8s %11s %11s" % ("arm", "rung", "wd", "grain", "n", "plateau5", "sd",
+      "range", "train5", "box", "rec_lo", "rec_hi", "coordlo_win", "coordhi_win"))
+    for a in D.ARMS:
+        xs = [per[(a, s)]["level"] for s in D.SEEDS[a]]
+        tr = [per[(a, s)]["train"] for s in D.SEEDS[a]]
+        occs = [per[(a, s)]["occ"] for s in D.SEEDS[a]]
+        bf = all(o["boxfree"] for o in occs)
+        m_ = mean(xs)
+        ss += sum((x - m_) ** 2 for x in xs)
+        df += len(xs) - 1
+        A[a] = dict(level=m_, train=mean(tr), range=max(xs) - min(xs), n=len(xs), boxfree=bf, sd=sd(xs), seeds=xs)
+        cl = [o["coord_lo_win"] for o in occs]
+        ch_ = [o["coord_hi_win"] for o in occs]
+        P("  %-6s %-4s %-6s %-9s %2d %9.4f %7.3f %7.3f %9.4f  %-8s %8.4f %8.4f %11s %11s" % (
+            a, D.RUNG_OF[a], D.WD[a], D.SPEC[a], len(xs), m_, A[a]["sd"], A[a]["range"], A[a]["train"],
+            "free" if bf else "BOUND", max(o["rec_lo"] for o in occs), max(o["rec_hi"] for o in occs),
+            "na" if None in cl else "%.6f" % max(cl), "na" if None in ch_ else "%.6f" % max(ch_)))
+    sig_in = math.sqrt(ss / df) if df else 0.0
+    sig, which = compose_sigma(sig_in)
+    P("\nSIGMA  O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    P("  SIGMA_PRIOR_frozen   %.6f  (df %d, filtered, literal)" % (SIGMA_PRIOR, SIGMA_PRIOR_DF))
+    P("  SIGMA_INBATCH        %.6f  (df %d, pooled within the 12 arms)" % (sig_in, df))
+    P("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+
+    primary, scal, states, K = decide(A, sig)
+    P("\nCONTRASTS (every one WITHIN a rung, IN BATCH; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    for r in D.RUNG_IDS:
+        d, se = K["D_" + r]
+        P("  D_%s  = ch%s - nd%s = %+.4f pp = %+.2f SE (SE %.6f)  [%+.4f, %+.4f]  TRAIN %+.4f   state %s"
+          % (r, r, r, d, d / se, se, d - RES * se, d + RES * se, K["DTRAIN_" + r], states[r]))
+    for k_ in ("DD_W2", "DD_W4"):
+        v, se = K[k_]
+        P("  %s = D_%s - D_W1 = %+.4f pp = %+.2f SE (SE %.6f)   DESCRIPTIVE" % (k_, k_[3:], v, v / se, se))
+    for r in D.RUNG_IDS:
+        for g in ("ch", "nd"):
+            v, se = K["T%s_%s" % (g, r)]
+            P("  T%s_%s = k01%s - %s%s = %+.4f pp = %+.2f SE%s" % (g, r, r, g, r, v, v / se,
+              "" if r == "W4" else "   DESCRIPTIVE"))
+    for r in D.RUNG_IDS:
+        v, se = K["G_" + r]
+        P("  G_%s  = kL%s - k01%s = %+.4f pp = %+.2f SE   DESCRIPTIVE (layerwise vs scalar in this cell)" % (r, r, r, v, v / se))
+    P("\nLADDERS (LEVELS, not effects; this cell only)")
+    for g in D.GRAIN_IDS:
+        P("  %-9s %s" % (D.SPEC_OF_GRAIN[g], " | ".join("%s %.4f" % (D.WD_TOKEN[r], A[g + r]["level"]) for r in D.RUNG_IDS)))
+
+    stamps = list(BOUNDS)
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    d1 = K["D_W1"][0]
+    stamps.append("ANCHOR-MATCHES-POOL" if abs(d1 - D.SGDM_POOL_D) <= MATCH else "ANCHOR-DIFFERS-FROM-POOL")
+    for g in D.GRAIN_IDS:
+        if abs(A[g + "W1"]["level"] - D.LANDED_W1[g]) > MATCH:
+            stamps.append("W1-LEVEL-DIFFERS-%s" % g)
+    if primary in ("AUDIT-SURVIVES", "AUDIT-REVERSES"):
+        stamps.append("TRAIN-AGREES" if (K["DTRAIN_W4"] > 0) == (K["D_W4"][0] > 0) else "TRAIN-DISAGREES")
+    g4, gse = K["G_W4"]
+    if g4 <= -SURV and g4 < -RES * gse:
+        stamps.append("LAYERWISE-BELOW-SCALAR-W4")
+    elif g4 >= SURV and g4 > RES * gse:
+        stamps.append("LAYERWISE-ABOVE-SCALAR-W4")
+    if not A["k01W4"]["boxfree"]:
+        stamps.append("SCALAR-W4-BOX-BOUND")
+    for a in D.ARMS:
+        if A[a]["range"] > DIVERGED:
+            stamps.append("DIVERGED-%s" % a)
+    stateword = "+".join("%s-%s" % (r, states[r]) for r in D.RUNG_IDS)
+    P("\nLICENCE (primary)  %s" % LICENCE[primary])
+    P("LICENCE (scalar)   %s" % LICENCE[scal])
+    P("\nFINAL %s | %s | %s | %s" % (primary, scal, stateword, " ".join(stamps)))
+    return 0
+
+
+# =====================================================================================================================
+# SELFTEST
+# =====================================================================================================================
+RESULTS = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+
+
+def chk(cond, label):
+    RESULTS["PASS" if cond else "FAIL"] += 1
+    print("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def skip(label):
+    RESULTS["SKIP"] += 1
+    print("  SKIP %s" % label)
+
+
+def _curve(level):
+    return [min(99.0, level * (1 - math.exp(-(e + 1) / 12.0))) for e in range(D.EPOCHS)]
+
+
+def _write_out(d, arm, seed, jid, level, save_dir, args_over=None, env_over=None, extra_line=None, done=True,
+               n_ep=D.EPOCHS, gpu="NVIDIA L4, 23034 MiB"):
+    rn = D.run_name(arm, seed)
+    pairs = D.expected_args(arm, seed, save_dir)
+    if args_over:
+        pairs = args_over(pairs)
+    args = "ARGS: " + " ".join("--%s %s" % kv for kv in pairs)
+    env = D.ENV_TEMPLATE.replace("<P>", os.path.join(save_dir, D.probe_dir_name(arm, seed)))
+    if env_over:
+        env = env_over(env)
+    c = _curve(level)
+    L = ["NODE=[HOST_2f2f29d9e1] | JOB=%s %d | AUGMENT=1" % (rn, jid), args, env, gpu, "",
+         "args_base includes unnecessary attributes {'normalizer_param'} ", ""]
+    if extra_line:
+        L.append(extra_line)
+    for e in range(n_ep):
+        te = level if e >= PL_LO - 5 else c[e]
+        L.append("Epoch %d, Train Accuracy: %.2f %%, Test Accuracy: %.2f %%" % (e, min(99.99, te + 5.0), te))
+    L.append("%d  minutes" % 50)
+    if done:
+        L.append("RUN_DONE")
+    open(os.path.join(d, "%s-%d.out" % (rn, jid)), "w").write("\n".join(L) + "\n")
+
+
+def _write_probe(pdir, m, lo=-8.0, hi=-5.0, n=D.N_RECORDS, nb=None, hi_frac=0.0):
+    os.makedirs(pdir, exist_ok=True)
+    with open(os.path.join(pdir, "probe.jsonl"), "w") as fh:
+        for i in range(n):
+            bmax = D.HI if i >= n * (1 - hi_frac) else hi + 1e-4 * (i % 7)
+            fh.write('{"step": %d, "beta_true_min": %.6f, "beta_true_max": %.6f, "n_beta": %d, "n_at_lo": 0, '
+                     '"n_at_hi": %d}\n' % (i * D.PROBE, lo - 1e-4 * (i % 5), bmax, nb if nb is not None else m,
+                                           1 if bmax >= D.HI else 0))
+
+
+JIT = {3: (0.0, 0.03, -0.03), 4: (0.02, 0.03, -0.03, -0.02)}   # zero-mean at both seed counts
+
+
+def _build(root, template, levels, save_dir="/SAVE/runs/cgw1", over=None, drop=(), extra=None, probe_over=None,
+           prov_over=None, jit=None):
+    """levels[arm] = mean plateau5.  over[(arm, seed)] = dict of _write_out kwargs.  Probe dirs are symlinked from the
+    template unless probe_over[(arm, seed)] gives _write_probe kwargs."""
+    os.makedirs(os.path.join(root, PREFIX), exist_ok=True)
+    jid = 7000000
+    for (arm, seed) in D.RUNS:
+        jid += 1
+        if (arm, seed) in drop:
+            continue
+        i = D.SEEDS[arm].index(seed)
+        lv = levels[arm] + (JIT[len(D.SEEDS[arm])][i] if jit is None else jit(arm, i))
+        kw = dict((over or {}).get((arm, seed), {}))
+        _write_out(os.path.join(root, PREFIX), arm, seed, jid, lv, save_dir, **kw)
+        dst = os.path.join(root, PREFIX, D.probe_dir_name(arm, seed))
+        if probe_over and (arm, seed) in probe_over:
+            _write_probe(dst, D.M_OF_ARM[arm], **probe_over[(arm, seed)])
+        else:
+            os.symlink(os.path.join(template, D.probe_dir_name(arm, seed)), dst)
+    for f in (extra or []):
+        f(os.path.join(root, PREFIX))
+    kv = {"MODE": "submit", "SCORER_SHA256": file_sha(os.path.abspath(__file__)),
+          "DESIGN_SHA256": file_sha(os.path.join(HERE, "cgw1_design.py")), "HF_SHA256": D.HF_LIVE_SHA}
+    kv.update(prov_over or {})
+    open(os.path.join(root, PREFIX, "PROVENANCE.txt"), "w").write("".join("%s %s\n" % x for x in kv.items()))
+    return root
+
+
+def _run(root, csvpath=None):
+    lines = []
+    rc = score(root, csvpath, out=lines.append)
+    lines = [x for ln in lines for x in ln.split("\n")]
+    fin = [ln for ln in lines if ln.startswith("FINAL ")]
+    return rc, (fin[0] if fin else ""), lines
+
+
+def _levels(w1=(92.56, 92.04, 92.26, 92.89), w2=(92.3, 91.8, 92.1, 92.4), w4=(91.8, 91.25, 91.6, 91.9)):
+    L = {}
+    for r, v in (("W1", w1), ("W2", w2), ("W4", w4)):
+        for g, x in zip(D.GRAIN_IDS, v):
+            L[g + r] = x
+    return L
+
+
+def selftest(csvpath, runsdir):
+    print("cgw1 SELFTEST -- the design, the frozen floor through corpus_exclusions.filter_rows, the decision tables with")
+    print("exhaustive reachability, and the REAL score() on synthetic runs (every account, every gate, the harness breaks).")
+    src = open(os.path.abspath(__file__)).read()
+    # ---- A: design --------------------------------------------------------------------------------------------------
+    print("\nA  DESIGN")
+    chk(D.NJOBS == 40 and len(D.ARMS) == 12, "A 12 arms, 40 runs (12 at W1, 12 at W2, 16 at W4)")
+    chk(sum(len(D.SEEDS[a]) for a in D.ARMS if D.RUNG_OF[a] == "W4") == 16, "A 16 runs at the primary rung (4 seeds x 4 grains)")
+    chk(all(set(D.SEEDS[a]) <= set(D.SEED_BLOCK) for a in D.ARMS) and set(D.UNUSED_SEEDS) == {156, 157, 158, 159},
+        "A every seed in the fresh block {152..159}; 156-159 unused")
+    chk(all(D.SEEDS["ch" + r] == D.SEEDS["nd" + r] == D.SEEDS["k01" + r] == D.SEEDS["kL" + r] for r in D.RUNG_IDS),
+        "A every grain at a rung shares that rung's seeds (all four grains IN BATCH at every rung)")
+    chk(D.WD_TOKEN == {"W1": "0.1", "W2": "1e-2", "W4": "5e-4"}, "A the three rung tokens are 0.1 / 1e-2 / 5e-4")
+    chk(D.N_EXCLUSION_ROWS == 28 and set(D.ARGS_DEVIATING) == set(a for a in D.ARMS if D.RUNG_OF[a] != "W1"),
+        "A 28 runs (W2 + W4) owe an ARGS_WD_BASE exclusion row; the 12 W1 runs owe none")
+    chk(D.M_OF_GRAIN == {"ch": 14421, "nd": 14420, "k01": 1, "kL": 62}, "A registered group counts 14421/14420/1/62")
+    chk(all(len(D.expected_args(a, s, "/x")) == 20 for a, s in D.RUNS), "A every expected ARGS line has 20 flags")
+    chk(all(" " not in v for a, s in D.RUNS for _f, v in D.expected_args(a, s, "/x")), "A every ARGS value is one token")
+    chk(abs(SIGMA_PRIOR * math.sqrt(2 / 4.0) - SE4) < 1e-6 and abs(SIGMA_PRIOR * math.sqrt(2 / 3.0) - SE3) < 1e-6,
+        "A SE4 / SE3 are SIGMA_PRIOR * sqrt(2/4) / sqrt(2/3)")
+    chk(POOL_EXCLUDE == D.SGDM_POOL_D, "A the frozen POOL_EXCLUDE bar is the landed SGDm pool literal +0.5556 (211.2)")
+    chk((SURV, NULLBAR, RES, HEALTH_MIN, DIVERGED, BOXFREE_MAX, MATCH) == (0.30, 0.15, 2.0, 85.0, 2.0, 0.05, 0.50),
+        "A the frozen bars: SURV 0.30 NULL 0.15 RES 2.0 HEALTH 85 DIVERGED 2.0 BOX 0.05 MATCH 0.50")
+    chk(all(compose_sigma(s)[0] == max(SIGMA_PRIOR, s) for s in (0.0, 0.1, SIGMA_PRIOR, 0.3, 2.0)),
+        "A SIGMA_USED == max(frozen floor, in-batch)")
+    dec_src = src[src.index("def rung_state("):src.index("# READING THE RUNS")]
+    chk("LANDED" not in dec_src and "SGDM_POOL" not in dec_src and "corpus" not in dec_src,
+        "A no landed level, design-module pool value or corpus figure enters the decision functions (O2, read from source; "
+        "POOL_EXCLUDE is a FROZEN BAR literal of this file, 291.6)")
+    sc_src = src[src.index("def score("):src.index("# SELFTEST")]
+    chk(sc_src.count("LANDED_W1") == 1 and sc_src.count("SGDM_POOL_D") == 1 and "ANCHOR-MATCHES-POOL" in sc_src,
+        "A the landed levels / pool are read ONCE each in score(), and only for non-gating stamps")
+    chk(all(t in LICENCE for t in PRIMARY_TOKENS + SCALAR_TOKENS), "A every token has a licence sentence")
+    chk(D.ENV_TEMPLATE.count("<P>") == 1 and "PROBE=5 " in D.ENV_TEMPLATE, "A ENV template: PROBE=5, one PROBE_DIR slot")
+
+    # ---- B: the floor ---------------------------------------------------------------------------------------------
+    print("\nB  THE FROZEN FLOOR, RE-DERIVED THROUGH corpus_exclusions.filter_rows")
+    if csvpath and os.path.exists(csvpath):
+        sys.path.insert(0, HERE)
+        import corpus_exclusions as ce
+        sys.path.pop(0)
+        rows = [r for r in csv.DictReader(open(csvpath)) if not r["run"].startswith(PREFIX + "-")]
+        CK = ["network", "dataset", "granularity", "base", "meta", "meta_stepsize", "alpha0", "gamma", "augment",
+              "beta_clip", "batch_size", "epochs_requested", "hier", "lam", "eta_ratio"]
+
+        def pooled(R):
+            cells = {}
+            for r in R:
+                if (r.get("superseded") == "0" and r.get("collapsed") == "0" and r.get("complete") == "1"
+                        and (r.get("plateau5") or "").strip() and r["network"] == D.NET and r["dataset"] == D.DSET
+                        and r["meta_stepsize"] == D.MST and r["alpha0"] in (D.A0, "0.001") and r["beta_clip"] == D.CLIP
+                        and r["epochs_requested"] == str(D.EPOCHS) and r["augment"] == D.AUG
+                        and r["batch_size"] == str(D.BATCH)):
+                    cells.setdefault(tuple(r[k] for k in CK), []).append(float(r["plateau5"]))
+            s2, df_, nc = 0.0, 0, 0
+            for v in cells.values():
+                if len(v) > 1:
+                    mm = mean(v)
+                    s2 += sum((x - mm) ** 2 for x in v)
+                    df_ += len(v) - 1
+                    nc += 1
+            return math.sqrt(s2 / df_), df_, nc
+        filt = ce.filter_rows(rows)
+        sF, dF, nF = pooled(filt)
+        sN, dN, _ = pooled(rows)
+        chk(abs(sF - SIGMA_PRIOR) < 1e-12 and dF == SIGMA_PRIOR_DF and nF == 34,
+            "B SIGMA_PRIOR: the FROZEN literal %r IS the FILTERED value (df %d, %d cells) on this corpus (%d rows)"
+            % (SIGMA_PRIOR, dF, nF, len(rows)))
+        chk(abs(sN - SIGMA_PRIOR_NAIVE) < 1e-12 and dN == dF,
+            "B the UNFILTERED value is identical (no exclusion row touches this cell) -- disclosure")
+        chk(len(filt) < len(rows), "B filter_rows drops rows on this corpus (%d -> %d): the filter is live" % (len(rows), len(filt)))
+    else:
+        skip("B no corpus at %s" % csvpath)
+
+    # ---- C: decision tables ------------------------------------------------------------------------------------------
+    print("\nC  THE DECISION, AT ITS BARS AND EXHAUSTIVELY")
+    se = SE4
+    chk(rung_state(0.30 + 1e-9, se, False, True, True) == "SURVIVES", "C D = +0.30 (> 2 SE) -> SURVIVES")
+    chk(rung_state(0.30 - 1e-9, se, False, True, True) == "UNDECIDED", "C D just below +0.30 -> UNDECIDED")
+    chk(rung_state(0.40, 0.25, False, True, True) == "UNDECIDED", "C D +0.40 with SE 0.25 (not > 2 SE) -> UNDECIDED")
+    chk(rung_state(0.15, se, False, True, True) == "VANISHES", "C D = +0.15 exactly -> VANISHES (at or below the bar)")
+    chk(rung_state(0.15 + 1e-9, se, False, True, True) == "UNDECIDED", "C D just above +0.15 -> UNDECIDED")
+    chk(rung_state(-0.15, 0.05, False, True, True) == "REVERSES", "C D = -0.15 with 2 SE < 0.15 -> REVERSES")
+    chk(rung_state(-0.20, 0.15, False, True, True) == "VANISHES", "C D -0.20 not resolved (SE 0.15) -> VANISHES, not REVERSES")
+    chk(rung_state(-0.14, 0.01, False, True, True) == "VANISHES", "C D -0.14 resolved but above -0.15 -> VANISHES")
+    chk(rung_state(0.10, 0.2276, False, True, True) == "VANISHES" and rung_state(0.10, 0.2279, False, True, True) == "UNDECIDED",
+        "C VANISHES needs D + 2 SE < +0.5556: D +0.10 at SE 0.2276 VANISHES, at SE 0.2279 is UNDECIDED (291.6)")
+    chk(rung_state(0.15, SE4, False, True, True) == "VANISHES", "C at the prior's 4 v 4 SE the pool-exclusion clause never binds for D <= +0.15")
+    chk(rung_state(0.9, se, True, True, True) == "DIVERGED" and rung_state(0.9, se, False, False, True) == "UNHEALTHY"
+        and rung_state(0.9, se, False, True, False) == "BOXBOUND", "C DIVERGED > UNHEALTHY > BOXBOUND > the D bands")
+    got = set()
+    for s1 in RUNG_STATES:
+        for s4 in RUNG_STATES:
+            got.add(primary_of(s1, s4))
+    chk(got == set(PRIMARY_TOKENS), "C EXHAUSTIVE: all 49 (W1, W4) state pairs map onto exactly the 9 registered primary tokens")
+    chk(primary_of("SURVIVES", "VANISHES") == "AUDIT-VANISHES" and primary_of("UNDECIDED", "SURVIVES") == "AUDIT-SURVIVES",
+        "C an UNDECIDED anchor still passes the anchor gate (D1 > +0.15)")
+    chk(primary_of("VANISHES", "SURVIVES") == "ANCHOR-NOT-REPRODUCED" and primary_of("BOXBOUND", "SURVIVES") == "ANCHOR-UNREADABLE",
+        "C the anchor gates precede every W4 reading")
+    chk(scalar_of(92.0, False, True, 0.31, 0.9, 0.1) == "SCALAR-BEATS-BEST", "C scalar +0.31 / +0.9 over both, > 2 SE -> BEATS")
+    chk(scalar_of(92.0, False, True, -0.30 + 2 * 0.1, 0.5, 0.1) == "SCALAR-TIES-BEST", "C min T - 2 SE == -0.30 -> TIES (edge)")
+    chk(scalar_of(92.0, False, True, -0.30 + 2 * 0.1 - 1e-9, 0.5, 0.1) == "SCALAR-UNRESOLVED", "C just below the tie edge, unresolved -> UNRESOLVED")
+    chk(scalar_of(92.0, False, True, -0.5, 0.2, 0.1) == "SCALAR-BELOW-BEST", "C min T -0.5 (< -2 SE) -> BELOW")
+    chk(scalar_of(92.0, False, True, 0.1, 0.9, 0.1) == "SCALAR-TIES-BEST", "C scalar above chunk by 0.1 (< 0.30) -> TIES, not BEATS")
+    chk(scalar_of(80.0, False, True, 0, 0, 0.1) == "SCALAR-COLLAPSED" and scalar_of(92, True, True, 0, 0, 0.1) == "SCALAR-DIVERGED"
+        and scalar_of(92, False, False, 0, 0, 0.1) == "SCALAR-UNREADABLE", "C the three scalar gates")
+    reach = set()
+    rng = random.Random(291)
+    for _ in range(20000):
+        t1, t2, s_ = rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5), rng.choice((0.02, 0.11, 0.3))
+        reach.add(scalar_of(rng.choice((70.0, 92.0, 92.0, 92.0)), rng.random() < 0.05, rng.random() > 0.05, t1, t2, s_))
+    chk(reach == set(SCALAR_TOKENS), "C every scalar token is reachable, and nothing else is (20,000 draws)")
+    # totality of decide()
+    tot = set()
+    for _ in range(3000):
+        A = {}
+        for a in D.ARMS:
+            A[a] = dict(level=rng.choice((rng.uniform(88, 94), rng.uniform(50, 94))), train=rng.uniform(90, 100),
+                        range=rng.choice((0.1, 0.3, 2.5)) if rng.random() < 0.1 else 0.2, n=len(D.SEEDS[a]),
+                        boxfree=rng.random() > 0.05)
+        p, s_, _st, _k = decide(A, rng.choice((SIGMA_PRIOR, 0.3)))
+        tot.add((p in PRIMARY_TOKENS) and (s_ in SCALAR_TOKENS))
+    chk(tot == {True}, "C TOTALITY: decide() returns a registered (primary, scalar) pair on 3,000 random arm tables")
+
+    # ---- E: the REAL score() on synthetic runs ------------------------------------------------------------------
+    print("\nE  THE REAL score() ON SYNTHETIC RUNS")
+    tmp = tempfile.mkdtemp(prefix="cgw1_selftest_")
+    try:
+        template = os.path.join(tmp, "template")
+        for (arm, seed) in D.RUNS:
+            _write_probe(os.path.join(template, D.probe_dir_name(arm, seed)), D.M_OF_ARM[arm])
+        n = [0]
+
+        def case(label, levels, want_rc, want, **kw):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, levels, **kw)
+            rc, fin, lines = _run(root, kw.get("csv"))
+            ok = rc == want_rc and all(w in fin for w in want) if want_rc == 0 else rc == want_rc
+            if want_rc != 0:
+                ok = ok and any(all(w in ln for w in want) for ln in lines)
+            if not chk(ok, "E %s -> rc %d %s" % (label, rc, fin[:150] if fin else [l for l in lines if "HARNESS" in l or "FINAL" in l][:1])):
+                print("\n".join("      | " + x for x in lines[-30:]))
+            return rc, fin, lines
+
+        base = _levels()
+        # the primary accounts
+        case("SURVIVES (D4 +0.55)", base, 0, ["FINAL AUDIT-SURVIVES", "W1-SURVIVES+W2-SURVIVES+W4-SURVIVES", "ANCHOR-MATCHES-POOL"])
+        case("VANISHES (D4 +0.05)", _levels(w4=(91.30, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-VANISHES"])
+        case("REVERSES (D4 -0.50)", _levels(w4=(90.75, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-REVERSES", "TRAIN-AGREES"])
+        case("UNDECIDED (D4 +0.22)", _levels(w4=(91.47, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-UNDECIDED"])
+        # near-bar (the exact bar edges are driven at the pure-function level in C; here the REAL score() sits one
+        # hundredth of a pp either side, because the .out files carry two decimals).  In-batch sigma < prior, so SE4 binds.
+        case("near-bar D4 = +0.31 -> SURVIVES", _levels(w4=(91.56, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-SURVIVES"])
+        case("near-bar D4 = +0.29 -> UNDECIDED", _levels(w4=(91.54, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-UNDECIDED"])
+        case("near-bar D4 = +0.14 -> VANISHES", _levels(w4=(91.39, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-VANISHES"])
+        case("near-bar D4 = +0.16 -> UNDECIDED", _levels(w4=(91.41, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-UNDECIDED"])
+        case("near-bar D4 = -0.26 (< -2 SE = -0.253) -> REVERSES", _levels(w4=(90.99, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-REVERSES"])
+        case("near-bar D4 = -0.24 (not < -2 SE) -> VANISHES", _levels(w4=(91.01, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-VANISHES"])
+        case("NOISY RUNG: D4 +0.05 but in-batch sigma ~0.43, so D + 2 SE > +0.5556 -> UNDECIDED, never VANISHES",
+             _levels(w4=(91.30, 91.25, 91.6, 91.9)), 0, ["FINAL AUDIT-UNDECIDED", "SIGMA-INBATCH"],
+             jit=lambda arm, i: {3: (0.4, -0.4, 0.0), 4: (0.4, -0.4, 0.4, -0.4)}[len(D.SEEDS[arm])][i])
+        # the scalar accounts
+        case("SCALAR-TIES-BEST (k01W4 = ch)", _levels(w4=(91.8, 91.25, 91.8, 91.9)), 0, ["| SCALAR-TIES-BEST |"])
+        case("SCALAR-BEATS-BEST (+0.5 over both)", _levels(w4=(91.8, 91.25, 92.3, 91.9)), 0, ["| SCALAR-BEATS-BEST |"])
+        case("SCALAR-BELOW-BEST (-0.6)", _levels(w4=(91.8, 91.25, 91.2, 91.9)), 0, ["| SCALAR-BELOW-BEST |"])
+        case("SCALAR-UNRESOLVED (-0.2)", _levels(w4=(91.8, 91.25, 91.6, 91.9)), 0, ["| SCALAR-UNRESOLVED |"])
+        case("SCALAR-COLLAPSED (k01W4 30)", _levels(w4=(91.8, 91.25, 30.0, 91.9)), 0, ["| SCALAR-COLLAPSED |", "FINAL AUDIT-SURVIVES"])
+        # the gates
+        case("ANCHOR-NOT-REPRODUCED (D1 +0.10)", _levels(w1=(92.14, 92.04, 92.26, 92.89)), 0, ["FINAL ANCHOR-NOT-REPRODUCED"])
+        case("ANCHOR-UNREADABLE (ndW1 unhealthy)", _levels(w1=(92.56, 60.0, 92.26, 92.89)), 0, ["FINAL ANCHOR-UNREADABLE"])
+        case("UNRESOLVED-UNHEALTHY-W4 (chW4 50)", _levels(w4=(50.0, 91.25, 91.6, 91.9)), 0,
+             ["FINAL UNRESOLVED-UNHEALTHY-W4", "| SCALAR-UNREADABLE |"])
+        case("UNRESOLVED-DIVERGED-W4 (a 3 pp seed on ndW4)", base, 0, ["FINAL UNRESOLVED-DIVERGED-W4", "DIVERGED-ndW4"],
+             jit=lambda arm, i: (3.0 if (arm == "ndW4" and i == 0) else JIT[len(D.SEEDS[arm])][i]))
+        case("UNRESOLVED-BOXBOUND-W4 (chW4 s155 at the ceiling on 10 % of records)", base, 0, ["FINAL UNRESOLVED-BOXBOUND-W4"],
+             probe_over={("chW4", 155): dict(hi_frac=0.10)})
+        case("box at 4 % of records is still FREE (the 5 % gate)", base, 0, ["FINAL AUDIT-SURVIVES"],
+             probe_over={("chW4", 155): dict(hi_frac=0.04)})
+        case("ANCHOR-UNREADABLE (ndW1 box-bound)", base, 0, ["FINAL ANCHOR-UNREADABLE"],
+             probe_over={("ndW1", 153): dict(hi_frac=0.2)})
+        case("scalar W4 box-bound is a STAMP, not a gate", _levels(w4=(91.8, 91.25, 91.8, 91.9)), 0,
+             ["| SCALAR-TIES-BEST |", "SCALAR-W4-BOX-BOUND"], probe_over={("k01W4", 152): dict(hi_frac=0.5)})
+        case("W1 level stamp: kLW1 1 pp off the landed level (non-gating)", _levels(w1=(92.56, 92.04, 92.26, 91.8)), 0,
+             ["FINAL AUDIT-SURVIVES", "W1-LEVEL-DIFFERS-kL"])
+        case("ANCHOR-DIFFERS-FROM-POOL stamp (D1 +1.2), non-gating", _levels(w1=(93.24, 92.04, 92.26, 92.89)), 0,
+             ["FINAL AUDIT-SURVIVES", "ANCHOR-DIFFERS-FROM-POOL"])
+        case("LAYERWISE-BELOW-SCALAR-W4 stamp", _levels(w4=(91.8, 91.25, 91.6, 90.9)), 0, ["LAYERWISE-BELOW-SCALAR-W4"])
+        case("SIGMA-INBATCH binds when the seeds are noisy", base, 0, ["SIGMA-INBATCH"],
+             jit=lambda arm, i: (0.0, 0.4, -0.4, 0.3, -0.3)[i])
+        # harness breaks
+        wd_break = lambda p: [(f, "1e-2" if f == "weight-decay-base" else v) for f, v in p]
+        case("HARNESS: chW4 s152 ran wd 1e-2 (another rung's token)", base, 3, ["G-ARGS", "cgw1-chW4-s152"],
+             over={("chW4", 152): dict(args_over=wd_break)})
+        case("HARNESS: kLW2 s153 ran at the anchor's 0.1", base, 3, ["G-ARGS", "cgw1-kLW2-s153"],
+             over={("kLW2", 153): dict(args_over=lambda p: [(f, "0.1" if f == "weight-decay-base" else v) for f, v in p])})
+        case("HARNESS: ndW4 s155 ran chunk777 (wrong grain)", base, 3, ["G-ARGS", "cgw1-ndW4-s155"],
+             over={("ndW4", 155): dict(args_over=lambda p: [(f, "chunk777" if f == "stepsize-groups" else v) for f, v in p])})
+        case("HARNESS: a repeated --alg-meta (the ml2 / sm3 bug)", base, 3, ["G-ARGS", "alg-meta"],
+             over={("chW1", 152): dict(args_over=lambda p: p + [("alg-meta", "Lion")])})
+        case("HARNESS: alpha0 1e-6 (the mechanism cell's)", base, 3, ["G-ARGS", "cgw1-k01W4-s154"],
+             over={("k01W4", 154): dict(args_over=lambda p: [(f, "1e-6" if f == "alpha0" else v) for f, v in p])})
+        case("HARNESS: ENV with BETA_CLIP -30:9.0", base, 3, ["G-ENV", "cgw1-ndW2-s152"],
+             over={("ndW2", 152): dict(env_over=lambda e: e.replace("-15:-2.3026", "-30:9.0"))})
+        case("HARNESS: ENV with PROBE=100", base, 3, ["G-ENV"],
+             over={("kLW1", 154): dict(env_over=lambda e: e.replace("PROBE=5 ", "PROBE=100 "))})
+        case("HARNESS: a DECAY_MASK: on witness", base, 3, ["G-KIND", "cgw1-chW2-s154"],
+             over={("chW2", 154): dict(extra_line="DECAY_MASK: on base=SGDm wd=0.01 spec=x")})
+        case("HARNESS: a PROBE_TENSOR line", base, 3, ["G-KIND"],
+             over={("chW2", 153): dict(extra_line="PROBE_TENSOR: on every=5 type=chunkwise")})
+        case("HARNESS: n_beta 14420 on a chunk777 run (grain != ARGS)", base, 3, ["G-STRUCT", "cgw1-chW4-s153", "n_beta"],
+             probe_over={("chW4", 153): dict(nb=14420)})
+        case("HARNESS: 9,999 probe records", base, 3, ["G-STRUCT", "records"], probe_over={("kLW4", 152): dict(n=9999)})
+        case("HARNESS: provenance names another scorer", base, 3, ["G-PROV", "SCORER_SHA256"], prov_over={"SCORER_SHA256": "0" * 64})
+        case("HARNESS: provenance names another HF", base, 3, ["G-PROV", "HF_SHA256"], prov_over={"HF_SHA256": "1" * 64})
+        case("HARNESS: an unregistered seed 157", base, 3, ["not a registered run"],
+             extra=[lambda d: _write_out(d, "chW1", 157, 8000001, 92.5, "/SAVE/runs/cgw1")])
+        case("HARNESS: two COMPLETE .out files for one run", base, 3, ["COMPLETE .out files"],
+             extra=[lambda d: _write_out(d, "ndW4", 154, 8000002, 91.2, "/SAVE/runs/cgw1")])
+        case("a TRUNCATED resubmission is ignored", base, 0, ["FINAL AUDIT-SURVIVES"],
+             extra=[lambda d: _write_out(d, "ndW4", 154, 8000003, 50.0, "/SAVE/runs/cgw1", n_ep=40, done=False)])
+        case("INCOMPLETE: one run dropped", base, 2, ["FINAL INCOMPLETE"], drop=(("kLW2", 152),))
+        case("INCOMPLETE: no RUN_DONE on one run", base, 2, ["FINAL INCOMPLETE"],
+             over={("k01W1", 153): dict(done=False)})
+        # O2: FINAL invariant to the corpus
+        fins = set()
+        for label, cp in (("real corpus", csvpath), ("no corpus", None), ("missing path", "/nonexistent.csv")):
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            rc, fin, _l = _run(root, cp)
+            fins.add((rc, fin))
+        if csvpath and os.path.exists(csvpath):
+            inv = os.path.join(tmp, "invented.csv")
+            rows = list(csv.DictReader(open(csvpath)))
+            with open(inv, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                for i in range(6):
+                    r = dict(rows[0])
+                    r.update(run="zzinv-%d" % i, job_id=str(9900000 + i), network=D.NET, dataset=D.DSET, granularity="chunk777",
+                             base="SGDm", meta="Lion", meta_stepsize=D.MST, alpha0=D.A0, gamma="1", augment="1",
+                             beta_clip=D.CLIP, batch_size="100", epochs_requested="100", hier="", lam="na",
+                             eta_ratio="na", superseded="0", collapsed="0", complete="1", plateau5=str(80 + 4 * i))
+                    w.writerow(r)
+            n[0] += 1
+            root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+            fins.add(_run(root, inv)[:2])
+            chk(len(fins) == 1 and list(fins)[0][1].startswith("FINAL AUDIT-SURVIVES"), "E O2: FINAL byte-identical on the real corpus, no corpus, a missing path and a corpus "
+                                "with invented rows at this cell (%s)" % list(fins)[0][1][:60])
+        else:
+            skip("E O2 invariance: no real corpus on this host")
+        # the documented one-argument invocation
+        n[0] += 1
+        root = _build(os.path.join(tmp, "c%03d" % n[0]), template, base)
+        p = subprocess.run([sys.executable, os.path.abspath(__file__), root], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(p.returncode == 0 and "FINAL AUDIT-SURVIVES" in p.stdout,
+            "E the DOCUMENTED one-argument invocation `cGW1_auditwd_score.py <runsdir>` reaches FINAL")
+        os.unlink(os.path.join(root, PREFIX, D.probe_dir_name("chW1", 152)))
+        chk(_run(root, None)[0] == 3, "E a missing probe directory -> HARNESS-FAIL rc 3")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- F: the real landed records read by the real probe audit ------------------------------------------------
+    print("\nF  THE PROBE AUDIT ON REAL LANDED RECORDS OF THIS EXACT CELL (gn1's BatchNorm arms: ResNet18 / CIFAR-10 / ms 1e-4 /")
+    print("   alpha0 1e-3 / box -15:-2.3026 / PROBE=5 / wd 0.1 -- two of the audit's SGDm pool runs)")
+    got_real = False
+    for base_ in ([runsdir] if runsdir else []) + ["/cluster/account_b/metaopt/runs"]:
+        pc = os.path.join(base_, "gn1", "probe_bn-ch_gn1_s0", "probe.jsonl")
+        pn = os.path.join(base_, "gn1", "probe_bn-node_gn1_s0", "probe.jsonl")
+        if os.path.exists(pc) and os.path.exists(pn):
+            got_real = True
+            rc_, rn_ = read_probe(pc), read_probe(pn)
+            okc, whyc, oc = probe_audit(rc_, 14421)
+            okn, whyn, on = probe_audit(rn_, 14420)
+            chk(okc and okn, "F landed gn1 bn-ch s0 (m 14421) and bn-node s0 (m 14420) pass G-STRUCT with their own m (%s %s)"
+                % (whyc, whyn))
+            chk(bool(oc and on and oc["boxfree"] and on["boxfree"]),
+                "F both are BOX-FREE under the published 5 %% gate (rec_lo %s / %s, rec_hi %s / %s) -- the audit's own reading"
+                % (oc and oc["rec_lo"], on and on["rec_lo"], oc and oc["rec_hi"], on and on["rec_hi"]))
+            ok2, why2, _o = probe_audit(rc_, 14420)
+            chk(not ok2 and "n_beta" in why2, "F the chunk777 records FAIL G-STRUCT when read as nodewise (%s)" % why2[:70])
+            ok3, why3, _o = probe_audit(rn_, 1)
+            chk(not ok3 and "n_beta" in why3, "F the nodewise records FAIL G-STRUCT when read as scalar")
+            break
+    if not got_real:
+        skip("F no landed gn1 probe records on this host")
+
+    # ---- G: the floor gate (164.6) on the registered predictions ---------------------------------------------
+    print("\nG  THE FLOOR GATE (164.6): every predicted arm level against chance, HEALTH_MIN and the ceiling")
+    worst_lo, worst_hi = 1e9, 1e9
+    for acc in D.ACCOUNTS:
+        for g, (lo, hi) in sorted(D.PRED_W4[acc].items()):
+            worst_lo = min(worst_lo, lo - HEALTH_MIN)
+            worst_hi = min(worst_hi, 100.0 - hi)
+            print("    %-26s %-4s W4 predicted [%.1f, %.1f]: %+.1f over chance %.0f, %+.1f over HEALTH_MIN, %.1f below 100"
+                  % (acc, g, lo, hi, lo - D.CHANCE, D.CHANCE, lo - HEALTH_MIN, 100.0 - hi))
+    chk(worst_lo >= 5.0 and worst_hi >= 7.0,
+        "G every predicted W4 level is >= 5 pp above HEALTH_MIN (min %.1f) and >= 7 pp below 100 (min %.1f): no account's D "
+        "is floor- or ceiling-bounded; the only route to a bounded D is an arm COLLAPSING, which UNHEALTHY / SCALAR-COLLAPSED "
+        "catch before any contrast is read" % (worst_lo, worst_hi))
+    chk(all(abs(D.LANDED_W1[g] - HEALTH_MIN) > 5.0 for g in D.GRAIN_IDS), "G the W1 prediction (landed level +/- 0.5) is clear of the gate")
+    chk(set(D.PRED_D4) == {"AUDIT-SURVIVES", "AUDIT-VANISHES", "AUDIT-REVERSES"} and D.PRED_D4["AUDIT-SURVIVES"][0] >= SURV
+        and D.PRED_D4["AUDIT-VANISHES"] == (-NULLBAR, NULLBAR) and D.PRED_D4["AUDIT-REVERSES"][1] <= -NULLBAR,
+        "G the predicted D4 bands are the scorer's own bars (SURVIVES >= +0.30, VANISHES within +/-0.15, REVERSES <= -0.15)")
+    chk(abs(sum(v for k, v in D.PRIOR_P.items() if k.startswith("AUDIT-")) - 1.0) < 1e-9, "G the four primary priors sum to 1")
+
+    print("\nSELFTEST %d PASS / %d FAIL / %d SKIP" % (RESULTS["PASS"], RESULTS["FAIL"], RESULTS["SKIP"]))
+    return 0 if RESULTS["FAIL"] == 0 else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runsdir", nargs="?")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--runsdir", dest="runsdir_opt")
+    ap.add_argument("--csv", default=DEFAULT_CSV)
+    a = ap.parse_args()
+    if a.selftest:
+        raise SystemExit(selftest(a.csv, a.runsdir_opt or a.runsdir))
+    if not a.runsdir:
+        ap.error("runsdir required")
+    raise SystemExit(score(a.runsdir, a.csv))
+
+
+if __name__ == "__main__":
+    main()

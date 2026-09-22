@@ -42,6 +42,11 @@ From the command line:
            witness and its ON kinds are registered in MULTI_KIND: the only listing both readers accept, since the
            completeness reader has that escape and the ARGS-value reader has none.  Each ON line is still held to
            its registered string, and the reverse listing still FAILs;
+           TWO-ARGS RUNS (CORRECTIONS 294): a run may deviate on TWO ARGS kinds at once -- caw2's XS / XL run the
+           AdamW base at `--momentum-param-base 0.9` AND the dose `--weight-decay-base 1.0`.  Such a run is listed
+           ONCE, by the ARGS witness of any one of its deviating kinds, and MULTI_ARGS registers the witness of EVERY
+           ARGS kind its (batch, arm) deviates on; each registered value is held to the run's own ARGS line, and a
+           two-ARGS run of an arm with no MULTI_ARGS entry still FAILs;
            then prints the noise-floor demonstration: the registered cvt1 sigmas (227.6) re-derived on
            the current corpus three ways -- as 227 did (every `cvt1-` row dropped), as a future
            registration should (only the listed rows dropped), and naively (nothing dropped).
@@ -258,6 +263,37 @@ ARGS_LINE_PREFIX = "ARGS:"   # jobs/run_cifar.sh echoes it on EVERY run, before 
 # `ARGS:` line; and an ARGS-kind name is followed by `_`, not `:`, so no `<KIND>: ...` line is read as an ARGS
 # line.  check() computes both and FAILs if an entry ever breaks them.
 #
+# ---- CORRECTIONS 294: TWO-ARGS RUNS -- two ARGS kinds deviating on the SAME run ---------------------------------
+# `caw2` (CORRECTIONS 290) swaps the base optimiser to AdamW, whose harness flags carry `--momentum-param-base 0.9`
+# (ARGS_MOMENTUM_BASE's non-standard value: the CSV `base` column says AdamW but no column carries the flag), and its
+# X cell runs that recipe at `--weight-decay-base 1.0`, a DOSE arm.  So XS / XL deviate on BOTH ARGS kinds, a TSV row
+# carries ONE witness, and the ARGS-value reader below FAILs a run that deviates on a kind its witness does not name
+# ("deviates on <KIND> but is listed with a <KIND> witness") -- 284.8's declared limit, owed by 290.9.
+#
+# THE RULE (the ARGS axis's counterpart of 245's MULTI_KIND): such a run is listed ONCE, by the ARGS witness of ANY one
+# of its deviating kinds, and MULTI_ARGS registers, for its (batch, arm), the witness of EVERY ARGS kind it deviates
+# on.  The ARGS-value reader then accepts the kinds the row does not carry ONLY for a registered (batch, arm) and ONLY
+# when the row is listed by an ARGS witness; the multi-ARGS block holds every registered witness to the run's OWN
+# `ARGS:` line and the registered kind SET to the run's own deviating set.  Nothing is weakened: an arm with no entry
+# still FAILs exactly as before (C26d / C38g), and the escape buys a stricter check on the kinds it covers.
+# An entry registers TWO OR MORE kinds (check() FAILs a smaller one) in `args_witness` form, verbatim value.
+#
+# Re-typed (NOT imported) from the registered design `analysis/caw2_design.py` (`args_pairs`: AdamW base
+# momentum-param-base "0.9"; ARM_TABLE: XS / XL wd token "1.0"; `args_deviating_kinds` names exactly XS / XL as the two-
+# kind arms).  tests/test_corpus_exclusions_check.py C39 pins these literals to that design; C37 / C38 run the rule.
+_CAW2_X_ARGS = {"ARGS_MOMENTUM_BASE": "ARGS_MOMENTUM_BASE: momentum-param-base=0.9",
+                "ARGS_WD_BASE": "ARGS_WD_BASE: weight-decay-base=1.0"}
+MULTI_ARGS = {
+    ("caw2", "XS"): dict(_CAW2_X_ARGS),
+    ("caw2", "XL"): dict(_CAW2_X_ARGS),
+}
+
+
+def multi_args_of(fn):
+    """-> the registered {ARGS kind: witness} of a `<batch>-<arm>-...` run name or .out file name, or None."""
+    return MULTI_ARGS.get(tuple(fn.split("-")[:2]))
+
+
 # SCOPE of the completeness check.  The standard values above are the MECHANISM LINE's cell (255.2: ResNet18_c100 /
 # PlainNet18_c100, CIFAR-100, 100 epochs, aug 1, clip -15:-2.3026, ms 1e-3, alpha0 1e-6, batch 100 -- `_pooled`'s
 # filter, re-typed as STD_CELL / STD_NETWORKS).  Older corpus batches outside that cell ran momentum 0.9 as THEIR
@@ -576,6 +612,10 @@ def check(runs_dirs):
                     if kd == ekd:
                         continue
                     if ent is not None:
+                        # CORRECTIONS 294: a registered two-ARGS (batch, arm) listed by an ARGS witness -- the other
+                        # kind is held to MULTI_ARGS in the multi-ARGS block below, not skipped
+                        if ekd in args_kind_names() and kd in (multi_args_of(fn) or {}):
+                            continue
                         bad.append("%s deviates on %s but is listed with a %s witness" % (fn, kd, ekd))
                     elif row is not None and in_standard_cell(row):
                         bad.append("%s is a CSV row in the standard cell whose ARGS deviates (%s) but is NOT listed"
@@ -615,6 +655,43 @@ def check(runs_dirs):
         print("  ARGS cell mixing (CORRECTIONS 263): %d cells hold an unlisted ingested run; none pools two different"
               " (%s) value sets: %s"
               % (len(cellvals), ", ".join(f for _k, f, _s in ARGS_KINDS), not mixed))
+        # ---- TWO-ARGS RUNS (CORRECTIONS 294) -----------------------------------------------------------------------
+        # A listed run of a MULTI_ARGS (batch, arm): its witness names one of the registered kinds, it deviates on
+        # EXACTLY the registered kinds, and each registered witness IS its own ARGS line's value.  Re-checked here
+        # independently of the reader above, so the line's verdict is a statement and not a label.
+        nb = len(bad)
+        n_ma = 0
+        for fn in sorted(listed):
+            reg = multi_args_of(fn)
+            if reg is None or fn not in outs:
+                continue
+            n_ma += 1
+            ekd = kind_of(listed[fn]["witness"])
+            dev = args_deviations(args_factors(outs[fn]) or {})
+            if ekd not in reg:
+                bad.append("%s is a two-ARGS run listed with a %s witness, not one of its registered ARGS kinds (%s)"
+                           % (fn, ekd, " / ".join(sorted(reg))))
+            if sorted(dev) != sorted(reg):
+                bad.append("%s is registered in MULTI_ARGS with %s but its own ARGS line deviates on %s (MULTI_ARGS)"
+                           % (fn, " / ".join(sorted(reg)), " / ".join(sorted(dev)) or "nothing"))
+            for kd in sorted(reg):
+                if dev.get(kd) != reg[kd]:
+                    bad.append("%s is registered with %r but its own ARGS line gives %r (MULTI_ARGS)"
+                               % (fn, reg[kd], dev.get(kd)))
+        print("  multi-ARGS runs (CORRECTIONS 294): %d listed runs deviate on two or more ARGS kinds at once; each is"
+              " listed ONCE by one of them and MULTI_ARGS registers ALL of them, every registered value equal to the"
+              " run's own ARGS line: %s" % (n_ma, len(bad) == nb))
+    # CORRECTIONS 294: MULTI_ARGS is well-formed -- two or more kinds per entry, each an `args_witness` of its own kind.
+    # Checked with or without --runs; it prints nothing and only FAILs.
+    aflag = dict((k, f) for k, f, _s in ARGS_KINDS)
+    for (mb, ma), reg in sorted(MULTI_ARGS.items()):
+        if len(reg) < 2:
+            bad.append("MULTI_ARGS entry %s/%s registers %d ARGS kind(s); an entry is for runs deviating on TWO or more"
+                       % (mb, ma, len(reg)))
+        for kd, w in sorted(reg.items()):
+            if kd not in aflag or kind_of(w) != kd or not w.startswith("%s: %s=" % (kd, aflag[kd])) \
+                    or w == "%s: %s=" % (kd, aflag[kd]):
+                bad.append("MULTI_ARGS entry %s/%s: %r is not a well-formed %s witness" % (mb, ma, w, kd))
     print("\nnoise-floor demonstration (227.6's definitions; cell = 15 CELLKEYS; complete, unsuperseded, std cell)")
     k = set(ks)
     variants = [("as 227 registered it: every cvt1- row dropped", [r for r in rows if not r["run"].startswith("cvt1-")]),
