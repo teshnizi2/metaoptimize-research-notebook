@@ -1,0 +1,594 @@
+"""STRUCTURE, LOUDNESS, ARITHMETIC, HYPERGRADIENT AND REALISED SHRINK OF PATCH_DECAYROUTE.  CORRECTIONS 305.
+
+Written BEFORE patches/patch_decayroute.py.  Sections:
+
+  R0  STRUCTURE (no torch): the post HF.py carries exactly the three registered regions; DELETING THEM REPRODUCES THE PRE
+      HF.py BYTE FOR BYTE; the twelve _dr_ methods sit, in order, right before check_required_attributes; the five
+      original base updates (SGD / SGDm / RMSProp / Lion / AdamW) are the registered text in pre AND post; every
+      pre-existing method is present, in order; a second application prints ALREADY_PATCHED and changes nothing; a
+      missing anchor is REFUSED with nothing written.
+  R1  THE PARSER (no torch; `_dr_parse` is lifted out of the post file by `ast` and run on a stub): the registered values
+      parse to the registered (mode, LAMBDA); 20 malformed values or premises raise ValueError.
+  --- the sections below need torch (skipped on the Mac, run inside the Slurm proof job on cluster_b) ---
+  R2  OFF IS INERT (CPU, float32): DECAY_ROUTE unset and empty -> ONE `DECAY_ROUTE: off` line, base_update NOT rebound,
+      `_dr_on` False, and 8 real HF.step()s (nonlinear loss, Lion meta, scalar AND layerwise) leave every weight, trace h,
+      base momentum and beta BITWISE the pre HF.py's, for all five base algorithms.
+  R3  EACH MODE CHANGES EXACTLY ITS TERM (bitwise, on --device; three successive updates from the same state, alpha a mix
+      of a numpy float32 scalar, 0-d tensors and per-row tensors, gamma 0.97):
+        shrink_only  w, base state BITWISE the unpatched update's; h == gamma*h0 - a*(u + wd*w0) and != the unpatched h
+        trace_only   w == w0 - a*u (!= unpatched); h == gamma*(1 - wd*a)*h0 - a*u; base state == unpatched
+        alpha_indep  w == w0 - LAMBDA*w0 - a*u (!= the unpatched update at wd 0); h == gamma*(1 - LAMBDA)*h0 - a*u;
+                     base state == unpatched; LAMBDA reaches the update BITWISE (5e-05 vs 7e-05 give different w, each
+                     equal to its own formula); the witness line carries repr(float(LAMBDA))
+  R4  THE HYPERGRADIENT (CPU, float64, a linear loss so that the harness's Hessian-free trace is EXACT): h_T against the
+      central finite difference dw_T/dbeta over T = 20 real HF.step()s, for all five base algorithms:
+        OFF (alpha-scaled, wd 0.2) and alpha_indep:0.02   rel err < 1e-7      (the trace IS the hypergradient)
+        two WRONG alpha_indep traces (factor dropped; decay put in delta)      rel err > 1e-3 (the check discriminates)
+        shrink_only / trace_only: rel err > 1e-3 (they are INTERVENTIONS on the trace, not its derivative), and the
+        correct trace of each one's weight update (alpha-scaled; no decay) recomputed here matches FD < 1e-7.
+  R5  REALISED SHRINK IN THE PROBE RECORD (CPU, float64, PROBE=1): every record carries dr_mode / dr_lam / dr_n (==
+      step + 2) and the MEASURED per-step shrink sum<w0 - a*u - w1, w0> / sum ||w0||^2:
+        alpha_indep == LAMBDA (rel 1e-9); trace_only == 0 (abs 1e-12); shrink_only == wd*a (rel 1e-9, scalar grain);
+        dr_shrink_applied and dr_trace_decay == their registered values.
+  R6  (only with --device cuda) the REALISED SHRINK ON THE GPU, float32, the live ResNet18's 62 tensor shapes:
+        alpha_indep:5e-05 measured == 5e-05 within rel 1e-3.
+
+  python3 tests/test_decayroute.py --pre <HF.py.pre_decayroute> --post <HF.py> [--structural-only] [--device cpu|cuda]
+      [--cifar-dir <tree>]   (the tree whose build_network gives R6 its shapes)
+"""
+import argparse
+import ast
+import contextlib
+import copy
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+PATCH = os.path.join(REPO, "patches", "patch_decayroute.py")
+FAILED = []
+NPASS = [0]
+
+R1 = "        self._dr_init()  # PATCH_DECAYROUTE\n"
+R2 = ("        # --- PATCH_DECAYROUTE ---\n"
+      "        if getattr(self, '_dr_on', False):\n"
+      "            self._dr_attach(rec)\n"
+      "        # --- end PATCH_DECAYROUTE ---\n")
+R3_HEAD = "    # ------------------------------------------------------ PATCH_DECAYROUTE\n"
+R3_TAIL = "    # -------------------------------------------------- end PATCH_DECAYROUTE\n\n"
+A1 = "        self.trace_meta = [0.0 for _ in  range(self.len_beta_list)]\n"
+A2 = "        self._pt_attach(rec)  # PATCH_PROBE_TENSOR\n"
+A3 = "    def check_required_attributes("
+METHODS = ["_dr_parse", "_dr_init", "_dr_meas_begin", "_dr_meas_add", "_dr_meas_end", "_dr_core",
+           "_dr_SGD_base_update", "_dr_SGDm_base_update", "_dr_RMSProp_base_update", "_dr_Lion_base_update",
+           "_dr_AdamW_base_update", "_dr_attach"]
+ORIG = {
+    "SGD": ("    def SGD_base_update(self,net,g):\n"
+            "        for w, grad, a ,i in zip(net.parameters(), g, self.alpha, range(self.num_layers)):\n"
+            "            delta_w = a * (grad + self.args_base['weight_decay']*w.data)\n"
+            "            w.data = w.data - delta_w\n"
+            "            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta_w\n"),
+    "SGDm": ("    def SGDm_base_update(self,net,g):\n"
+             "        #Base update\n"
+             "        for w, grad, a ,i in zip(net.parameters(), g, self.alpha, range(self.num_layers)):\n"
+             "            delta = a * (self.momentum_base[i] + self.args_base['weight_decay']*w.data)\n"
+             "            w.data = w.data - delta\n"
+             "            self.momentum_base[i] = self.args_base['momentum_param']*self.momentum_base[i] + (1 - self.args_base['momentum_param'])*grad\n"
+             "            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta\n"),
+    "RMSProp": ("    def RMSProp_base_update(self,net,g):\n"
+                "        self.lambda_base_t *= self.args_base['normalizer_param']\n"
+                "        mu_base = (1-self.args_base['normalizer_param'])/(1-self.lambda_base_t)\n"
+                "        self.trace_base = [self.args_base['normalizer_param']*self.trace_base[i] + g[i]**2 for i in range(self.num_layers)]\n"
+                "        for w, grad, a, tr_ ,i in zip(net.parameters(), g, self.alpha, self.trace_base, range(self.num_layers)):\n"
+                "            delta_w = a * (torch.div(grad, (mu_base*tr_+self.epsilon)**.5) + self.args_base['weight_decay']*w.data)\n"
+                "            w.data = w.data - delta_w\n"
+                "            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta_w\n"),
+    "Lion": ("    def Lion_base_update(self,net,g):\n"
+             "        delta_w = []\n"
+             "        for w, grad, a, moment, i in zip(net.parameters(), g, self.alpha, self.momentum_base, range(self.num_layers)):\n"
+             "            delta_w = a * (torch.sign(self.args_base['Lion_beta2'] * moment + (1-self.args_base['Lion_beta2'])*grad) + self.args_base['weight_decay'] * w.data)\n"
+             "            w.data = w.data -  delta_w\n"
+             "            self.momentum_base[i] = self.args_base['momentum_param'] * moment + (1-self.args_base['momentum_param'])*grad\n"
+             "            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta_w\n"),
+    "AdamW": ("    def AdamW_base_update(self,net,g):\n"
+              "        self.lambda_base_t *= self.args_base['normalizer_param']\n"
+              "        mu_base = (1-self.args_base['normalizer_param'])/(1-self.lambda_base_t)\n"
+              "        self.momentum_base = [self.args_base['momentum_param']*self.momentum_base[i] + g[i] for i in range(self.num_layers)]\n"
+              "        self.trace_base = [self.args_base['normalizer_param']*self.trace_base[i] + g[i]**2 for i in range(self.num_layers)]\n"
+              "        for w, m, a, tr_ ,i in zip(net.parameters(), self.momentum_base, self.alpha, self.trace_base, range(self.num_layers)):\n"
+              "            delta_w = a * (torch.div(m, (mu_base*tr_+self.epsilon)**.5) + self.args_base['weight_decay']*w.data)\n"
+              "            w.data = w.data - delta_w\n"
+              "            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta_w\n"),
+}
+ALGS = ["SGD", "SGDm", "RMSProp", "Lion", "AdamW"]
+
+
+def chk(cond, label, extra=""):
+    print("  %-4s %s%s" % ("PASS" if cond else "FAIL", label, ("   " + extra) if extra else ""))
+    if cond:
+        NPASS[0] += 1
+    else:
+        FAILED.append(label)
+    return bool(cond)
+
+
+# ------------------------------------------------------------------------------------------------ R0 structure
+def strip_regions(post):
+    s = post.replace(R1, "", 1).replace(R2, "", 1)
+    i, j = s.find(R3_HEAD), s.find(R3_TAIL)
+    if i < 0 or j < 0:
+        return None
+    return s[:i] + s[j + len(R3_TAIL):]
+
+
+def structure(pre, post, pre_path):
+    print("R0 STRUCTURE")
+    chk("PATCH_DECAYROUTE" not in pre and "_dr_" not in pre and "DECAY_ROUTE" not in pre,
+        "R0 the pre file carries no PATCH_DECAYROUTE / _dr_ / DECAY_ROUTE")
+    chk(post.count(R1) == 1, "R0 region 1 (the _dr_init call) present once")
+    chk(post.count(R2) == 1, "R0 region 2 (the guarded _dr_attach) present once")
+    i3, j3 = post.find(R3_HEAD), post.find(R3_TAIL)
+    chk(i3 > 0 and j3 > i3 and post.count(R3_HEAD) == 1 and post.count(R3_TAIL) == 1, "R0 region 3 (the method block) present once")
+    if FAILED:
+        return
+    chk(post.index(R1) + len(R1) == post.index(A1), "R0 region 1 sits IMMEDIATELY before `self.trace_meta = ...` in init_meta")
+    chk(post.index(R2) + len(R2) == post.index(A2), "R0 region 2 sits IMMEDIATELY before `self._pt_attach(rec)  # PATCH_PROBE_TENSOR`")
+    chk(j3 + len(R3_TAIL) == post.index(A3), "R0 region 3 sits IMMEDIATELY before check_required_attributes")
+    st = strip_regions(post)
+    chk(st == pre, "R0 DELETING THE THREE REGIONS REPRODUCES THE PRE HF.py BYTE FOR BYTE", "%d vs %d bytes" % (len(st or ""), len(pre)))
+    block = post[i3:j3]
+    meths = re.findall(r"^    def (\w+)\(", block, re.M)
+    chk(meths == METHODS, "R0 the block defines exactly the %d _dr_ methods, in order" % len(METHODS), str(meths))
+    pm = re.findall(r"^    def (\w+)\(", pre, re.M)
+    qm = [m for m in re.findall(r"^    def (\w+)\(", post, re.M) if not m.startswith("_dr_")]
+    chk(pm == qm, "R0 every pre-existing method present, in order (%d)" % len(pm))
+    for alg in ALGS:
+        chk(pre.count(ORIG[alg]) == 1 and post.count(ORIG[alg]) == 1, "R0 %s_base_update is the registered text in pre AND post" % alg)
+    chk(block.count("self.base_update = ") == 1, "R0 the block rebinds base_update in exactly one place")
+    chk("self.args_base['weight_decay'] =" not in block and "self.alpha =" not in block and "self.beta" not in block,
+        "R0 the block never assigns weight_decay or alpha and never touches beta")
+    # the shrink_only delta is the original expression, verbatim
+    core = block[block.index("    def _dr_core("):block.index("    def _dr_SGD_base_update(")]
+    chk(core.count("            delta = a * (u + self.args_base['weight_decay']*w.data)\n") == 1
+        and core.count("            self.h_condenced[i] = self.gamma*self.h_condenced[i] - delta\n") == 1
+        and core.count("            self.h_condenced[i] = self.gamma*(1-self.args_base['weight_decay']*a)*self.h_condenced[i] - delta\n") == 1
+        and core.count("            w.data = w.data - self._dr_lam*w.data - delta\n") == 1
+        and core.count("            self.h_condenced[i] = self.gamma*(1-self._dr_lam)*self.h_condenced[i] - delta\n") == 1,
+        "R0 _dr_core carries the six registered weight / trace lines")
+    # idempotence and refusal, on scratch copies
+    td = tempfile.mkdtemp(prefix="dr_r0_")
+    try:
+        p2 = os.path.join(td, "HF.py")
+        open(p2, "w").write(post)
+        r = subprocess.run([sys.executable, PATCH], env=dict(os.environ, HF_PATH=p2), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(r.returncode == 0 and r.stdout.strip().endswith("ALREADY_PATCHED") and open(p2).read() == post,
+            "R0 a second application prints ALREADY_PATCHED and changes nothing", r.stdout.strip()[-60:])
+        for anc, lab in ((A1, "anchor 1"), (A2, "anchor 2"), (A3, "anchor 3")):
+            k = anc.strip()[:4]
+            bad = pre.replace(anc, anc.replace(k, k.upper(), 1), 1)
+            p3 = os.path.join(td, "HF_bad.py")
+            open(p3, "w").write(bad)
+            r = subprocess.run([sys.executable, PATCH], env=dict(os.environ, HF_PATH=p3), stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, universal_newlines=True)
+            chk(bad != pre and r.returncode != 0 and open(p3).read() == bad and not os.path.exists(p3 + ".pre_decayroute"),
+                "R0 a missing %s is REFUSED, nothing written" % lab)
+        p4 = os.path.join(td, "HF_fresh.py")
+        shutil.copyfile(pre_path, p4)
+        r = subprocess.run([sys.executable, PATCH], env=dict(os.environ, HF_PATH=p4), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True)
+        chk(r.returncode == 0 and open(p4).read() == post and open(p4 + ".pre_decayroute").read() == pre,
+            "R0 applying the patch to the pre bytes reproduces the post bytes; the backup == the pre bytes")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+# ------------------------------------------------------------------------------------------------ R1 parser
+def lift_parser(post):
+    tree = ast.parse(post)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_dr_parse":
+            src = textwrap.dedent(ast.get_source_segment(post, node))
+            ns = {}
+            exec(compile(src, "<_dr_parse>", "exec"), ns)
+            return ns["_dr_parse"]
+    return None
+
+
+def parser_tests(post):
+    print("R1 THE PARSER (lifted from the post file)")
+    P = lift_parser(post)
+    if not chk(P is not None, "R1 _dr_parse found in the post file"):
+        return
+    SGDm1 = {"alg": "SGDm", "weight_decay": 0.1, "momentum_param": 0.99}
+    SGDm0 = {"alg": "SGDm", "weight_decay": 0.0, "momentum_param": 0.99}
+    good = [("shrink_only", SGDm1, "", ("shrink_only", None)),
+            ("trace_only", SGDm1, "", ("trace_only", None)),
+            ("shrink_only", {"alg": "AdamW", "weight_decay": 5e-4}, "cosine", ("shrink_only", None)),
+            ("alpha_indep:5e-05", SGDm0, "", ("alpha_indep", 5e-05)),
+            ("alpha_indep:5e-5", SGDm0, "", ("alpha_indep", 5e-05)),
+            ("alpha_indep:0.001", {"alg": "Lion", "weight_decay": 0}, "", ("alpha_indep", 0.001)),
+            ("alpha_indep:1e-4", {"alg": "RMSProp", "weight_decay": 0.0}, "", ("alpha_indep", 1e-4)),
+            ("alpha_indep:0.5", {"alg": "SGD", "weight_decay": 0.0}, "", ("alpha_indep", 0.5))]
+    for raw, ab, sch, want in good:
+        try:
+            got = P(None, raw, ab, sch)
+        except Exception as ex:  # noqa
+            got = repr(ex)
+        chk(got == want and (got[1] is None or type(got[1]) is float), "R1 %r (%s, wd %r) -> %r" % (raw, ab["alg"], ab["weight_decay"], want), repr(got))
+    bad = [("SHRINK_ONLY", SGDm1, ""), ("shrink_only ", SGDm1, ""), (" trace_only", SGDm1, ""), ("shrink", SGDm1, ""),
+           ("alpha_indep", SGDm0, ""), ("alpha_indep:", SGDm0, ""), ("alpha_indep:0", SGDm0, ""),
+           ("alpha_indep:1", SGDm0, ""), ("alpha_indep:2e0", SGDm0, ""), ("alpha_indep:-1e-4", SGDm0, ""),
+           ("alpha_indep:1e-4,x", SGDm0, ""), ("alpha_indep:inf", SGDm0, ""), ("alpha_indep:nan", SGDm0, ""),
+           ("alpha_indep:1e-400", SGDm0, ""), ("alpha_indep:5e-05", SGDm1, ""), ("alpha_indep:5e-05", SGDm0, "cosine"),
+           ("shrink_only", SGDm0, ""), ("trace_only", {"alg": "SGDm", "weight_decay": -0.1}, ""),
+           ("trace_only", {"alg": "Adam", "weight_decay": 0.1}, ""), ("shrink_only", {"alg": "SGDm"}, "")]
+    for raw, ab, sch in bad:
+        try:
+            P(None, raw, ab, sch)
+            ok, msg = False, "no exception"
+        except ValueError as ex:
+            ok, msg = "PATCH_DECAYROUTE" in str(ex), str(ex)[:70]
+        except Exception as ex:  # noqa
+            ok, msg = False, repr(ex)[:70]
+        chk(ok, "R1 LOUD: %r (alg %s, wd %r, SCHED %r) -> ValueError" % (raw, ab.get("alg"), ab.get("weight_decay"), sch), msg)
+
+
+# ------------------------------------------------------------------------------------------------ torch sections
+def load_hf(path, name):
+    import importlib.machinery
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path, loader=importlib.machinery.SourceFileLoader(name, path))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m.HF
+
+
+class _W:
+    def add_scalar(self, *a, **k):
+        pass
+
+
+def args_base_for(alg, wd):
+    return {"SGD": {"alg": "SGD", "weight_decay": wd},
+            "SGDm": {"alg": "SGDm", "weight_decay": wd, "momentum_param": 0.9},
+            "RMSProp": {"alg": "RMSProp", "weight_decay": wd, "normalizer_param": 0.99},
+            "AdamW": {"alg": "AdamW", "weight_decay": wd, "normalizer_param": 0.99, "momentum_param": 0.9},
+            "Lion": {"alg": "Lion", "weight_decay": wd, "momentum_param": 0.99, "Lion_beta2": 0.9}}[alg]
+
+
+META_LION = {"alg": "Lion", "meta_stepsize": 1e-3, "momentum_param": 0.99, "Lion_beta2": 0.9, "weight_decay": 0}
+ENVKEYS = ("DECAY_ROUTE", "PROBE", "PROBE_DIR", "PROBE_TENSOR", "SCHED", "HIER", "BETA_CLIP", "DECAY_MASK")
+
+
+@contextlib.contextmanager
+def env(**kw):
+    old = {k: os.environ.get(k) for k in ENVKEYS}
+    for k in ENVKEYS:
+        os.environ.pop(k, None)
+    for k, v in kw.items():
+        if v is not None:
+            os.environ[k] = v
+    try:
+        yield
+    finally:
+        for k in ENVKEYS:
+            os.environ.pop(k, None)
+            if old[k] is not None:
+                os.environ[k] = old[k]
+
+
+def tiny_net(torch, seed, dtype):
+    torch.manual_seed(seed)
+    net = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.Tanh(), torch.nn.Linear(3, 2))
+    return net.to(dtype)
+
+
+def build(HF, net, alg, wd, grain, meta, dr, alpha0=1e-2, gamma=1.0, **extra):
+    buf = io.StringIO()
+    with env(DECAY_ROUTE=dr, **extra):
+        with contextlib.redirect_stdout(buf):
+            o = HF(net, stepsize_groups=grain, alpha0=alpha0, args_base=args_base_for(alg, wd), args_meta=dict(meta),
+                   gamma=gamma, writer=_W())
+    return o, [l for l in buf.getvalue().splitlines() if l.startswith("DECAY_ROUTE")]
+
+
+def same(torch, x, y):
+    if torch.is_tensor(x) or torch.is_tensor(y):
+        return torch.is_tensor(x) and torch.is_tensor(y) and x.shape == y.shape and x.dtype == y.dtype and torch.equal(x, y)
+    return type(x) == type(y) and x == y
+
+
+def lists_same(torch, X, Y):
+    return len(X) == len(Y) and all(same(torch, x, y) for x, y in zip(X, Y))
+
+
+def r2_off(HFpre, HFpost, torch):
+    print("R2 OFF IS INERT (unset and empty; 8 real HF.step()s; bitwise vs the pre HF.py)")
+    X = torch.randn(16, 4, generator=torch.Generator().manual_seed(5))
+    Y = torch.randn(16, 2, generator=torch.Generator().manual_seed(6))
+    for alg in ALGS:
+        for grain in ("scalar", "layerwise"):
+            for dr, lab in ((None, "unset"), ("", "empty")):
+                na, nb = tiny_net(torch, 11, torch.float32), tiny_net(torch, 11, torch.float32)
+                oa, _ = build(HFpre, na, alg, 0.1, grain, META_LION, None)
+                ob, wl = build(HFpost, nb, alg, 0.1, grain, META_LION, dr)
+                ok = wl == ["DECAY_ROUTE: off"] and ob._dr_on is False
+                ok = ok and ob.base_update.__func__ is getattr(HFpost, "%s_base_update" % alg)
+                with env():
+                    for _ in range(8):
+                        oa.step(na, ((na(X) - Y) ** 2).mean())
+                        ob.step(nb, ((nb(X) - Y) ** 2).mean())
+                ok = ok and lists_same(torch, [p.data for p in na.parameters()], [p.data for p in nb.parameters()])
+                ok = ok and lists_same(torch, oa.h_condenced, ob.h_condenced) and lists_same(torch, oa.beta, ob.beta)
+                ok = ok and lists_same(torch, list(oa.momentum_base), list(ob.momentum_base))
+                ok = ok and lists_same(torch, list(oa.trace_base), list(ob.trace_base))
+                chk(ok, "R2 %-7s %-9s %-5s: `DECAY_ROUTE: off`, not rebound, w / h / beta / base state BITWISE the pre HF.py's" % (alg, grain, lab))
+
+
+def ref_dir(torch, alg, o, g, i, mom0, tr0, lam0):
+    """The base direction u (a*u is the step) from the PRE-update state, written independently of the patch."""
+    ab = o.args_base
+    if alg == "SGD":
+        return g[i]
+    if alg == "SGDm":
+        return mom0[i]
+    if alg == "Lion":
+        return torch.sign(ab['Lion_beta2'] * mom0[i] + (1 - ab['Lion_beta2']) * g[i])
+    lam_t = lam0 * ab['normalizer_param']
+    mu = (1 - ab['normalizer_param']) / (1 - lam_t)
+    tr = ab['normalizer_param'] * tr0[i] + g[i] ** 2
+    if alg == "RMSProp":
+        return torch.div(g[i], (mu * tr + o.epsilon) ** .5)
+    m = ab['momentum_param'] * mom0[i] + g[i]
+    return torch.div(m, (mu * tr + o.epsilon) ** .5)
+
+
+def r3_terms(HFpost, torch, device):
+    print("R3 EACH MODE CHANGES EXACTLY ITS TERM (bitwise, device %s)" % device)
+    import numpy as np
+    shapes = [(6, 5, 3, 3), (6,), (6,), (10, 24), (10,)]
+    for alg in ALGS:
+        for mode in ("shrink_only", "trace_only", "alpha_indep:5e-05", "alpha_indep:7e-05"):
+            wd = 0.0 if mode.startswith("alpha") else 0.1
+            lam = float(mode.split(":")[1]) if mode.startswith("alpha") else None
+            torch.manual_seed(3)
+            net = torch.nn.Module()
+            net.ps = torch.nn.ParameterList([torch.nn.Parameter(torch.randn(*s, device=device) * 0.5) for s in shapes])
+            o, wl = build(HFpost, net, alg, wd, "layerwise", META_LION, mode, gamma=0.97)
+            want = "DECAY_ROUTE: on mode=%s base=%s wd=%r lambda=%s lambda_f32=%s gamma=0.97" % (
+                mode.split(":")[0], alg, wd, "na" if lam is None else repr(lam),
+                "na" if lam is None else repr(float(np.float32(lam))))
+            chk(wl == [want], "R3 %-7s %-17s witness line" % (alg, mode), (wl or ["(none)"])[0])
+            chk(o.base_update.__func__ is getattr(HFpost, "_dr_%s_base_update" % alg), "R3 %-7s %-17s base_update rebound to _dr_%s_base_update" % (alg, mode, alg))
+            o.h_condenced = [torch.randn_like(p) * 0.1 for p in net.parameters()]
+            o.counter = -1
+            okw = okh = okb = okdiff = True
+            for step in range(3):
+                g = [torch.randn_like(p) for p in net.parameters()]
+                o.alpha = [np.float32(0.03), torch.tensor(0.02, device=device), torch.tensor(0.05, device=device),
+                           (torch.rand(10, device=device) * 0.05 + 0.01).view(-1, 1), torch.tensor(0.04, device=device)]
+                w0 = [p.data for p in net.parameters()]
+                h0 = list(o.h_condenced)
+                mom0, tr0, lam0 = list(o.momentum_base), list(o.trace_base), o.lambda_base_t
+                ref = copy.deepcopy(o)
+                rnet = copy.deepcopy(net)
+                if lam is not None:
+                    ref.args_base = dict(ref.args_base, weight_decay=0.0)
+                getattr(HFpost, "%s_base_update" % alg)(ref, rnet, g)   # the UNPATCHED update from the same state
+                with env(DECAY_ROUTE=mode):
+                    o.base_update(net, g)
+                for i, p in enumerate(net.parameters()):
+                    a = o.alpha[i]
+                    u = ref_dir(torch, alg, o, g, i, mom0, tr0, lam0)
+                    rw = list(rnet.parameters())[i].data
+                    if mode == "shrink_only":
+                        ew = rw
+                        eh = o.gamma * h0[i] - a * (u + wd * w0[i])
+                        okdiff = okdiff and not torch.equal(o.h_condenced[i], ref.h_condenced[i])
+                    elif mode == "trace_only":
+                        ew = w0[i] - a * u
+                        eh = o.gamma * (1 - wd * a) * h0[i] - a * u
+                        okdiff = okdiff and not torch.equal(p.data, rw)
+                    else:
+                        ew = w0[i] - lam * w0[i] - a * u
+                        eh = o.gamma * (1 - lam) * h0[i] - a * u
+                        okdiff = okdiff and not torch.equal(p.data, rw)
+                    okw = okw and same(torch, p.data, ew)
+                    okh = okh and same(torch, o.h_condenced[i], eh)
+                okb = okb and lists_same(torch, list(o.momentum_base), list(ref.momentum_base)) \
+                    and lists_same(torch, list(o.trace_base), list(ref.trace_base)) and o.lambda_base_t == ref.lambda_base_t
+            what = {"shrink_only": "w == unpatched w (BITWISE); h == gamma*h0 - a*(u + wd*w0)",
+                    "trace_only": "w == w0 - a*u; h == gamma*(1 - wd*a)*h0 - a*u"}.get(mode, "w == w0 - LAMBDA*w0 - a*u; h == gamma*(1 - LAMBDA)*h0 - a*u")
+            chk(okw and okh, "R3 %-7s %-17s %s, 3 updates, BITWISE" % (alg, mode, what))
+            chk(okb, "R3 %-7s %-17s base momentum / trace / lambda_t BITWISE the unpatched update's" % (alg, mode))
+            chk(okdiff, "R3 %-7s %-17s the intended term DIFFERS from the unpatched update's (non-vacuity)" % (alg, mode))
+            chk(o._dr_n == 3, "R3 %-7s %-17s dr_n counts the 3 updates" % (alg, mode))
+    # LAMBDA reaches the update: two values, same state -> different weights
+    torch.manual_seed(4)
+    outs = []
+    for mode in ("alpha_indep:5e-05", "alpha_indep:7e-05"):
+        torch.manual_seed(4)
+        net = torch.nn.Module()
+        net.ps = torch.nn.ParameterList([torch.nn.Parameter(torch.randn(*s, device=device)) for s in shapes])
+        o, _ = build(HFpost, net, "SGDm", 0.0, "layerwise", META_LION, mode)
+        o.counter = -1
+        o.alpha = [torch.tensor(0.02, device=device)] * len(shapes)
+        g = [torch.ones_like(p) for p in net.parameters()]
+        o.base_update(net, g)
+        outs.append([p.data.clone() for p in net.parameters()])
+    chk(not any(torch.equal(x, y) for x, y in zip(*outs)), "R3 LAMBDA 5e-05 vs 7e-05 from the same state: EVERY tensor differs")
+
+
+def lin_run(HF, torch, alg, wd, dr, beta_shift, T, alpha0=0.05):
+    """T real HF.step()s on a LINEAR loss (so the Hessian-free trace is exact), float64, layerwise, meta fixed."""
+    net = tiny_net(torch, 21, torch.float64)
+    with env(DECAY_ROUTE=dr):
+        o, _ = build(HF, net, alg, wd, "layerwise", {"alg": "fixed"}, dr, alpha0=alpha0)
+        import math
+        o.beta = [torch.full((o.num_layers,), math.log(alpha0) + beta_shift, dtype=torch.float64)]
+        C = [torch.randn(p.shape, generator=torch.Generator().manual_seed(100 + k), dtype=torch.float64) for k, p in enumerate(net.parameters())]
+        W = [[p.data.clone() for p in net.parameters()]]
+        for _ in range(T):
+            loss = sum((c * p).sum() for c, p in zip(C, net.parameters()))
+            o.step(net, loss)
+            W.append([p.data.clone() for p in net.parameters()])
+    return o, W
+
+
+def rel(torch, H, F):
+    num = sum(float(((h - f) ** 2).sum()) for h, f in zip(H, F)) ** 0.5
+    den = sum(float((f ** 2).sum()) for f in F) ** 0.5
+    return num / den
+
+
+def r4_fd(HFpost, torch):
+    print("R4 THE HYPERGRADIENT: h_T vs central finite difference dw_T/dbeta (float64, linear loss, T=20)")
+    T, eps, LAM = 20, 1e-5, 0.02
+    for alg in ALGS:
+        for dr, wd in ((None, 0.2), ("alpha_indep:%r" % LAM, 0.0), ("shrink_only", 0.2), ("trace_only", 0.2)):
+            o, W = lin_run(HFpost, torch, alg, wd, dr, 0.0, T)
+            _, Wp = lin_run(HFpost, torch, alg, wd, dr, +eps, T)
+            _, Wm = lin_run(HFpost, torch, alg, wd, dr, -eps, T)
+            FD = [(p - m) / (2 * eps) for p, m in zip(Wp[-1], Wm[-1])]
+            e = rel(torch, o.h_condenced, FD)
+            lab = dr or "OFF(alpha-scaled)"
+            a = [float(v) for v in torch.exp(o.beta[0])]
+            if dr is None or dr.startswith("alpha"):
+                chk(e < 1e-7, "R4 %-7s %-17s the trace IS the hypergradient: rel err %.2e < 1e-7" % (alg, lab, e))
+            else:
+                chk(e > 1e-3, "R4 %-7s %-17s an INTERVENTION, not the derivative: rel err %.2e > 1e-3" % (alg, lab, e))
+            # recompute alternative / correct traces from the realised trajectory: delta_t is the alpha-proportional step
+            fac_true, H_alt1, H_alt2, H_cor = None, [torch.zeros_like(w) for w in W[0]], [torch.zeros_like(w) for w in W[0]], [torch.zeros_like(w) for w in W[0]]
+            for t in range(T):
+                for i in range(len(W[0])):
+                    w0, w1 = W[t][i], W[t + 1][i]
+                    if dr is None or dr == "shrink_only":
+                        step_full = w0 - w1                         # = a*(u + wd*w0): the applied change
+                        H_cor[i] = (1 - wd * a[i]) * H_cor[i] - step_full
+                    elif dr == "trace_only":
+                        step = w0 - w1                              # = a*u (no decay applied)
+                        H_cor[i] = H_cor[i] - step
+                    else:
+                        step = (1 - LAM) * w0 - w1                  # = a*u
+                        H_alt1[i] = H_alt1[i] - step                # WRONG: factor dropped
+                        H_alt2[i] = (1 - LAM) * H_alt2[i] - (step + LAM * w0)   # WRONG: decay put into delta
+            if dr is not None and dr.startswith("alpha"):
+                chk(rel(torch, H_alt1, FD) > 1e-3 and rel(torch, H_alt2, FD) > 1e-3,
+                    "R4 %-7s %-17s the two WRONG traces fail FD (%.2e, %.2e > 1e-3): the check discriminates"
+                    % (alg, lab, rel(torch, H_alt1, FD), rel(torch, H_alt2, FD)))
+            else:
+                chk(rel(torch, H_cor, FD) < 1e-7, "R4 %-7s %-17s the CORRECT trace of this weight update matches FD (%.2e < 1e-7)"
+                    % (alg, lab, rel(torch, H_cor, FD)))
+
+
+def r5_meas(HFpost, torch):
+    print("R5 REALISED SHRINK IN THE PROBE RECORD (float64, PROBE=1, scalar grain, 6 steps)")
+    import json
+    X = torch.randn(16, 4, generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+    Y = torch.randn(16, 2, generator=torch.Generator().manual_seed(6), dtype=torch.float64)
+    for alg in ALGS:
+        for dr, wd in (("alpha_indep:0.003", 0.0), ("trace_only", 0.1), ("shrink_only", 0.1)):
+            td = tempfile.mkdtemp(prefix="dr_r5_")
+            try:
+                net = tiny_net(torch, 31, torch.float64)
+                o, _ = build(HFpost, net, alg, wd, "scalar", {"alg": "fixed"}, dr, alpha0=0.01, PROBE="1", PROBE_DIR=td)
+                with env(DECAY_ROUTE=dr, PROBE="1", PROBE_DIR=td):
+                    for _ in range(6):
+                        o.step(net, ((net(X) - Y) ** 2).mean())
+                recs = [json.loads(l) for l in open(os.path.join(td, "probe.jsonl"))]
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
+            a = float(o.alpha[0])
+            ok = len(recs) >= 5
+            for r in recs:
+                ok = ok and r.get("dr_mode") == dr.split(":")[0] and r.get("dr_n") == r["step"] + 2
+                s, sa, td_ = r.get("dr_shrink_meas"), r.get("dr_shrink_applied"), r.get("dr_trace_decay")
+                if dr.startswith("alpha"):
+                    ok = ok and r.get("dr_lam") == 0.003 and s is not None and abs(s / 0.003 - 1) < 1e-9
+                    ok = ok and abs(sa / 0.003 - 1) < 1e-12 and abs(td_ - (1 - 0.003)) < 1e-12
+                elif dr == "trace_only":
+                    ok = ok and r.get("dr_lam") is None and s is not None and abs(s) < 1e-12 and sa == 0.0
+                    ok = ok and abs(td_ - (1 - wd * a)) < 1e-12
+                else:
+                    ok = ok and s is not None and abs(s / (wd * a) - 1) < 1e-9 and abs(sa / (wd * a) - 1) < 1e-12 and abs(td_ - 1.0) < 1e-12
+            chk(ok, "R5 %-7s %-17s %d records: dr_n == step+2, measured shrink == %s" % (
+                alg, dr, len(recs), {"trace_only": "0"}.get(dr, "LAMBDA" if dr.startswith("alpha") else "wd*a")))
+
+
+def r6_gpu(HFpost, torch, cifar_dir):
+    print("R6 REALISED SHRINK ON THE GPU (float32, the live ResNet18's tensor shapes, alpha_indep:5e-05)")
+    import json
+    sys.path.insert(0, cifar_dir)
+    from build_network import build_network  # noqa
+    td = tempfile.mkdtemp(prefix="dr_r6_")
+    try:
+        torch.manual_seed(0)
+        net = build_network("ResNet18", "cuda")
+        o, _ = build(HFpost, net, "SGDm", 0.0, "scalar", META_LION, "alpha_indep:5e-05", alpha0=1e-3, PROBE="1", PROBE_DIR=td)
+        X = torch.randn(8, 3, 32, 32, device="cuda")
+        Yl = torch.randint(0, 10, (8,), device="cuda")
+        with env(DECAY_ROUTE="alpha_indep:5e-05", PROBE="1", PROBE_DIR=td):
+            for _ in range(4):
+                o.step(net, torch.nn.functional.cross_entropy(net(X), Yl))
+        recs = [json.loads(l) for l in open(os.path.join(td, "probe.jsonl"))]
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    ss = [r.get("dr_shrink_meas") for r in recs]
+    chk(len(recs) >= 3 and all(s is not None and abs(s / 5e-05 - 1) < 1e-3 for s in ss),
+        "R6 %d GPU records, measured per-step shrink within rel 1e-3 of 5e-05" % len(recs), str(ss))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pre", required=True)
+    ap.add_argument("--post", required=True)
+    ap.add_argument("--structural-only", action="store_true")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--cifar-dir", default=None)
+    a = ap.parse_args()
+    print("TEST_SHA256 %s" % __import__("hashlib").sha256(open(os.path.abspath(__file__), "rb").read()).hexdigest())
+    if not os.path.exists(PATCH):
+        chk(False, "patches/patch_decayroute.py exists")
+        print("\nFAILURES (%d): %r" % (len(FAILED), FAILED))
+        raise SystemExit(1)
+    if not (os.path.exists(a.pre) and os.path.exists(a.post)):
+        chk(False, "--pre and --post exist")
+        raise SystemExit(1)
+    pre, post = open(a.pre).read(), open(a.post).read()
+    structure(pre, post, a.pre)
+    parser_tests(post)
+    if not a.structural_only:
+        try:
+            import torch
+        except ImportError:
+            torch = None
+            print("SKIP R2-R6: no torch on this host")
+        if torch is not None:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            HFpre = load_hf(a.pre, "HF_pre_dr")
+            HFpost = load_hf(a.post, "HF_post_dr")
+            r2_off(HFpre, HFpost, torch)
+            r3_terms(HFpost, torch, "cpu")
+            if a.device == "cuda":
+                r3_terms(HFpost, torch, "cuda")
+            r4_fd(HFpost, torch)
+            r5_meas(HFpost, torch)
+            if a.device == "cuda":
+                if a.cifar_dir:
+                    r6_gpu(HFpost, torch, a.cifar_dir)
+                else:
+                    chk(False, "R6 needs --cifar-dir with --device cuda")
+    print("\n%d PASS / %d FAIL" % (NPASS[0], len(FAILED)))
+    print("ALL PASS" if not FAILED else "FAILURES (%d): %r" % (len(FAILED), FAILED))
+    raise SystemExit(1 if FAILED else 0)
+
+
+if __name__ == "__main__":
+    main()

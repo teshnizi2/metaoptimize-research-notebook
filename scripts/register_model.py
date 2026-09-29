@@ -393,6 +393,30 @@ ADDED_PHASES = [{
     # MECH10_FIRST_ROW is 244; it is defined further down the file, so the ID is written out.
     "experimentIds": ["MT244"],
     "source": "docs/CORRECTIONS.md 315 at 12a4c5d",
+}, {
+    # crd1 + cai1, the two alpha-independent batches of ICML-PLAN row 1.6 (the patch PATCH_DECAYROUTE proved at CORRECTIONS
+    # 305, registered at 306 and 307, submitted 22 Sep, ingested together at fecd462 and written up at fc48d02, CORRECTIONS
+    # 317 and 318). One phase: both batches ask what the weight decay's route does, one at the mechanism cell and one at the
+    # audit's own cell.
+    "id": "phase-21", "date": "2026-09-22", "period": "22 Sep", "title": "Which route does the weight decay take, and does anything survive taking it off the learned step size",
+    "test": "A sha-pinned patch that moves one route of the decay at a time: at the mechanism cell, the weight shrink alone, the learned trace factor alone, and a constant rate that does not move with the learned step size; and at the audit's own cell, that constant rate at two doses bracketing a standard recipe's per-step shrink, with all four grains and four fresh seeds",
+    "observed_result": "At the mechanism cell the weight shrink alone still collapses the shared step size, the learned trace factor alone does not, and the constant rate collapses neither grain, so the collapse needs the decay to move with the learned step size; at the audit's own cell neither dose can be read -- at the smaller one the uniform partition's step sizes reach the harness's upper limit past the registered gate, and at the larger one every arm trains too poorly to compare -- so the control was run and came back unreadable, and the headline is neither confirmed nor removed",
+    "next_question": "Whether any dose between the two, or a higher step-size limit, makes the control readable at the audit's cell",
+    # MECH11_FIRST_ROW is 245 and MECH11_LAST_ROW is 246; they are defined further down the file, so the IDs are written out.
+    "experimentIds": ["MT245", "MT246"],
+    "source": "docs/CORRECTIONS.md 317 and 318 at fc48d02",
+}, {
+    # crt2, the second pass of the ICML plan's 4a rank 2: the retune past crt1's alpha0 grid edge (registered at CORRECTIONS
+    # 313, commit 986e165, submitted 22 Sep, scored at 328523b, ingested at d597d00 and written up at 043155d, CORRECTIONS
+    # 319). A separate phase from phase-17: that phase re-tuned inside a grid whose top edge every grain chose; this one
+    # tunes past that edge.
+    "id": "phase-22", "date": "2026-09-28", "period": "28 Sep", "title": "Does plain scalar still tie the better partition once every grain is tuned past the earlier grid edge",
+    "test": "The audit's core cell at weight decay 5e-4 on a five-point grid over the meta step size and the initial step size, centred one step above the earlier batch's chosen corner, with the two count-matched partitions and plain scalar at three fresh seeds each, every grain's setting chosen on training accuracy and compared on test",
+    "observed_result": "Raising the initial step size past the earlier batch's edge removes plain scalar's apparent advantage without replacing it with a partition advantage: plain scalar lands 0.14 points below the better partition, with an interval running from 0.72 points behind to 0.44 points ahead, so it cannot be called either way; and the tuning did not finish, because every grain's best setting again sat at an edge of the search -- the partitions at the top of the meta step size axis and plain scalar at the harness's fixed step-size ceiling",
+    "next_question": "Whether extending the meta step size axis upward brackets either partition's optimum, and whether a held-out split rather than training accuracy picks the same settings",
+    # MECH12_FIRST_ROW is 247; it is defined further down the file, so the ID is written out.
+    "experimentIds": ["MT247"],
+    "source": "docs/CORRECTIONS.md 319 at a32bd86",
 }]
 
 # line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
@@ -531,7 +555,9 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
                              (MECH7_INGEST_COMMIT, MECH7_INTERVENTIONS_TSV_SHA256),
                              (MECH8_INGEST_COMMIT, MECH8_INTERVENTIONS_TSV_SHA256),
                              (MECH9_INGEST_COMMIT, MECH9_INTERVENTIONS_TSV_SHA256),
-                             (MECH10_INGEST_COMMIT, MECH10_INTERVENTIONS_TSV_SHA256)]:
+                             (MECH10_INGEST_COMMIT, MECH10_INTERVENTIONS_TSV_SHA256),
+                             (MECH11_INGEST_COMMIT, MECH11_INTERVENTIONS_TSV_SHA256),
+                             (MECH12_INGEST_COMMIT, MECH12_INTERVENTIONS_TSV_SHA256)]:
         pinned = subprocess.check_output(["git", "-C", str(repo), "show", f"{commit}:{INTERVENTIONS_TSV}"])
         if hashlib.sha256(pinned).hexdigest() != expected:
             raise ValueError(f"{INTERVENTIONS_TSV} at {commit[:12]} does not match the pinned bytes")
@@ -542,7 +568,8 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     rows = list(csv.DictReader(body, delimiter="\t"))
     runs = {}
     for eid, spec in {**LANDED_INTERVENTIONS, **CVT23_INTERVENTIONS, **CVT45_INTERVENTIONS, **CVT67_INTERVENTIONS, **CVT89_INTERVENTIONS,
-                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS, **MECH6_INTERVENTIONS, **MECH9_INTERVENTIONS}.items():
+                      **MECH4_INTERVENTIONS, **MECH5_INTERVENTIONS, **MECH6_INTERVENTIONS, **MECH9_INTERVENTIONS,
+                      **MECH11_INTERVENTIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as a patch intervention with an ARGS-value witness")
@@ -551,7 +578,7 @@ def intervened_runs(repo: Path) -> dict[str, dict]:
     # CORRECTIONS 263's ARGS-value rows: no patch ran, so the row is read by its flag and checked against the run's own
     # ARGS line rather than a "<PATCH>: on" line (CORRECTIONS 255, cmo1's M9 and W0 arms).
     for eid, spec in {**MUST_ARGS_DEVIATIONS, **MECH6_ARGS_DEVIATIONS, **MECH7_ARGS_DEVIATIONS, **MECH8_ARGS_DEVIATIONS, **MECH9_ARGS_DEVIATIONS,
-                      **MECH10_ARGS_DEVIATIONS}.items():
+                      **MECH10_ARGS_DEVIATIONS, **MECH11_ARGS_DEVIATIONS, **MECH12_ARGS_DEVIATIONS}.items():
         for row in listed_rows(rows, eid, spec):
             if not is_args_deviation(row["witness"]):
                 raise ValueError(f"{INTERVENTIONS_TSV} lists {row['run']} as an ARGS-value deviation without an ARGS-value witness")
@@ -599,7 +626,10 @@ INTERVENTION_KINDS = {"VOTE_W": "vote-weight", "BETA_HOLD": "step-size hold", "C
                       "GROUP_HOLD": "group step-size hold", "REST_HOLD": "rest-group step-size hold", "WINDOW_HOLD": "update-window hold",
                       "DECAY_MASK": "coupled weight-decay mask", "SHADOW_VOTE": "shadow-vote",
                       # CORRECTIONS 304's ninth line kind (cvl1, 312): <n_val>:<split_seed>, a held-out validation split.
-                      "VAL_SPLIT": "held-out validation split"}
+                      "VAL_SPLIT": "held-out validation split",
+                      # CORRECTIONS 308's tenth line kind (crd1, 317; cai1, 318): shrink_only / trace_only / alpha_indep:<Lambda>,
+                      # the route the base weight decay takes through the update and the meta trace.
+                      "DECAY_ROUTE": "weight-decay route"}
 
 
 def intervention_kinds(intervention: str) -> list[tuple[str, str]]:
@@ -652,6 +682,20 @@ def additional_witness(lines: list[str], patch: str, value: str) -> str:
             raise ValueError(f"Unreadable {patch} value: {value!r}")
         if f" n_val={split[1]} " not in found[0] + " " or f" split_seed={split[2]} " not in found[0] + " ":
             raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
+        return found[0]
+    if patch == "DECAY_ROUTE":
+        # CORRECTIONS 308's tenth kind. shrink_only and trace_only carry no rate; alpha_indep:<Lambda> names the
+        # alpha-independent per-step rate, which the log echoes as lambda=<value> in the harness's own float
+        # formatting (5e-05 for a listed 5e-5), so the rate is compared as a NUMBER and the mode as an exact word.
+        route, sep, rate = value.partition(":")
+        if route not in ("shrink_only", "trace_only", "alpha_indep") or bool(sep) != (route == "alpha_indep") or (sep and not rate):
+            raise ValueError(f"Unreadable {patch} value: {value!r}")
+        if f" mode={route} " not in found[0] + " ":
+            raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
+        if route == "alpha_indep":
+            logged = [field.split("=", 1)[1] for field in found[0].split() if field.startswith("lambda=")]
+            if len(logged) != 1 or not args_equal(logged[0], rate):
+                raise ValueError(f"The run log's {patch} line does not match the listed {value!r}")
         return found[0]
     if patch == "DECAY_MASK":
         # The mask names its tensor set, which the log echoes as spec=<value> beside the count it resolved to.
@@ -2718,6 +2762,211 @@ def mech10_rows(lines: list[str]) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 21. The crd1 + cai1 landing (CORRECTIONS 317 and 318): two appended rows, ONE ingest.
+# ---------------------------------------------------------------------------
+# Campaign commit fc48d02 (cycle 166; CORRECTIONS 317 and 318) appended the crd1 landing as MASTER-TABLE line 245 and the
+# cai1 landing as line 246 and recounted header line 3. It amended no earlier row, did not touch line 5, and no line moved.
+# The ONE joint ingest fecd462 touched results/ alone. CORRECTIONS 316 (a zero-GPU audit addendum to 315) owns no row; it
+# records that MASTER-TABLE row 244's bound (5) transposes the ch / nd W4 health margins (they are +8.01 / +7.94, not
+# +7.94 / +8.01). Row 244 is pinned and was not rewritten, so MT244 keeps its text and the slip is recorded as a journal
+# correction instead.
+#
+# MT245 (crd1) is GOAL MET. It passes the MT230 test that the MT218-MT236 precedent applies (MECH6's note): the fired
+# account ROUTE-IS-WEIGHT-SHRINK + INDEP-NOGAP is the registered prediction (307.6, prior 0.25) and returns its state words
+# in the registered direction (S COLLAPSE, T NOGAP, I NOGAP); every arm lands in that account's registered band (SRS 22.7653
+# in 1-30; SRL 70.0587, TRS 63.7207, TRL 60.2460, AIS 62.9967 and AIL 63.6360 in 60-76), so no registered expectation is
+# defied (unlike MT242, whose GPL band was missed); every gate passes, and the dose ratios read as designed (S and I REACHED,
+# T BELOW by construction). T's
+# thin reference (TRL +5.2460 pp over REF_MIN) and the absent in-batch OFF anchor are bounds carried in the reason, not
+# failed controls.
+# MT246 (cai1) is OPEN, as MT244: the PRIMARY returned AI-UNREADABLE (I5 BOXBOUND, I4 UNHEALTHY), whose registered licence is
+# "both LAMBDA rungs are unreadable: no partition reading under alpha-independent decay"; neither the survive nor the
+# artefact branch was reached.
+# Neither row corrects an earlier PUBLISHED notebook claim, so neither carries a Corrected badge.
+MECH11_COMMIT = "fc48d0221390d2a63408ae434eb4eecd5ccddf80"
+MECH11_MASTER_TABLE_SHA256 = "a447f951301d3f927f01cc8c6547a90a28fa3b7afd502da91be6de96d1e54b9d"
+MECH11_FIRST_ROW, MECH11_LAST_ROW = 245, 246
+MECH11_EDITED_LINES = {3}  # the run / GPU-hour header and the tally, recounted in place; no row amended, line 5 untouched.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH11_ROWS = {
+    245: ("met", 9, ["crd1"], ["page-19"], None, "ROUTE-IS-WEIGHT-SHRINK: the registered prediction -- which ROUTE of the alpha-scaled weight decay carries the shared-step-size collapse at the mechanism cell (ResNet18_c100 / CIFAR-100, SGDm 0.99 + Lion, ms 1e-3, alpha0 1e-6, weight decay 0.1), tested by a sha-pinned patch that moves ONE route at a time: shrink_only (the weight shrink, the trace factor dropped), trace_only (the learned trace factor, the weights undecayed) and alpha_indep (decay at a constant rate that does not move with the learned step size). Cell S COLLAPSES: scalar 22.7653 against its own in-batch layerwise 70.0587, G +47.2933 pp (+90.99 SE) [+46.2538, +48.3328], 3 of 3 seeds at the bar. Cell T does NOT: G -3.4747 pp (-6.69 SE), scalar AHEAD, NOGAP. Cell I does NOT either: G +0.6393 pp (+1.23 SE), NOGAP. As registered, verbatim: at the mechanism cell (wd 0.1) the alpha-scaled weight shrink with the trace factor removed collapses the scalar step size to at most half its in-batch layerwise level, and the learned trace factor with the weights undecayed does not (grains within the 10 pp bar); and with alpha-INDEPENDENT decay at the onset-matched per-step dose (LAMBDA 3.15e-4, applied from step 0, about 14x the source's cumulative shrink) scalar and layerwise stay within the 10 pp bar. So the collapse travels through the weight shrink (with the direct a*wd*w term in the trace, undecayed) and REQUIRES the decay to move with the learned alpha -- a property of alpha-scaled decay, which is PyTorch AdamW's default form, not of decay as such. With csh1 (row 242), the trace route is excluded as a SUFFICIENT account in BOTH forms, a constant gamma and the learned horizon, as bounds. Bounded, and led with: SUFFICIENCY, NOT NECESSITY -- S says the shrink is ENOUGH, never that the trace plays no part when both routes are on; the shrink cannot be separated from its own undecayed trace term, so no sentence may say the shrink alone; shrink_only and trace_only are interventions, not hypergradients of their own weight update; T's null rests on a THIN reference (TRL 60.2460, only +5.2460 pp above REF_MIN 55); the alpha-independent arm is NOT a pure route control (Kosson et al. arXiv:2305.17212), its LAMBDA is onset-matched rather than init- or cumulative-matched, there is ONE LAMBDA on a constant schedule and both its grains under-fit, so INDEP-NOGAP says only that neither grain collapses relative to the other; there is no in-batch OFF anchor (the OFF premise is the landed cwd5 W1, read between batches and gating nothing); every COLLAPSE and NOGAP is a bound; and the scope is one network, one cell, 100 epochs, three seeds. A refute pass could not refute the verdict and applied four wording and precision fixes; no RULE 16 defect."),
+    246: ("open", 10, ["cai1"], ["page-8"], None, "AI-UNREADABLE: the primary is unreadable at BOTH rungs -- does the count-matched sign (chunk777 - nodewise) SURVIVE, and does SCALAR-BEATS-BEST hold, when the base decay no longer moves with the learned step size, i.e. under ALPHA-INDEPENDENT decay in Loshchilov and Hutter's form (arXiv:1711.05101) with a constant schedule? This is the paper's biggest open referee point: every campaign number uses the harness's alpha-scaled decay, and the stamp DECOUPLED-NOT-TESTED said the control had never been run. It has now been run, at cgw1's own cell (ResNet18 / CIFAR-10, SGDm 0.99 + Lion, ms 1e-4, alpha0 1e-3) with --weight-decay-base 0 and DECAY_ROUTE=alpha_indep at LAMBDA 5e-5 (rung I5) and 5e-4 (rung I4), four grains, four fresh seeds, and NEITHER RUNG CAN BE READ. I5 is BOXBOUND: all four grains are healthy (90.13-90.77) but chunk777's step sizes sit at the box's upper edge -2.3026 on 7.02-7.38 % of its records, past the registered 5 % gate (nodewise box-free at 2.91 %, layerwise 7.36 %, scalar 0), so D_I5 = +0.3220 pp (+0.93 SE) [-0.3711, +1.0151] is PRINTED AND NOT READ. I4 is UNHEALTHY: at a standard recipe's own per-step shrink every arm is below HEALTH_MIN 85 (77.42-80.78). As registered, verbatim: both LAMBDA rungs are unreadable: no partition reading under alpha-independent decay; the levels themselves are the finding; and for the co-reported scalar reading, at least one LAMBDA's scalar reading is unresolved or gated: report both rungs' intervals; no combined scalar sentence. So the headline NEITHER survives NOR weakens NOR becomes an artefact: the question is unanswered at this cell, the count-matched headline keeps its at alpha-scaled decay qualifier unchanged and IS NOT REMOVED, and DECOUPLED-NOT-TESTED is spent as a claim that the control was never run while NOT being lifted for the audit headline. The registered artefact branch, which could have removed the headline, had a prior of 0.30 together with -REVERSES and was NOT reached; the survive branch (0.15) was not reached either. Bounded, and led with: one cell; two LAMBDA that bracket a standard recipe's per-step shrink and locate nothing between them; the alpha-scaled reference is read between batches; the rotational-equilibrium confound; shrink-matched and not ratio-matched; a constant schedule; every floor reading is a bound; the scalar reading is UNTUNED at crt1's M2 configuration; and the I4 box onset, identical on all 16 runs, is exactly the maximum Lion meta-rate under float32 arithmetic. A refute pass could not refute the verdict; one wrong sub-claim inside a bound was replaced and three wording fixes applied; no RULE 16 defect."),
+}
+# Earlier records these rows bear on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH11_BEARS_ON = {
+    245: ["MT242", "MT238", "MT236"],  # csh1's constant-gamma horizon control; the collapse premise; cwd5's OFF anchor
+    246: ["MT240", "MT175", "MT241"],  # cgw1's cell, which this control re-runs; the audit headline; crt1's untuned M2
+}
+# The 50 exclusion rows of the ingest fecd462 (CORRECTIONS 318.9) are of TWO kinds across TWO batches, so each record spec
+# below names only its own arms ("shared_batch"): crd1's 12 SR* / TR* runs are one-kind rows under the NEW DECAY_ROUTE patch
+# kind (CORRECTIONS 308's tenth line kind), witnessed by each run's own "DECAY_ROUTE: on mode=..." line; crd1's 6 AI* runs
+# and all 32 cai1 runs are TWO-AXIS rows (CORRECTIONS 284's rule), listed by ARGS_WD_BASE: weight-decay-base=0 with the
+# DECAY_ROUTE clause held beside it and read back from the run's own log.
+MECH11_INGEST_COMMIT = "fecd46235f021238bcbbb24d5af2a7c8f072659c"
+MECH11_INTERVENTIONS_TSV_SHA256 = "a592d07d8934e0b9a9b2f4c5cad38248df588989182ceb927c24742b0ccd05cf"
+MECH11_INTERVENTIONS = {
+    "MT245": {
+        "batch": "crd1", "arms": {arm: 3 for arm in ("SRS", "SRL", "TRS", "TRL")}, "shared_batch": True,
+        "title": "crd1's shrink-only and trace-only arms move ONE route of the alpha-scaled weight decay at a time",
+        "source": f"{INTERVENTIONS_TSV} at {MECH11_INGEST_COMMIT[:7]}; CORRECTIONS 305, 307 and 317",
+        "note": "crd1 asks which route of the alpha-scaled weight decay carries the collapse. Its SR* runs keep the weight shrink and drop the trace factor; its TR* runs keep the learned trace factor and leave the weights undecayed. Both run the sha-pinned harness_cdr1 tree with one --export item, DECAY_ROUTE=shrink_only or trace_only, and nothing else about the cell changes. results/all_runs.csv has no column for the decay route, so these 12 runs carry the plain 0.1 cell key of their grain and are NOT measurements of that cell. Each is listed under the DECAY_ROUTE witness kind added at CORRECTIONS 308, by its own DECAY_ROUTE: on line, which names the mode, the base optimiser, the weight decay, the rate and gamma. crd1's 6 AI* runs also set --weight-decay-base 0 and are listed as TWO-AXIS rows (see the ARGS-value note). Drop every listed row before pooling runs by cell.",
+    },
+}
+MECH11_ARGS_DEVIATIONS = {
+    "MT245": {
+        "batch": "crd1", "arms": {arm: 3 for arm in ("AIS", "AIL")}, "shared_batch": True,
+        "title": "crd1's alpha-independent arms differ from the mechanism cell in the base weight-decay flag AND their decay route",
+        "source": f"{INTERVENTIONS_TSV} at {MECH11_INGEST_COMMIT[:7]}; CORRECTIONS 263, 284, 308 and 317",
+        "note": "crd1's AI* runs replace the cell's alpha-scaled decay with a constant rate that does not move with the learned step size: --weight-decay-base 0 with DECAY_ROUTE=alpha_indep:3.15e-4, the onset-matched dose. The corpus has no column for a base-optimiser CLI flag and none for the decay route, so these 6 runs carry the plain 0.1 cell key of their grain. They are TWO-AXIS rows (CORRECTIONS 284): each is listed with the ARGS witness ARGS_WD_BASE, read from the run's OWN ARGS: line with argparse last-wins semantics, and its DECAY_ROUTE clause is held beside it and read back from the run's own log. Drop every listed row before pooling runs by cell.",
+    },
+    "MT246": {
+        "batch": "cai1", "arms": {f"{grain}{rung}": 4 for rung in ("I5", "I4") for grain in ("ch", "nd", "k01", "kL")},
+        "title": "Every cai1 run replaces the audit cell's alpha-scaled decay with a constant, alpha-independent rate",
+        "source": f"{INTERVENTIONS_TSV} at {MECH11_INGEST_COMMIT[:7]}; CORRECTIONS 263, 284, 305, 306, 308 and 318",
+        "note": "cai1 runs cgw1's cell with the decay taken off the learned step size: --weight-decay-base 0 with DECAY_ROUTE=alpha_indep at LAMBDA 5e-5 (rung I5) and 5e-4 (rung I4), on the sha-pinned harness_cdr1 tree. The corpus has no column for a base-optimiser CLI flag and none for the decay route, so all 32 runs carry the plain 0.1 cell key of their grain and are NOT measurements of that cell. Every row is TWO-AXIS (CORRECTIONS 284): listed with the ARGS witness ARGS_WD_BASE: weight-decay-base=0 generated from the run's own ARGS: line, with its rung's DECAY_ROUTE clause held beside it and read back from the run's own log, where a per-record check confirms the measured per-step shrink equals the rung's LAMBDA within 1 %. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md at the landing is the g3b landing's file with every line above its closing trailer unchanged and
+# entries 316-318 appended below it, closed by a fresh "Next free number: " trailer. No in-place edit, no reserved stub.
+MECH11_CORRECTIONS_SHA256 = "5597d685c4169bb486ed78e3f6ee1007a85f3f34343591294f1043c3c03a2d45"
+MECH11_ENTRIES = (316, 317, 318)
+
+
+def mech11_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the crd1 / cai1 landing; ONE step that edits header line 3 and appends TWO rows, and nothing else."""
+    before = mech10_master_table(repo)
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH11_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH11_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH11_COMMIT[:12]} does not match the pinned crd1/cai1-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH11_LAST_ROW or len(before) != MECH11_FIRST_ROW - 1 or changed != MECH11_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH11_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH11_EDITED_LINES)}: {sorted(changed)}")
+    mech11_corrections(repo)  # neither landing amends a row, so the append-only CORRECTIONS check rides here
+    return lines
+
+
+def mech11_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the crd1 / cai1 landing; append-only below the g3b landing's closing trailer."""
+    older = mech10_corrections(repo)[0]
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH11_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH11_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH11_COMMIT[:12]} does not match the pinned bytes")
+    later = raw.decode("utf-8").splitlines()
+    if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MUST_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH11_COMMIT[:7]} does not append entries below the previous closing trailer")
+    if later[:len(older) - 1] != older[:-1]:
+        changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH11_COMMIT[:7]} changed an earlier line: {changed[:8]}")
+    appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MECH11_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH11_COMMIT[:7]} does not append exactly entries {MECH11_ENTRIES}: {appended[:4]}")
+    if any(".  RESERVED" in line or line.split(" — ")[0].endswith("RESERVED") for line in appended):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH11_COMMIT[:7]} still carries a reserved stub")
+    return later, older
+
+
+def mech11_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE lines 245-246 (crd1, cai1) and attach both exclusion notes.  Neither amends a row."""
+    rows = with_interventions(appended_rows(lines, MECH11_ROWS, MECH11_FIRST_ROW, MECH11_LAST_ROW, MECH11_COMMIT), MECH11_INTERVENTIONS)
+    for row in rows:
+        spec = MECH11_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 22. The crt2 landing (CORRECTIONS 319): one appended row, its own ingest.
+# ---------------------------------------------------------------------------
+# Campaign commit 043155d (cycle 167; CORRECTIONS 319) appended the crt2 landing as MASTER-TABLE line 247 and recounted
+# header line 3; a32bd86 then rewrote row 247's verdict cell in section 10's own token convention (no number, level or
+# licence word changed), so the pin is a32bd86. No earlier row was amended, line 5 is untouched and no line moved. The
+# ingest d597d00 touched results/ alone.
+# MT247 (crt2) is OPEN, as MT240, MT243 and MT244: the PRIMARY returned RETUNE-UNDECIDED (neither grain resolved above the
+# other, neither 0.30 pp tie bound held) with LOC-PARTIAL (every grain selected at a grid edge, so no optimum is located),
+# and the registered licence is "report the interval min T +/- (2 SE + B)". Unlike MT241 (crt1, Mixed), it returns no
+# definite registered branch to split. It corrects no PUBLISHED notebook claim, so it carries no Corrected badge; MT241's
+# sentence is superseded by CORRECTIONS 319.10, but MASTER-TABLE row 241 was not amended, so MT241 keeps its record and
+# outcome and the relation is recorded in content/later-evidence.json.
+MECH12_COMMIT = "a32bd8640a49a6151eb7bb27ba017f448a669e58"
+MECH12_MASTER_TABLE_SHA256 = "f7c5aea4dec30039e85b0a8b5b212b18ab951e3f16e4e2d6a8f4f9c1a3994672"
+MECH12_FIRST_ROW, MECH12_LAST_ROW = 247, 247
+MECH12_EDITED_LINES = {3}  # the run / GPU-hour header and the tally, recounted in place; no row amended, line 5 untouched.
+# line -> (rule, section, batches, figure pages, corrected note or None, one-line reason)
+MECH12_ROWS = {
+    247: ("open", 10, ["crt2"], ["page-8"], None, "RETUNE-UNDECIDED: the primary is unresolved AND nothing is located -- after tuning each grain until its optimum is located, does plain scalar TIE, BEAT or FALL BELOW the better count-matched partition at alpha-scaled weight decay 5e-4? crt1 (row 241) landed WEAKENED-TO-TIE, but every grain had selected alpha0 1e-2, the TOP of a two-point axis, so no optimum was located. crt2 is the retune past that edge: crt1's cell verbatim on a FIVE-POINT PLUS grid over meta step size and alpha0 centred on (1e-4, 3e-2), three grains, three fresh seeds, selection on TRAIN and an oracle best-of-grid on TEST. ALL THREE GRAINS SELECTED AT A GRID EDGE: chunk777 and nodewise at ms 3e-4, the top of the ms axis, and scalar at alpha0 1e-1, whose start IS the harness's fixed box ceiling -2.3026, so it is NOT LOCATED by construction -- LOC-PARTIAL, and the registered question is NOT ANSWERED FOR ANY GRAIN. Over the grid that was run the answer is NEITHER: T_ch -0.0373 pp and T_nd -0.1407 pp at the TRAIN-selected arms, interval of min T [-0.7164, +0.4351] (width 1.1515 = 2 x (2 SE + B)), both 0.30 pp tie bounds missed (SCALAR-TIES short by 0.4164, PARTITION-TIES over by 0.1351) and PARTITION-ABOVE 0.3271 pp short. Raising alpha0 past crt1's 1e-2 REMOVES THE SCALAR LEAD ENTIRELY AND DOES NOT REPLACE IT WITH A PARTITION LEAD: the sign flipped from crt1's +0.4487 / +0.6880, and the point estimates cross zero inside the grid (scalar ahead at A2 and L3, behind at A3, A4 and H3). The ORACLE is PARTITION-TIES-SCALAR, interval [-1.0071, +0.1444] with T_ch + B = -0.2636, so under best-of-grid selection no scalar lead above 0.30 pp survives; and unlike crt1, TRAIN and TEST DISAGREE for both partitions, so the oracle is independent evidence. As registered, verbatim: after re-tuning, neither grain is resolved above the other and neither 0.30 pp tie bound holds: report the interval min T +/- (2 SE + B). TMLR: the row may say neither beats nor ties (a bound); it states the interval and the grid; with the LOC-PARTIAL clause, NOT LOCATED for at least one grain: the reading holds over this grid only, and the question after tuning until located is NOT answered for that grain. So the scalar row weakens one more step, from ties (a bound) after re-tuning to an interval plus the grid, and crt1's sentence is SUPERSEDED; the count-matched headline is untouched and is NOT removed, D = chunk777 - nodewise being unresolved at every config (at most 0.2880 pp, 1.41 SE). Bounded, and led with: nothing is located; an interval containing zero is never the grains are equal; one cell, one decay, three seeds, no validation split, the ceiling fixed and itself 10x below a standard recipe's effective step; every arm 17.5x-98.9x under-decayed against that recipe, and the grains matched on NOMINAL decay only (the partition arms 1.67-4.73x the same-config scalar arm's realised shrink; proxies, so a bound); the selector is near saturation (train5 maxes 0.1400 pp below 100); and sigma is a PRE-COMMITMENT, not a robustness result -- the reading is UNRESOLVED only for sigma above 0.191226, and both estimates derivable from this cell's data (in-batch 0.188910, corpus floor 0.178183) fall below it, where the branch would be TIE-SCALAR-LEAD-BOUNDED. A refute pass could NOT move the FINAL, the branch or any level, contrast, interval, selection, stamp or gate, but returned holds=false on the verdict's statement of its OWN bounds: three substantive failures (the realised-shrink range printed three inconsistent wrong ways; a leave-one-seed-out triple that is in no artifact; the sigma robustness claim inverted) and six wording fixes, all re-checked from the raw logs and all applied. No RULE 16 defect."),
+}
+# Earlier records this row bears on. The import does not rewrite them; the relationship is listed so it stays reviewable.
+MECH12_BEARS_ON = {
+    247: ["MT241", "MT175", "MT240", "MT244"],  # crt1, whose sentence this supersedes; the audit headline; cgw1's cell; g3b's untuned scalar reading
+}
+MECH12_INTERVENTIONS: dict[str, dict] = {}  # no patch ran: crt2 runs the UNPATCHED pinned tree, so no run prints an ON line
+# The 45 exclusion rows of the ingest d597d00 (CORRECTIONS 319.9): every crt2 run, all of kind ARGS_WD_BASE and NONE
+# two-axis -- the meta step size and alpha0 are CSV cell-key COLUMNS (CORRECTIONS 313.11), and the tree is unpatched.
+MECH12_INGEST_COMMIT = "d597d00bae991a512575f229f30871d2b64c79fd"
+MECH12_INTERVENTIONS_TSV_SHA256 = "5295e74483755505218c461fa866232ca8372902b98ab6cba859a6ea7e86f9c4"
+MECH12_ARGS_DEVIATIONS = {
+    "MT247": {
+        "batch": "crt2", "arms": {f"{grain}{cfg}": 3 for cfg in ("A2", "A3", "A4", "H3", "L3") for grain in ("ch", "nd", "k01")},
+        "title": "Every crt2 run differs from the audit's core cell in the base weight-decay flag",
+        "source": f"{INTERVENTIONS_TSV} at {MECH12_INGEST_COMMIT[:7]}; CORRECTIONS 263, 313 and 319",
+        "note": "crt2 re-tunes the audit's core cell at the non-standard base weight decay 5e-4. The corpus has no column for a base-optimiser CLI flag, so all 45 runs at --weight-decay-base 5e-4 carry the plain 0.1 cell key of their grain and are NOT measurements of that cell. No patch ran -- crt2 uses the UNPATCHED pinned tree, so no run prints a DECAY_ROUTE or VAL_SPLIT line and no row is two-axis -- and the witness is the run's OWN ARGS: line, read with argparse last-wins semantics, under the ARGS-value kind ARGS_WD_BASE added at CORRECTIONS 263. The meta step size and alpha0 the grid varies are CSV cell-key columns, so no run deviates on a second ARGS kind. Drop every listed row before pooling runs by cell.",
+    },
+}
+# docs/CORRECTIONS.md at the landing is the crd1 / cai1 landing's file with every line above its closing trailer unchanged
+# and entry 319 appended below it, closed by a fresh "Next free number: " trailer. No in-place edit, no reserved stub.
+MECH12_CORRECTIONS_SHA256 = "8887f63bfad108831a56a2adf4f88636dbdbe5ae97f7f88ad11b56e9add034e4"
+MECH12_ENTRIES = (319,)
+
+
+def mech12_master_table(repo: Path) -> list[str]:
+    """MASTER-TABLE at the crt2 landing; ONE step that edits header line 3 and appends ONE row, and nothing else."""
+    before = mech11_master_table(repo)
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH12_COMMIT}:{MASTER_TABLE}"])
+    if hashlib.sha256(raw).hexdigest() != MECH12_MASTER_TABLE_SHA256:
+        raise ValueError(f"{MASTER_TABLE} at {MECH12_COMMIT[:12]} does not match the pinned crt2-landing bytes")
+    lines = raw.decode("utf-8").splitlines()
+    changed = {n for n in range(1, len(before) + 1) if lines[n - 1] != before[n - 1]}
+    if len(lines) != MECH12_LAST_ROW or len(before) != MECH12_FIRST_ROW - 1 or changed != MECH12_EDITED_LINES:
+        raise ValueError(f"MASTER-TABLE at {MECH12_COMMIT[:7]} moved a line or edited lines other than {sorted(MECH12_EDITED_LINES)}: {sorted(changed)}")
+    mech12_corrections(repo)  # the landing amends no row, so the append-only CORRECTIONS check rides here
+    return lines
+
+
+def mech12_corrections(repo: Path) -> tuple[list[str], list[str]]:
+    """docs/CORRECTIONS.md at the crt2 landing; append-only below the crd1 / cai1 landing's closing trailer."""
+    older = mech11_corrections(repo)[0]
+    raw = subprocess.check_output(["git", "-C", str(repo), "show", f"{MECH12_COMMIT}:{CORRECTIONS_DOC}"])
+    if hashlib.sha256(raw).hexdigest() != MECH12_CORRECTIONS_SHA256:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH12_COMMIT[:12]} does not match the pinned bytes")
+    later = raw.decode("utf-8").splitlines()
+    if len(later) <= len(older) or not older[-1].startswith(MUST_TRAILER) or not later[-1].startswith(MUST_TRAILER):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH12_COMMIT[:7]} does not append entries below the previous closing trailer")
+    if later[:len(older) - 1] != older[:-1]:
+        changed = [n for n in range(1, len(older)) if later[n - 1] != older[n - 1]]
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH12_COMMIT[:7]} changed an earlier line: {changed[:8]}")
+    appended = [line for line in later[len(older) - 1:] if line.startswith("## ")]
+    if [line.split(".")[0] for line in appended] != [f"## {number}" for number in MECH12_ENTRIES]:
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH12_COMMIT[:7]} does not append exactly entries {MECH12_ENTRIES}: {appended[:4]}")
+    if any(".  RESERVED" in line or line.split(" — ")[0].endswith("RESERVED") for line in appended):
+        raise ValueError(f"{CORRECTIONS_DOC} at {MECH12_COMMIT[:7]} still carries a reserved stub")
+    return later, older
+
+
+def mech12_rows(lines: list[str]) -> list[dict]:
+    """Parse MASTER-TABLE line 247 (crt2) and attach its ARGS-value note (all 45 runs)."""
+    rows = with_interventions(appended_rows(lines, MECH12_ROWS, MECH12_FIRST_ROW, MECH12_LAST_ROW, MECH12_COMMIT), MECH12_INTERVENTIONS)
+    for row in rows:
+        spec = MECH12_ARGS_DEVIATIONS.get(row["id"])
+        if spec:
+            row["args_deviations"] = json.dumps({"title": spec["title"], "note": spec["note"], "batch": spec["batch"],
+                                                 "arms": spec["arms"], "source": spec["source"]}, ensure_ascii=False)
+    return rows
+
+
 def apply_mech4_amendments(rows: list[dict], repo: Path) -> list[dict]:
     """Apply CORRECTIONS 273's in-place amendment of row 229 (cst1, MT229) to its record, moving its outcome."""
     lines, before = mech4_master_table(repo), must_master_table(repo)
@@ -3052,7 +3301,9 @@ def load_unamended_register(workspace: Path, repo: Path) -> list[dict]:
              + mech7_rows(mech7_master_table(Path(repo)))
              + mech8_rows(mech8_master_table(Path(repo)))
              + mech9_rows(mech9_master_table(Path(repo)))
-             + mech10_rows(mech10_master_table(Path(repo))))
+             + mech10_rows(mech10_master_table(Path(repo)))
+             + mech11_rows(mech11_master_table(Path(repo)))
+             + mech12_rows(mech12_master_table(Path(repo))))
     existing = {row["id"] for row in base}
     collisions = existing & {row["id"] for row in added}
     high = sorted(i for i in existing if re.fullmatch(r"MT\d{3}", i) and int(i[2:]) >= NEW_ID_FLOOR)

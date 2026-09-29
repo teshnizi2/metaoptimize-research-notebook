@@ -17,10 +17,10 @@ test('the register CSV has one row per published record and the documented colum
   assert.deepEqual(parsed.errors, []);
   assert.deepEqual(parsed.meta.fields, columns);
   assert.equal(rows.length, data.experiments.length);
-  assert.equal(rows.length, 181);
+  assert.equal(rows.length, 184);
   assert.deepEqual(rows.map(row => row.id), data.experiments.map(e => e.id));
   const table = data.tables.find(entry => entry.href === '/assets/tables/complete_experiment_register.csv')!;
-  assert.deepEqual([table.rows, table.columns], [181, columns.length], 'the table catalog reports the regenerated size');
+  assert.deepEqual([table.rows, table.columns], [184, columns.length], 'the table catalog reports the regenerated size');
 });
 
 test('every CSV row carries its four-way outcome, kind and a separate Corrected column', () => {
@@ -37,7 +37,7 @@ test('every CSV row carries its four-way outcome, kind and a separate Corrected 
     assert.equal(row.area, record.area, row.id);
   }
   const count = (key: string, value: string) => rows.filter(row => row[key] === value).length;
-  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [163, 18, 35]);
+  assert.deepEqual([count('kind', 'research'), count('kind', 'method-check'), count('corrected', 'Corrected')], [166, 18, 35]);
   assert.deepEqual(['success', 'fail', 'mixed', 'unresolved'].map(outcome => count('outcome', outcome)), [56, 41, 40, 26]);
   assert.deepEqual(['outcome', 'outcome_label'].map(key => rows.find(row => row.id === 'MT019')![key]), ['success', 'Goal met'], 'MT019 moved from Open at CORRECTIONS 229');
   assert.deepEqual(rows.filter(row => /^MT2(1[2-9]|2\d|3[0-5])$/.test(row.id)).map(row => [row.id, row.master_table_line, row.outcome_label]),

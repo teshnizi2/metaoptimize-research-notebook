@@ -1,0 +1,996 @@
+#!/usr/bin/env python3
+# =============================================================================
+# cai1_attack_indep.py -- THE INDEPENDENT PARSER OF `cai1` (CORRECTIONS 306: the count-matched audit's core cell --
+# ResNet18 / CIFAR-10 / SGDm 0.99 + Lion, ms 1e-4, alpha0 1e-3, --weight-decay-base 0 -- under PATCH_DECAYROUTE's
+# alpha-INDEPENDENT decay at LAMBDA 5e-5 (I5) and 5e-4 (I4) x {chunk777, nodewise, scalar, layerwise} x seeds
+# {192..195}, 32 runs, jobs 5081292-5081323)
+#
+# It re-derives, FROM THE RAW RUN FILES ALONE (each run's `Epoch e, ... Test Accuracy` lines, its `DECAY_ROUTE:` witness
+# line and its probe.jsonl), every line the REGISTERED scorer analysis/cAI1_alphaindep_score.py (sha fb766d93...)
+# prints, and compares that rebuild with one or more committed scorer logs, line by line, in order.
+#
+#   python3 analysis/cai1_attack_indep.py <runsdir> <scorer-log> [<scorer-log> ...] --stage DIR --rows P
+#
+#   <runsdir>  $WS/runs on cluster_b or cluster_a-backup/runs_cluster_b on the Mac: the 32 `cai1-*.out` files at its top level (or
+#              under cai1/), the probe directories and PROVENANCE.txt under <runsdir>/cai1/.
+#   --stage    a `git archive 03f5e3c -- analysis bin results patches tests jobs` extraction: its scorer and design are
+#              HASHED (never imported) and its results/all_runs.csv + results/CORPUS-EXCLUSIONS.tsv give the disclosure
+#              count.
+#   --rows     results/cai1_exclusion_rows_PROPOSED.tsv: the 32 TWO-AXIS rows this landing owes (306.9, 308.8), checked
+#              row for row against a rebuild from the runs' own file names, ARGS lines and DECAY_ROUTE lines.
+#
+# INDEPENDENCE, deliberately (the cwd2 ... g3b pattern):
+#   * it imports NOTHING from the repo: not cAI1_alphaindep_score.py, cai1_design.py, corpus_exclusions.py,
+#     argsline_guard.py or any other module.  Stdlib only: hashlib, json, math, os, struct, sys.
+#   * NO regular expressions and no shlex: `.out` lines are split on commas / colons / whitespace, file names on
+#     hyphens, the TSV on tabs, the CSV by a hand-written quote-aware splitter.
+#   * every bar, literal, sha, token, licence sentence and stamp name below is RE-TYPED from CORRECTIONS 305 / 306 / 308
+#     and the registered scorer's docstring and module constants; the ARGS line, the ENV line and the DECAY_ROUTE
+#     witness are rebuilt from the design as written in 306.4 (the witness's float32 is recomputed with struct).
+#   * plain left-to-right float addition everywhere (no builtin sum on floats), so the stdout does not depend on the
+#     Python version's summation algorithm.
+#
+# HOST INDEPENDENCE.  THIS parser's stdout names no path, host, time or Python version, so it is byte-identical on both
+# hosts when the run files are.  Two scorer lines are host-dependent and are MATCHED, not rebuilt byte for byte:
+# (1) `runsdir <path>`, matched by its prefix; (2) the G-PROV line, whose PROVENANCE path is host-dependent -- everything
+# after the path is rebuilt.
+#
+# WHAT IT ADDS BEYOND A REPLAY:
+#   [0] sync integrity: one digest over every run file's name and sha256 (equal on both hosts <=> the sync is exact);
+#       job ids against the launcher's order; PROVENANCE keys; the stage's scorer and design bytes.
+#   [1]-[3] per run: the ARGS line rebuilt flag by flag and compared BYTE FOR BYTE, the ENV line, EXACTLY ONE
+#       DECAY_ROUTE line equal to its OWN rung's witness (and not the other rung's), no other ON witness, no PROBE_TENSOR,
+#       RUN_DONE once, epochs 0..99 once each; the probe structure; and G-SHRINK re-done on EVERY record (mode, LAMBDA,
+#       dr_n, applied shrink, trace factor, MEASURED shrink within 1 %).  A per-run table of the realised shrink.
+#   [4]-[5] every level, sigma, contrast, state, token, stamp and the FINAL recomputed; the scorer's stdout rebuilt and
+#       compared with each committed log.
+#   [6] THE TWO QUESTIONS OF 306, answered from the numbers, bounds first.
+#   [7] what bounds the verdict (DESCRIPTIVE): margins to every bar, sigma sensitivity, leave-one-seed-out, paired
+#       seeds, the floor gate, predicted bands, and the realised shrink beside cgw1 (296.4) and crt1 (309.3).
+#   [8] the 32 exclusion rows owed at ingest (TWO-AXIS, 308.8), rebuilt and compared with the PROPOSED file.
+# =============================================================================
+
+import hashlib
+import json
+import math
+import os
+import struct
+import sys
+
+# ---------------------------------------------------------------------------------------------------------------------
+# RE-TYPED LITERALS (CORRECTIONS 305.2, 306.4-306.11, 308.8 and the registered scorer's docstring / module constants)
+# ---------------------------------------------------------------------------------------------------------------------
+BATCH = "cai1"
+SCORER_SHA = "fb766d935e2f4b074b6d5bbb759696f3935821ee7872b41441e2a567fe0420f5"
+DESIGN_SHA = "edf7000df4abbd9546ff0e3031763df1eafb60e991200547a1e351135b61c919"
+HF_SHA = "17ee0a2862b31b48c4196a75e88d60cf19f49d0f993cecc2750af832fe44b020"
+HF_PRE_SHA = "4732b74aa3a10508896e92eccced5c89051c353fa8a01a3af21aab9aeda0cecd"
+RUNNER_SHA = "d3d3bdd781282416316be2eab91a70cf796e2d725a24df4c153696146b81083c"
+PATCH_SHA = "12c107884db4c9285a012ef06c4bdcb3f5f6528c6c3da0c16421944718be4c95"
+PROOF_LOG_SHA = "dc73dfbabf25fa01f2d0669a46fdb3202502e0e4a5851d4b4cce99146c8f25b1"
+REG_COMMIT = "03f5e3c1c19d0105b4395ebd4d2d660f7439b7df"
+ENV_PRE = ("ENV: AUGMENT=1 BETA_CLIP=-15:-2.3026 HIER=none LAM=na ETA_RATIO=na COS_TOTAL=default COS_WARMUP=default "
+           "SCHED=none SCHED_TOTAL=none SCHED_WARMUP=none SCHED_MIN=none PROBE=5 PROBE_DIR=")
+ENV_POST = " EB_RHO=na EB_LOG=0"
+
+RUNGS = ("I5", "I4")
+LAM_TXT = {"I5": "5e-5", "I4": "5e-4"}
+LAM = {"I5": 5e-05, "I4": 5e-04}
+GRAINS = ("ch", "nd", "k01", "kL")
+SPEC_OF = {"ch": "chunk777", "nd": "nodewise", "k01": "scalar", "kL": "layerwise"}
+M_OF = {"ch": 14421, "nd": 14420, "k01": 1, "kL": 62}
+SEEDS = (192, 193, 194, 195)
+ARMS = tuple(g + r for r in RUNGS for g in GRAINS)
+JOB0 = 5081292                       # 306.11: I5 292-307, I4 308-323; within each seed ch / nd / k01 / kL
+NEPOCH = 100
+STEPS_PER_EPOCH = 500
+PROBE = 5
+NREC = 10000
+LO, HI = -15.0, -2.3026
+ALPHA0 = 1e-3
+NTENS = 62
+
+SIGMA_PRIOR = 0.17818264951145454
+SIGMA_PRIOR_DF = 190
+SIGMA_DEMO = 0.636566                # 306.5: corpus_exclusions --check's noise-floor DEMONSTRATION, quoted, no bar
+SIGMA_DEMO_DF = 274
+SURV = 0.30
+NULLBAR = 0.15
+POOL = 0.5556
+RES = 2.0
+HEALTH_MIN = 85.0
+DIVERGED = 2.0
+BOXFREE_MAX = 0.05
+BOX_EPS = 1e-3
+PL_LO, PL_HI = 95, 99
+WIN_STEP = 95 * 500
+SHRINK_TOL = 0.01
+APPLIED_TOL = 1e-9
+TRACE_TOL = 1e-12
+LRWD_REF = 5e-5
+STD_RECIPE_REF = 5e-4
+
+CGW1_D = {"W1": 0.3693, "W2": 0.4533, "W4": 0.2410}
+CGW1_ST = {"W1": "SURVIVES", "W2": "SURVIVES", "W4": "UNDECIDED", "SCALAR_W4": "SCALAR-BEATS-BEST"}
+CGW1_T4 = {"ch": 2.5590, "nd": 2.8000}
+# realised plateau shrink a*wd of the alpha-scaled references, re-typed (DESCRIPTIVE, between batch, never pooled):
+# cgw1 W4 (5e-4) from 296.4 (ch / nd approximate); crt1's selected A2 arms from 309.3.
+CGW1_SHRINK_W4 = (("ch", 2.0424e-6), ("nd", 5.6611e-7), ("k01", 4.3493e-6), ("kL", 2.8833e-6))
+CGW1_SHRINK_W1_K01 = 2.3732e-6
+CRT1_SHRINK_A2 = (("ch", 1.1556e-5), ("nd", 5.0457e-6), ("k01", 5.2467e-6))
+CRT1_T_TUNED = (("ch", 0.4487), ("nd", 0.6880))
+PRED = {"I5": (89.0, 92.5), "I4": (84.0, 91.0)}
+
+BOUNDS = ("ONE-CELL", "TWO-LAMBDAS-BRACKET", "ALPHA-SCALED-REFERENCE-BETWEEN-BATCH", "ROTATIONAL-EQUILIBRIUM-CONFOUND",
+          "SHRINK-MATCHED-NOT-RATIO-MATCHED", "CONSTANT-SCHEDULE", "FLOOR-READINGS-ARE-BOUNDS")
+
+REF_TXT = "cgw1 (between batch, alpha-scaled): D +0.3693 SURVIVES at 0.1 and +0.4533 SURVIVES at 1e-2"
+LICENCE = {
+    "AI-SURVIVES": "at this ONE cell the uniform partition beats the aligned one at matched count by at least the audit's "
+                   "+0.30 pp bar, resolved, under alpha-INDEPENDENT decay at BOTH standard-recipe shrinks (5e-5 and "
+                   "5e-4): the audit's sign is not an artefact of the harness's alpha-scaled decay HERE.  TMLR: the "
+                   "headline may drop its 'at alpha-scaled decay' qualifier for this cell only; DECOUPLED-NOT-TESTED "
+                   "becomes 'tested at one cell'.",
+    "AI-ARTEFACT-VANISHES": "under alpha-independent decay at BOTH standard-recipe shrinks the count-matched gap is at or "
+                            "below +0.15 pp (a BOUND, not a measured zero), while " + REF_TXT + ": at this ONE cell the "
+                            "audit's sign is a property of alpha-scaled decay -- an ARTEFACT of it in the sense this "
+                            "batch can test.  TMLR: the headline must be stated as conditional on alpha-scaled decay, "
+                            "with this row beside it; and it carries ROTATIONAL-EQUILIBRIUM-CONFOUND (the partition may "
+                            "simply stop controlling the effective step of normalised tensors).",
+    "AI-ARTEFACT-REVERSES": "under alpha-independent decay the gap is absent at BOTH LAMBDAs and REVERSED (aligned beats "
+                            "uniform, resolved) at one or both, while " + REF_TXT + ": at this ONE cell the audit's sign "
+                            "does not survive a change of decay form.  TMLR: the headline may not be stated without "
+                            "'under alpha-scaled decay'; the reversal is reported, bounded by ROTATIONAL-EQUILIBRIUM-"
+                            "CONFOUND.",
+    "AI-LAMBDA-DEPENDENT": "under alpha-independent decay the gap SURVIVES at one standard-recipe LAMBDA and is ABSENT at "
+                           "the other: at this cell the audit's sign depends on the decay STRENGTH within the standard "
+                           "bracket.  TMLR: report both rows; no 'artefact' and no 'robust' sentence.",
+    "AI-SURVIVES-ONE-LAMBDA": "the gap SURVIVES at one LAMBDA and is UNDECIDED at the other: report both intervals; "
+                              "no artefact sentence, and 'robust to the decay form' is licensed at the surviving "
+                              "LAMBDA only.",
+    "AI-ABSENT-ONE-LAMBDA": "the gap is ABSENT (a bound) at one LAMBDA and UNDECIDED at the other: report both intervals; "
+                            "the artefact sentence is NOT licensed (it needs both), and neither is a survive sentence.",
+    "AI-UNDECIDED": "the gap is between the bars (or unresolved) at both LAMBDAs: report the intervals; no seeds may be "
+                    "added after seeing them (108.6a); no survive / artefact sentence.",
+    "AI-ONE-RUNG-SURVIVES": "one LAMBDA rung is unreadable (diverged / unhealthy / box-bound -- itself a fact about that "
+                            "decay strength in this cell); at the other the gap SURVIVES: licensed at that LAMBDA only.",
+    "AI-ONE-RUNG-ABSENT": "one LAMBDA rung is unreadable; at the other the gap is ABSENT (a bound): the artefact sentence "
+                          "is NOT licensed (it needs both); report that rung's interval.",
+    "AI-ONE-RUNG-UNDECIDED": "one LAMBDA rung is unreadable and the other is undecided: report the levels and interval.",
+    "AI-UNREADABLE": "both LAMBDA rungs are unreadable: no partition reading under alpha-independent decay; the levels "
+                     "themselves are the finding.",
+}
+SC_LICENCE = {
+    "SC-BEATS-BOTH": "plain scalar is ABOVE both audit partitions by >= 0.30 pp, resolved, under alpha-independent decay "
+                     "at BOTH standard-recipe LAMBDAs: cgw1's SCALAR-BEATS-BEST (alpha-scaled 5e-4) is not an artefact "
+                     "of the decay form at this cell.",
+    "SC-BELOW-BOTH": "plain scalar is resolved BELOW an audit partition by >= 0.30 pp at BOTH LAMBDAs: under "
+                     "alpha-independent decay partitioning pays in this cell, so cgw1's SCALAR-BEATS-BEST is a property "
+                     "of alpha-scaled decay here -- an artefact of it for the practical-significance qualifier.",
+    "SC-TIES-OR-BEATS-BOTH": "at both LAMBDAs scalar ties (a BOUND: at most 0.30 pp below the better partition at the "
+                             "2 SE edge) or beats the audit partitions: under alpha-independent decay too, the partition "
+                             "buys nothing a single step size does not; the practical-significance qualifier stands.",
+    "SC-LAMBDA-DEPENDENT": "scalar ties or beats at one LAMBDA and is resolved below a partition at the other: the "
+                           "scalar reading depends on the decay strength; report both.",
+    "SC-PARTIAL": "at least one LAMBDA's scalar reading is unresolved or gated: report both rungs' intervals; no "
+                  "combined scalar sentence.",
+    "SC-UNREADABLE": "the scalar comparison is gated (diverged / collapsed / comparator unreadable) at both LAMBDAs.",
+}
+
+DIGITS = "0123456789"
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+OUT = []
+NPASS = [0]
+NFAIL = [0]
+
+
+def P(s=""):
+    OUT.append(s)
+
+
+def check(cond, label):
+    if cond:
+        NPASS[0] += 1
+    else:
+        NFAIL[0] += 1
+    P("  %s %s" % ("PASS" if cond else "FAIL", label))
+    return cond
+
+
+def sha_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as fh:
+        while True:
+            b = fh.read(1 << 20)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def asum(v):
+    t = 0.0
+    for x in v:
+        t += x
+    return t
+
+
+def amean(v):
+    return asum(v) / float(len(v))
+
+
+def asd(v):
+    m = amean(v)
+    return math.sqrt(asum([(x - m) ** 2 for x in v]) / (len(v) - 1))
+
+
+def amed(v):
+    w = sorted(v)
+    n = len(w)
+    if n == 0:
+        return float("nan")
+    if n % 2:
+        return w[n // 2]
+    return 0.5 * (w[n // 2 - 1] + w[n // 2])
+
+
+def f32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def run_name(arm, seed):
+    return "%s-%s-s%d" % (BATCH, arm, seed)
+
+
+def grain_of(arm):
+    return arm[:-2]
+
+
+def rung_of(arm):
+    return arm[-2:]
+
+
+def job_of(arm, seed):
+    return JOB0 + RUNGS.index(rung_of(arm)) * 16 + SEEDS.index(seed) * 4 + GRAINS.index(grain_of(arm))
+
+
+def witness(rung):
+    """305.2's witness form, 306.4's two lines: mode alpha_indep, base SGDm, wd 0.0, lambda repr, its float32, gamma 1.0."""
+    lam = LAM[rung]
+    return ("DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=%r lambda=%r lambda_f32=%r gamma=%r"
+            % (0.0, lam, f32(lam), 1.0))
+
+
+def design_args(arm, seed, save_dir):
+    flags = [("optimizer", "HF"), ("alg-base", "SGDm"), ("momentum-param-base", "0.99"),
+             ("weight-decay-base", "0"), ("alg-meta", "Lion"), ("momentum-param-meta", "0.99"),
+             ("Lion-beta2-meta", "0.9"), ("weight-decay-meta", "0"), ("dataset", "CIFAR10"),
+             ("NN-name", "ResNet18"), ("batch-size", "100"), ("max-time", "999:00:00"), ("gamma", "1"),
+             ("meta-stepsize", "1e-4"), ("alpha0", "1e-3"), ("num-epochs", "100"),
+             ("stepsize-groups", SPEC_OF[grain_of(arm)]), ("seed", str(seed)), ("save-directory", save_dir),
+             ("run-name", run_name(arm, seed))]
+    return "ARGS: " + " ".join("--%s %s" % kv for kv in flags)
+
+
+def is_kind_on(line):
+    """a `<KIND>: on` witness: uppercase letter, then uppercase / underscore, then ': on' at a word end."""
+    k = line.find(": on")
+    if k < 2:
+        return False
+    head = line[:k]
+    if head[0] not in UPPER or any(c not in UPPER + "_" for c in head):
+        return False
+    rest = line[k + 4:k + 5]
+    return rest == "" or not (rest.isalnum() or rest == "_")
+
+
+def parse_epoch(line):
+    """'Epoch 98, Train Accuracy: 95.62 %, Test Accuracy: 64.00 %' -> (98, 95.62, 64.00) or None."""
+    if not line.startswith("Epoch "):
+        return None
+    parts = line.split(",")
+    if len(parts) != 3:
+        return None
+    e = parts[0][len("Epoch "):].strip()
+    if not e or any(c not in DIGITS for c in e):
+        return None
+    tr = parts[1].strip()
+    te = parts[2].strip()
+    if not (tr.startswith("Train Accuracy:") and tr.endswith("%") and te.startswith("Test Accuracy:") and te.endswith("%")):
+        return None
+    try:
+        a = float(tr[len("Train Accuracy:"):-1].strip())
+        b = float(te[len("Test Accuracy:"):-1].strip())
+    except ValueError:
+        return None
+    return int(e), a, b
+
+
+def read_out(path):
+    L = open(path, errors="replace").read().split("\n")
+    r = dict(args=[], env=[], eps={}, dup=[], done=0, gpu=None, node=None, kinds=[], pt=0, bad_acc=0, minutes=None,
+             dr=[], dr_mention=0)
+    for ln in L:
+        if "DECAY_ROUTE" in ln:
+            r["dr_mention"] += 1
+        if ln.startswith("ARGS:"):
+            r["args"].append(ln)
+        elif ln.startswith("ENV:"):
+            r["env"].append(ln)
+        elif ln.startswith("NODE=") and r["node"] is None:
+            r["node"] = ln.split("|")[0].strip()
+        elif ln.startswith("NVIDIA") and r["gpu"] is None:
+            r["gpu"] = ln.split(",")[0].strip()
+        elif ln.strip() == "RUN_DONE":
+            r["done"] += 1
+        elif ln.startswith("PROBE_TENSOR:"):
+            r["pt"] += 1
+        elif ln.startswith("DECAY_ROUTE"):
+            r["dr"].append(ln.rstrip())
+        else:
+            ep = parse_epoch(ln)
+            if ep is not None:
+                if ep[0] in r["eps"]:
+                    r["dup"].append(ep[0])
+                r["eps"][ep[0]] = (ep[1], ep[2])
+            elif "Test Accuracy" in ln:
+                r["bad_acc"] += 1
+            if is_kind_on(ln.strip()):
+                r["kinds"].append(ln.strip())
+            w = ln.split()
+            if len(w) == 2 and w[1] == "minutes" and all(c in DIGITS for c in w[0]):
+                r["minutes"] = int(w[0])
+    return r
+
+
+def read_probe(path, lam):
+    """-> (records, shrink-gate failures).  Each record: (step, n_beta, len(beta), bmin, bmax, n_at_lo, n_at_hi,
+    median exp(beta), first beta, measured shrink, relative deviation)."""
+    recs, bad = [], []
+    with open(path, errors="replace") as fh:
+        for ln in fh:
+            ln = ln.strip()
+            if not ln:
+                continue
+            d = json.loads(ln)
+            b = d["beta"]
+            u = amed([math.exp(v) for v in b])
+            st = d["step"]
+            sm, sa, tdc = d.get("dr_shrink_meas"), d.get("dr_shrink_applied"), d.get("dr_trace_decay")
+            dv = None
+            if d.get("dr_mode") != "alpha_indep":
+                bad.append("step %s mode %r" % (st, d.get("dr_mode")))
+            elif d.get("dr_lam") != lam:
+                bad.append("step %s lam %r" % (st, d.get("dr_lam")))
+            elif d.get("dr_n") != st + 2:
+                bad.append("step %s dr_n %r" % (st, d.get("dr_n")))
+            elif sm is None or sa is None or tdc is None:
+                bad.append("step %s null" % st)
+            elif abs(sa / lam - 1.0) > APPLIED_TOL or abs(tdc - (1.0 - lam)) > TRACE_TOL:
+                bad.append("step %s applied / trace %r %r" % (st, sa, tdc))
+            else:
+                dv = sm / lam - 1.0
+                if abs(dv) > SHRINK_TOL:
+                    bad.append("step %s measured %r" % (st, sm))
+            recs.append((st, d["n_beta"], len(b), d["beta_true_min"], d["beta_true_max"], d.get("n_at_lo"),
+                         d.get("n_at_hi"), u, b[0] if len(b) else None, sm, dv))
+    return recs, bad
+
+
+def csv_split(line):
+    out, cur, q, i = [], [], False, 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            if c == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    cur.append('"')
+                    i += 1
+                else:
+                    q = False
+            else:
+                cur.append(c)
+        else:
+            if c == '"':
+                q = True
+            elif c == ",":
+                out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
+def corpus_count(csvp, tsvp):
+    lines = [ln for ln in open(csvp).read().split("\n") if ln != ""]
+    head = csv_split(lines[0])
+    ir, ij = head.index("run"), head.index("job_id")
+    t = [ln for ln in open(tsvp).read().split("\n") if ln.strip() and not ln.startswith("#")]
+    th = t[0].split("\t")
+    kr, kj = th.index("run"), th.index("job_id")
+    ex = set()
+    for ln in t[1:]:
+        f = ln.split("\t")
+        ex.add((f[kr], f[kj]))
+    n = 0
+    for ln in lines[1:]:
+        f = csv_split(ln)
+        if f[ir].startswith(BATCH + "-"):
+            continue
+        if (f[ir], f[ij]) in ex:
+            continue
+        n += 1
+    return n, len(lines) - 1, len(ex)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# THE REGISTERED DECISION, re-typed from 306.5 (cgw1's rung_state / scalar_of, 291.6)
+# ---------------------------------------------------------------------------------------------------------------------
+def state_of(d, se, div, healthy, boxfree):
+    if div:
+        return "DIVERGED"
+    if not healthy:
+        return "UNHEALTHY"
+    if not boxfree:
+        return "BOXBOUND"
+    if d <= -NULLBAR and d < -RES * se:
+        return "REVERSES"
+    if d <= NULLBAR and d + RES * se < POOL:
+        return "VANISHES"
+    if d >= SURV and d > RES * se:
+        return "SURVIVES"
+    return "UNDECIDED"
+
+
+def group(s):
+    if s in ("DIVERGED", "UNHEALTHY", "BOXBOUND"):
+        return "B"
+    if s == "SURVIVES":
+        return "S"
+    if s in ("VANISHES", "REVERSES"):
+        return "X"
+    return "U"
+
+
+def primary_token(s5, s4):
+    g5, g4 = group(s5), group(s4)
+    if g5 == "B" and g4 == "B":
+        return "AI-UNREADABLE"
+    if g5 == "B" or g4 == "B":
+        other = g4 if g5 == "B" else g5
+        return {"S": "AI-ONE-RUNG-SURVIVES", "X": "AI-ONE-RUNG-ABSENT", "U": "AI-ONE-RUNG-UNDECIDED"}[other]
+    both = "".join(sorted(set([g5, g4])))
+    if both == "S":
+        return "AI-SURVIVES"
+    if both == "X":
+        return "AI-ARTEFACT-REVERSES" if "REVERSES" in (s5, s4) else "AI-ARTEFACT-VANISHES"
+    if both == "SX":
+        return "AI-LAMBDA-DEPENDENT"
+    if both == "SU":
+        return "AI-SURVIVES-ONE-LAMBDA"
+    if both == "UX":
+        return "AI-ABSENT-ONE-LAMBDA"
+    return "AI-UNDECIDED"
+
+
+def scalar_token(k, kdiv, cmp_ok, tch, tnd, se):
+    if kdiv:
+        return "SCALAR-DIVERGED"
+    if k < HEALTH_MIN:
+        return "SCALAR-COLLAPSED"
+    if not cmp_ok:
+        return "SCALAR-UNREADABLE"
+    if tch >= SURV and tnd >= SURV and tch > RES * se and tnd > RES * se:
+        return "SCALAR-BEATS-BEST"
+    tmin = min(tch, tnd)
+    if tmin - RES * se >= -SURV:
+        return "SCALAR-TIES-BEST"
+    if tmin <= -SURV and tmin < -RES * se:
+        return "SCALAR-BELOW-BEST"
+    return "SCALAR-UNRESOLVED"
+
+
+def sc_token(t5, t4):
+    gated = ("SCALAR-DIVERGED", "SCALAR-COLLAPSED", "SCALAR-UNREADABLE")
+    ok = ("SCALAR-BEATS-BEST", "SCALAR-TIES-BEST")
+    if t5 in gated and t4 in gated:
+        return "SC-UNREADABLE"
+    if t5 == "SCALAR-BEATS-BEST" and t4 == "SCALAR-BEATS-BEST":
+        return "SC-BEATS-BOTH"
+    if t5 == "SCALAR-BELOW-BEST" and t4 == "SCALAR-BELOW-BEST":
+        return "SC-BELOW-BOTH"
+    if t5 in ok and t4 in ok:
+        return "SC-TIES-OR-BEATS-BOTH"
+    if (t5 in ok and t4 == "SCALAR-BELOW-BEST") or (t4 in ok and t5 == "SCALAR-BELOW-BEST"):
+        return "SC-LAMBDA-DEPENDENT"
+    return "SC-PARTIAL"
+
+
+def contrasts(A, sig, box_override=None, health_override=None):
+    st, K, sc = {}, {}, {}
+    for r in RUNGS:
+        c, n = A["ch" + r], A["nd" + r]
+        d = c["level"] - n["level"]
+        se = sig * math.sqrt(1.0 / c["n"] + 1.0 / n["n"])
+        st[r] = state_of(d, se, c["range"] > DIVERGED or n["range"] > DIVERGED,
+                         (c["level"] >= HEALTH_MIN and n["level"] >= HEALTH_MIN) if health_override is None else health_override,
+                         (c["boxfree"] and n["boxfree"]) if box_override is None else box_override)
+        K["D" + r] = (d, se)
+        K["DTR" + r] = c["train"] - n["train"]
+        k, L = A["k01" + r], A["kL" + r]
+        for g in ("ch", "nd"):
+            K["T" + g + r] = (k["level"] - A[g + r]["level"], sig * math.sqrt(1.0 / k["n"] + 1.0 / A[g + r]["n"]))
+        K["G" + r] = (L["level"] - k["level"], sig * math.sqrt(1.0 / k["n"] + 1.0 / L["n"]))
+        cmp_ok = (c["level"] >= HEALTH_MIN and n["level"] >= HEALTH_MIN and c["range"] <= DIVERGED
+                  and n["range"] <= DIVERGED)
+        sc[r] = scalar_token(k["level"], k["range"] > DIVERGED, cmp_ok, K["Tch" + r][0], K["Tnd" + r][0], K["Tch" + r][1])
+    d5, se5 = K["DI5"]
+    d4, se4 = K["DI4"]
+    K["DD"] = (d4 - d5, math.sqrt(se5 ** 2 + se4 ** 2))
+    return st, K, sc
+
+
+def arms_from(per, drop=None):
+    A = {}
+    ss, df = 0.0, 0
+    for a in ARMS:
+        ss_ = [s for s in SEEDS if s != drop]
+        xs = [per[(a, s)]["level"] for s in ss_]
+        m = amean(xs)
+        for x in xs:
+            ss += (x - m) ** 2
+        df += len(xs) - 1
+        A[a] = dict(level=m, train=amean([per[(a, s)]["train"] for s in ss_]), range=max(xs) - min(xs), n=len(xs),
+                    boxfree=all(per[(a, s)]["boxfree"] for s in ss_), sd=asd(xs), seeds=xs)
+    return A, math.sqrt(ss / df), df
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+def main(argv):
+    runsdir, logs, stage, rowsp = None, [], None, None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--stage":
+            stage = argv[i + 1]
+            i += 2
+        elif a == "--rows":
+            rowsp = argv[i + 1]
+            i += 2
+        elif runsdir is None:
+            runsdir = a
+            i += 1
+        else:
+            logs.append(a)
+            i += 1
+    if runsdir is None or not logs or stage is None or rowsp is None:
+        sys.stderr.write("usage: cai1_attack_indep.py <runsdir> <scorer-log> [...] --stage DIR --rows P\n")
+        return 2
+
+    P("=" * 110)
+    P("cai1_attack_indep.py -- an INDEPENDENT re-derivation of cai1 (CORRECTIONS 306) from the raw run files")
+    P("  stdlib only, no repo import, no regex, no shlex; every literal re-typed.  Scorer under attack: sha %s" % SCORER_SHA[:16])
+    P("=" * 110)
+
+    # ---- [0] files ---------------------------------------------------------------------------------------------------
+    P("")
+    P("[0] RUN FILES, SYNC INTEGRITY, PROVENANCE, STAGE")
+    found = {}
+    for base in (runsdir, os.path.join(runsdir, BATCH)):
+        if not os.path.isdir(base):
+            continue
+        for fn in sorted(os.listdir(base)):
+            if fn.startswith(BATCH + "-") and fn.endswith(".out"):
+                found.setdefault(fn, []).append(os.path.join(base, fn))
+    check(all(len(v) == 1 for v in found.values()), "each cai1-*.out file name occurs once across <runsdir> and <runsdir>/cai1")
+    check(len(found) == 32, "32 cai1-*.out files found (found %d)" % len(found))
+    runs = {}
+    ok_names = True
+    for fn, ps in sorted(found.items()):
+        parts = fn[:-4].split("-")
+        if len(parts) != 4 or parts[0] != BATCH or parts[1] not in ARMS or not parts[2].startswith("s"):
+            ok_names = False
+            continue
+        seed, jid = int(parts[2][1:]), int(parts[3])
+        if seed not in SEEDS or (parts[1], seed) in runs:
+            ok_names = False
+            continue
+        runs[(parts[1], seed)] = (jid, ps[0])
+    check(ok_names and len(runs) == 32, "the 32 file names are exactly the design's (arm, seed) set, 8 arms x seeds 192-195")
+    if len(runs) != 32:
+        print("\n".join(OUT))
+        return 1
+    pdir = os.path.join(runsdir, BATCH)
+    files = []
+    for (arm, seed), (jid, p) in sorted(runs.items()):
+        files.append(("%s-%d.out" % (run_name(arm, seed), jid), p))
+        files.append(("probe_%s/probe.jsonl" % run_name(arm, seed), os.path.join(pdir, "probe_" + run_name(arm, seed), "probe.jsonl")))
+    have = all(os.path.exists(p) for _n, p in files)
+    check(have, "all 64 run files present (32 .out + 32 probe.jsonl)")
+    if not have:
+        print("\n".join(OUT))
+        return 1
+    dig = hashlib.sha256()
+    nbytes = 0
+    for n, p in sorted(files):
+        dig.update(n.encode() + b"\0" + sha_file(p).encode() + b"\n")
+        nbytes += os.path.getsize(p)
+    P("  DIGEST over the 64 run files' names and sha256: %s  (%d bytes)" % (dig.hexdigest(), nbytes))
+    check(all(runs[(a, s)][0] == job_of(a, s) for a in ARMS for s in SEEDS),
+          "job ids are 5081292-5081323, contiguous, I5 then I4, per seed ch / nd / k01 / kL (306.11)")
+    prov = os.path.join(pdir, "PROVENANCE.txt")
+    kv = {}
+    for ln in open(prov).read().split("\n"):
+        if " " in ln:
+            k, v = ln.split(" ", 1)
+            kv[k] = v.strip()
+    for k, v in (("MODE", "submit"), ("SCORER_SHA256", SCORER_SHA), ("DESIGN_SHA256", DESIGN_SHA), ("HF_SHA256", HF_SHA),
+                 ("RUNNER_SHA256", RUNNER_SHA), ("PATCH_SHA256", PATCH_SHA), ("PROOF_LOG_SHA256", PROOF_LOG_SHA),
+                 ("REGISTERED_COMMIT", REG_COMMIT), ("DECAY_ROUTE", "I5=alpha_indep:5e-5 I4=alpha_indep:5e-4"),
+                 ("WEIGHT_DECAY_BASE", "0"), ("SEEDS", "192 193 194 195"),
+                 ("GRAINS", "ch=chunk777 nd=nodewise k01=scalar kL=layerwise")):
+        check(kv.get(k) == v, "PROVENANCE %s = %s" % (k, v[:16] if len(v) == 64 or len(v) == 40 else v))
+    check(kv.get("HF_SHA256") != HF_PRE_SHA, "PROVENANCE HF is the PATCHED HF.py, not the unpatched %s" % HF_PRE_SHA[:16])
+    sc = os.path.join(stage, "analysis", "cAI1_alphaindep_score.py")
+    ds = os.path.join(stage, "analysis", "cai1_design.py")
+    check(os.path.exists(sc) and sha_file(sc) == SCORER_SHA, "stage scorer sha256 = %s (the registered bytes)" % SCORER_SHA[:16])
+    check(os.path.exists(ds) and sha_file(ds) == DESIGN_SHA, "stage design sha256 = %s" % DESIGN_SHA[:16])
+    check(not os.path.exists(os.path.join(stage, "paper")), "the stage carries no paper/ directory")
+
+    # ---- [1]-[3] per run --------------------------------------------------------------------------------------------
+    P("")
+    P("[1]-[3] PER RUN: ARGS rebuilt flag by flag, ENV, the DECAY_ROUTE witness, epoch lines, probe structure, G-SHRINK")
+    check(witness("I5") == "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=5e-05 lambda_f32=4.999999873689376e-05 gamma=1.0",
+          "the I5 witness rebuilt with struct equals 306.4's line (and the proof job's real-run line, 305.5)")
+    check(witness("I4") == "DECAY_ROUTE: on mode=alpha_indep base=SGDm wd=0.0 lambda=0.0005 lambda_f32=0.0005000000237487257 gamma=1.0",
+          "the I4 witness rebuilt with struct equals 306.4's line")
+    per = {}
+    fails = {"args": [], "env": [], "wit": [], "kind": [], "done": [], "eps": [], "bad": [], "probe": [], "first": [],
+             "gpu": [], "shrink": []}
+    save_dirs = set()
+    gpus = {}
+    for (arm, seed), (jid, p) in sorted(runs.items(), key=lambda kv_: kv_[1][0]):
+        rn = run_name(arm, seed)
+        r = rung_of(arm)
+        o = read_out(p)
+        sd_ = None
+        if len(o["args"]) == 1:
+            toks = o["args"][0].split(" ")
+            if "--save-directory" in toks:
+                sd_ = toks[toks.index("--save-directory") + 1]
+        save_dirs.add(sd_)
+        if len(o["args"]) != 1 or sd_ is None or o["args"][0] != design_args(arm, seed, sd_):
+            fails["args"].append(rn)
+        envw = ENV_PRE + (sd_ or "?") + "/probe_" + rn + ENV_POST
+        if len(o["env"]) != 1 or o["env"][0] != envw:
+            fails["env"].append(rn)
+        other = RUNGS[1 - RUNGS.index(r)]
+        if o["dr"] != [witness(r)] or witness(other) in o["dr"] or o["dr_mention"] != 1:
+            fails["wit"].append(rn)
+        if [k for k in o["kinds"] if not k.startswith("DECAY_ROUTE")] or o["pt"]:
+            fails["kind"].append(rn)
+        if o["done"] != 1:
+            fails["done"].append(rn)
+        if o["dup"] or sorted(o["eps"]) != list(range(NEPOCH)):
+            fails["eps"].append(rn)
+        if o["bad_acc"]:
+            fails["bad"].append(rn)
+        if o["gpu"] != "NVIDIA L4":
+            fails["gpu"].append(rn)
+        gpus[o["gpu"]] = gpus.get(o["gpu"], 0) + 1
+        recs, sbad = read_probe(os.path.join(pdir, "probe_" + rn, "probe.jsonl"), LAM[r])
+        if sbad:
+            fails["shrink"].append("%s (%s)" % (rn, sbad[0]))
+        m = M_OF[grain_of(arm)]
+        blen = 1 if m == 1 else NTENS
+        good = (len(recs) == NREC and [x[0] for x in recs] == list(range(0, NREC * PROBE, PROBE))
+                and all(x[1] == m for x in recs) and all(x[2] == blen for x in recs)
+                and max(x[4] for x in recs) - min(x[3] for x in recs) > 1e-9
+                and all(x[5] is not None and x[6] is not None for x in recs))
+        if not good:
+            fails["probe"].append(rn)
+        if abs(recs[0][8] - math.log(ALPHA0)) > 1e-3:
+            fails["first"].append(rn)
+        T = float(len(recs))
+        rec_lo = sum(1 for x in recs if x[3] <= LO + BOX_EPS) / T
+        rec_hi = sum(1 for x in recs if x[4] >= HI - BOX_EPS) / T
+        win = [x for x in recs if x[0] >= WIN_STEP]
+        devs = [x[10] for x in recs if x[10] is not None]
+        meas = [x[9] for x in recs if x[9] is not None]
+        eps = o["eps"]
+        per[(arm, seed)] = dict(
+            level=amean([eps[e][1] for e in range(PL_LO, PL_HI + 1)]),
+            train=amean([eps[e][0] for e in range(PL_LO, PL_HI + 1)]),
+            last=eps[99][1] if 99 in eps else float("nan"), rec_lo=rec_lo, rec_hi=rec_hi,
+            boxfree=(rec_lo < BOXFREE_MAX and rec_hi < BOXFREE_MAX),
+            a_pl=amed([x[7] for x in win]), jid=jid, minutes=o["minutes"],
+            med_meas=LAM[r] * (1.0 + amed(devs)) if devs else float("nan"),
+            maxdev=max(abs(x) for x in devs) if devs else float("nan"),
+            meas_min=min(meas), meas_max=max(meas), meas_win=amed([x[9] for x in win]),
+            first_hi=next((x[0] for x in recs if x[4] >= HI - BOX_EPS), None),
+            first_lo=next((x[0] for x in recs if x[3] <= LO + BOX_EPS), None))
+    check(not fails["args"], "ARGS: exactly ONE line per run, equal to the design's 20 flags in order (wd 0), byte for byte (%d of 32 fail; %s)" % (len(fails["args"]), fails["args"][:3]))
+    check(len(save_dirs) == 1, "ONE save directory across the 32 runs")
+    check(not fails["env"], "ENV: exactly ONE line per run, the registered one with the run's own PROBE_DIR (%d fail)" % len(fails["env"]))
+    check(not fails["wit"], "DECAY_ROUTE: exactly ONE line per run, its OWN rung's witness, never the other rung's, and no other line mentions DECAY_ROUTE (%d fail; %s)" % (len(fails["wit"]), fails["wit"][:3]))
+    check(not fails["kind"], "no other `<KIND>: on` witness and no PROBE_TENSOR line (%d fail)" % len(fails["kind"]))
+    check(not fails["done"], "RUN_DONE exactly once on every run (%d fail)" % len(fails["done"]))
+    check(not fails["eps"], "Epoch lines: epochs 0..99 once each, 100 lines (%d fail)" % len(fails["eps"]))
+    check(not fails["bad"], "every line carrying `Test Accuracy` parses as an epoch line (%d fail)" % len(fails["bad"]))
+    check(not fails["gpu"], "every run's nvidia-smi line names an NVIDIA L4 (%d fail)" % len(fails["gpu"]))
+    check(not fails["probe"], "probe.jsonl: 10,000 records at steps 0,5,...,49995, n_beta == the arm's m, beta list 1 (scalar) or 62 entries, beta moved, n_at_lo / n_at_hi present (%d fail)" % len(fails["probe"]))
+    check(not fails["first"], "every run's first probe record sits at ln(alpha0 1e-3) = -6.9078 (+/-1e-3) (%d fail)" % len(fails["first"]))
+    check(not fails["shrink"], "G-SHRINK re-done on all 320,000 records: dr_mode alpha_indep, dr_lam == the rung's LAMBDA, dr_n == step + 2, applied == LAMBDA (1e-9 rel), trace factor == 1 - LAMBDA (1e-12), MEASURED shrink within 1 %% of LAMBDA (%d fail; %s)" % (len(fails["shrink"]), fails["shrink"][:2]))
+    P("")
+    P("  PER RUN (plateau5 = mean TEST of epochs 95-99; MEASURED per-step shrink dr_shrink_meas from the raw probe records:")
+    P("  median over all 10,000 records via the relative deviation, min, max, and the plateau-window median; minutes from the run's own line)")
+    P("  %-16s %8s %9s %9s %8s %8s %13s %13s %13s %13s %9s %7s" % ("run", "job", "plateau5", "train5", "rec_lo", "rec_hi",
+      "shrink_med", "shrink_min", "shrink_max", "shrink_win", "maxreldev", "minutes"))
+    for (arm, seed), x in sorted(per.items(), key=lambda kv_: kv_[1]["jid"]):
+        P("  %-16s %8d %9.4f %9.4f %8.4f %8.4f %13.6e %13.6e %13.6e %13.6e %9.2e %7s" % (
+            run_name(arm, seed), x["jid"], x["level"], x["train"], x["rec_lo"], x["rec_hi"], x["med_meas"],
+            x["meas_min"], x["meas_max"], x["meas_win"], x["maxdev"], x["minutes"]))
+    mins = 0
+    for x in per.values():
+        mins += x["minutes"] or 0
+    P("  GPU time by the runs' own `minutes` lines: %d min = %.4f GPU-h (registered expectation 26.99, hard bound 64)" % (mins, mins / 60.0))
+
+    # ---- [4] levels, sigma, contrasts --------------------------------------------------------------------------------
+    A, sig_in, df = arms_from(per)
+    sig, which = (SIGMA_PRIOR, "SIGMA_PRIOR_frozen") if SIGMA_PRIOR >= sig_in else (sig_in, "SIGMA_INBATCH")
+    st, K, scal = contrasts(A, sig)
+    primary = primary_token(st["I5"], st["I4"])
+    sc = sc_token(scal["I5"], scal["I4"])
+
+    R = []
+    R.append("=" * 110)
+    R.append("cai1 -- THE COUNT-MATCHED AUDIT UNDER ALPHA-INDEPENDENT DECAY  (CORRECTIONS 306; ICML-PLAN 1.6, DECOUPLED-NOT-TESTED)")
+    R.append("scorer sha256 %s   design sha256 %s" % (SCORER_SHA, DESIGN_SHA))
+    R.append("@RUNSDIR")
+    R.append("=" * 110)
+    R.append("COMPLETION  %d / %d registered runs complete (100 epoch lines + RUN_DONE)" % (len(per), 32))
+    R.append("@GPROV  MODE %s  SCORER %s  DESIGN %s  HF %s" % (kv.get("MODE"), kv.get("SCORER_SHA256", "")[:16],
+             kv.get("DESIGN_SHA256", "")[:16], kv.get("HF_SHA256", "")[:16]))
+    R.append("G-ARGS / G-ENV / G-WITNESS / G-KIND / G-STRUCT / G-SHRINK  %d of %d complete runs pass (20 flags each, wd 0, the "
+             "registered ENV line, ONE own-rung DECAY_ROUTE witness, no other patch witness, 10,000 probe records with n_beta == "
+             "m, every record's measured shrink within 0.01 of its LAMBDA)" % (len(per), len(per)))
+    R.append("G-HW (DISCLOSURE ONLY, never a gate): %s" % ", ".join("%s x%d" % (k, v) for k, v in sorted(gpus.items(), key=str)))
+    ncorp, ncsv, nex = corpus_count(os.path.join(stage, "results", "all_runs.csv"), os.path.join(stage, "results", "CORPUS-EXCLUSIONS.tsv"))
+    R.append("corpus: %d rows after corpus_exclusions.filter_rows, %s- excluded  (DISCLOSURE ONLY -- enters no bar, sigma, "
+             "level, state, contrast or stamp)" % (ncorp, BATCH))
+    R.append("")
+    R.append("ARMS  plateau5 = mean TEST over epochs %d-%d from each run's OWN .out; box occupancy, measured shrink and learned"
+             " step size from its OWN probe.jsonl" % (PL_LO, PL_HI))
+    R.append("  %-6s %-4s %-7s %-9s %2s %9s %7s %7s %9s  %-5s %7s %7s %12s %10s %12s %9s" % (
+        "arm", "rung", "LAMBDA", "grain", "n", "plateau5", "sd", "range", "train5", "box", "rec_lo", "rec_hi",
+        "shrink_meas", "maxreldev", "a_plateau", "LAM/a"))
+    arm_shr = {}
+    for a in ARMS:
+        x = A[a]
+        pr = [per[(a, s)] for s in SEEDS]
+        apm = amed([q["a_pl"] for q in pr])
+        shm = amed([q["med_meas"] for q in pr])
+        arm_shr[a] = (shm, max(q["maxdev"] for q in pr), apm)
+        R.append("  %-6s %-4s %-7s %-9s %2d %9.4f %7.3f %7.3f %9.4f  %-5s %7.4f %7.4f %12.6e %10.2e %12s %9s" % (
+            a, rung_of(a), LAM_TXT[rung_of(a)], SPEC_OF[grain_of(a)], x["n"], x["level"], x["sd"], x["range"], x["train"],
+            "free" if x["boxfree"] else "BOUND", max(q["rec_lo"] for q in pr), max(q["rec_hi"] for q in pr),
+            shm, max(q["maxdev"] for q in pr), "%.6e" % apm, "%.3g" % (LAM[rung_of(a)] / apm)))
+    R.append("  (shrink_meas / a_plateau / LAM/a are DESCRIPTIVE: a_plateau = median over the epoch-95+ records of the median over"
+             " the record's stored step sizes of exp(beta); for chunk777 / nodewise the probe stores 62 per-tensor MEANS of log"
+             " step size, not the per-group values -- APPROXIMATE, as 296.4)")
+    R.append("")
+    R.append("SIGMA  O2: max(frozen floor, in-batch) -- nothing from the corpus")
+    R.append("  SIGMA_PRIOR_frozen   %.6f  (df %d, filtered, literal)" % (SIGMA_PRIOR, SIGMA_PRIOR_DF))
+    R.append("  SIGMA_INBATCH        %.6f  (df %d, pooled within the 8 arms)" % (sig_in, df))
+    R.append("  SIGMA_USED           %.6f  (= %s)" % (sig, which))
+    R.append("")
+    R.append("CONTRASTS (every one WITHIN a LAMBDA rung, IN BATCH; +/-2 SE is a HALF-WIDTH, not a bound on any effect)")
+    for r in RUNGS:
+        d, se = K["D" + r]
+        R.append("  D_%s  = ch%s - nd%s = %+.4f pp = %+.2f SE (SE %.6f)  [%+.4f, %+.4f]  TRAIN %+.4f   state %s"
+                 % (r, r, r, d, d / se, se, d - RES * se, d + RES * se, K["DTR" + r], st[r]))
+    v, se = K["DD"]
+    R.append("  DD   = D_I4 - D_I5 = %+.4f pp = %+.2f SE (SE %.6f)   DESCRIPTIVE" % (v, v / se, se))
+    for r in RUNGS:
+        for g in ("ch", "nd"):
+            v, se = K["T" + g + r]
+            R.append("  T%s_%s = k01%s - %s%s = %+.4f pp = %+.2f SE" % (g, r, r, g, r, v, v / se))
+        R.append("    scalar reading at %s: %s" % (r, scal[r]))
+    for r in RUNGS:
+        v, se = K["G" + r]
+        R.append("  G_%s  = kL%s - k01%s = %+.4f pp = %+.2f SE   DESCRIPTIVE (layerwise vs scalar in this cell)" % (r, r, r, v, v / se))
+    R.append("")
+    R.append("LADDERS (LEVELS, not effects; this cell only)")
+    for g in GRAINS:
+        R.append("  %-9s %s" % (SPEC_OF[g], " | ".join("LAMBDA %s %.4f" % (LAM_TXT[r], A[g + r]["level"]) for r in RUNGS)))
+    R.append("")
+    R.append("REFERENCE (between batch, never pooled; cgw1 296.3, alpha-scaled): D_W1 %+.4f %s, D_W2 %+.4f %s, D_W4 %+.4f %s; "
+             "scalar at W4 %s" % (CGW1_D["W1"], CGW1_ST["W1"], CGW1_D["W2"], CGW1_ST["W2"], CGW1_D["W4"], CGW1_ST["W4"],
+                                  CGW1_ST["SCALAR_W4"]))
+    stamps = list(BOUNDS)
+    stamps.append("SIGMA-PRIOR-FROZEN" if which == "SIGMA_PRIOR_frozen" else "SIGMA-INBATCH")
+    for r in RUNGS:
+        stamps.append("%s-VS-CGW1-W1-%s" % (r, "SAME" if st[r] == CGW1_ST["W1"] else "DIFFERS"))
+        if st[r] in ("SURVIVES", "REVERSES"):
+            stamps.append("TRAIN-%s-%s" % ("AGREES" if (K["DTR" + r] > 0) == (K["D" + r][0] > 0) else "DISAGREES", r))
+        g_, gse = K["G" + r]
+        if g_ <= -SURV and g_ < -RES * gse:
+            stamps.append("LAYERWISE-BELOW-SCALAR-%s" % r)
+        elif g_ >= SURV and g_ > RES * gse:
+            stamps.append("LAYERWISE-ABOVE-SCALAR-%s" % r)
+        for g in ("k01", "kL"):
+            if not A[g + r]["boxfree"]:
+                stamps.append("BOX-BOUND-%s%s" % (g, r))
+    for a in ARMS:
+        if A[a]["range"] > DIVERGED:
+            stamps.append("DIVERGED-%s" % a)
+        if A[a]["level"] < HEALTH_MIN:
+            stamps.append("UNHEALTHY-%s" % a)
+    R.append("")
+    R.append("LICENCE (primary)  %s" % LICENCE[primary])
+    R.append("LICENCE (scalar)   %s" % SC_LICENCE[sc])
+    R.append("")
+    final = "FINAL %s | %s | %s | %s | %s" % (primary, sc, "+".join("%s-%s" % (r, st[r]) for r in RUNGS),
+                                             "+".join("%s-%s" % (r, scal[r]) for r in RUNGS), " ".join(stamps))
+    R.append(final)
+
+    # ---- [5] compare with each committed log -------------------------------------------------------------------------
+    P("")
+    P("[4]-[5] THE SCORER'S STDOUT REBUILT (%d lines) AND COMPARED LINE BY LINE WITH EACH COMMITTED LOG" % len(R))
+    P("  rebuild digest (host-dependent lines as their @ placeholders): %s" % hashlib.sha256("\n".join(R).encode()).hexdigest())
+    P("  corpus disclosure rebuilt from the stage's CSV (%d rows) and TSV (%d listed keys): %d rows" % (ncsv, nex, ncorp))
+    for li, lp in enumerate(logs):
+        L = open(lp).read().split("\n")
+        while L and L[-1] == "":
+            L.pop()
+        bad = []
+        if len(L) != len(R):
+            bad.append("length %d != %d" % (len(L), len(R)))
+        for j in range(min(len(L), len(R))):
+            want = R[j]
+            got = L[j]
+            if want == "@RUNSDIR":
+                okj = got.startswith("runsdir ") and len(got) > len("runsdir ")
+            elif want.startswith("@GPROV"):
+                tail = want[len("@GPROV"):]
+                okj = (got.startswith("G-PROV  ") and got.endswith(tail)
+                       and got[len("G-PROV  "):-len(tail)].endswith("/cai1/PROVENANCE.txt"))
+            else:
+                okj = (got == want)
+            if not okj:
+                bad.append("line %d" % (j + 1))
+        check(not bad, "committed log #%d: %d lines, every line equal to the rebuild (%d byte for byte, 2 host lines by form) %s"
+              % (li + 1, len(L), len(R) - 2, bad[:4]))
+        check(bool(L) and L[-1] == final, "committed log #%d: its LAST line is the rebuilt FINAL" % (li + 1))
+        check(all(b in L[-1].split(" ") for b in BOUNDS), "committed log #%d: all seven registered bounds are on the FINAL" % (li + 1))
+
+    # ---- [6] the two questions ---------------------------------------------------------------------------------------
+    d5, se5 = K["DI5"]
+    d4, se4 = K["DI4"]
+    P("")
+    P("[6] THE TWO QUESTIONS OF 306, FROM THE NUMBERS (bounds first)")
+    P("  BOUNDS on every reading: %s" % " ".join(BOUNDS))
+    P("  FINAL %s" % final[len("FINAL "):])
+    P("  sigma_used %.6f (%s; in-batch %.6f df %d is %+.1f %% against the frozen floor %.6f df %d); noise-floor demo %.6f (df %d) quoted, no bar"
+      % (sig, which, sig_in, df, 100.0 * (sig_in / SIGMA_PRIOR - 1.0), SIGMA_PRIOR, SIGMA_PRIOR_DF, SIGMA_DEMO, SIGMA_DEMO_DF))
+    for r, (d, se) in (("I5", (d5, se5)), ("I4", (d4, se4))):
+        P("  Q1 %s (LAMBDA %s)  D = ch - nd %+.4f pp, 2 SE %.4f, [%+.4f, %+.4f], TRAIN %+.4f -> %s" % (
+            r, LAM_TXT[r], d, RES * se, d - RES * se, d + RES * se, K["DTR" + r], st[r]))
+    P("  Q1 PRIMARY -> %s" % primary)
+    for r in RUNGS:
+        tch, tse = K["Tch" + r]
+        tnd, _t = K["Tnd" + r]
+        P("  Q2 %s  Tch = k01 - ch %+.4f, Tnd = k01 - nd %+.4f (2 SE %.4f); min T - 2 SE %+.4f -> %s" % (
+            r, tch, tnd, RES * tse, min(tch, tnd) - RES * tse, scal[r]))
+    P("  Q2 SCALAR -> %s" % sc)
+
+    # ---- [7] what bounds the verdict ---------------------------------------------------------------------------------
+    P("")
+    P("[7] WHAT BOUNDS THE VERDICT (DESCRIPTIVE unless it restates a registered gate)")
+    for r, (d, se) in (("I5", (d5, se5)), ("I4", (d4, se4))):
+        P("  %s margins: SURVIVES needs D >= 0.30 and D > 2 SE %.4f (D %+.4f: %+.4f to the 0.30 bar, %+.4f to 2 SE); VANISHES needs"
+          " D <= 0.15 (%+.4f) and D + 2 SE < 0.5556 (%+.4f, margin %+.4f); REVERSES needs D <= -0.15 and D < -2 SE"
+          % (r, RES * se, d, d - SURV, d - RES * se, NULLBAR - d, d + RES * se, POOL - (d + RES * se)))
+    for s_alt, lab in ((SIGMA_PRIOR, "the frozen floor"), (sig_in, "the in-batch sigma"), (SIGMA_DEMO, "the quoted demo")):
+        st2, _k2, sc2 = contrasts(A, s_alt)
+        P("  sigma sensitivity at %s %.6f: %s | %s | %s" % (lab, s_alt, primary_token(st2["I5"], st2["I4"]),
+          sc_token(sc2["I5"], sc2["I4"]), " ".join("%s-%s/%s" % (r, st2[r], sc2[r]) for r in RUNGS)))
+    i5 = [a for a in ARMS if rung_of(a) == "I5"]
+    ss5 = 0.0
+    for a in i5:
+        for x in A[a]["seeds"]:
+            ss5 += (x - A[a]["level"]) ** 2
+    sig5 = math.sqrt(ss5 / (4 * (len(SEEDS) - 1)))
+    for s_alt, lab in ((sig, "SIGMA_USED"), (SIGMA_PRIOR, "the frozen floor"), (sig5, "the I5-only pooled sd (df 12, NOT a registered sigma)")):
+        stx, kx, _scx = contrasts(A, s_alt, box_override=True)
+        P("  COUNTERFACTUAL (no token, licenses nothing): 5 %% box gate removed, sigma = %s %.6f: I5-%s (D %+.4f, 2 SE %.4f)" % (
+          lab, s_alt, stx["I5"], kx["DI5"][0], RES * kx["DI5"][1]))
+    stx, kx, _scx = contrasts(A, sig, box_override=True, health_override=True)
+    P("  COUNTERFACTUAL (no token, licenses nothing): box AND health gates removed at SIGMA_USED: I4-%s (D %+.4f, 2 SE %.4f); every I4 arm is below HEALTH_MIN 85"
+      % (stx["I4"], kx["DI4"][0], RES * kx["DI4"][1]))
+    P("  leave-one-seed-out (drop the same seed from every arm; sigma re-composed by O2 on the 3-seed in-batch value):")
+    for s in SEEDS:
+        A3, si3, _df3 = arms_from(per, drop=s)
+        sg3 = SIGMA_PRIOR if SIGMA_PRIOR >= si3 else si3
+        st3, k3, sc3 = contrasts(A3, sg3)
+        P("    drop s%d: D_I5 %+.4f (%s)  D_I4 %+.4f (%s)  -> %s | %s" % (s, k3["DI5"][0], st3["I5"], k3["DI4"][0], st3["I4"],
+          primary_token(st3["I5"], st3["I4"]), sc_token(sc3["I5"], sc3["I4"])))
+    for r in RUNGS:
+        P("  same-seed paired ch%s - nd%s: %s" % (r, r, ", ".join("s%d %+.4f" % (s, per[("ch" + r, s)]["level"] - per[("nd" + r, s)]["level"]) for s in SEEDS)))
+        P("  same-seed k01%s - max(ch%s, nd%s): %s" % (r, r, r, ", ".join(
+            "s%d %+.4f" % (s, per[("k01" + r, s)]["level"] - max(per[("ch" + r, s)]["level"], per[("nd" + r, s)]["level"])) for s in SEEDS)))
+    P("  FLOOR GATE (164.6): every level vs HEALTH_MIN 85 / chance 10 / 100: %s" % ", ".join(
+        "%s %+.2f / %+.2f / %.2f" % (a, A[a]["level"] - HEALTH_MIN, A[a]["level"] - 10.0, 100.0 - A[a]["level"]) for a in ARMS))
+    P("  predicted bands (306.6: every I5 arm 89.0-92.5, every I4 arm 84.0-91.0) vs measured: %s" % ", ".join(
+        "%s %.4f %s" % (a, A[a]["level"], "in" if PRED[rung_of(a)][0] <= A[a]["level"] <= PRED[rung_of(a)][1] else "OUT")
+        for a in ARMS))
+    P("  box onset per run (first probe step whose largest step size sits at the upper edge -2.3026 / smallest at -15; '-' = never):")
+    for a in ARMS:
+        P("    %-6s %s" % (a, "  ".join("s%d hi %s lo %s" % (s, "-" if per[(a, s)]["first_hi"] is None else per[(a, s)]["first_hi"],
+          "-" if per[(a, s)]["first_lo"] is None else per[(a, s)]["first_lo"]) for s in SEEDS)))
+    edge_steps = (HI - BOX_EPS - math.log(ALPHA0)) / 1e-4
+    P("  box-onset arithmetic (DESCRIPTIVE): a step size rising from ln(alpha0) = %.4f by the Lion meta step 1e-4 on EVERY step first reaches"
+      " the gate's edge -2.3026 - 1e-3 after %.1f steps; the I4 onsets span steps %d-%d" % (math.log(ALPHA0), edge_steps,
+      min(per[(a, s)]["first_hi"] for a in ARMS if rung_of(a) == "I4" for s in SEEDS),
+      max(per[(a, s)]["first_hi"] for a in ARMS if rung_of(a) == "I4" for s in SEEDS)))
+    P("  box: %s" % ", ".join("%s %s (rec_lo %.4f rec_hi %.4f)" % (a, "free" if A[a]["boxfree"] else "BOUND",
+      max(per[(a, s)]["rec_lo"] for s in SEEDS), max(per[(a, s)]["rec_hi"] for s in SEEDS)) for a in ARMS))
+    P("  level change I5 -> I4 per grain: %s" % ", ".join("%s %+.4f" % (g, A[g + "I4"]["level"] - A[g + "I5"]["level"]) for g in GRAINS))
+    P("  cgw1 side by side (alpha-scaled, cross-batch, never pooled): D_W1 %+.4f %s, D_W2 %+.4f %s, D_W4 %+.4f %s; Tch_W4 %+.4f, Tnd_W4 %+.4f (untuned;"
+      " crt1's retune ties at the tuned selection, Tch %+.4f / Tnd %+.4f, 309.3)" % (CGW1_D["W1"], CGW1_ST["W1"], CGW1_D["W2"], CGW1_ST["W2"],
+      CGW1_D["W4"], CGW1_ST["W4"], CGW1_T4["ch"], CGW1_T4["nd"], CRT1_T_TUNED[0][1], CRT1_T_TUNED[1][1]))
+    P("  REALISED PER-STEP SHRINK (G-SHRINK: it must equal LAMBDA).  cai1 per arm, MEASURED dr_shrink_meas (median of the seed medians):")
+    for a in ARMS:
+        shm, mdv, apm = arm_shr[a]
+        P("    %-6s LAMBDA %s  measured %.6e (= %.6f x LAMBDA; max |rel dev| %.2e)  = %.2fx lr*wd 5e-5, %.2fx a recipe's ~5e-4;"
+          " a_plateau %.4e, LAMBDA/a %.3g" % (a, LAM_TXT[rung_of(a)], shm, shm / LAM[rung_of(a)], mdv, shm / LRWD_REF,
+                                              shm / STD_RECIPE_REF, apm, LAM[rung_of(a)] / apm))
+    P("    cgw1 W4 (alpha-scaled 5e-4, plateau a*wd, 296.4; ch / nd approximate): %s; cgw1 W1 scalar %.4e" % (
+        ", ".join("%s %.4e (1/%.0f of 5e-4)" % (g, v, STD_RECIPE_REF / v) for g, v in CGW1_SHRINK_W4), CGW1_SHRINK_W1_K01))
+    P("    crt1 selected A2 arms (alpha-scaled 5e-4, 309.3; ch / nd approximate): %s" % ", ".join(
+        "%s %.4e (1/%.0f of 5e-4)" % (g, v, STD_RECIPE_REF / v) for g, v in CRT1_SHRINK_A2))
+    lo_c = min(v for _g, v in CGW1_SHRINK_W4 + CRT1_SHRINK_A2)
+    hi_c = max(v for _g, v in CGW1_SHRINK_W4 + CRT1_SHRINK_A2)
+    P("    so cai1's I5 shrink is %.0f-%.0fx and its I4 shrink %.0f-%.0fx the alpha-scaled 5e-4 references' plateau shrink (%.4e-%.4e)" % (
+        LAM["I5"] / hi_c, LAM["I5"] / lo_c, LAM["I4"] / hi_c, LAM["I4"] / lo_c, lo_c, hi_c))
+
+    # ---- [8] exclusion rows ------------------------------------------------------------------------------------------
+    P("")
+    P("[8] THE 32 EXCLUSION ROWS OWED AT INGEST (306.9, 308.8: TWO-AXIS), REBUILT FROM THE RUNS' OWN FILE NAMES, ARGS AND DECAY_ROUTE LINES")
+    want = []
+    for (arm, seed), x in sorted(per.items(), key=lambda kv_: kv_[1]["jid"]):
+        o = read_out(runs[(arm, seed)][1])
+        toks = o["args"][0].split(" ")
+        wdv = toks[toks.index("--weight-decay-base") + 1]
+        mom = toks[toks.index("--momentum-param-base") + 1]
+        if float(mom) != 0.99 or wdv != "0" or o["dr"] != [witness(rung_of(arm))]:
+            want.append("UNEXPECTED %s" % run_name(arm, seed))
+            continue
+        g = grain_of(arm)
+        want.append("\t".join([run_name(arm, seed), str(x["jid"]), BATCH, arm, "%s (granularity %s)" % (g, SPEC_OF[g]),
+                               "--weight-decay-base 0 + DECAY_ROUTE=alpha_indep:" + LAM_TXT[rung_of(arm)],
+                               "ARGS_WD_BASE: weight-decay-base=" + wdv, "CORRECTIONS 318",
+                               "TWO-AXIS (CORRECTIONS 284 / 308): the alpha-independent decay route AND the removed "
+                               "alpha-scaled base decay are carried by no CSV column; listed with the ARGS witness, the "
+                               "DECAY_ROUTE line held to MULTI_KIND and DECAY_ROUTE_ARMS"]))
+    got = [ln for ln in open(rowsp).read().split("\n") if ln.strip() and not ln.startswith("#")]
+    check(bool(got) and got[0] == "run\tjob_id\tbatch\tarm\tlooks_like\tintervention\twitness\tregistered_at\treason",
+          "PROPOSED file header is CORPUS-EXCLUSIONS.tsv's 9-column header")
+    check(len(want) == 32 and not [w for w in want if w.startswith("UNEXPECTED")],
+          "all 32 runs are two-axis (wd 0 + their own rung's DECAY_ROUTE line); no momentum deviation")
+    check(got[1:] == want, "the PROPOSED rows equal the rebuild byte for byte, in job order (%d rows)" % (len(got) - 1))
+    check(all(len(w.split("\t")) == 9 for w in want), "every rebuilt row has 9 tab-separated fields")
+    P("  rows digest %s" % hashlib.sha256("\n".join(want).encode()).hexdigest())
+    for w in want:
+        P("  " + w)
+
+    P("")
+    P("SUMMARY %d PASS / %d FAIL" % (NPASS[0], NFAIL[0]))
+    print("\n".join(OUT))
+    return 0 if NFAIL[0] == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -33,8 +33,8 @@ const CWD2_FINAL = ['WD-ROUTE', 'SCALAR-NEEDS-CARRIER-WD', 'HARNESS-CLEAN', 'PAT
   'SIGMA-PRIOR-FROZEN', 'POSITIVE-CONTROL-REPRODUCES', 'FLOOR-READINGS-ARE-BOUNDS', 'TRAIN-AGREES (two branch tokens + 14 stamps)'];
 
 test('MT232-MT235 carry the outcome the documented rules give them, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-13, -9).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended in line order, before the later cwd3, cwd4, cwd5, caw2, cgw1, crt1, csh1, cvl1 and g3b rows');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [181, 163, 18, 3501]);
+  assert.deepEqual(data.experiments.slice(-16, -12).map(e => e.id), ['MT232', 'MT233', 'MT234', 'MT235'], 'appended in line order, before the later cwd3, cwd4, cwd5, caw2, cgw1, crt1, csh1, cvl1, g3b, crd1, cai1 and crt2 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [184, 166, 18, 3596]);
   assert.deepEqual([CVT10_FINAL.length, CWD1_FINAL.length, CSV1_FINAL.length, CWD2_FINAL.length], [23, 13, 22, 16]);
   // cwd2 is the one row of the cycle whose FINAL carries two branch tokens, so its reason opens with both.
   const cases: [string, string, string[], number, string][] = [
@@ -137,11 +137,11 @@ test('the four intervention warnings name the arms, the patches and the exclusio
     assert.match(warning.detail, /results\/CORPUS-EXCLUSIONS\.tsv at 2972d48; CORRECTIONS \d+, 269 and 27\d\.$|results\/CORPUS-EXCLUSIONS\.tsv at 2972d48; CORRECTIONS 258 and 270\.$/, id);
   }
   // None of the four ran with a base-optimiser flag deviation, so the ARGS-value kind stays cmo1's alone.
-  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation', 'warning-MT243-args-deviation', 'warning-MT244-args-deviation']);
+  assert.deepEqual(data.warnings.filter(w => w.id.endsWith('-args-deviation')).map(w => w.id), ['warning-MT228-args-deviation', 'warning-MT238-args-deviation', 'warning-MT239-args-deviation', 'warning-MT240-args-deviation', 'warning-MT241-args-deviation', 'warning-MT242-args-deviation', 'warning-MT243-args-deviation', 'warning-MT244-args-deviation', 'warning-MT245-args-deviation', 'warning-MT246-args-deviation', 'warning-MT247-args-deviation']);
 });
 
 test('the 72 runs link to MT232-MT235 with sanitized logs, and exactly the 45 intervened runs are marked', () => {
-  assert.equal(runs.length, 3501);
+  assert.equal(runs.length, 3596);
   const batches: [string, string, number, string[], string, number][] = [
     ['cvt10', 'MT232', 30, ['120', '121', '122'], 'ResNet18_c100', 15],
     ['cwd1', 'MT233', 9, ['128', '129', '130'], 'ResNet18_c100', 6],
@@ -198,7 +198,7 @@ test('the 72 runs link to MT232-MT235 with sanitized logs, and exactly the 45 in
   // ISOSPLIT is the one listed arm with no plain twin at its cell key, so its note cannot name one.
   assert.match(armOf('cvt10-ISOSPLIT-s120').parameters.interventionNote!, /^Not a plain measurement of its cell key \(granularity sets:1-49,51-52,54-58,60-62\//);
   assert.match(armOf('cvt10-ISOSPLIT-s120').parameters.interventionNote!, /which no free arm anywhere in the corpus shares/);
-  assert.equal(runs.filter(run => run.batch !== 'cvl1' && run.parameters.intervention).length, 183, 'the 108 earlier patch interventions, these 45, cwd3\'s 12 and cwd4\'s 18');
+  assert.equal(runs.filter(run => !['cvl1', 'crd1'].includes(run.batch) && run.parameters.intervention).length, 183, 'the 108 earlier patch interventions, these 45, cwd3\'s 12 and cwd4\'s 18');
   // The arm means of the published plateau5 values reproduce every level the four rows read.
   const mean = (batch: string, arm: string) => {
     const armRuns = runs.filter(run => run.batch === batch && run.parameters.runLabel.split('-')[1] === arm);

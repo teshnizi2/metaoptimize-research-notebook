@@ -24,8 +24,8 @@ const G3B_FINAL = ['UNRESOLVED-BOXBOUND-W4', 'SCALAR-BEATS-BEST', 'DENOM-HOLDS',
   '5 stamps; the 6 registered bounds in the next column)'];
 
 test('MT244 carries the outcome the documented rules give it, with every FINAL token quoted', () => {
-  assert.deepEqual(data.experiments.slice(-1).map(e => e.id), ['MT244'], 'appended after every existing record');
-  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [181, 163, 18, 3501]);
+  assert.deepEqual(data.experiments.slice(-4, -3).map(e => e.id), ['MT244'], 'appended in line order, before the later crd1, cai1 and crt2 rows');
+  assert.deepEqual([data.meta.stats.experiments, data.meta.stats.researchQuestions, data.meta.stats.methodChecks, data.meta.stats.runs], [184, 166, 18, 3596]);
   // g3b belongs to the count-matched partition audit; Open, as MT240 and MT243, and it corrects no earlier published claim.
   assert.deepEqual([g3b.section, g3b.area, g3b.kind, g3b.outcome, g3b.corrected, g3b.batches],
     [10, 'Count-matched partition audit', 'research', 'unresolved', false, ['g3b']]);
@@ -65,7 +65,7 @@ test('the ARGS-value warning names its kind, and every W4 row of the batch is li
 });
 
 test('the 32 runs link to MT244 with sanitized logs; only the W4 runs carry the ARGS-value mark', () => {
-  assert.equal(runs.length, 3501);
+  assert.equal(runs.length, 3596);
   const linked = runs.filter(run => run.batch === 'g3b');
   assert.equal(linked.length, 32);
   assert.deepEqual([...g3b.runIds].sort(), linked.map(run => run.id).sort());
@@ -88,8 +88,8 @@ test('the 32 runs link to MT244 with sanitized logs; only the W4 runs carry the 
       assert.equal(run.parameters.argsDeviationAxes, undefined, `${run.id} is a one-axis row`);
     }
   }
-  assert.equal(runs.filter(run => run.parameters.intervention).length, 199, 'no patch intervention was added');
-  assert.equal(runs.filter(run => run.parameters.argsDeviation).length, 171, "155 before, plus g3b's 16 W4 rows");
+  assert.equal(runs.filter(run => run.batch !== 'crd1' && run.parameters.intervention).length, 199, 'no patch intervention was added');
+  assert.equal(runs.filter(run => !['crd1', 'cai1', 'crt2'].includes(run.batch) && run.parameters.argsDeviation).length, 171, "155 before, plus g3b's 16 W4 rows");
 });
 
 test('the published arm means reproduce every level the row reads', () => {
@@ -110,7 +110,7 @@ test('phase-20 is its own documented phase and carries one record', () => {
   const phase20 = data.activity.find(e => e.id === 'phase-20')!;
   assert.deepEqual([phase20.experimentIds, phase20.kind, phase20.date], [['MT244'], 'research-phase', '2026-09-22']);
   assert.match(phase20.title, /Does the audit's weight-decay reading hold on CIFAR-100/);
-  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 20);
+  assert.equal(data.activity.filter(e => e.kind === 'research-phase').length, 22);
 });
 
 test('the landing links the scorer, parser, design and audit tools it cites', () => {
