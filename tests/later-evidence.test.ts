@@ -109,6 +109,17 @@ test('the later record shows what it bears on', () => {
   assert.match(html, /Bears on/);
   assert.match(html, /Weakens/);
   assert.match(html, /href="\/experiments\/MT240"/);
+  // MT241 is itself superseded by MT247 (CORRECTIONS 319.10), so it now carries a Later evidence note as well.
+  assert.match(html, /Later evidence/);
+  assert.match(html, /Superseded by/);
+  assert.match(html, /href="\/experiments\/MT247"/);
+});
+
+test('a record that only bears on earlier ones shows no Later evidence note', () => {
+  const html = render('MT247');
+  assert.match(html, /Bears on/);
+  assert.match(html, /Supersedes/);
+  assert.match(html, /href="\/experiments\/MT241"/);
   assert.doesNotMatch(html, /Later evidence/);
 });
 
