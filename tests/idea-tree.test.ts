@@ -208,10 +208,12 @@ test('a key result is marked only by a small star: no colour of its own, no fill
   }
   for (const f of ['IdeaTree', 'IdeaGraph', 'IdeaChanged', 'MainIdea', 'Achievements']) {
     const css = read(`src/components/${f}.css`);
-    assert.ok(!/0b4d2a|052e18|\.tree-key[ ,.{]/.test(css.replace('tree-key-legend', '')), `${f}.css has no dark green key fill`);
+    // Dark green is allowed only as the colour of the star itself (the .tree-star rule), never as a box fill.
+    const withoutStar = css.replace(/\.tree-star \{[^}]*\}/, '');
+    assert.ok(!/0b4d2a|052e18|\.tree-key[ ,.{]/.test(withoutStar.replace('tree-key-legend', '')), `${f}.css has no dark green key fill`);
   }
   const css = read('src/components/IdeaTree.css');
-  assert.match(css, /\.tree-star \{[^}]*color: #e8a600/);
+  assert.match(css, /\.tree-star \{[^}]*color: #0b4d2a/);
   assert.ok(!/\.tree-star \{[^}]*(background|border:)/.test(css), 'the star has no disc and no border');
   assert.ok(read('src/components/IdeaTreeDetail.tsx').includes('★ Key result for the paper: {leaf.keyReason}'));
 });
