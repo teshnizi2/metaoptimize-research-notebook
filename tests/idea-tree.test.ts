@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { countStatuses, findNode, ideaTree, sentenceCount } from '../src/lib/idea-tree.ts';
-import { ancestorsOf, buildChildren, expandableIds, fitView, layoutGraph, wideSizes } from '../src/lib/idea-graph.ts';
+import { ancestorsOf, buildChildren, expandableIds, fitView, layoutGraph, narrowRadial, radialLayout, wideRadial, wideSizes } from '../src/lib/idea-graph.ts';
 
 const research = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8'));
 const known = new Set<string>(research.experiments.map((e: { id: string }) => e.id));
@@ -90,4 +90,33 @@ test('a shared link opens every box above the selected test; fit keeps the graph
   assert.deepEqual(ancestorsOf(ideaTree, 'B7.3'), ['B7.2', 'B7.1', 'B7', 'root']);
   const v = fitView({ minX: 0, minY: 0, maxX: 1000, maxY: 500 }, 500, 400, 0.1, 1);
   assert.ok(v.k <= 0.5 && v.x >= 0 && v.y >= 0);
+});
+
+test('radial view: question in the centre, parts on a ring, every box shown with everything open and none overlapping', () => {
+  for (const sizes of [wideRadial, narrowRadial]) {
+    const closed = radialLayout(ideaTree, new Set(['root']), sizes);
+    assert.equal(closed.nodes.length, 1 + ideaTree.parts.length);
+    const root = closed.nodes.find(n => n.id === 'root')!;
+    assert.equal(root.radius, 0);
+    const rings = new Set(closed.nodes.filter(n => n.kind === 'part').map(n => Math.round(n.radius!)));
+    assert.equal(rings.size, 1, 'all parts sit on one ring');
+
+    const all = radialLayout(ideaTree, new Set(expandableIds(ideaTree)), sizes);
+    assert.equal(all.nodes.length, 1 + ideaTree.parts.length + 79);
+    for (let i = 0; i < all.nodes.length; i += 1) for (let j = i + 1; j < all.nodes.length; j += 1) {
+      const a = all.nodes[i], b = all.nodes[j];
+      const apart = a.x + a.w + 2 <= b.x || b.x + b.w + 2 <= a.x || a.y + a.h + 2 <= b.y || b.y + b.h + 2 <= a.y;
+      assert.ok(apart, `${a.id} overlaps ${b.id}`);
+    }
+    // A follow-up grows further out than the test it follows, and every test further out than its part.
+    const at = new Map(all.nodes.map(n => [n.id, n.radius!]));
+    for (const l of all.links) assert.ok(at.get(l.to)! > at.get(l.from)!, l.id);
+  }
+});
+
+test('radial view: opening or folding a box never moves another box', () => {
+  const one = radialLayout(ideaTree, new Set(['root', 'B7']), wideRadial);
+  const more = radialLayout(ideaTree, new Set(['root', 'B7', 'B8', 'B7.1']), wideRadial);
+  const at = new Map(more.nodes.map(n => [n.id, `${Math.round(n.x)},${Math.round(n.y)}`]));
+  for (const n of one.nodes) assert.equal(at.get(n.id), `${Math.round(n.x)},${Math.round(n.y)}`, n.id);
 });

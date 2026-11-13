@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { linkHorizontal } from 'd3-shape';
+import { linkHorizontal, linkRadial } from 'd3-shape';
 import { select } from 'd3-selection';
 import { zoom, zoomIdentity, zoomTransform, type ZoomBehavior } from 'd3-zoom';
 import { Maximize2, Minus, Plus, X } from 'lucide-react';
 import { countStatuses, findNode, ideaTree, statusInfo, statusOrder, type IdeaTreeData, type TreeNode } from '../lib/idea-tree';
-import { ancestorsOf, childLabel, expandableIds, fitView, layoutGraph, narrowSizes, wideSizes, type GraphNode, type View } from '../lib/idea-graph';
+import { ancestorsOf, childLabel, expandableIds, fitView, layoutGraph, narrowRadial, narrowSizes, radialLayout, wideRadial, wideSizes, type GraphNode, type View } from '../lib/idea-graph';
 import { TreeDetail, TreeIcon, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 import './IdeaGraph.css';
 
-const MIN_K = 0.15, MAX_K = 2.5;
+const MIN_K = 0.15, MAX_K = 2.5, MIN_ZOOM = 0.08;
+/** Radial view: opening a box zooms out, but never below this, to bring its tests into view. */
+const REVEAL_MIN_K = 0.85;
 const link = linkHorizontal<{ s: [number, number]; t: [number, number] }, [number, number]>().source(d => d.s).target(d => d.t).x(p => p[0]).y(p => p[1]);
+
+type Polar = { a: number; r: number };
+const radialLink = linkRadial<{ source: Polar; target: Polar }, Polar>().angle(p => p.a).radius(p => p.r);
 
 function useWidth(ref: React.RefObject<HTMLElement | null>) {
   const [width, setWidth] = useState(0);
@@ -29,8 +34,10 @@ function useWidth(ref: React.RefObject<HTMLElement | null>) {
 const PAD = 20;
 const PANEL_MAX = 380;
 
-export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = null, onSelectChange, header }: {
+export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, initialNode = null, onSelectChange, header }: {
   data?: IdeaTreeData;
+  /** 'tree' runs left to right; 'radial' puts the question in the centre and grows every part outward. */
+  mode?: 'tree' | 'radial';
   pageIds: ReadonlySet<string>;
   testLink: TestLink;
   initialNode?: string | null;
@@ -47,11 +54,13 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   const pending = useRef<number | 'start' | null>(null);
   const frameWidth = useWidth(frameRef);
   const narrow = frameWidth > 0 && frameWidth < 700;
+  const radial = mode === 'radial';
   const sizes = narrow ? narrowSizes : wideSizes;
+  const radialSizes = narrow ? narrowRadial : wideRadial;
 
   const [selectedId, setSelectedId] = useState<string | null>(initialNode && findNode(data, initialNode) ? initialNode : null);
   const [open, setOpen] = useState<Set<string>>(() => new Set(['root', ...(initialNode && findNode(data, initialNode) ? ancestorsOf(data, initialNode) : [])]));
-  const layout = useMemo(() => layoutGraph(data, open, sizes), [data, open, sizes]);
+  const layout = useMemo(() => (radial ? radialLayout(data, open, radialSizes) : layoutGraph(data, open, sizes)), [data, open, sizes, radial, radialSizes]);
   const byId = useMemo(() => new Map(layout.nodes.map(n => [n.id, n])), [layout]);
   const node: TreeNode | null = findNode(data, selectedId);
 
@@ -68,7 +77,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    const z = zoom<HTMLDivElement, unknown>().scaleExtent([MIN_K, MAX_K])
+    const z = zoom<HTMLDivElement, unknown>().scaleExtent([MIN_ZOOM, MAX_K])
       .filter(e => (e.type === 'wheel' ? e.ctrlKey || e.metaKey : !e.button && !e.ctrlKey))
       .on('zoom', e => {
         if (stageRef.current) stageRef.current.style.transform = `translate(${e.transform.x}px, ${e.transform.y}px) scale(${e.transform.k})`;
@@ -88,6 +97,13 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   /** Readable start: full-size cards, the question and the first parts in view, the rest a drag or scroll away. */
   const startView = useCallback((view: HTMLElement): View => {
     const col = layout.nodes.filter(n => n.depth <= 1);
+    if (radial) {
+      // The question and the ring of parts, as large as fits but not below a readable size (a phone starts a little smaller).
+      const x0 = Math.min(...col.map(n => n.x)), x1 = Math.max(...col.map(n => n.x + n.w)), y0 = Math.min(...col.map(n => n.y)), y1 = Math.max(...col.map(n => n.y + n.h));
+      const fitK = Math.min((view.clientWidth - 2 * PAD) / (x1 - x0), (view.clientHeight - 2 * PAD) / (y1 - y0));
+      const k = Math.min(1, Math.max(fitK, narrow ? 0.5 : 0.62));
+      return { k, x: view.clientWidth / 2 - ((x0 + x1) / 2) * k, y: view.clientHeight / 2 - ((y0 + y1) / 2) * k };
+    }
     const minY = Math.min(...col.map(n => n.y)), maxY = Math.max(...col.map(n => n.y + n.h)), maxX = Math.max(...col.map(n => n.x + n.w));
     const root = byId.get('root')!;
     const k = Math.min(1, (view.clientWidth - 2 * PAD) / maxX);
@@ -95,12 +111,12 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     // Everything fits: centre it. Otherwise centre on the question, never starting lower than the first part.
     const y = (maxY - minY) * k + 2 * PAD <= vh ? (vh - (maxY - minY) * k) / 2 - minY * k : Math.min(vh / 2 - (root.y + root.h / 2) * k, PAD - minY * k);
     return { k, x: PAD, y };
-  }, [layout, byId]);
+  }, [layout, byId, radial, narrow]);
 
   const fit = useCallback(() => {
     const view = viewRef.current;
-    if (view) apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, MIN_K, 1.1));
-  }, [apply, layout]);
+    if (view) apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, radial ? MIN_ZOOM : MIN_K, 1.1));
+  }, [apply, layout, radial]);
 
   // First paint: a readable start, or the selected box when a shared link names one.
   useLayoutEffect(() => {
@@ -110,7 +126,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     if (!view) return;
     const target = selectedId ? byId.get(selectedId) : null;
     if (target) {
-      const k = narrow ? Math.min(1, (view.clientWidth - 2 * PAD) / (sizes.part.w + sizes.gap + sizes.leaf.w)) : 1;
+      const k = narrow && !radial ? Math.min(1, (view.clientWidth - 2 * PAD) / (sizes.part.w + sizes.gap + sizes.leaf.w)) : 1;
       const cx = narrow ? view.clientWidth / 2 : Math.min(visibleWidth(view, true) / 2, view.clientWidth / 2);
       apply({ k, x: cx - (target.x + target.w / 2) * k, y: view.clientHeight * (narrow ? 0.24 : 0.5) - (target.y + target.h / 2) * k });
     } else {
@@ -135,6 +151,22 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     if (!n) return;
     const t = zoomTransform(view);
     let x = a.sx - (n.x + n.w / 2) * t.k, y = a.sy - (n.y + n.h / 2) * t.k;
+    if (a.reveal && radial) {
+      // The new boxes fan out beyond the clicked one: zoom out a little if they do not fit, then slide them into the visible area.
+      const kids = layout.links.filter(l => l.from === a.id).map(l => byId.get(l.to)).filter((c): c is GraphNode => !!c);
+      if (kids.length) {
+        const vw = visibleWidth(view, selectedId !== null), vh = view.clientHeight;
+        const all = [n, ...kids];
+        const x0 = Math.min(...all.map(c => c.x)), x1 = Math.max(...all.map(c => c.x + c.w)), y0 = Math.min(...all.map(c => c.y)), y1 = Math.max(...all.map(c => c.y + c.h));
+        const k = Math.min(t.k, Math.max(Math.min((vw - 2 * PAD) / (x1 - x0), (vh - 2 * PAD) / (y1 - y0)), REVEAL_MIN_K));
+        x = a.sx - (n.x + n.w / 2) * k; y = a.sy - (n.y + n.h / 2) * k;
+        const slide = (lo: number, hi: number, plo: number, phi: number, min: number, max: number) => (hi - lo <= max - min ? (lo < min ? min - lo : hi > max ? max - hi : 0) : (plo + phi) / 2 < (lo + hi) / 2 ? min - lo : max - hi);
+        x += slide(x0 * k + x, x1 * k + x, n.x * k + x, (n.x + n.w) * k + x, PAD, vw - PAD);
+        y += slide(y0 * k + y, y1 * k + y, n.y * k + y, (n.y + n.h) * k + y, PAD, vh - PAD);
+        apply({ x, y, k });
+        return;
+      }
+    }
     if (a.reveal) {
       const kids = layout.links.filter(l => l.from === a.id).map(l => byId.get(l.to)).filter((c): c is GraphNode => !!c);
       if (kids.length) {
@@ -150,7 +182,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     }
     apply({ x, y, k: t.k });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layout, byId, apply, narrow]);
+  }, [layout, byId, apply, narrow, radial]);
 
   const select_ = (id: string | null) => { setSelectedId(id); onSelectChange?.(id); };
 
@@ -178,7 +210,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   };
 
   const expandable = useMemo(() => expandableIds(data), [data]);
-  const openAll = () => { pending.current = 0.2; setOpen(new Set(expandable)); };
+  const openAll = () => { pending.current = radial ? MIN_ZOOM : 0.2; setOpen(new Set(expandable)); };
   const closeAll = () => { pending.current = 'start'; setOpen(new Set(['root'])); };
 
   const zoomBy = (factor: number) => {
@@ -188,7 +220,10 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
 
   const links = layout.links.map(l => {
     const a = byId.get(l.from)!, b = byId.get(l.to)!;
-    return { id: l.id, d: link({ s: [a.x + a.w, a.y + a.h / 2], t: [b.x, b.y + b.h / 2] }) ?? '', status: b.status };
+    const d = radial
+      ? radialLink({ source: { a: a.angle ?? 0, r: a.radius ?? 0 }, target: { a: b.angle ?? 0, r: b.radius ?? 0 } })
+      : link({ s: [a.x + a.w, a.y + a.h / 2], t: [b.x, b.y + b.h / 2] });
+    return { id: l.id, d: d ?? '', status: b.status };
   });
 
   const leaves = data.parts.flatMap(p => p.leaves);
@@ -215,15 +250,15 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     }
     if (found.kind === 'part') {
       return <>
-        <span className="ig-head"><TreeIcon status={found.part.status}/><span className="tree-node-kicker">Part {found.part.number} · {found.part.dates}</span></span>
+        <span className="ig-head"><TreeIcon status={found.part.status}/><span className="tree-node-kicker">Part {found.part.number}{radial ? '' : ` · ${found.part.dates}`}</span>{radial && badge}</span>
         <strong className="ig-title">{found.part.title}</strong>
-        {badge}
+        {!radial && badge}
       </>;
     }
     return <>
-      <span className="ig-head"><TreeIcon status={found.leaf.status}/><span className="tree-node-kicker">{found.leaf.id}</span></span>
+      <span className="ig-head"><TreeIcon status={found.leaf.status}/><span className="tree-node-kicker">{found.leaf.id}</span>{radial && badge}</span>
       <strong className="ig-title">{found.leaf.title}</strong>
-      {badge}
+      {!radial && badge}
     </>;
   };
 
@@ -232,7 +267,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     <TreeDetail node={node} data={data} pageIds={pageIds} testLink={testLink} onSelect={select_}/>
   </>;
 
-  return <div className={`ig ${narrow ? 'ig-narrow' : 'ig-wide'}`} ref={frameRef}>
+  return <div className={`ig ${narrow ? 'ig-narrow' : 'ig-wide'}${radial ? ' ig-radial' : ''}`} ref={frameRef}>
     <div className="ig-bar">
       <div className="ig-bar-head">{header}</div>
       <div className="ig-controls" role="toolbar" aria-label="Graph controls">
@@ -246,7 +281,7 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     <div className="ig-canvas">
       <div className="ig-view" ref={viewRef} role="application" aria-label="Idea tree graph">
         <div className="ig-stage" ref={stageRef}>
-          <svg className="ig-links" width={Math.max(1, layout.bounds.maxX + 4)} height={1} aria-hidden="true">
+          <svg className="ig-links" width={1} height={1} aria-hidden="true">
             {links.map(l => <path key={l.id} d={l.d} className={`ig-link ${l.status ? `tree-${l.status}` : ''}`}/>)}
           </svg>
           {layout.nodes.map(n => <button
