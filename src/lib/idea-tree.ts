@@ -14,6 +14,10 @@ export interface TreeLeaf {
   dateBasis: 'primer' | 'runs' | 'part';
   /** Experiment pages of this test (MT numbers); empty when the notebook has none. */
   experiments: string[];
+  /** Id of the test this one followed up, in the same part; set only where the written record says so. */
+  parent?: string;
+  /** One short line on why this test followed its parent. */
+  parentNote?: string;
 }
 
 export interface TreePart {
