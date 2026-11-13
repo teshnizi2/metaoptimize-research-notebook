@@ -16,6 +16,9 @@ export interface GraphNode {
   /** Direct children, whether or not they are shown. */
   childCount: number;
   open: boolean;
+  /** Radial view only: where the card's centre is, as an angle (radians, clockwise from twelve o'clock) and a distance from the question. */
+  angle?: number;
+  radius?: number;
 }
 
 export interface GraphLink { id: string; from: string; to: string }
@@ -121,4 +124,85 @@ export function childLabel(kind: GraphKind, count: number): string {
   if (kind === 'root') return `${count} parts`;
   if (kind === 'part') return `${count} test${count === 1 ? '' : 's'}`;
   return `${count} follow-up${count === 1 ? '' : 's'}`;
+}
+
+export interface RadialSizes {
+  root: { w: number; h: number };
+  part: { w: number; h: number };
+  leaf: { w: number; h: number };
+  /** Distance from the question to the ring of parts. */
+  r1: number;
+  /** Distance from the part ring to the first ring of tests. */
+  start: number;
+  /** Arc length one test takes along its ring. */
+  slot: number;
+  /** Tests of one level take turns on this many radii, which packs them closer. */
+  lanes: number;
+  /** Distance between those radii. */
+  lane: number;
+}
+
+// lanes * slot is at least a card's diagonal and lane is wider than a card, so neighbours on a ring never touch.
+export const wideRadial: RadialSizes = { root: { w: 260, h: 180 }, part: { w: 190, h: 100 }, leaf: { w: 176, h: 62 }, r1: 400, start: 230, slot: 48, lanes: 4, lane: 190 };
+export const narrowRadial: RadialSizes = { root: { w: 190, h: 190 }, part: { w: 150, h: 96 }, leaf: { w: 150, h: 58 }, r1: 330, start: 200, slot: 42, lanes: 4, lane: 162 };
+
+/**
+ * Radial tree: the question in the centre, the parts on a ring around it, each part's tests further out in the part's own
+ * direction, follow-up tests further still. The place of every box is worked out with everything open, so opening or folding
+ * a box never moves another one; only the open boxes are returned.
+ */
+export function radialLayout(data: IdeaTreeData, open: ReadonlySet<string>, s: RadialSizes): GraphLayout {
+  const kids = buildChildren(data);
+  const statusOf = new Map<string, TreeStatus>();
+  for (const part of data.parts) {
+    statusOf.set(part.id, part.status);
+    for (const leaf of part.leaves as TreeLeaf[]) statusOf.set(leaf.id, leaf.status);
+  }
+  const partIds = new Set(data.parts.map(p => p.id));
+  const kindOf = (id: string): GraphKind => (id === 'root' ? 'root' : partIds.has(id) ? 'part' : 'leaf');
+
+  const bigSlot = Math.hypot(s.leaf.w, s.leaf.h) + 12;
+  const partSlot = Math.hypot(s.part.w, s.part.h) + 10;
+  // The ring of parts is at least large enough for its parts to sit side by side.
+  const r1 = Math.max(s.r1, Math.ceil((data.parts.length * partSlot * 1.08) / (2 * Math.PI)));
+  const ring = (depth: number, k: number) => (depth === 0 ? 0 : depth === 1 ? r1 : depth === 2 ? r1 + s.start * k : r1 + s.start * k + s.lanes * s.lane + (depth - 3) * s.lane);
+  const arc = (depth: number) => (depth === 1 ? partSlot : depth === 2 ? s.slot : bigSlot);
+
+  const lay = (k: number) => {
+    const root = hierarchy<string>('root', id => kids.get(id));
+    tree<string>().nodeSize([1, 1]).separation((a, b) => (arc(a.depth) * (a.parent === b.parent ? 1 : 1.6)) / ring(a.depth, k))(root);
+    const xs = root.descendants().map(d => d.x ?? 0);
+    const min = Math.min(...xs);
+    return { root, min, total: Math.max(...xs) - min + Math.max(arc(1) / ring(1, k), (arc(2) * 1.6) / ring(2, k)) };
+  };
+  // Smallest distance between the part ring and the test rings at which everything fits round the circle.
+  let lo = 1, hi = 12;
+  if (lay(1).total > 2 * Math.PI) {
+    for (let i = 0; i < 30; i += 1) { const mid = (lo + hi) / 2; if (lay(mid).total > 2 * Math.PI) lo = mid; else hi = mid; }
+  } else hi = 1;
+  const { root, min, total } = lay(hi);
+  const turn = (2 * Math.PI) / total;
+
+  const lane = new Map<string, number>();
+  const byDepth = new Map<number, typeof root[]>();
+  for (const d of root.descendants()) byDepth.set(d.depth, [...(byDepth.get(d.depth) ?? []), d]);
+  (byDepth.get(2) ?? []).sort((a, b) => (a.x ?? 0) - (b.x ?? 0)).forEach((d, i) => lane.set(d.data, i % s.lanes));
+
+  const shown = new Set<string>(['root']);
+  const nodes: GraphNode[] = [];
+  const links: GraphLink[] = [];
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  root.each(d => {
+    if (d.parent && !(shown.has(d.parent.data) && open.has(d.parent.data))) return;
+    shown.add(d.data);
+    const kind = kindOf(d.data);
+    const { w, h } = s[kind];
+    const angle = ((d.x ?? 0) - min) * turn;
+    const radius = ring(d.depth, hi) + (d.depth === 2 ? (lane.get(d.data) ?? 0) * s.lane : 0);
+    const cx = radius * Math.sin(angle), cy = -radius * Math.cos(angle);
+    minX = Math.min(minX, cx - w / 2); maxX = Math.max(maxX, cx + w / 2); minY = Math.min(minY, cy - h / 2); maxY = Math.max(maxY, cy + h / 2);
+    nodes.push({ id: d.data, kind, depth: d.depth, x: cx - w / 2, y: cy - h / 2, w, h, status: statusOf.get(d.data) ?? null, childCount: kids.get(d.data)?.length ?? 0, open: open.has(d.data), angle, radius });
+    if (d.parent) links.push({ id: `${d.parent.data}>${d.data}`, from: d.parent.data, to: d.data });
+  });
+  return { nodes, links, bounds: { minX, minY, maxX, maxY } };
 }
