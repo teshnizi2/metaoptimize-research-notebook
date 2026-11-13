@@ -5,6 +5,7 @@ import { KeyLegendItem, KeyStar, TreeIcon } from '../components/IdeaTreeDetail';
 import { achievementStatus, achievements, isKeyAchievement, groups, notebookCard, type Achievement, type Fact } from '../lib/achievements';
 import { findNode, ideaTree, statusInfo } from '../lib/idea-tree';
 import { useResearch } from '../data';
+import { treeAddress } from '../lib/idea-tree-url';
 import '../components/IdeaTree.css';
 import '../components/Achievements.css';
 
@@ -14,7 +15,7 @@ function Chip({ id }: { id: string }) {
   const { leaf } = node;
   const mt = leaf.experiments[0];
   return <span className={`ach-chip tree-${leaf.status}`} title={statusInfo[leaf.status].name}>
-    <Link to={`/idea-tree?view=radial&node=${id}`}><TreeIcon status={leaf.status}/><span><strong>{id}</strong> · {leaf.title}{leaf.key && <> <KeyStar/></>}</span></Link>
+    <Link to={treeAddress(id)}><TreeIcon status={leaf.status}/><span><strong>{id}</strong> · {leaf.title}{leaf.key && <> <KeyStar/></>}</span></Link>
     {mt && <Link to={`/experiments/${mt}`} className="ach-chip-page">Test page <ArrowUpRight size={14}/></Link>}
   </span>;
 }
@@ -45,7 +46,7 @@ function Card({ card }: { card: Achievement }) {
       {(card.parts ?? []).map(id => {
         const node = findNode(ideaTree, id);
         return node?.kind === 'part' ? <span key={id} className={`ach-chip tree-${node.part.status}`}>
-          <Link to={`/idea-tree?view=radial&node=${id}`}><TreeIcon status={node.part.status}/><span><strong>Part {node.part.number}</strong> · {node.part.title}</span></Link>
+          <Link to={treeAddress(id)}><TreeIcon status={node.part.status}/><span><strong>Part {node.part.number}</strong> · {node.part.title}</span></Link>
         </span> : null;
       })}
     </div>
