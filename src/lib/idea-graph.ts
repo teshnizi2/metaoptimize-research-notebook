@@ -166,8 +166,8 @@ export interface RadialSizes {
 }
 
 // lanes * slot is at least a card's diagonal and lane is wider than a card, so neighbours on a ring never touch.
-export const wideRadial: RadialSizes = { root: { w: 260, h: 180 }, part: { w: 190, h: 100 }, leaf: { w: 176, h: 62 }, r1: 400, start: 230, slot: 48, lanes: 4, lane: 190 };
-export const narrowRadial: RadialSizes = { root: { w: 190, h: 190 }, part: { w: 150, h: 96 }, leaf: { w: 150, h: 58 }, r1: 330, start: 200, slot: 42, lanes: 4, lane: 162 };
+export const wideRadial: RadialSizes = { root: { w: 260, h: 180 }, part: { w: 190, h: 100 }, leaf: { w: 176, h: 70 }, r1: 400, start: 230, slot: 48, lanes: 4, lane: 190 };
+export const narrowRadial: RadialSizes = { root: { w: 190, h: 190 }, part: { w: 150, h: 96 }, leaf: { w: 150, h: 66 }, r1: 330, start: 200, slot: 42, lanes: 4, lane: 162 };
 
 /**
  * Radial tree: the question in the centre, the parts on a ring around it, each part's tests further out in the part's own
