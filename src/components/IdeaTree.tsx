@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Star } from 'lucide-react';
 import { useResearch } from '../data';
-import { countStatuses, findNode, ideaTree, statusInfo, statusOrder, type TreeNode } from '../lib/idea-tree';
-import { TreeDetail, TreeIcon, testPath, type TestLink } from './IdeaTreeDetail';
+import { countStatuses, findNode, ideaTree, keyCount, keyIds, statusInfo, statusOrder, type TreeNode } from '../lib/idea-tree';
+import { KeyLegendItem, KeyStar, TreeDetail, TreeIcon, testPath, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 
 const WIDE_QUERY = '(min-width: 1000px)';
@@ -58,14 +58,22 @@ export function IdeaTree() {
   const allLeaves = ideaTree.parts.flatMap(p => p.leaves);
   const totals = countStatuses(allLeaves);
 
+  const keyParts = ideaTree.parts.filter(p => keyCount(p) > 0).map(p => p.id);
+  const showKeys = () => {
+    setOpen(new Set(keyParts));
+    window.setTimeout(() => document.querySelector('.tree-part-row .tree-star')?.scrollIntoView({ block: 'center' }), 80);
+  };
+
   const detailBelow = (id: string) => !wide && node && node.id === id ? <Detail node={node} inline/> : null;
 
   return <div className={wide ? 'tree-wide' : 'tree-narrow'}>
     <ul className="tree-legend" aria-label="Legend">
       {statusOrder.map(s => <li key={s} className={`tree-${s}`}><Icon status={s}/><span>{statusInfo[s].name}<small>{totals[s]} tests</small></span></li>)}
+      <KeyLegendItem total={keyIds(ideaTree).length}/>
     </ul>
     <div className="tree-toolbar">
       <p>Colour shows what the project concluded. Select a box for a short summary; the summary links to that test’s page when the notebook has one.</p>
+      <button className="button" type="button" onClick={showKeys}><Star size={15}/> Show key results</button>
       <button className="button" type="button" onClick={() => setOpen(allOpen ? new Set() : new Set(ideaTree.parts.map(p => p.id)))}>{allOpen ? 'Collapse all parts' : 'Open all parts'}</button>
     </div>
     <div className="tree-layout">
@@ -83,7 +91,7 @@ export function IdeaTree() {
                 <button type="button" className={`tree-node tree-${part.status}`} aria-current={selectedId === part.id} onClick={() => { select(part.id); if (!expanded) toggle(part.id); }}>
                   <Icon status={part.status}/>
                   <span className="tree-node-text">
-                    <span className="tree-node-kicker">Part {part.number} · {part.dates}</span>
+                    <span className="tree-node-kicker">Part {part.number} · {part.dates}{keyCount(part) > 0 && <> <KeyStar count={keyCount(part)}/></>}</span>
                     <strong>{part.title}</strong>
                     <small>{part.verdict}</small>
                     <span className="tree-dots" aria-hidden="true">{part.leaves.map(l => <i key={l.id} className={`tree-${l.status}`}/>)}</span>
@@ -97,9 +105,9 @@ export function IdeaTree() {
               {detailBelow(part.id)}
               {expanded && <ul className="tree-list tree-leaves">
                 {part.leaves.map(leaf => <li key={leaf.id}>
-                  <button type="button" className={`tree-node tree-leaf tree-${leaf.status}`} aria-current={selectedId === leaf.id} onClick={() => select(leaf.id)}>
+                  <button type="button" className={`tree-node tree-leaf tree-${leaf.status}${leaf.key ? ' tree-key' : ''}`} aria-current={selectedId === leaf.id} onClick={() => select(leaf.id)}>
                     <Icon status={leaf.status}/>
-                    <span className="tree-node-text"><strong>{leaf.title}</strong><small>{leaf.result}</small></span>
+                    <span className="tree-node-text"><strong>{leaf.title}{leaf.key && <> <KeyStar/></>}</strong><small>{leaf.result}</small></span>
                   </button>
                   {detailBelow(leaf.id)}
                 </li>)}

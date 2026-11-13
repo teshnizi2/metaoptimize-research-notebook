@@ -114,7 +114,7 @@ export const achievements: Achievement[] = [
       { part: 'B6', quote: 'tuned SGD with momentum and a cosine schedule' },
       { test: 'B6.6', quote: 'Gap widens to 14.6 pp' },
     ],
-    tests: ['B6.2', 'B6.3', 'B6.4', 'B6.5'],
+    tests: ['B6.2', 'B6.3', 'B6.4', 'B6.5', 'B6.6'],
   },
   {
     id: 'pull', group: 'negative',
@@ -240,6 +240,11 @@ export function sourceHolds(source: Source, data: IdeaTreeData = ideaTree): bool
     return node.part.leaves.length === source.partCount.n && node.part.leaves.every(l => l.status === source.partCount.status);
   }
   return sourceText(source, data).includes(source.quote);
+}
+
+/** A finding or a negative result is a key result for the paper when a test it rests on is one. The "checked" and "built" cards are not results. */
+export function isKeyAchievement(card: Achievement, data: IdeaTreeData = ideaTree): boolean {
+  return (card.group === 'stand' || card.group === 'negative') && card.tests.some(id => { const n = findNode(data, id); return n?.kind === 'leaf' && !!n.leaf.key; });
 }
 
 /** One status when the tests agree, mixed (a) when they differ. */
