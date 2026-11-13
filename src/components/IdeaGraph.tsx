@@ -144,11 +144,21 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     for (const i of attached) for (const a of [ideaParent(i), ...ancestorsOf(data, ideaParent(i), attached)]) ids.add(a);
     return ids;
   }, [data, attached]);
+  /** Frames the ideas to do now (all of them if none is "now") with the boxes they hang from, at a size that can be read; the rest is a drag away. */
   const ideasView = useCallback((view: HTMLElement): View => {
-    const focus = layout.nodes.filter(n => ideaOpen.has(n.id) || n.kind === 'idea');
-    const box = { minX: Math.min(...focus.map(n => n.x)), minY: Math.min(...focus.map(n => n.y)), maxX: Math.max(...focus.map(n => n.x + n.w)), maxY: Math.max(...focus.map(n => n.y + n.h)) };
-    return fitView(box, view.clientWidth, view.clientHeight, MIN_ZOOM, 1.1);
-  }, [layout, ideaOpen]);
+    const urgent = attached.some(i => i.priority === 'now') ? attached.filter(i => i.priority === 'now') : attached;
+    // Ideas of one part are close together, so a readable frame shows the part with the most urgent ideas.
+    const partOf = (i: FutureIdea) => [ideaParent(i), ...ancestorsOf(data, ideaParent(i), attached)].find(id => data.parts.some(p => p.id === id)) ?? ideaParent(i);
+    const groups = new Map<string, FutureIdea[]>();
+    for (const i of urgent) groups.set(partOf(i), [...(groups.get(partOf(i)) ?? []), i]);
+    const best = [...groups.values()].sort((x, y) => y.length - x.length)[0] ?? [];
+    const ids = new Set<string>();
+    for (const i of best) for (const x of [i.id, ideaParent(i)]) ids.add(x);
+    const focus = layout.nodes.filter(n => ids.has(n.id));
+    const minX = Math.min(...focus.map(n => n.x)), minY = Math.min(...focus.map(n => n.y)), maxX = Math.max(...focus.map(n => n.x + n.w)), maxY = Math.max(...focus.map(n => n.y + n.h));
+    const k = Math.min(1.1, Math.max(narrow ? 0.45 : 0.55, Math.min((view.clientWidth - 40) / (maxX - minX), (view.clientHeight - 40) / (maxY - minY))));
+    return { k, x: view.clientWidth / 2 - ((minX + maxX) / 2) * k, y: view.clientHeight / 2 - ((minY + maxY) / 2) * k };
+  }, [layout, attached, data, narrow]);
 
   const fit = useCallback(() => {
     const view = viewRef.current;
