@@ -18,6 +18,10 @@ export interface TreeLeaf {
   parent?: string;
   /** One short line on why this test followed its parent. */
   parentNote?: string;
+  /** A key result for the paper: drawn dark green with a star. Only the ids in tests/idea-tree.test.ts carry it. */
+  key?: boolean;
+  /** One short line on why it is a key result; set with `key`. */
+  keyReason?: string;
 }
 
 export interface TreePart {
@@ -44,6 +48,18 @@ export const statusInfo: Record<TreeStatus, { icon: string; name: string; short:
   a: { icon: '~', name: 'Mixed or only partly', short: 'Mixed' },
   u: { icon: '?', name: 'Open, not tested or not certain', short: 'Open' },
 };
+
+/** Ids of the key results, in tree order. */
+export function keyIds(data: IdeaTreeData): string[] {
+  return data.parts.flatMap(p => p.leaves.filter(l => l.key).map(l => l.id));
+}
+
+/** How many key results a part holds. */
+export function keyCount(part: TreePart): number {
+  return part.leaves.filter(l => l.key).length;
+}
+
+export const KEY_LEGEND = 'Dark green ★ = key result for the paper (its icon still shows whether it worked)';
 
 export const statusOrder: TreeStatus[] = ['g', 'r', 'a', 'u'];
 

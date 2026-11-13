@@ -1,7 +1,7 @@
 import { ArrowRight } from 'lucide-react';
-import { ideaTree, statusInfo, statusOrder, type IdeaTreeData } from '../lib/idea-tree';
+import { findNode, ideaTree, statusInfo, statusOrder, type IdeaTreeData } from '../lib/idea-tree';
 import { changedRows, chipStatus } from '../lib/idea-changed';
-import { MAIN_IDEA_PAGE, TreeIcon, type TestLink } from './IdeaTreeDetail';
+import { KeyLegendItem, KeyStar, MAIN_IDEA_PAGE, TreeIcon, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 import './IdeaChanged.css';
 
@@ -17,6 +17,7 @@ export function IdeaChanged({ data = ideaTree, onOpen, testLink }: {
     <p className="ic-top">The audit (row 2) is the main result; most of it ran at weight decay 0.1.</p>
     <ul className="ic-legend" aria-label="Colours">
       {statusOrder.map(s => <li key={s} className={`tree-${s}`}><TreeIcon status={s}/>{statusInfo[s].short}</li>)}
+      <KeyLegendItem/>
       <li className="ic-legend-setting"><span className="ic-dash" aria-hidden="true"/>Setting only, no test of its own</li>
     </ul>
     <p className="ic-hint">Choose a coloured box to see that test in the tree.</p>
@@ -38,11 +39,12 @@ export function IdeaChanged({ data = ideaTree, onOpen, testLink }: {
                 <span className="ic-outcome">setting</span>
               </span></li>;
             }
-            return <li key={chip.label}><button type="button" className={`ic-chip tree-${status}`} data-status={status} onClick={() => onOpen(chip.tests[0])}
-              aria-label={`${chip.label}: ${chip.outcome}. ${statusInfo[status].name}. Open ${chip.tests.join(', ')} in the tree.`}>
+            const isKey = chip.tests.some(id => { const n = findNode(data, id); return n?.kind === 'leaf' && n.leaf.key; });
+            return <li key={chip.label}><button type="button" className={`ic-chip tree-${status}${isKey ? ' tree-key' : ''}`} data-status={status} onClick={() => onOpen(chip.tests[0])}
+              aria-label={`${chip.label}: ${chip.outcome}. ${statusInfo[status].name}.${isKey ? ' Key result for the paper.' : ''} Open ${chip.tests.join(', ')} in the tree.`}>
               <TreeIcon status={status}/>
               <span className="ic-text">
-                <span className="ic-label">{chip.label}</span>
+                <span className="ic-label">{chip.label}{isKey && <> <KeyStar/></>}</span>
                 <span className="ic-outcome">{chip.outcome}</span>
                 <span className="ic-ids">{chip.tests.join(' · ')}</span>
               </span>

@@ -21,6 +21,7 @@ export function IdeaTreePage() {
   const setView = (next: 'radial' | 'tree' | 'list' | 'changed') => {
     const query = new URLSearchParams(params);
     query.set('view', next);
+    query.delete('keys');
     setParams(query, { replace: true });
   };
   const onSelectChange = (id: string | null) => {
@@ -63,6 +64,6 @@ export function IdeaTreePage() {
     <IdeaGraph
       key={view} mode={view}
       header={<div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div>}
-      pageIds={pageIds} testLink={siteLink} initialNode={params.get('node')} onSelectChange={onSelectChange}/>
+      pageIds={pageIds} testLink={siteLink} initialNode={params.get('node')} initialKeys={params.get('keys') === '1'} onSelectChange={onSelectChange}/>
   </div>;
 }

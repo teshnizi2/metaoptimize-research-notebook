@@ -70,3 +70,11 @@ test('the notebook counts come from the record', () => {
   const page = readFileSync(new URL('src/pages/Achievements.tsx', root), 'utf8');
   assert.ok(!new RegExp(`\\b(${stats.runs}|3,596|${stats.experiments})\\b`).test(page), 'counts are read at runtime, not typed');
 });
+
+test('the audit, the rival comparison and the collapse case study are key cards; the rest are not', async () => {
+  const { isKeyAchievement } = await import('../src/lib/achievements.ts');
+  const keys = achievements.filter(c => isKeyAchievement(c)).map(c => c.id).sort();
+  assert.deepEqual(keys, ['audit', 'collapse', 'rival']);
+  // A key card keeps its verdict: the rival card is still red.
+  assert.equal(achievementStatus(achievements.find(c => c.id === 'rival')!), 'r');
+});

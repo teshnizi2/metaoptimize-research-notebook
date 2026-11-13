@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { countStatuses, findNode, ideaTree, sentenceCount } from '../src/lib/idea-tree.ts';
+import { countStatuses, findNode, ideaTree, keyCount, keyIds, KEY_LEGEND, sentenceCount } from '../src/lib/idea-tree.ts';
 import { changedRows, chipStatus } from '../src/lib/idea-changed.ts';
 import { ancestorsOf, buildChildren, expandableIds, fitView, layoutGraph, narrowRadial, radialLayout, wideRadial, wideSizes } from '../src/lib/idea-graph.ts';
 
@@ -150,4 +150,49 @@ test('What we changed: a chip with no test is only a setting, and mixed tests tu
   assert.equal(chipStatus({ label: 'x', tests: [] }, ideaTree), 'setting');
   assert.equal(chipStatus({ label: 'x', tests: ['B3.1', 'B4.3'] }, ideaTree), 'a');
   assert.equal(chipStatus({ label: 'x', tests: ['B3.1', 'B3.2'] }, ideaTree), 'r');
+});
+
+test('only the key results for the paper carry the key mark, each with a reason', () => {
+  const expected = ['B5.1', 'B5.2', 'B5.4', 'B6.2', 'B6.3', 'B6.4', 'B6.5', 'B6.6', 'B10.2', 'B7.5', 'B7.6', 'B7.7', 'B7.8', 'B8.3'];
+  const marked = ideaTree.parts.flatMap(p => p.leaves.filter(l => l.key).map(l => l.id));
+  assert.deepEqual([...marked].sort(), [...expected].sort());
+  assert.deepEqual(keyIds(ideaTree), marked);
+  for (const p of ideaTree.parts) {
+    assert.equal((p as { key?: boolean }).key, undefined, `${p.id} is a part: it gets a badge, not the mark`);
+    for (const l of p.leaves) {
+      if (l.key) assert.ok(l.keyReason && l.keyReason.length > 10 && l.keyReason.length < 120, `${l.id} keyReason`);
+      else assert.equal(l.keyReason, undefined, `${l.id} has a reason but no mark`);
+    }
+  }
+  assert.ok(!findNode(ideaTree, 'B6.1') || !(findNode(ideaTree, 'B6.1') as { leaf: { key?: boolean } }).leaf.key, 'B6.1 is not a key result');
+  const counts = Object.fromEntries(ideaTree.parts.map(p => [p.id, keyCount(p)]).filter(([, n]) => n));
+  assert.deepEqual(counts, { B5: 3, B6: 5, B7: 4, B8: 1, B10: 1 });
+});
+
+test('the key mark never changes a verdict: key results keep their own status', () => {
+  const status = (id: string) => { const n = findNode(ideaTree, id); return n?.kind === 'leaf' ? n.leaf.status : null; };
+  assert.equal(status('B6.2'), 'r');
+  assert.equal(status('B10.2'), 'a');
+  assert.equal(status('B5.1'), 'g');
+});
+
+test('"Show key results" opens the paths to the key boxes (the question, the five parts that hold one) and shows every key box', () => {
+  const keys = keyIds(ideaTree);
+  const open = new Set(['root', ...keys.flatMap(id => ancestorsOf(ideaTree, id))]);
+  for (const id of ['root', 'B5', 'B6', 'B7', 'B8', 'B10']) assert.ok(open.has(id), id);
+  assert.ok(!open.has('B1') && !open.has('B3'), 'parts without a key result stay closed');
+  // A key test that follows up another test needs that test open too (B8.3 follows B8.2).
+  assert.ok(open.has('B8.2'));
+  for (const s of [wideRadial, narrowRadial]) {
+    const ids = new Set(radialLayout(ideaTree, open, s).nodes.map(n => n.id));
+    for (const k of keys) assert.ok(ids.has(k), k);
+  }
+  assert.ok(KEY_LEGEND.startsWith('Dark green ★ = key result for the paper'));
+});
+
+test('a "What we changed" chip is a key result when one of its tests is', () => {
+  const keyChips = changedRows.flatMap(r => r.chips.filter(c => c.tests.some(id => { const n = findNode(ideaTree, id); return n?.kind === 'leaf' && n.leaf.key; })).map(c => c.label));
+  assert.ok(keyChips.includes('Equal chunks (777 weights)'));
+  assert.ok(keyChips.includes('Rival: tuned plain SGD + cosine'));
+  assert.ok(!keyChips.includes('Full pull (r = 0)'));
 });

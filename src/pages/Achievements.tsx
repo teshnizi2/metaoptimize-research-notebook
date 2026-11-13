@@ -1,8 +1,8 @@
 import { Link } from 'react-router-dom';
 import { ArrowRight, ArrowUpRight } from 'lucide-react';
 import { PageHeading } from '../components/common';
-import { TreeIcon } from '../components/IdeaTreeDetail';
-import { achievementStatus, achievements, groups, notebookCard, type Achievement, type Fact } from '../lib/achievements';
+import { KeyLegendItem, KeyStar, TreeIcon } from '../components/IdeaTreeDetail';
+import { achievementStatus, achievements, isKeyAchievement, groups, notebookCard, type Achievement, type Fact } from '../lib/achievements';
 import { findNode, ideaTree, statusInfo } from '../lib/idea-tree';
 import { useResearch } from '../data';
 import '../components/IdeaTree.css';
@@ -13,8 +13,8 @@ function Chip({ id }: { id: string }) {
   if (!node || node.kind !== 'leaf') return null;
   const { leaf } = node;
   const mt = leaf.experiments[0];
-  return <span className={`ach-chip tree-${leaf.status}`} title={statusInfo[leaf.status].name}>
-    <Link to={`/idea-tree?view=radial&node=${id}`}><TreeIcon status={leaf.status}/><span><strong>{id}</strong> · {leaf.title}</span></Link>
+  return <span className={`ach-chip tree-${leaf.status}${leaf.key ? ' tree-key' : ''}`} title={statusInfo[leaf.status].name}>
+    <Link to={`/idea-tree?view=radial&node=${id}`}><TreeIcon status={leaf.status}/><span><strong>{id}</strong> · {leaf.title}{leaf.key && <> <KeyStar/></>}</span></Link>
     {mt && <Link to={`/experiments/${mt}`} className="ach-chip-page">Test page <ArrowUpRight size={14}/></Link>}
   </span>;
 }
@@ -27,11 +27,13 @@ function Card({ card }: { card: Achievement }) {
   const status = achievementStatus(card);
   const judged = card.group === 'stand' || card.group === 'negative';
   const [key, ...rest] = card.facts;
-  return <article className={`ach-card tree-${judged ? status : 'u'}`} id={card.id}>
+  const isKey = isKeyAchievement(card);
+  return <article className={`ach-card tree-${judged ? status : 'u'}${isKey ? ' tree-key' : ''}`} id={card.id}>
     <header>
       {judged
         ? <span className="tree-verdict"><TreeIcon status={status}/>{card.group === 'stand' ? 'Stands' : statusInfo[status].name}</span>
         : <span className="ach-tag">{card.group === 'checked' ? 'Checked' : 'Built'}</span>}
+      {isKey && <KeyStar/>}
     </header>
     <h3>{card.claim}</h3>
     <p className="ach-key">{key.label}</p>
@@ -60,6 +62,7 @@ export function AchievementsPage() {
       title="What we achieved"
       description="These are results the project can stand behind, each with the condition it holds under. For what didn’t work, see the Idea tree."
     />
+    <ul className="ach-legend" aria-label="Legend"><KeyLegendItem/></ul>
     <p className="ach-links"><Link className="text-link" to="/idea-tree">Idea tree<ArrowRight size={16}/></Link><Link className="text-link" to="/main-idea">The main idea<ArrowRight size={16}/></Link></p>
     {groups.map(group => {
       const cards = achievements.filter(c => c.group === group.id);
