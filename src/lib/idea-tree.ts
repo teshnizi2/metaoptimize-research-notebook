@@ -18,7 +18,7 @@ export interface TreeLeaf {
   parent?: string;
   /** One short line on why this test followed its parent. */
   parentNote?: string;
-  /** A key result for the paper: drawn dark green with a star. Only the ids in tests/idea-tree.test.ts carry it. */
+  /** A key result for the paper: marked with a small dark green star. Only the ids in tests/idea-tree.test.ts carry it. */
   key?: boolean;
   /** One short line on why it is a key result; set with `key`. */
   keyReason?: string;
