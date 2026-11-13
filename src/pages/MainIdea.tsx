@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowRight } from 'lucide-react';
 import { PageHeading } from '../components/common';
-import { TreeDetail, MAIN_IDEA_PAGE, type TestLink } from '../components/IdeaTreeDetail';
+import { TreeDetail, testPath, type TestLink } from '../components/IdeaTreeDetail';
 import { BarChart, LineChart, TestChip } from '../components/MainIdeaCharts';
 import { findNode, ideaTree } from '../lib/idea-tree';
 import { barCharts, lineCharts, mainIdeaIntro, mainIdeaTests, reasons } from '../lib/main-idea';
@@ -10,7 +10,7 @@ import { useResearch } from '../data';
 import '../components/IdeaTree.css';
 import '../components/MainIdea.css';
 
-const siteLink: TestLink = (id, className, children) => <Link className={className} to={id === MAIN_IDEA_PAGE ? '/main-idea' : `/experiments/${id}`}>{children}</Link>;
+const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/${testPath(id)}`}>{children}</Link>;
 
 /** Evidence ids are tests (B3.6) or whole parts (B7); both open in the idea tree. */
 const inTree = (id: string) => `/idea-tree?view=radial&node=${id}`;
@@ -69,6 +69,6 @@ export function MainIdeaPage() {
       </ol>
     </section>
 
-    <p className="mi-close">What survived was a measuring tool, and the project then moved on to the count-matched audit. <Link className="text-link" to={inTree('B5')}>See Part 5 in the idea tree<ArrowRight size={16}/></Link></p>
+    <p className="mi-close">What survived was a measuring tool, and the project then moved on to the count-matched audit. <Link className="text-link" to={inTree('B5')}>See Part 5 in the idea tree<ArrowRight size={16}/></Link> <Link className="text-link" to="/achievements">What we achieved<ArrowRight size={16}/></Link></p>
   </div>;
 }

@@ -42,6 +42,7 @@ export function LearnPage() {
       title="Learn the project"
       description="Short videos with subtitles, a guide and glossary for newcomers, and a study path that puts them in a good order."
     />
+    <p className="learn-small">Want to see what the project found? <Link className="text-link" to="/achievements">What we achieved<ArrowRight size={16}/></Link></p>
 
     <section className="learn-section" aria-labelledby="learn-start">
       <h2 id="learn-start">Start here</h2>
