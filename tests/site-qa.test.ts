@@ -48,6 +48,7 @@ test('section labels match whole route segments and unknown routes are not calle
   assert.equal(sectionLabel('/runs/run-4683077'), 'Run ledger');
   assert.equal(sectionLabel('/warnings'), 'Warnings & limits');
   assert.equal(sectionLabel('/activity'), 'Research log');
+  assert.equal(sectionLabel('/learn'), 'Learn');
   for (const path of ['/nonexistent/deep/route', '/codex', '/runsheet', '/experiments/CVK2/extra', '/activity/phase-01', '/warnings/x'])
     assert.equal(sectionLabel(path), 'Page not found', path);
 });
