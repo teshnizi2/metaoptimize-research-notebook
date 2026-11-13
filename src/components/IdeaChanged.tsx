@@ -3,11 +3,13 @@ import { findNode, ideaTree, statusInfo, statusOrder, type IdeaTreeData } from '
 import { changedRows, chipStatus } from '../lib/idea-changed';
 import { attachedIdeas, futureRows, type FutureChip, type FutureIdea } from '../lib/future-ideas';
 import { KeyLegendItem, KeyStar, MAIN_IDEA_PAGE, TreeIcon, type TestLink } from './IdeaTreeDetail';
-import { IdeaLegendItem, IdeaMark, IdeasToggle } from './FutureIdeas';
+import { IdeaLegendItem, IdeaMark, IdeasToggle, PriorityTag } from './FutureIdeas';
 import './IdeaTree.css';
 import './IdeaChanged.css';
 
 /** "What we changed": the settings the tests varied, one row each, with every value or comparison coloured by the tests behind it. */
+const soonest = (ideas: FutureIdea[]) => (['now', 'next', 'later'] as const).find(p => ideas.some(i => i.priority === p)) ?? 'later';
+
 /** A dashed chip: a setting that no test has run yet, with the future idea(s) behind it. */
 function FutureChipItem({ chip, onOpen }: { chip: FutureChip; onOpen: (id: string) => void }) {
   const ids = chip.ideas.map(i => i.id);
@@ -18,6 +20,7 @@ function FutureChipItem({ chip, onOpen }: { chip: FutureChip; onOpen: (id: strin
       <span className="ic-label">{chip.label}</span>
       <span className="ic-outcome">future idea, not run yet</span>
       <span className="ic-ids">{ids.join(' · ')}</span>
+      <PriorityTag priority={soonest(chip.ideas)}/>
     </span>
   </button></li>;
 }

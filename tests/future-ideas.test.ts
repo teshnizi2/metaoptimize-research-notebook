@@ -127,3 +127,9 @@ test('the graph, list and changed views carry the buttons and the legend line', 
   assert.match(read('src/components/FutureIdeas.tsx'), /Cost <small>\(estimate\)/);
   assert.match(read('src/pages/IdeaTreePage.tsx'), /useIdeas/);
 });
+
+test('every place that draws an idea shows its priority label', () => {
+  for (const f of ['IdeaGraph', 'IdeaTree', 'IdeaChanged', 'FutureIdeas']) {
+    assert.ok(readFileSync(new URL(`../src/components/${f}.tsx`, import.meta.url), 'utf8').includes('PriorityTag'), `${f} shows the priority`);
+  }
+});

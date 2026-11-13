@@ -7,7 +7,7 @@ import { countStatuses, findNode, ideaTree, keyCount, keyIds, statusInfo, status
 import { ancestorsOf, childLabel, expandableIds, fitView, layoutGraph, narrowRadial, narrowSizes, radialLayout, wideRadial, wideSizes, type GraphNode, type View } from '../lib/idea-graph';
 import { attachedIdeas, findIdeaNode, ideaParent, isKnown, type FutureIdea, type IdeaNode } from '../lib/future-ideas';
 import { KeyLegendItem, KeyStar, TreeDetail, TreeIcon, type TestLink } from './IdeaTreeDetail';
-import { IdeaLegendItem, IdeaMark, IdeasToggle } from './FutureIdeas';
+import { IdeaLegendItem, IdeaMark, IdeasToggle, PriorityTag } from './FutureIdeas';
 import './IdeaTree.css';
 import './IdeaGraph.css';
 
@@ -294,7 +294,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     if (n.kind === 'idea' || n.kind === 'branch') {
       const f = findIdeaNode(futures, n.id);
       return <>
-        <span className="ig-head"><IdeaMark/><span className="tree-node-kicker">{f?.kind === 'idea' ? `Idea · ${f.idea.id}` : 'New branch'}</span>{radial && badge}</span>
+        <span className="ig-head"><IdeaMark/><span className="tree-node-kicker">{f?.kind === 'idea' ? `Idea · ${f.idea.id}` : 'New branch'}</span>{f?.kind === 'idea' && <PriorityTag priority={f.idea.priority}/>}{radial && badge}</span>
         <strong className="ig-title">{f?.kind === 'idea' ? f.idea.title : f?.kind === 'branch' ? f.name : n.id}</strong>
         {!radial && badge}
       </>;
