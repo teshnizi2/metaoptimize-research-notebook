@@ -23,18 +23,24 @@ export function IdeaTreePage() {
     if (id) next.set('node', id); else next.delete('node');
     setParams(next, { replace: true });
   };
-  return <>
-    <PageHeading
-      eyebrow="Research map"
-      title="Idea tree"
-      description="The project’s question on the left, and every main idea it tested, coloured by whether it worked. Select a box to open what comes next and to read a short summary."
-    />
-    <div className="ig-modes" role="group" aria-label="View">
-      <button type="button" aria-pressed={!list} onClick={() => setView('graph')}>Tree graph</button>
-      <button type="button" aria-pressed={list} onClick={() => setView('list')}>List view</button>
-    </div>
-    {list
-      ? <IdeaTree/>
-      : <IdeaGraph pageIds={pageIds} testLink={siteLink} initialNode={params.get('node')} onSelectChange={onSelectChange}/>}
-  </>;
+  const modes = <div className="ig-modes" role="group" aria-label="View">
+    <button type="button" aria-pressed={!list} onClick={() => setView('graph')}>Tree graph</button>
+    <button type="button" aria-pressed={list} onClick={() => setView('list')}>List view</button>
+  </div>;
+  if (list) {
+    return <div className="ig-page-list">
+      <PageHeading
+        eyebrow="Research map"
+        title="Idea tree"
+        description="Every main idea the project tested, in the order it happened, coloured by whether it worked. Select a box for a short summary, then open that test’s page."
+      />
+      {modes}
+      <IdeaTree/>
+    </div>;
+  }
+  return <div className="ig-page">
+    <IdeaGraph
+      header={<div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div>}
+      pageIds={pageIds} testLink={siteLink} initialNode={params.get('node')} onSelectChange={onSelectChange}/>
+  </div>;
 }

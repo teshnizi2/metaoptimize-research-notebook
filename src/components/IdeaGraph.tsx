@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { linkHorizontal } from 'd3-shape';
 import { select } from 'd3-selection';
 import { zoom, zoomIdentity, zoomTransform, type ZoomBehavior } from 'd3-zoom';
@@ -26,12 +26,17 @@ function useWidth(ref: React.RefObject<HTMLElement | null>) {
   return width;
 }
 
-export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = null, onSelectChange }: {
+const PAD = 20;
+const PANEL_MAX = 380;
+
+export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = null, onSelectChange, header }: {
   data?: IdeaTreeData;
   pageIds: ReadonlySet<string>;
   testLink: TestLink;
   initialNode?: string | null;
   onSelectChange?: (id: string | null) => void;
+  /** Shown at the left of the toolbar row (the page title and view switch). */
+  header?: ReactNode;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -39,10 +44,9 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   const zoomRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
   const anchor = useRef<{ id: string; sx: number; sy: number; reveal: boolean } | null>(null);
   const first = useRef(true);
-  const pendingFit = useRef<number | null>(null);
+  const pending = useRef<number | 'start' | null>(null);
   const frameWidth = useWidth(frameRef);
   const narrow = frameWidth > 0 && frameWidth < 700;
-  const sheet = frameWidth < 1000;
   const sizes = narrow ? narrowSizes : wideSizes;
 
   const [selectedId, setSelectedId] = useState<string | null>(initialNode && findNode(data, initialNode) ? initialNode : null);
@@ -51,54 +55,77 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
   const byId = useMemo(() => new Map(layout.nodes.map(n => [n.id, n])), [layout]);
   const node: TreeNode | null = findNode(data, selectedId);
 
+  /** Width of the canvas that is not covered by the summary panel (the panel sits on the right when the graph is wide). */
+  const visibleWidth = (view: HTMLElement, panelOpen: boolean) => view.clientWidth - (panelOpen && !narrow ? Math.min(PANEL_MAX, view.clientWidth * 0.46) + 10 : 0);
+
   const apply = useCallback((v: View) => {
     const view = viewRef.current, z = zoomRef.current;
     if (!view || !z) return;
-    const t = zoomIdentity.translate(v.x, v.y).scale(v.k);
-    select(view).call(z.transform, t);
+    select(view).call(z.transform, zoomIdentity.translate(v.x, v.y).scale(v.k));
   }, []);
 
-  // Pan and zoom: drag, wheel and pinch. The stage is moved with a CSS transform, so cards stay real, selectable HTML.
+  // Pan and zoom. Drag moves; the wheel scrolls (so the text stays readable); Ctrl/Cmd + wheel and two-finger pinch zoom.
   useEffect(() => {
     const view = viewRef.current;
     if (!view) return;
-    const z = zoom<HTMLDivElement, unknown>().scaleExtent([MIN_K, MAX_K]).on('zoom', e => {
-      if (stageRef.current) stageRef.current.style.transform = `translate(${e.transform.x}px, ${e.transform.y}px) scale(${e.transform.k})`;
-    });
+    const z = zoom<HTMLDivElement, unknown>().scaleExtent([MIN_K, MAX_K])
+      .filter(e => (e.type === 'wheel' ? e.ctrlKey || e.metaKey : !e.button && !e.ctrlKey))
+      .on('zoom', e => {
+        if (stageRef.current) stageRef.current.style.transform = `translate(${e.transform.x}px, ${e.transform.y}px) scale(${e.transform.k})`;
+      });
     zoomRef.current = z;
     select(view).call(z).on('dblclick.zoom', null);
-    return () => { select(view).on('.zoom', null); };
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      const unit = e.deltaMode === 1 ? 16 : 1;
+      select(view).call(z.translateBy, (-e.deltaX * unit) / zoomTransform(view).k, (-e.deltaY * unit) / zoomTransform(view).k);
+    };
+    view.addEventListener('wheel', onWheel, { passive: false });
+    return () => { select(view).on('.zoom', null); view.removeEventListener('wheel', onWheel); };
   }, []);
 
-  const fit = useCallback((minK: number) => {
+  /** Readable start: full-size cards, the question and the first parts in view, the rest a drag or scroll away. */
+  const startView = useCallback((view: HTMLElement): View => {
+    const col = layout.nodes.filter(n => n.depth <= 1);
+    const minY = Math.min(...col.map(n => n.y)), maxY = Math.max(...col.map(n => n.y + n.h)), maxX = Math.max(...col.map(n => n.x + n.w));
+    const root = byId.get('root')!;
+    const k = Math.min(1, (view.clientWidth - 2 * PAD) / maxX);
+    const vh = view.clientHeight;
+    // Everything fits: centre it. Otherwise centre on the question, never starting lower than the first part.
+    const y = (maxY - minY) * k + 2 * PAD <= vh ? (vh - (maxY - minY) * k) / 2 - minY * k : Math.min(vh / 2 - (root.y + root.h / 2) * k, PAD - minY * k);
+    return { k, x: PAD, y };
+  }, [layout, byId]);
+
+  const fit = useCallback(() => {
     const view = viewRef.current;
-    if (!view) return;
-    apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, minK, 1.1));
+    if (view) apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, MIN_K, 1.1));
   }, [apply, layout]);
 
-  // First paint: show the whole graph, or the selected box when a shared link names one.
+  // First paint: a readable start, or the selected box when a shared link names one.
   useLayoutEffect(() => {
     if (!frameWidth || !first.current) return;
     first.current = false;
     const view = viewRef.current;
     if (!view) return;
-    const start = selectedId ? byId.get(selectedId) : null;
-    if (start) {
-      const k = narrow ? 0.9 : 1;
-      apply({ k, x: view.clientWidth / 2 - (start.x + start.w / 2) * k, y: view.clientHeight * (sheet ? 0.24 : 0.5) - (start.y + start.h / 2) * k });
+    const target = selectedId ? byId.get(selectedId) : null;
+    if (target) {
+      const k = narrow ? Math.min(1, (view.clientWidth - 2 * PAD) / (sizes.part.w + sizes.gap + sizes.leaf.w)) : 1;
+      const cx = narrow ? view.clientWidth / 2 : Math.min(visibleWidth(view, true) / 2, view.clientWidth / 2);
+      apply({ k, x: cx - (target.x + target.w / 2) * k, y: view.clientHeight * (narrow ? 0.24 : 0.5) - (target.y + target.h / 2) * k });
     } else {
-      const box = { ...layout.bounds, maxX: layout.bounds.maxX };
-      apply(fitView(box, view.clientWidth, view.clientHeight, narrow ? 0.85 : 0.6, 1));
+      apply(startView(view));
     }
-  }, [frameWidth, narrow, sheet, layout, byId, selectedId, apply]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [frameWidth, narrow, layout, byId, selectedId, apply, startView]);
 
-  // After a box opens or folds, keep it where it was on screen, and bring its new children into view.
+  // After a box opens or folds, keep it where it was on screen, and bring its new children into view at the same size.
   useLayoutEffect(() => {
     const a = anchor.current, view = viewRef.current;
     if (!view) return;
-    if (pendingFit.current !== null) {
-      apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, pendingFit.current, 1.1));
-      pendingFit.current = null;
+    if (pending.current !== null) {
+      apply(pending.current === 'start' ? startView(view) : fitView(layout.bounds, view.clientWidth, view.clientHeight, pending.current, 1.1));
+      pending.current = null;
       anchor.current = null;
       return;
     }
@@ -111,18 +138,19 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     if (a.reveal) {
       const kids = layout.links.filter(l => l.from === a.id).map(l => byId.get(l.to)).filter((c): c is GraphNode => !!c);
       if (kids.length) {
-        const pad = 16, vw = view.clientWidth, vh = view.clientHeight;
+        const vw = visibleWidth(view, selectedId !== null), vh = view.clientHeight;
         const right = Math.max(...kids.map(c => c.x + c.w)) * t.k + x, left = n.x * t.k + x;
-        if (right > vw - pad) x -= Math.min(right - (vw - pad), Math.max(0, left - pad));
+        if (right > vw - PAD) x -= Math.min(right - (vw - PAD), Math.max(0, left - PAD));
         const top = Math.min(...kids.map(c => c.y)) * t.k + y, bottom = Math.max(...kids.map(c => c.y + c.h)) * t.k + y;
-        if (!sheet && bottom - top <= vh - 2 * pad) {
-          if (top < pad) y += pad - top;
-          else if (bottom > vh - pad) y -= bottom - (vh - pad);
+        if (!narrow && bottom - top <= vh - 2 * PAD) {
+          if (top < PAD) y += PAD - top;
+          else if (bottom > vh - PAD) y -= bottom - (vh - PAD);
         }
       }
     }
     apply({ x, y, k: t.k });
-  }, [layout, byId, apply, sheet]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layout, byId, apply, narrow]);
 
   const select_ = (id: string | null) => { setSelectedId(id); onSelectChange?.(id); };
 
@@ -132,10 +160,11 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     if (!view) return;
     const t = zoomTransform(view);
     const opening = !open.has(n.id);
-    // Where the box is on screen now; with the summary sheet up, keep it in the visible top part.
-    const sx = (n.x + n.w / 2) * t.k + t.x;
+    // Where the box is on screen now. With the bottom sheet up keep it in the visible top part; with the side panel up keep it left of the panel.
+    let sx = (n.x + n.w / 2) * t.k + t.x;
     let sy = (n.y + n.h / 2) * t.k + t.y;
-    if (sheet) sy = Math.min(sy, view.clientHeight * 0.26);
+    if (narrow) sy = Math.min(sy, view.clientHeight * 0.26);
+    else sx = Math.min(sx, visibleWidth(view, true) - PAD - (n.w / 2) * t.k);
     if (n.childCount > 0) {
       anchor.current = { id: n.id, sx, sy, reveal: opening };
       setOpen(prev => {
@@ -143,14 +172,14 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
         if (opening) next.add(n.id); else next.delete(n.id);
         return next;
       });
-    } else if (sheet) {
+    } else {
       apply({ k: t.k, x: sx - (n.x + n.w / 2) * t.k, y: sy - (n.y + n.h / 2) * t.k });
     }
   };
 
   const expandable = useMemo(() => expandableIds(data), [data]);
-  const openAll = () => { pendingFit.current = 0.2; setOpen(new Set(expandable)); };
-  const closeAll = () => { pendingFit.current = narrow ? 0.85 : 0.6; setOpen(new Set(['root'])); };
+  const openAll = () => { pending.current = 0.2; setOpen(new Set(expandable)); };
+  const closeAll = () => { pending.current = 'start'; setOpen(new Set(['root'])); };
 
   const zoomBy = (factor: number) => {
     const view = viewRef.current, z = zoomRef.current;
@@ -198,47 +227,45 @@ export function IdeaGraph({ data = ideaTree, pageIds, testLink, initialNode = nu
     </>;
   };
 
-  return <div className={`ig ${narrow ? 'ig-narrow' : 'ig-medium'} ${sheet ? 'ig-sheeted' : 'ig-wide'}`} ref={frameRef}>
-    <ul className="tree-legend" aria-label="Legend">
-      {statusOrder.map(s => <li key={s} className={`tree-${s}`}><TreeIcon status={s}/><span>{statusInfo[s].name}<small>{totals[s]} tests</small></span></li>)}
-    </ul>
-    <div className="ig-controls" role="toolbar" aria-label="Graph controls">
-      <button type="button" className="button" onClick={openAll}>Open all</button>
-      <button type="button" className="button" onClick={closeAll}>Close all</button>
-      <button type="button" className="button" onClick={() => fit(0.15)}><Maximize2 size={15}/> Fit to screen</button>
-      <span className="ig-zoom">
-        <button type="button" className="button" aria-label="Zoom in" onClick={() => zoomBy(1.3)}><Plus size={16}/></button>
-        <button type="button" className="button" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.3)}><Minus size={16}/></button>
-      </span>
-    </div>
-    <p className="ig-hint">Select a box: it opens what comes next on the right and shows its summary. Select it again to fold it. Drag to move, scroll or pinch to zoom.</p>
-    <div className="ig-body">
-      <div className="ig-canvas">
-        <div className="ig-view" ref={viewRef} role="application" aria-label="Idea tree graph">
-          <div className="ig-stage" ref={stageRef}>
-            <svg className="ig-links" width={Math.max(1, layout.bounds.maxX + 4)} height={1} aria-hidden="true">
-              {links.map(l => <path key={l.id} d={l.d} className={`ig-link ${l.status ? `tree-${l.status}` : ''}`}/>)}
-            </svg>
-            {layout.nodes.map(n => <button
-              key={n.id}
-              type="button"
-              className={`ig-card ig-${n.kind} ${n.status ? `tree-${n.status}` : ''}`}
-              style={{ left: n.x, top: n.y, width: n.w, height: n.h }}
-              aria-current={selectedId === n.id}
-              aria-expanded={n.childCount > 0 ? n.open : undefined}
-              aria-label={label(n)}
-              onClick={() => onNode(n)}
-            >{cardInner(n)}</button>)}
-          </div>
-        </div>
-        {sheet && node && <div className="ig-sheet">
-          <button type="button" className="ig-sheet-close" aria-label="Close summary" onClick={close}><X size={18}/></button>
-          <TreeDetail node={node} data={data} pageIds={pageIds} testLink={testLink} onSelect={select_}/>
-        </div>}
+  const panel = node && <>
+    <button type="button" className="ig-panel-close" aria-label="Close summary" onClick={close}><X size={18}/></button>
+    <TreeDetail node={node} data={data} pageIds={pageIds} testLink={testLink} onSelect={select_}/>
+  </>;
+
+  return <div className={`ig ${narrow ? 'ig-narrow' : 'ig-wide'}`} ref={frameRef}>
+    <div className="ig-bar">
+      <div className="ig-bar-head">{header}</div>
+      <div className="ig-controls" role="toolbar" aria-label="Graph controls">
+        <button type="button" className="button" onClick={openAll}>Open all</button>
+        <button type="button" className="button" onClick={closeAll}>Close all</button>
+        <button type="button" className="button" onClick={fit}><Maximize2 size={15}/> Fit to screen</button>
+        <button type="button" className="button ig-icon" aria-label="Zoom in" onClick={() => zoomBy(1.3)}><Plus size={16}/></button>
+        <button type="button" className="button ig-icon" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.3)}><Minus size={16}/></button>
       </div>
-      {!sheet && <aside className="ig-side" aria-label="Summary of the selected box">
-        <TreeDetail node={node} data={data} pageIds={pageIds} testLink={testLink} onSelect={select_}/>
-      </aside>}
+    </div>
+    <div className="ig-canvas">
+      <div className="ig-view" ref={viewRef} role="application" aria-label="Idea tree graph">
+        <div className="ig-stage" ref={stageRef}>
+          <svg className="ig-links" width={Math.max(1, layout.bounds.maxX + 4)} height={1} aria-hidden="true">
+            {links.map(l => <path key={l.id} d={l.d} className={`ig-link ${l.status ? `tree-${l.status}` : ''}`}/>)}
+          </svg>
+          {layout.nodes.map(n => <button
+            key={n.id}
+            type="button"
+            className={`ig-card ig-${n.kind} ${n.status ? `tree-${n.status}` : ''}`}
+            style={{ left: n.x, top: n.y, width: n.w, height: n.h }}
+            aria-current={selectedId === n.id}
+            aria-expanded={n.childCount > 0 ? n.open : undefined}
+            aria-label={label(n)}
+            onClick={() => onNode(n)}
+          >{cardInner(n)}</button>)}
+        </div>
+      </div>
+      <ul className="ig-legend" aria-label="Legend">
+        {statusOrder.map(s => <li key={s} className={`tree-${s}`}><TreeIcon status={s}/><span>{statusInfo[s].short}<small>{totals[s]}</small></span></li>)}
+      </ul>
+      <p className="ig-hint">Select a box to open what comes next and read its summary; select it again to fold it. Drag or scroll to move. Ctrl or ⌘ + scroll, or pinch, to zoom.</p>
+      {node && <aside className={narrow ? 'ig-sheet' : 'ig-panel'} aria-label="Summary of the selected box">{panel}</aside>}
     </div>
   </div>;
 }
