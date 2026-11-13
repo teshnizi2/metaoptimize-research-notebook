@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { PageHeading } from '../components/common';
 import { IdeaTree } from '../components/IdeaTree';
@@ -6,6 +6,7 @@ import { IdeaGraph } from '../components/IdeaGraph';
 import { IdeaChanged } from '../components/IdeaChanged';
 import { testPath, type TestLink } from '../components/IdeaTreeDetail';
 import { useResearch } from '../data';
+import { viewOf, withNode, withView, type PageView, type TreeView } from '../lib/idea-tree-url';
 
 const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/${testPath(id)}`}>{children}</Link>;
 
@@ -15,20 +16,13 @@ export function IdeaTreePage() {
   const pageIds = useMemo(() => new Set(research.experiments.map(e => e.id)), [research]);
   // Radial is the default; a phone is too narrow to read it at first sight, so it starts left to right.
   const [phone] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 700px)').matches);
-  const asked = params.get('view');
-  const view: 'radial' | 'tree' | 'list' | 'changed' = asked === 'list' || asked === 'tree' || asked === 'radial' || asked === 'changed' ? asked : phone ? 'tree' : 'radial';
+  const view: PageView = viewOf(params, phone);
   const list = view === 'list';
-  const setView = (next: 'radial' | 'tree' | 'list' | 'changed') => {
-    const query = new URLSearchParams(params);
-    query.set('view', next);
-    query.delete('keys');
-    setParams(query, { replace: true });
-  };
-  const onSelectChange = (id: string | null) => {
-    const next = new URLSearchParams(params);
-    if (id) next.set('node', id); else next.delete('node');
-    setParams(next, { replace: true });
-  };
+  // The tree view the reader was last in, so a chip in "What we changed" opens its test there.
+  const lastTree = useRef<TreeView>(phone ? 'tree' : 'radial');
+  if (view !== 'changed') lastTree.current = view;
+  const setView = (next: PageView) => setParams(withView(params, next), { replace: true });
+  const onSelectChange = (id: string | null) => setParams(withNode(params, id), { replace: true });
   const modes = <div className="ig-modes" role="group" aria-label="View">
     <button type="button" aria-pressed={view === 'radial'} onClick={() => setView('radial')}>Radial</button>
     <button type="button" aria-pressed={view === 'tree'} onClick={() => setView('tree')}>Left to right</button>
@@ -36,12 +30,9 @@ export function IdeaTreePage() {
     <button type="button" aria-pressed={view === 'changed'} onClick={() => setView('changed')}>What we changed</button>
   </div>;
   if (view === 'changed') {
-    // A chip opens its test in the tree: radial, or left to right on a phone.
+    // A chip opens its test in the tree view the reader came from (the default if there was none).
     const open = (id: string) => {
-      const query = new URLSearchParams(params);
-      query.set('view', phone ? 'tree' : 'radial');
-      query.set('node', id);
-      setParams(query);
+      setParams(withNode(withView(params, lastTree.current), id));
       window.scrollTo(0, 0);
     };
     return <div className="ig-page-list">

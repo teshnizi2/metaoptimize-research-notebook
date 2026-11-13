@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { ChevronRight, Star } from 'lucide-react';
 import { useResearch } from '../data';
+import { withNode } from '../lib/idea-tree-url';
 import { countStatuses, findNode, ideaTree, keyCount, keyIds, statusInfo, statusOrder, type TreeNode } from '../lib/idea-tree';
 import { KeyLegendItem, KeyStar, TreeDetail, TreeIcon, testPath, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
@@ -48,7 +49,8 @@ export function IdeaTree() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const select = (id: string) => setParams({ node: id }, { replace: true });
+  // Only `node` changes: the address keeps its view (list) and anything else it carries.
+  const select = (id: string) => setParams(withNode(params, id), { replace: true });
   const toggle = (id: string) => setOpen(prev => {
     const next = new Set(prev);
     if (next.has(id)) next.delete(id); else next.add(id);

@@ -7,13 +7,14 @@ import { BarChart, LineChart, TestChip } from '../components/MainIdeaCharts';
 import { findNode, ideaTree } from '../lib/idea-tree';
 import { barCharts, lineCharts, mainIdeaIntro, mainIdeaTests, reasons } from '../lib/main-idea';
 import { useResearch } from '../data';
+import { treeAddress } from '../lib/idea-tree-url';
 import '../components/IdeaTree.css';
 import '../components/MainIdea.css';
 
 const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/${testPath(id)}`}>{children}</Link>;
 
 /** Evidence ids are tests (B3.6) or whole parts (B7); both open in the idea tree. */
-const inTree = (id: string) => `/idea-tree?view=radial&node=${id}`;
+const inTree = (id: string) => treeAddress(id);
 
 export function MainIdeaPage() {
   const research = useResearch();
