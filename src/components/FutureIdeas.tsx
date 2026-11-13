@@ -8,6 +8,11 @@ export function IdeaMark() {
   return <span className="idea-mark" aria-hidden="true">💡</span>;
 }
 
+/** Small label with when an idea is planned: do now, do next or later. Neutral greys, never a verdict colour. */
+export function PriorityTag({ priority }: { priority: FutureIdea['priority'] }) {
+  return <span className={`idea-prio idea-prio-${priority}`}>{priorityName[priority]}</span>;
+}
+
 /** Legend entry: dashed, light, never one of the four verdict colours. */
 export function IdeaLegendItem({ total }: { total?: number }) {
   return <li className="idea-legend"><IdeaMark/><span>{IDEA_LEGEND}{total !== undefined && <small>{total}</small>}</span></li>;
@@ -60,7 +65,7 @@ export function IdeaDetail({ node, data, inline, onSelect }: { node: IdeaNode; d
   return <article className={cls} aria-live="polite">
     <header>
       <span className="idea-pill"><IdeaMark/>Future idea · not run yet</span>
-      <span className="idea-tag">{priorityName[idea.priority]}</span>
+      <PriorityTag priority={idea.priority}/>
       <span className="idea-tag" title="How likely it is to work as planned: 5 is sure, 1 is not possible as planned">Feasibility {idea.feasibility} / 5</span>
     </header>
     <p className="tree-where">{idea.id} · {kindName[idea.kind]} · grows from {parentLabel(idea, data)}</p>

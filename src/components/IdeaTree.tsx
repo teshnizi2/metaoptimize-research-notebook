@@ -7,7 +7,7 @@ import { countStatuses, findNode, ideaTree, keyCount, keyIds, statusInfo, status
 import { attachedIdeas, findIdeaNode, ideaBranches, ideasOn, type FutureIdea, type IdeaNode } from '../lib/future-ideas';
 import { ancestorsOf } from '../lib/idea-graph';
 import { KeyLegendItem, KeyStar, TreeDetail, TreeIcon, testPath, type TestLink } from './IdeaTreeDetail';
-import { IdeaLegendItem, IdeaMark, IdeasToggle } from './FutureIdeas';
+import { IdeaLegendItem, IdeaMark, IdeasToggle, PriorityTag } from './FutureIdeas';
 import './IdeaTree.css';
 
 const WIDE_QUERY = '(min-width: 1000px)';
@@ -38,7 +38,7 @@ function Detail({ node, inline, onSelect }: { node: TreeNode | IdeaNode | null; 
 function IdeaItem({ idea, current, onSelect }: { idea: FutureIdea; current: boolean; onSelect: (id: string) => void }) {
   return <button type="button" className="tree-node tree-future" aria-current={current} onClick={() => onSelect(idea.id)}>
     <IdeaMark/>
-    <span className="tree-node-text"><span className="tree-node-kicker">Future idea · {idea.id} · not run yet</span><strong>{idea.title}</strong>{idea.question && <small>{idea.question}</small>}</span>
+    <span className="tree-node-text"><span className="tree-node-kicker">Future idea · {idea.id} · not run yet <PriorityTag priority={idea.priority}/></span><strong>{idea.title}</strong>{idea.question && <small>{idea.question}</small>}</span>
   </button>;
 }
 
