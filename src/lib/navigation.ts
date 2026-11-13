@@ -2,6 +2,7 @@
 export const sections = [
   { to: '/', label: 'Overview', detail: false },
   { to: '/experiments', label: 'Experiments', detail: true },
+  { to: '/idea-tree', label: 'Idea tree', detail: false },
   { to: '/figures', label: 'Figures & tables', detail: true },
   { to: '/code', label: 'Source code', detail: true },
   { to: '/runs', label: 'Run ledger', detail: true },
