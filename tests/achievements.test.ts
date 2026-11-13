@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { findNode, ideaTree } from '../src/lib/idea-tree.ts';
-import { achievementStatus, achievements, groups, sourceHolds, sourceText, type Source } from '../src/lib/achievements.ts';
+import { achievementStatus, achievements, groups, sectionOf, sections, sourceHolds, sourceText, type Source } from '../src/lib/achievements.ts';
+import { firstUses, gloss } from '../src/lib/glossary.ts';
 
 const root = new URL('../', import.meta.url);
 
@@ -77,4 +78,37 @@ test('the audit, the rival comparison and the collapse case study are key cards;
   assert.deepEqual(keys, ['audit', 'collapse', 'rival']);
   // A key card keeps its verdict: the rival card is still red.
   assert.equal(achievementStatus(achievements.find(c => c.id === 'rival')!), 'r');
+});
+
+test('the page reads in five sections, in order, and every card lands in one', () => {
+  assert.deepEqual(sections.map(s => s.id), ['key', 'stand', 'negative', 'checked', 'built']);
+  assert.deepEqual(sections.map(s => s.title), [
+    'Key results for the paper', 'Other findings that hold', 'Clean negatives: what we ruled out', 'How the work was checked', 'What we built',
+  ]);
+  for (const card of achievements) assert.ok(sections.some(s => s.id === sectionOf(card)), card.id);
+  assert.deepEqual(achievements.filter(c => sectionOf(c) === 'key').map(c => c.id).sort(), ['audit', 'collapse', 'rival']);
+});
+
+test('"At a glance" has 4 to 6 one-line claims, each pointing at a card', () => {
+  const lines = achievements.filter(c => c.glance);
+  assert.ok(lines.length >= 4 && lines.length <= 6, `${lines.length} lines`);
+  for (const c of lines) assert.ok(c.glance!.length < 140 && !c.glance!.includes('\n'), c.id);
+  assert.ok(new Set(achievements.map(c => c.id)).size === achievements.length, 'card ids are unique anchors');
+});
+
+test('every card says why it matters, and the text says "points", never "pp"', () => {
+  for (const card of achievements) {
+    assert.ok(card.matters.length > 10, `${card.id} matters`);
+    const words = [card.claim, card.holds, card.caveat ?? '', card.matters, card.glance ?? '', ...card.facts.map(f => f.label)].join(' | ');
+    assert.ok(!/\bpp\b/i.test(words), `${card.id}: "pp" in the text`);
+  }
+});
+
+test('a plain term is explained once, at its first use', () => {
+  const pieces = gloss('BatchNorm helps, and BatchNorm again', new Set(['batchnorm']));
+  assert.equal(pieces.filter(p => p.term).length, 1);
+  assert.equal(pieces.map(p => p.text).join(''), 'BatchNorm helps, and BatchNorm again');
+  const plan = firstUses([{ key: 'a', text: 'we use SGD' }, { key: 'b', text: 'SGD again' }]);
+  assert.ok(plan.get('a')?.has('sgd'));
+  assert.ok(!plan.get('b')?.has('sgd'));
 });
