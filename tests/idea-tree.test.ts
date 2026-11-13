@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import { countStatuses, findNode, ideaTree, sentenceCount } from '../src/lib/idea-tree.ts';
+import { changedRows, chipStatus } from '../src/lib/idea-changed.ts';
 import { ancestorsOf, buildChildren, expandableIds, fitView, layoutGraph, narrowRadial, radialLayout, wideRadial, wideSizes } from '../src/lib/idea-graph.ts';
 
 const research = JSON.parse(readFileSync(new URL('../public/data/research.json', import.meta.url), 'utf8'));
@@ -119,4 +120,34 @@ test('radial view: opening or folding a box never moves another box', () => {
   const more = radialLayout(ideaTree, new Set(['root', 'B7', 'B8', 'B7.1']), wideRadial);
   const at = new Map(more.nodes.map(n => [n.id, `${Math.round(n.x)},${Math.round(n.y)}`]));
   for (const n of one.nodes) assert.equal(at.get(n.id), `${Math.round(n.x)},${Math.round(n.y)}`, n.id);
+});
+
+test('What we changed: every chip is coloured by the tests it links to, and invents no verdict', () => {
+  assert.equal(changedRows.length, 10);
+  for (const row of changedRows) {
+    assert.ok(row.question.endsWith('?'), row.title);
+    assert.ok(row.chips.length >= 3, row.title);
+    for (const chip of row.chips) {
+      const status = chipStatus(chip, ideaTree);
+      if (chip.tests.length === 0) {
+        assert.equal(status, 'setting', chip.label);
+        assert.equal(chip.outcome, undefined, chip.label);
+        continue;
+      }
+      assert.ok(chip.outcome && chip.outcome.split(/\s+/).length <= 7, chip.label);
+      const own = chip.tests.map(id => {
+        const node = findNode(ideaTree, id);
+        assert.equal(node?.kind, 'leaf', `${chip.label}: ${id} is a test`);
+        return node!.kind === 'leaf' ? node!.leaf.status : 'u';
+      });
+      // One status when the tests agree, amber (mixed) when they differ.
+      assert.equal(status, new Set(own).size === 1 ? own[0] : 'a', chip.label);
+    }
+  }
+});
+
+test('What we changed: a chip with no test is only a setting, and mixed tests turn amber', () => {
+  assert.equal(chipStatus({ label: 'x', tests: [] }, ideaTree), 'setting');
+  assert.equal(chipStatus({ label: 'x', tests: ['B3.1', 'B4.3'] }, ideaTree), 'a');
+  assert.equal(chipStatus({ label: 'x', tests: ['B3.1', 'B3.2'] }, ideaTree), 'r');
 });
