@@ -1,7 +1,12 @@
 import { hierarchy, tree } from 'd3-hierarchy';
 import type { IdeaTreeData, TreeLeaf, TreeStatus } from './idea-tree';
+import { attachedIdeas, ideaBranches, ideaParent, type FutureIdea } from './future-ideas';
 
-export type GraphKind = 'root' | 'part' | 'leaf';
+/** `idea` is a future idea (a test or part's follow-up not run yet); `branch` is a new branch of ideas off the question. Both are drawn dashed and carry no verdict. */
+export type GraphKind = 'root' | 'part' | 'leaf' | 'idea' | 'branch';
+
+/** The card size a kind of box uses: an idea is as big as a test, a new branch as big as a part. */
+export const sizeKind = (kind: GraphKind): 'root' | 'part' | 'leaf' => (kind === 'idea' ? 'leaf' : kind === 'branch' ? 'part' : kind);
 
 export interface GraphNode {
   id: string;
@@ -15,6 +20,8 @@ export interface GraphNode {
   status: TreeStatus | null;
   /** Direct children, whether or not they are shown. */
   childCount: number;
+  /** How many of those children are future ideas (or, for the question, new branches). */
+  ideaCount: number;
   open: boolean;
   /** Radial view only: where the card's centre is, as an angle (radians, clockwise from twelve o'clock) and a distance from the question. */
   angle?: number;
@@ -42,45 +49,57 @@ export const wideSizes: GraphSizes = { root: { w: 260, h: 190 }, part: { w: 280,
 export const narrowSizes: GraphSizes = { root: { w: 140, h: 210 }, part: { w: 176, h: 104 }, leaf: { w: 200, h: 104 }, gap: 28, pitch: 114 };
 
 /** Children of a node in the full tree: root -> parts -> tests, where a test with a `parent` hangs under that test. */
-export function buildChildren(data: IdeaTreeData): Map<string, string[]> {
+export function buildChildren(data: IdeaTreeData, ideas: readonly FutureIdea[] = []): Map<string, string[]> {
   const kids = new Map<string, string[]>();
   const add = (parent: string, id: string) => kids.set(parent, [...(kids.get(parent) ?? []), id]);
   for (const part of data.parts) {
     add('root', part.id);
     for (const leaf of part.leaves) add(leaf.parent ?? part.id, leaf.id);
   }
+  // Future ideas come after the tests of the box they grow from; new branches after the parts.
+  const shown = attachedIdeas(data, ideas);
+  for (const b of ideaBranches(shown)) add('root', b.id);
+  for (const idea of shown) add(ideaParent(idea), idea.id);
   return kids;
 }
 
+/** Ids of the future-idea boxes and new-branch boxes of a tree. */
+export function ideaBoxIds(data: IdeaTreeData, ideas: readonly FutureIdea[]): Set<string> {
+  const shown = attachedIdeas(data, ideas);
+  return new Set([...shown.map(i => i.id), ...ideaBranches(shown).map(b => b.id)]);
+}
+
 /** Id of the parent of every node. */
-export function buildParents(data: IdeaTreeData): Map<string, string> {
+export function buildParents(data: IdeaTreeData, ideas: readonly FutureIdea[] = []): Map<string, string> {
   const parents = new Map<string, string>();
-  for (const [parent, ids] of buildChildren(data)) for (const id of ids) parents.set(id, parent);
+  for (const [parent, ids] of buildChildren(data, ideas)) for (const id of ids) parents.set(id, parent);
   return parents;
 }
 
 /** Ids of all nodes that have children, i.e. everything "Open all" should open. */
-export function expandableIds(data: IdeaTreeData): string[] {
-  return [...buildChildren(data).keys()];
+export function expandableIds(data: IdeaTreeData, ideas: readonly FutureIdea[] = []): string[] {
+  return [...buildChildren(data, ideas).keys()];
 }
 
 /** Ids that must be open to show `id`. */
-export function ancestorsOf(data: IdeaTreeData, id: string): string[] {
-  const parents = buildParents(data);
+export function ancestorsOf(data: IdeaTreeData, id: string, ideas: readonly FutureIdea[] = []): string[] {
+  const parents = buildParents(data, ideas);
   const out: string[] = [];
   for (let p = parents.get(id); p; p = parents.get(p)) out.push(p);
   return out;
 }
 
-export function layoutGraph(data: IdeaTreeData, open: ReadonlySet<string>, sizes: GraphSizes): GraphLayout {
-  const kids = buildChildren(data);
+export function layoutGraph(data: IdeaTreeData, open: ReadonlySet<string>, sizes: GraphSizes, ideas: readonly FutureIdea[] = []): GraphLayout {
+  const kids = buildChildren(data, ideas);
+  const futureIds = ideaBoxIds(data, ideas);
+  const branchIds = new Set(ideaBranches(attachedIdeas(data, ideas)).map(b => b.id));
   const statusOf = new Map<string, TreeStatus>();
   for (const part of data.parts) {
     statusOf.set(part.id, part.status);
     for (const leaf of part.leaves as TreeLeaf[]) statusOf.set(leaf.id, leaf.status);
   }
   const partIds = new Set(data.parts.map(p => p.id));
-  const kindOf = (id: string): GraphKind => (id === 'root' ? 'root' : partIds.has(id) ? 'part' : 'leaf');
+  const kindOf = (id: string): GraphKind => (id === 'root' ? 'root' : partIds.has(id) ? 'part' : branchIds.has(id) ? 'branch' : futureIds.has(id) ? 'idea' : 'leaf');
 
   const root = hierarchy<string>('root', id => (open.has(id) ? kids.get(id) ?? [] : []).length ? kids.get(id) : undefined);
   tree<string>().nodeSize([sizes.pitch, 1]).separation(() => 1)(root);
@@ -96,11 +115,11 @@ export function layoutGraph(data: IdeaTreeData, open: ReadonlySet<string>, sizes
   let minY = Infinity, maxY = -Infinity, maxX = 0;
   for (const d of root.descendants()) {
     const kind = kindOf(d.data);
-    const { w, h } = sizes[kind];
+    const { w, h } = sizes[sizeKind(kind)];
     const y = (d.x ?? 0) - h / 2;
     const x = colX[d.depth];
     minY = Math.min(minY, y); maxY = Math.max(maxY, y + h); maxX = Math.max(maxX, x + w);
-    nodes.push({ id: d.data, kind, depth: d.depth, x, y, w, h, status: statusOf.get(d.data) ?? null, childCount: kids.get(d.data)?.length ?? 0, open: open.has(d.data) });
+    nodes.push({ id: d.data, kind, depth: d.depth, x, y, w, h, status: statusOf.get(d.data) ?? null, childCount: kids.get(d.data)?.length ?? 0, ideaCount: (kids.get(d.data) ?? []).filter(c => futureIds.has(c)).length, open: open.has(d.data) });
     if (d.parent) links.push({ id: `${d.parent.data}>${d.data}`, from: d.parent.data, to: d.data });
   }
   return { nodes, links, bounds: { minX: 0, minY, maxX, maxY } };
@@ -120,10 +139,14 @@ export function fitView(box: { minX: number; minY: number; maxX: number; maxY: n
 }
 
 /** Short label for the badge on a card that has children. */
-export function childLabel(kind: GraphKind, count: number): string {
-  if (kind === 'root') return `${count} parts`;
-  if (kind === 'part') return `${count} test${count === 1 ? '' : 's'}`;
-  return `${count} follow-up${count === 1 ? '' : 's'}`;
+export function childLabel(kind: GraphKind, count: number, future = 0): string {
+  const s = (n: number) => (n === 1 ? '' : 's');
+  if (kind === 'branch') return `${count} idea${s(count)}`;
+  const main = count - future;
+  const parts: string[] = [];
+  if (main > 0) parts.push(kind === 'root' ? `${main} parts` : kind === 'part' ? `${main} test${s(main)}` : `${main} follow-up${s(main)}`);
+  if (future > 0) parts.push(kind === 'root' ? `${future} new branch${future === 1 ? '' : 'es'}` : `💡 ${future}`);
+  return parts.join(' · ');
 }
 
 export interface RadialSizes {
@@ -151,20 +174,22 @@ export const narrowRadial: RadialSizes = { root: { w: 190, h: 190 }, part: { w: 
  * direction, follow-up tests further still. The place of every box is worked out with everything open, so opening or folding
  * a box never moves another one; only the open boxes are returned.
  */
-export function radialLayout(data: IdeaTreeData, open: ReadonlySet<string>, s: RadialSizes): GraphLayout {
-  const kids = buildChildren(data);
+export function radialLayout(data: IdeaTreeData, open: ReadonlySet<string>, s: RadialSizes, ideas: readonly FutureIdea[] = []): GraphLayout {
+  const kids = buildChildren(data, ideas);
+  const futureIds = ideaBoxIds(data, ideas);
+  const branchIds = new Set(ideaBranches(attachedIdeas(data, ideas)).map(b => b.id));
   const statusOf = new Map<string, TreeStatus>();
   for (const part of data.parts) {
     statusOf.set(part.id, part.status);
     for (const leaf of part.leaves as TreeLeaf[]) statusOf.set(leaf.id, leaf.status);
   }
   const partIds = new Set(data.parts.map(p => p.id));
-  const kindOf = (id: string): GraphKind => (id === 'root' ? 'root' : partIds.has(id) ? 'part' : 'leaf');
+  const kindOf = (id: string): GraphKind => (id === 'root' ? 'root' : partIds.has(id) ? 'part' : branchIds.has(id) ? 'branch' : futureIds.has(id) ? 'idea' : 'leaf');
 
   const bigSlot = Math.hypot(s.leaf.w, s.leaf.h) + 12;
   const partSlot = Math.hypot(s.part.w, s.part.h) + 10;
   // The ring of parts is at least large enough for its parts to sit side by side.
-  const r1 = Math.max(s.r1, Math.ceil((data.parts.length * partSlot * 1.08) / (2 * Math.PI)));
+  const r1 = Math.max(s.r1, Math.ceil(((kids.get('root')?.length ?? data.parts.length) * partSlot * 1.08) / (2 * Math.PI)));
   const ring = (depth: number, k: number) => (depth === 0 ? 0 : depth === 1 ? r1 : depth === 2 ? r1 + s.start * k : r1 + s.start * k + s.lanes * s.lane + (depth - 3) * s.lane);
   const arc = (depth: number) => (depth === 1 ? partSlot : depth === 2 ? s.slot : bigSlot);
 
@@ -196,12 +221,12 @@ export function radialLayout(data: IdeaTreeData, open: ReadonlySet<string>, s: R
     if (d.parent && !(shown.has(d.parent.data) && open.has(d.parent.data))) return;
     shown.add(d.data);
     const kind = kindOf(d.data);
-    const { w, h } = s[kind];
+    const { w, h } = s[sizeKind(kind)];
     const angle = ((d.x ?? 0) - min) * turn;
     const radius = ring(d.depth, hi) + (d.depth === 2 ? (lane.get(d.data) ?? 0) * s.lane : 0);
     const cx = radius * Math.sin(angle), cy = -radius * Math.cos(angle);
     minX = Math.min(minX, cx - w / 2); maxX = Math.max(maxX, cx + w / 2); minY = Math.min(minY, cy - h / 2); maxY = Math.max(maxY, cy + h / 2);
-    nodes.push({ id: d.data, kind, depth: d.depth, x: cx - w / 2, y: cy - h / 2, w, h, status: statusOf.get(d.data) ?? null, childCount: kids.get(d.data)?.length ?? 0, open: open.has(d.data), angle, radius });
+    nodes.push({ id: d.data, kind, depth: d.depth, x: cx - w / 2, y: cy - h / 2, w, h, status: statusOf.get(d.data) ?? null, childCount: kids.get(d.data)?.length ?? 0, ideaCount: (kids.get(d.data) ?? []).filter(c => futureIds.has(c)).length, open: open.has(d.data), angle, radius });
     if (d.parent) links.push({ id: `${d.parent.data}>${d.data}`, from: d.parent.data, to: d.data });
   });
   return { nodes, links, bounds: { minX, minY, maxX, maxY } };
