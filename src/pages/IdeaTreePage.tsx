@@ -4,10 +4,10 @@ import { PageHeading } from '../components/common';
 import { IdeaTree } from '../components/IdeaTree';
 import { IdeaGraph } from '../components/IdeaGraph';
 import { IdeaChanged } from '../components/IdeaChanged';
-import type { TestLink } from '../components/IdeaTreeDetail';
+import { MAIN_IDEA_PAGE, type TestLink } from '../components/IdeaTreeDetail';
 import { useResearch } from '../data';
 
-const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/experiments/${id}`}>{children}</Link>;
+const siteLink: TestLink = (id, className, children) => <Link className={className} to={id === MAIN_IDEA_PAGE ? '/main-idea' : `/experiments/${id}`}>{children}</Link>;
 
 export function IdeaTreePage() {
   const [params, setParams] = useSearchParams();
@@ -45,7 +45,7 @@ export function IdeaTreePage() {
     };
     return <div className="ig-page-list">
       <div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div>
-      <IdeaChanged onOpen={open}/>
+      <IdeaChanged onOpen={open} testLink={siteLink}/>
     </div>;
   }
   if (list) {

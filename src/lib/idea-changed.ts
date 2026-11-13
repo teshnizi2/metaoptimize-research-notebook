@@ -12,6 +12,8 @@ export interface ChangedRow {
   title: string;
   question: string;
   chips: ChangedChip[];
+  /** Shows a link to the page about the main idea under the row. */
+  mainIdea?: boolean;
 }
 
 /** The ten settings the tests varied. Chip colours are not written here: they come from the linked tests (see chipStatus). */
@@ -38,6 +40,7 @@ export const changedRows: ChangedRow[] = [
   {
     title: 'Pull toward one step size',
     question: 'Does pulling each step size toward a shared one help?',
+    mainIdea: true,
     chips: [
       { label: 'Dial r = 1, no pull', tests: [] },
       { label: 'Full pull (r = 0)', outcome: 'lost 3.0 points', tests: ['B3.1'] },

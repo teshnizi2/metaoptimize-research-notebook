@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { ChevronRight } from 'lucide-react';
 import { useResearch } from '../data';
 import { countStatuses, findNode, ideaTree, statusInfo, statusOrder, type TreeNode } from '../lib/idea-tree';
-import { TreeDetail, TreeIcon, type TestLink } from './IdeaTreeDetail';
+import { TreeDetail, TreeIcon, MAIN_IDEA_PAGE, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 
 const WIDE_QUERY = '(min-width: 1000px)';
@@ -22,7 +22,7 @@ function useWide() {
 
 const Icon = TreeIcon;
 
-const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/experiments/${id}`}>{children}</Link>;
+const siteLink: TestLink = (id, className, children) => <Link className={className} to={id === MAIN_IDEA_PAGE ? '/main-idea' : `/experiments/${id}`}>{children}</Link>;
 
 function Detail({ node, inline }: { node: TreeNode | null; inline?: boolean }) {
   const data = useResearch();

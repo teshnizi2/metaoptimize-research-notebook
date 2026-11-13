@@ -1,12 +1,15 @@
+import { ArrowRight } from 'lucide-react';
 import { ideaTree, statusInfo, statusOrder, type IdeaTreeData } from '../lib/idea-tree';
 import { changedRows, chipStatus } from '../lib/idea-changed';
-import { TreeIcon } from './IdeaTreeDetail';
+import { MAIN_IDEA_PAGE, TreeIcon, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 import './IdeaChanged.css';
 
 /** "What we changed": the settings the tests varied, one row each, with every value or comparison coloured by the tests behind it. */
-export function IdeaChanged({ data = ideaTree, onOpen }: {
+export function IdeaChanged({ data = ideaTree, onOpen, testLink }: {
   data?: IdeaTreeData;
+  /** Links the pull row to the page about the main idea. */
+  testLink: TestLink;
   /** Called with a test id when a chip is chosen; the page shows that test in the tree. */
   onOpen: (id: string) => void;
 }) {
@@ -46,6 +49,7 @@ export function IdeaChanged({ data = ideaTree, onOpen }: {
             </button></li>;
           })}
         </ul>
+        {row.mainIdea && <p className="ic-more">{testLink(MAIN_IDEA_PAGE, 'text-link', <>The main idea: why it lost<ArrowRight size={16}/></>)}</p>}
       </li>)}
     </ol>
   </div>;

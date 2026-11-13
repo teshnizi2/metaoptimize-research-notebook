@@ -6,6 +6,9 @@ export function TreeIcon({ status }: { status: TreeStatus }) {
   return <span className="tree-icon" aria-hidden="true">{statusInfo[status].icon}</span>;
 }
 
+/** A page id, not a test: `testLink(MAIN_IDEA_PAGE, …)` links to the page about the main idea. */
+export const MAIN_IDEA_PAGE = 'main-idea';
+
 /** How a page turns an experiment id into a link: the site uses its router, the standalone copy a plain address. */
 export type TestLink = (id: string, className: string | undefined, children: ReactNode) => ReactNode;
 
@@ -38,6 +41,7 @@ export function TreeDetail({ node, inline, data = ideaTree, pageIds, testLink, o
       <p className="tree-headline">{part.verdict}</p>
       <p className="tree-summary">{part.summary}</p>
       <p className="tree-date"><strong>When:</strong> {part.dates}. {part.leaves.length} tests below.</p>
+      {part.id === 'B3' && <div className="tree-links">{testLink(MAIN_IDEA_PAGE, 'button primary', <>The main idea: why it lost<ArrowUpRight size={16}/></>)}</div>}
     </article>;
   }
   const { part, leaf } = node;
