@@ -264,7 +264,7 @@ export interface NotebookStats { runs: number; experiments: number; figures: num
 export const notebookCard = {
   id: 'notebook',
   claim: 'A notebook that keeps the whole record in one place.',
-  holdsText: 'as of the notebook’s snapshot date; the counts are those the record holds, not a claim about anything newer.',
+  holdsText: 'you read the counts as of the notebook’s snapshot date, not as a claim about anything newer.',
   links: [
     { to: '/runs', label: 'Run ledger' },
     { to: '/experiments', label: 'Experiment pages' },
