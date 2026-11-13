@@ -34,8 +34,9 @@ export interface GraphSizes {
   pitch: number;
 }
 
-export const wideSizes: GraphSizes = { root: { w: 250, h: 170 }, part: { w: 270, h: 98 }, leaf: { w: 240, h: 84 }, gap: 72, pitch: 110 };
-export const narrowSizes: GraphSizes = { root: { w: 156, h: 156 }, part: { w: 196, h: 98 }, leaf: { w: 200, h: 84 }, gap: 40, pitch: 110 };
+export const wideSizes: GraphSizes = { root: { w: 260, h: 190 }, part: { w: 280, h: 104 }, leaf: { w: 250, h: 104 }, gap: 72, pitch: 114 };
+// On a phone the question, the gap and the part column together fit one 375 px screen at full size.
+export const narrowSizes: GraphSizes = { root: { w: 140, h: 210 }, part: { w: 176, h: 104 }, leaf: { w: 200, h: 104 }, gap: 28, pitch: 114 };
 
 /** Children of a node in the full tree: root -> parts -> tests, where a test with a `parent` hangs under that test. */
 export function buildChildren(data: IdeaTreeData): Map<string, string[]> {
