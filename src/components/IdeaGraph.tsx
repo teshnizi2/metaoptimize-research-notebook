@@ -60,8 +60,6 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
   const sizes = narrow ? narrowSizes : wideSizes;
   const radialSizes = narrow ? narrowRadial : wideRadial;
 
-  /** After "Show key results": the other tests are dimmed so the key boxes stand out. */
-  const [focusKeys, setFocusKeys] = useState(initialKeys && !initialNode);
   const [selectedId, setSelectedId] = useState<string | null>(initialNode && findNode(data, initialNode) ? initialNode : null);
   const keys = useMemo(() => keyIds(data), [data]);
   /** The question, and the parts that hold a key result: the paths to the key boxes. */
@@ -224,9 +222,9 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
   };
 
   const expandable = useMemo(() => expandableIds(data), [data]);
-  const openAll = () => { setFocusKeys(false); pending.current = radial ? MIN_ZOOM : 0.2; setOpen(new Set(expandable)); };
-  const closeAll = () => { setFocusKeys(false); pending.current = 'start'; setOpen(new Set(['root'])); };
-  const showKeys = () => { setFocusKeys(true); pending.current = 'keys'; select_(null); setOpen(new Set(keyOpen)); };
+  const openAll = () => { pending.current = radial ? MIN_ZOOM : 0.2; setOpen(new Set(expandable)); };
+  const closeAll = () => { pending.current = 'start'; setOpen(new Set(['root'])); };
+  const showKeys = () => { pending.current = 'keys'; select_(null); setOpen(new Set(keyOpen)); };
 
   const zoomBy = (factor: number) => {
     const view = viewRef.current, z = zoomRef.current;
@@ -290,7 +288,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
       <div className="ig-controls" role="toolbar" aria-label="Graph controls">
         <button type="button" className="button" onClick={openAll}>Open all</button>
         <button type="button" className="button" onClick={closeAll}>Close all</button>
-        <button type="button" className="button ig-keys" onClick={showKeys}><Star size={15}/> Show key results</button>
+        <button type="button" className="button" onClick={showKeys}><Star size={15}/> Show key results</button>
         <button type="button" className="button" onClick={fit}><Maximize2 size={15}/> Fit to screen</button>
         <button type="button" className="button ig-icon" aria-label="Zoom in" onClick={() => zoomBy(1.3)}><Plus size={16}/></button>
         <button type="button" className="button ig-icon" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.3)}><Minus size={16}/></button>
@@ -305,7 +303,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
           {layout.nodes.map(n => <button
             key={n.id}
             type="button"
-            className={`ig-card ig-${n.kind} ${n.status ? `tree-${n.status}` : ''}${keys.includes(n.id) ? ' tree-key' : ''}${focusKeys && n.kind === 'leaf' && !keys.includes(n.id) ? ' ig-dim' : ''}`}
+            className={`ig-card ig-${n.kind} ${n.status ? `tree-${n.status}` : ''}`}
             style={{ left: n.x, top: n.y, width: n.w, height: n.h }}
             aria-current={selectedId === n.id}
             aria-expanded={n.childCount > 0 ? n.open : undefined}

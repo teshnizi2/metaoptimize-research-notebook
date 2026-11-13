@@ -40,14 +40,15 @@ export function IdeaChanged({ data = ideaTree, onOpen, testLink }: {
               </span></li>;
             }
             const isKey = chip.tests.some(id => { const n = findNode(data, id); return n?.kind === 'leaf' && n.leaf.key; });
-            return <li key={chip.label}><button type="button" className={`ic-chip tree-${status}${isKey ? ' tree-key' : ''}`} data-status={status} onClick={() => onOpen(chip.tests[0])}
+            return <li key={chip.label}><button type="button" className={`ic-chip tree-${status}`} data-status={status} onClick={() => onOpen(chip.tests[0])}
               aria-label={`${chip.label}: ${chip.outcome}. ${statusInfo[status].name}.${isKey ? ' Key result for the paper.' : ''} Open ${chip.tests.join(', ')} in the tree.`}>
               <TreeIcon status={status}/>
               <span className="ic-text">
-                <span className="ic-label">{chip.label}{isKey && <> <KeyStar/></>}</span>
+                <span className="ic-label">{chip.label}</span>
                 <span className="ic-outcome">{chip.outcome}</span>
                 <span className="ic-ids">{chip.tests.join(' · ')}</span>
               </span>
+              {isKey && <KeyStar/>}
             </button></li>;
           })}
         </ul>

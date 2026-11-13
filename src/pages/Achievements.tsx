@@ -13,7 +13,7 @@ function Chip({ id }: { id: string }) {
   if (!node || node.kind !== 'leaf') return null;
   const { leaf } = node;
   const mt = leaf.experiments[0];
-  return <span className={`ach-chip tree-${leaf.status}${leaf.key ? ' tree-key' : ''}`} title={statusInfo[leaf.status].name}>
+  return <span className={`ach-chip tree-${leaf.status}`} title={statusInfo[leaf.status].name}>
     <Link to={`/idea-tree?view=radial&node=${id}`}><TreeIcon status={leaf.status}/><span><strong>{id}</strong> · {leaf.title}{leaf.key && <> <KeyStar/></>}</span></Link>
     {mt && <Link to={`/experiments/${mt}`} className="ach-chip-page">Test page <ArrowUpRight size={14}/></Link>}
   </span>;
@@ -28,7 +28,7 @@ function Card({ card }: { card: Achievement }) {
   const judged = card.group === 'stand' || card.group === 'negative';
   const [key, ...rest] = card.facts;
   const isKey = isKeyAchievement(card);
-  return <article className={`ach-card tree-${judged ? status : 'u'}${isKey ? ' tree-key' : ''}`} id={card.id}>
+  return <article className={`ach-card tree-${judged ? status : 'u'}`} id={card.id}>
     <header>
       {judged
         ? <span className="tree-verdict"><TreeIcon status={status}/>{card.group === 'stand' ? 'Stands' : statusInfo[status].name}</span>

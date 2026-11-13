@@ -8,12 +8,12 @@ export function TreeIcon({ status }: { status: TreeStatus }) {
 
 /** The ★ that marks a key result, or a part that holds some (with how many). */
 export function KeyStar({ count }: { count?: number }) {
-  return <span className="tree-star" title="Key result for the paper" aria-label={count === undefined ? 'Key result for the paper' : `${count} key result${count === 1 ? '' : 's'} for the paper`}>★{count === undefined ? '' : ` ${count}`}</span>;
+  return <span className="tree-star" title="Key result for the paper" aria-label={count === undefined ? 'Key result for the paper' : `${count} key result${count === 1 ? '' : 's'} for the paper`}>★{count !== undefined && <span className="tree-star-n">{count}</span>}</span>;
 }
 
 /** The legend entry that explains the dark green ★. */
 export function KeyLegendItem({ total }: { total?: number }) {
-  return <li className="tree-key tree-key-legend"><span className="tree-star" aria-hidden="true">★</span><span>{KEY_LEGEND}{total !== undefined && <small>{total}</small>}</span></li>;
+  return <li className="tree-key-legend"><span className="tree-star" aria-hidden="true">★</span><span>{KEY_LEGEND.replace(/^★ /, '')}{total !== undefined && <small>{total}</small>}</span></li>;
 }
 
 /** A page id, not a test: `testLink(MAIN_IDEA_PAGE, …)` links to the page about the main idea. */
@@ -68,7 +68,7 @@ export function TreeDetail({ node, inline, data = ideaTree, pageIds, testLink, o
   const followUps = part.leaves.filter(l => l.parent === leaf.id);
   return <article className={`${cls} tree-${leaf.status}`} aria-live="polite">
     <header><span className="tree-verdict"><TreeIcon status={leaf.status}/>{statusInfo[leaf.status].name}</span>{leaf.key && <KeyStar/>}</header>
-    {leaf.key && <p className="tree-keyreason"><strong>Key result for the paper.</strong> {leaf.keyReason}</p>}
+    {leaf.key && <p className="tree-keyreason">★ Key result for the paper: {leaf.keyReason}</p>}
     <p className="tree-where">Part {part.number} · {part.title}</p>
     <h2>{leaf.title}</h2>
     <p className="tree-headline">{leaf.result}</p>

@@ -10,7 +10,7 @@ export function TestChip({ id }: { id: string }) {
   if (!node || node.kind !== 'leaf') return null;
   const mt = node.leaf.experiments[0];
   const body = <><TreeIcon status={node.leaf.status}/><span><strong>{id}</strong> · {node.leaf.title}{node.leaf.key && <> <KeyStar/></>}</span></>;
-  return <span className={`mi-chip tree-${node.leaf.status}${node.leaf.key ? ' tree-key' : ''}`} title={statusInfo[node.leaf.status].name}>
+  return <span className={`mi-chip tree-${node.leaf.status}`} title={statusInfo[node.leaf.status].name}>
     {body}
     {mt && <Link to={`/experiments/${mt}`} className="mi-chip-link">Open test page <ArrowUpRight size={14}/></Link>}
   </span>;
