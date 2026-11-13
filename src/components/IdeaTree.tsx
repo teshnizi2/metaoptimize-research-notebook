@@ -105,9 +105,10 @@ export function IdeaTree() {
               {detailBelow(part.id)}
               {expanded && <ul className="tree-list tree-leaves">
                 {part.leaves.map(leaf => <li key={leaf.id}>
-                  <button type="button" className={`tree-node tree-leaf tree-${leaf.status}${leaf.key ? ' tree-key' : ''}`} aria-current={selectedId === leaf.id} onClick={() => select(leaf.id)}>
+                  <button type="button" className={`tree-node tree-leaf tree-${leaf.status}`} aria-current={selectedId === leaf.id} onClick={() => select(leaf.id)}>
                     <Icon status={leaf.status}/>
-                    <span className="tree-node-text"><strong>{leaf.title}{leaf.key && <> <KeyStar/></>}</strong><small>{leaf.result}</small></span>
+                    <span className="tree-node-text"><strong>{leaf.title}</strong><small>{leaf.result}</small></span>
+                    {leaf.key && <KeyStar/>}
                   </button>
                   {detailBelow(leaf.id)}
                 </li>)}

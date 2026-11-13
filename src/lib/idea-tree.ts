@@ -59,7 +59,7 @@ export function keyCount(part: TreePart): number {
   return part.leaves.filter(l => l.key).length;
 }
 
-export const KEY_LEGEND = 'Dark green ★ = key result for the paper (its icon still shows whether it worked)';
+export const KEY_LEGEND = '★ = key result for the paper';
 
 export const statusOrder: TreeStatus[] = ['g', 'r', 'a', 'u'];
 

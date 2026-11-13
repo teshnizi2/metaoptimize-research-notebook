@@ -187,7 +187,7 @@ test('"Show key results" opens the paths to the key boxes (the question, the fiv
     const ids = new Set(radialLayout(ideaTree, open, s).nodes.map(n => n.id));
     for (const k of keys) assert.ok(ids.has(k), k);
   }
-  assert.ok(KEY_LEGEND.startsWith('Dark green ★ = key result for the paper'));
+  assert.equal(KEY_LEGEND, '★ = key result for the paper');
 });
 
 test('a "What we changed" chip is a key result when one of its tests is', () => {
@@ -195,4 +195,23 @@ test('a "What we changed" chip is a key result when one of its tests is', () => 
   assert.ok(keyChips.includes('Equal chunks (777 weights)'));
   assert.ok(keyChips.includes('Rival: tuned plain SGD + cosine'));
   assert.ok(!keyChips.includes('Full pull (r = 0)'));
+});
+
+test('a key result is marked only by a small star: no colour of its own, no fill, anywhere', () => {
+  const root = new URL('../', import.meta.url);
+  const read = (p: string) => readFileSync(new URL(p, root), 'utf8');
+  const files = ['src/components/IdeaGraph.tsx', 'src/components/IdeaTree.tsx', 'src/components/IdeaChanged.tsx', 'src/components/MainIdeaCharts.tsx', 'src/pages/Achievements.tsx', 'src/components/IdeaTreeDetail.tsx'];
+  for (const f of files) {
+    const src = read(f);
+    assert.ok(src.includes('KeyStar'), `${f} draws the star`);
+    assert.ok(!/tree-key['"` ]|ig-dim|ig-keys/.test(src.replace('tree-key-legend', '')), `${f} adds no key colour class`);
+  }
+  for (const f of ['IdeaTree', 'IdeaGraph', 'IdeaChanged', 'MainIdea', 'Achievements']) {
+    const css = read(`src/components/${f}.css`);
+    assert.ok(!/0b4d2a|052e18|\.tree-key[ ,.{]/.test(css.replace('tree-key-legend', '')), `${f}.css has no dark green key fill`);
+  }
+  const css = read('src/components/IdeaTree.css');
+  assert.match(css, /\.tree-star \{[^}]*color: #e8a600/);
+  assert.ok(!/\.tree-star \{[^}]*(background|border:)/.test(css), 'the star has no disc and no border');
+  assert.ok(read('src/components/IdeaTreeDetail.tsx').includes('★ Key result for the paper: {leaf.keyReason}'));
 });
