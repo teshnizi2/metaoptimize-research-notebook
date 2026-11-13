@@ -2,10 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { linkHorizontal, linkRadial } from 'd3-shape';
 import { select } from 'd3-selection';
 import { zoom, zoomIdentity, zoomTransform, type ZoomBehavior } from 'd3-zoom';
-import { Maximize2, Minus, Plus, Star, X } from 'lucide-react';
+import { Lightbulb, Maximize2, Minus, Plus, Star, X } from 'lucide-react';
 import { countStatuses, findNode, ideaTree, keyCount, keyIds, statusInfo, statusOrder, type IdeaTreeData, type TreeNode } from '../lib/idea-tree';
 import { ancestorsOf, childLabel, expandableIds, fitView, layoutGraph, narrowRadial, narrowSizes, radialLayout, wideRadial, wideSizes, type GraphNode, type View } from '../lib/idea-graph';
+import { attachedIdeas, findIdeaNode, ideaParent, isKnown, type FutureIdea, type IdeaNode } from '../lib/future-ideas';
 import { KeyLegendItem, KeyStar, TreeDetail, TreeIcon, type TestLink } from './IdeaTreeDetail';
+import { IdeaLegendItem, IdeaMark, IdeasToggle } from './FutureIdeas';
 import './IdeaTree.css';
 import './IdeaGraph.css';
 
@@ -34,7 +36,7 @@ function useWidth(ref: React.RefObject<HTMLElement | null>) {
 const PAD = 20;
 const PANEL_MAX = 380;
 
-export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, initialNode = null, initialKeys = false, onSelectChange, header }: {
+export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, initialNode = null, initialKeys = false, onSelectChange, header, ideas = [], showIdeas: showIdeasProp, onShowIdeasChange }: {
   data?: IdeaTreeData;
   /** 'tree' runs left to right; 'radial' puts the question in the centre and grows every part outward. */
   mode?: 'tree' | 'radial';
@@ -46,6 +48,11 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
   onSelectChange?: (id: string | null) => void;
   /** Shown at the left of the toolbar row (the page title and view switch). */
   header?: ReactNode;
+  /** Future ideas, drawn dashed beside the tests they grow from. Empty or missing: nothing extra shows. */
+  ideas?: FutureIdea[];
+  /** Whether the future ideas are drawn (default yes). The page can own this so the other views follow. */
+  showIdeas?: boolean;
+  onShowIdeasChange?: (shown: boolean) => void;
 }) {
   const frameRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -53,21 +60,27 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
   const zoomRef = useRef<ZoomBehavior<HTMLDivElement, unknown> | null>(null);
   const anchor = useRef<{ id: string; sx: number; sy: number; reveal: boolean } | null>(null);
   const first = useRef(true);
-  const pending = useRef<number | 'start' | 'keys' | null>(null);
+  const pending = useRef<number | 'start' | 'keys' | 'ideas' | null>(null);
   const frameWidth = useWidth(frameRef);
   const narrow = frameWidth > 0 && frameWidth < 700;
   const radial = mode === 'radial';
   const sizes = narrow ? narrowSizes : wideSizes;
   const radialSizes = narrow ? narrowRadial : wideRadial;
 
-  const [selectedId, setSelectedId] = useState<string | null>(initialNode && findNode(data, initialNode) ? initialNode : null);
+  const attached = useMemo(() => attachedIdeas(data, ideas), [data, ideas]);
+  const [localShow, setLocalShow] = useState(true);
+  const showIdeas = showIdeasProp ?? localShow;
+  const setShowIdeas = onShowIdeasChange ?? setLocalShow;
+  const futures = useMemo(() => (showIdeas ? attached : []), [showIdeas, attached]);
+
+  const [selectedId, setSelectedId] = useState<string | null>(initialNode && isKnown(data, attached, initialNode) ? initialNode : null);
   const keys = useMemo(() => keyIds(data), [data]);
   /** The question, and the parts that hold a key result: the paths to the key boxes. */
   const keyOpen = useMemo(() => new Set(['root', ...keys.flatMap(id => ancestorsOf(data, id))]), [data, keys]);
-  const [open, setOpen] = useState<Set<string>>(() => (initialKeys && !(initialNode && findNode(data, initialNode)) ? new Set(keyOpen) : new Set(['root', ...(initialNode && findNode(data, initialNode) ? ancestorsOf(data, initialNode) : [])])));
-  const layout = useMemo(() => (radial ? radialLayout(data, open, radialSizes) : layoutGraph(data, open, sizes)), [data, open, sizes, radial, radialSizes]);
+  const [open, setOpen] = useState<Set<string>>(() => (initialKeys && !(initialNode && isKnown(data, attached, initialNode)) ? new Set(keyOpen) : new Set(['root', ...(initialNode && isKnown(data, attached, initialNode) ? ancestorsOf(data, initialNode, attached) : [])])));
+  const layout = useMemo(() => (radial ? radialLayout(data, open, radialSizes, futures) : layoutGraph(data, open, sizes, futures)), [data, open, sizes, radial, radialSizes, futures]);
   const byId = useMemo(() => new Map(layout.nodes.map(n => [n.id, n])), [layout]);
-  const node: TreeNode | null = findNode(data, selectedId);
+  const node: TreeNode | IdeaNode | null = findNode(data, selectedId) ?? findIdeaNode(futures, selectedId);
 
   /** Width of the canvas that is not covered by the summary panel (the panel sits on the right when the graph is wide). */
   const visibleWidth = (view: HTMLElement, panelOpen: boolean) => view.clientWidth - (panelOpen && !narrow ? Math.min(PANEL_MAX, view.clientWidth * 0.46) + 10 : 0);
@@ -125,6 +138,18 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     return fitView(box, view.clientWidth, view.clientHeight, MIN_ZOOM, 1.1);
   }, [layout, keyOpen, keys]);
 
+  /** The question, every future idea and the boxes they hang from: opened by "Show future ideas". */
+  const ideaOpen = useMemo(() => {
+    const ids = new Set<string>(['root']);
+    for (const i of attached) for (const a of [ideaParent(i), ...ancestorsOf(data, ideaParent(i), attached)]) ids.add(a);
+    return ids;
+  }, [data, attached]);
+  const ideasView = useCallback((view: HTMLElement): View => {
+    const focus = layout.nodes.filter(n => ideaOpen.has(n.id) || n.kind === 'idea');
+    const box = { minX: Math.min(...focus.map(n => n.x)), minY: Math.min(...focus.map(n => n.y)), maxX: Math.max(...focus.map(n => n.x + n.w)), maxY: Math.max(...focus.map(n => n.y + n.h)) };
+    return fitView(box, view.clientWidth, view.clientHeight, MIN_ZOOM, 1.1);
+  }, [layout, ideaOpen]);
+
   const fit = useCallback(() => {
     const view = viewRef.current;
     if (view) apply(fitView(layout.bounds, view.clientWidth, view.clientHeight, radial ? MIN_ZOOM : MIN_K, 1.1));
@@ -152,7 +177,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     const a = anchor.current, view = viewRef.current;
     if (!view) return;
     if (pending.current !== null) {
-      apply(pending.current === 'start' ? startView(view) : pending.current === 'keys' ? keysView(view) : fitView(layout.bounds, view.clientWidth, view.clientHeight, pending.current, 1.1));
+      apply(pending.current === 'start' ? startView(view) : pending.current === 'keys' ? keysView(view) : pending.current === 'ideas' ? ideasView(view) : fitView(layout.bounds, view.clientWidth, view.clientHeight, pending.current, 1.1));
       pending.current = null;
       anchor.current = null;
       return;
@@ -221,10 +246,15 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     }
   };
 
-  const expandable = useMemo(() => expandableIds(data), [data]);
+  const expandable = useMemo(() => expandableIds(data, futures), [data, futures]);
   const openAll = () => { pending.current = radial ? MIN_ZOOM : 0.2; setOpen(new Set(expandable)); };
   const closeAll = () => { pending.current = 'start'; setOpen(new Set(['root'])); };
   const showKeys = () => { pending.current = 'keys'; select_(null); setOpen(new Set(keyOpen)); };
+  const showIdeaPaths = () => { pending.current = 'ideas'; select_(null); setShowIdeas(true); setOpen(new Set(ideaOpen)); };
+  const toggleIdeas = (next: boolean) => {
+    setShowIdeas(next);
+    if (!next && findIdeaNode(attached, selectedId)) select_(null);
+  };
 
   const zoomBy = (factor: number) => {
     const view = viewRef.current, z = zoomRef.current;
@@ -236,7 +266,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
     const d = radial
       ? radialLink({ source: { a: a.angle ?? 0, r: a.radius ?? 0 }, target: { a: b.angle ?? 0, r: b.radius ?? 0 } })
       : link({ s: [a.x + a.w, a.y + a.h / 2], t: [b.x, b.y + b.h / 2] });
-    return { id: l.id, d: d ?? '', status: b.status };
+    return { id: l.id, d: d ?? '', status: b.status, future: b.kind === 'idea' || b.kind === 'branch' };
   });
 
   const leaves = data.parts.flatMap(p => p.leaves);
@@ -246,6 +276,11 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
 
   const label = (n: GraphNode) => {
     if (n.kind === 'root') return `The question: ${data.root.title}`;
+    if (n.kind === 'idea' || n.kind === 'branch') {
+      const f = findIdeaNode(futures, n.id);
+      if (f?.kind === 'idea') return `Future idea, not run yet: ${f.idea.title}`;
+      return f?.kind === 'branch' ? `Future idea, new branch, not run yet: ${f.name}` : n.id;
+    }
     const found = findNode(data, n.id);
     if (!found || found.kind === 'root') return n.id;
     return found.kind === 'part'
@@ -255,7 +290,15 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
 
   const cardInner = (n: GraphNode) => {
     const found = findNode(data, n.id);
-    const badge = n.childCount > 0 ? <span className="ig-badge" aria-hidden="true">{n.open ? '−' : '+'} {childLabel(n.kind, n.childCount)}</span> : null;
+    const badge = n.childCount > 0 ? <span className="ig-badge" aria-hidden="true">{n.open ? '−' : '+'} {childLabel(n.kind, n.childCount, n.ideaCount)}</span> : null;
+    if (n.kind === 'idea' || n.kind === 'branch') {
+      const f = findIdeaNode(futures, n.id);
+      return <>
+        <span className="ig-head"><IdeaMark/><span className="tree-node-kicker">{f?.kind === 'idea' ? `Idea · ${f.idea.id}` : 'New branch'}</span>{radial && badge}</span>
+        <strong className="ig-title">{f?.kind === 'idea' ? f.idea.title : f?.kind === 'branch' ? f.name : n.id}</strong>
+        {!radial && badge}
+      </>;
+    }
     if (!found || found.kind === 'root') {
       return <>
         <span className="tree-node-kicker">The question</span>
@@ -289,6 +332,8 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
         <button type="button" className="button" onClick={openAll}>Open all</button>
         <button type="button" className="button" onClick={closeAll}>Close all</button>
         <button type="button" className="button" onClick={showKeys}><Star size={15}/> Show key results</button>
+        {attached.length > 0 && <button type="button" className="button" onClick={showIdeaPaths}><Lightbulb size={15}/> Show future ideas</button>}
+        <IdeasToggle count={attached.length} shown={showIdeas} onChange={toggleIdeas}/>
         <button type="button" className="button" onClick={fit}><Maximize2 size={15}/> Fit to screen</button>
         <button type="button" className="button ig-icon" aria-label="Zoom in" onClick={() => zoomBy(1.3)}><Plus size={16}/></button>
         <button type="button" className="button ig-icon" aria-label="Zoom out" onClick={() => zoomBy(1 / 1.3)}><Minus size={16}/></button>
@@ -298,12 +343,12 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
       <div className="ig-view" ref={viewRef} role="application" aria-label="Idea tree graph">
         <div className="ig-stage" ref={stageRef}>
           <svg className="ig-links" width={1} height={1} aria-hidden="true">
-            {links.map(l => <path key={l.id} d={l.d} className={`ig-link ${l.status ? `tree-${l.status}` : ''}`}/>)}
+            {links.map(l => <path key={l.id} d={l.d} className={`ig-link ${l.future ? 'ig-link-future' : l.status ? `tree-${l.status}` : ''}`}/>)}
           </svg>
           {layout.nodes.map(n => <button
             key={n.id}
             type="button"
-            className={`ig-card ig-${n.kind} ${n.status ? `tree-${n.status}` : ''}`}
+            className={`ig-card ig-${n.kind} ${n.kind === 'idea' || n.kind === 'branch' ? 'ig-future' : n.status ? `tree-${n.status}` : ''}`}
             style={{ left: n.x, top: n.y, width: n.w, height: n.h }}
             aria-current={selectedId === n.id}
             aria-expanded={n.childCount > 0 ? n.open : undefined}
@@ -315,6 +360,7 @@ export function IdeaGraph({ data = ideaTree, mode = 'tree', pageIds, testLink, i
       <ul className="ig-legend" aria-label="Legend">
         {statusOrder.map(s => <li key={s} className={`tree-${s}`}><TreeIcon status={s}/><span>{statusInfo[s].short}<small>{totals[s]}</small></span></li>)}
         <KeyLegendItem total={keys.length}/>
+        {futures.length > 0 && <IdeaLegendItem total={futures.length}/>}
       </ul>
       <p className="ig-hint">Select a box to open what comes next and read its summary; select it again to fold it. Drag or scroll to move. Ctrl or ⌘ + scroll, or pinch, to zoom.</p>
       {node && <aside className={narrow ? 'ig-sheet' : 'ig-panel'} aria-label="Summary of the selected box">{panel}</aside>}

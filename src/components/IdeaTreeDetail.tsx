@@ -1,5 +1,7 @@
 import type { ReactNode } from 'react';
 import { ArrowUpRight } from 'lucide-react';
+import type { IdeaNode } from '../lib/future-ideas';
+import { IdeaDetail } from './FutureIdeas';
 import { ideaTree, keyCount, KEY_LEGEND, statusInfo, type IdeaTreeData, type TreeNode, type TreeStatus } from '../lib/idea-tree';
 
 export function TreeIcon({ status }: { status: TreeStatus }) {
@@ -29,7 +31,7 @@ export function testPath(id: string): string {
 export type TestLink = (id: string, className: string | undefined, children: ReactNode) => ReactNode;
 
 export function TreeDetail({ node, inline, data = ideaTree, pageIds, testLink, onSelect }: {
-  node: TreeNode | null;
+  node: TreeNode | IdeaNode | null;
   inline?: boolean;
   data?: IdeaTreeData;
   pageIds: ReadonlySet<string>;
@@ -40,6 +42,7 @@ export function TreeDetail({ node, inline, data = ideaTree, pageIds, testLink, o
   if (!node) {
     return <div className="tree-detail tree-detail-empty" aria-live="polite">Select a part or a test to see what was tried, what came out, and where to read more.</div>;
   }
+  if (node.kind === 'idea' || node.kind === 'branch') return <IdeaDetail node={node} data={data} inline={inline} onSelect={onSelect}/>;
   const cls = `tree-detail${inline ? ' tree-detail-inline' : ''}`;
   if (node.kind === 'root') {
     return <article className={cls} aria-live="polite">
