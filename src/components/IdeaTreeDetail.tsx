@@ -8,6 +8,12 @@ export function TreeIcon({ status }: { status: TreeStatus }) {
 
 /** A page id, not a test: `testLink(MAIN_IDEA_PAGE, …)` links to the page about the main idea. */
 export const MAIN_IDEA_PAGE = 'main-idea';
+export const ACHIEVEMENTS_PAGE = 'achievements';
+
+/** Where a page id or an experiment id lives, relative to the site root. */
+export function testPath(id: string): string {
+  return id === MAIN_IDEA_PAGE || id === ACHIEVEMENTS_PAGE ? id : `experiments/${id}`;
+}
 
 /** How a page turns an experiment id into a link: the site uses its router, the standalone copy a plain address. */
 export type TestLink = (id: string, className: string | undefined, children: ReactNode) => ReactNode;
@@ -30,6 +36,7 @@ export function TreeDetail({ node, inline, data = ideaTree, pageIds, testLink, o
       <p className="tree-where">The project question</p>
       <h2>{node.title}</h2>
       <p className="tree-summary">{node.summary}</p>
+      <div className="tree-links">{testLink(ACHIEVEMENTS_PAGE, 'button primary', <>What we achieved<ArrowUpRight size={16}/></>)}</div>
     </article>;
   }
   if (node.kind === 'part') {
