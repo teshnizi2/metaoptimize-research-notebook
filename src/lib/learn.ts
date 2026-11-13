@@ -1,8 +1,9 @@
-/** Where the Learn page finds its media. This is the one place to change when the files move
- *  (for example to a private Blob route). `available` stays false until the files are really served. */
+/** Where the Learn page finds its media. This is the one place to change when the files move.
+ *  /learn-files/* is rewritten (vercel.json) to api/learn-file.ts, which reads a private Blob store behind the Vercel sign-in.
+ *  `available: false` shows a "coming soon" box instead of a player. */
 export const LEARN_FILES = {
   base: '/learn-files',
-  available: false,
+  available: true,
 };
 
 export const videoUrl = (id: string) => `${LEARN_FILES.base}/video/${id}.mp4`;

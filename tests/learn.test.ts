@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { LEARN_FILES, formatLength, leftOutVideos, learnVideos, mapLinks, pdfUrl, studyPath, subtitleUrl, videoUrl, videosOf } from '../src/lib/learn.ts';
 import { srtToVtt } from '../src/lib/srt-to-vtt.ts';
+import { learnFileType } from '../api/learn-file.ts';
 
 const everyString = (): string[] => [
   ...learnVideos.flatMap(v => [v.id, v.title, v.learn]),
@@ -46,7 +47,7 @@ test('no local file paths reach the page', () => {
 });
 
 test('file addresses come from one setting', () => {
-  assert.equal(LEARN_FILES.available, false, 'stays off until the files are really served');
+  assert.equal(LEARN_FILES.base, '/learn-files', 'vercel.json rewrites this prefix to the private file route');
   assert.equal(videoUrl('B01'), `${LEARN_FILES.base}/video/B01.mp4`);
   assert.equal(subtitleUrl('01'), `${LEARN_FILES.base}/subs/01.vtt`);
   assert.equal(pdfUrl('guide', 5), `${LEARN_FILES.base}/pdf/guide.pdf#page=5`);
@@ -61,4 +62,19 @@ test('lengths read as minutes and seconds', () => {
 test('srt becomes WebVTT', () => {
   const vtt = srtToVtt('﻿1\r\n00:00:01,500 --> 00:00:03,000\r\nHello, world\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,250\r\nBye\r\n');
   assert.equal(vtt, 'WEBVTT\n\n1\n00:00:01.500 --> 00:00:03.000\nHello, world\n\n2\n00:00:03.000 --> 00:00:04.250\nBye\n');
+});
+
+test('the private file route serves exactly the files the page uses', () => {
+  const served = [
+    ...learnVideos.flatMap(v => [`video/${v.id}.mp4`, `subs/${v.id}.vtt`]),
+    'pdf/guide.pdf', 'pdf/glossary.pdf',
+  ];
+  for (const path of served) assert.ok(learnFileType(path), path);
+  for (const v of learnVideos) {
+    assert.equal(videoUrl(v.id), `/learn-files/${served.find(p => p === `video/${v.id}.mp4`)}`);
+    assert.equal(subtitleUrl(v.id), `/learn-files/${served.find(p => p === `subs/${v.id}.vtt`)}`);
+  }
+  for (const bad of ['video/B17.mp4', 'video/B18.mp4', 'video/08.mp4', 'video/09.mp4', 'subs/B17.vtt', 'subs/09.vtt', 'video/B01.mov', '../video/B01.mp4', 'video/../pdf/guide.pdf', 'pdf/other.pdf', '', 'video/B01.mp4/x']) {
+    assert.equal(learnFileType(bad), null, bad);
+  }
 });
