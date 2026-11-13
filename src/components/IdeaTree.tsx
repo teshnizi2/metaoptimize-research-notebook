@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { ChevronRight, ArrowUpRight } from 'lucide-react';
+import { ChevronRight } from 'lucide-react';
 import { useResearch } from '../data';
-import { countStatuses, findNode, ideaTree, statusInfo, statusOrder, type TreeNode, type TreeStatus } from '../lib/idea-tree';
+import { countStatuses, findNode, ideaTree, statusInfo, statusOrder, type TreeNode } from '../lib/idea-tree';
+import { TreeDetail, TreeIcon, type TestLink } from './IdeaTreeDetail';
 import './IdeaTree.css';
 
 const WIDE_QUERY = '(min-width: 1000px)';
@@ -19,50 +20,14 @@ function useWide() {
   return wide;
 }
 
-function Icon({ status }: { status: TreeStatus }) {
-  return <span className="tree-icon" aria-hidden="true">{statusInfo[status].icon}</span>;
-}
+const Icon = TreeIcon;
+
+const siteLink: TestLink = (id, className, children) => <Link className={className} to={`/experiments/${id}`}>{children}</Link>;
 
 function Detail({ node, inline }: { node: TreeNode | null; inline?: boolean }) {
   const data = useResearch();
-  if (!node) {
-    return <div className="tree-detail tree-detail-empty" aria-live="polite">Select a part or a test to see what was tried, what came out, and where to read more.</div>;
-  }
-  const cls = `tree-detail${inline ? ' tree-detail-inline' : ''}`;
-  if (node.kind === 'root') {
-    return <article className={cls} aria-live="polite">
-      <p className="tree-where">The project question</p>
-      <h2>{node.title}</h2>
-      <p className="tree-summary">{node.summary}</p>
-    </article>;
-  }
-  if (node.kind === 'part') {
-    const { part } = node;
-    return <article className={`${cls} tree-${part.status}`} aria-live="polite">
-      <header><span className="tree-verdict"><Icon status={part.status}/>{statusInfo[part.status].name}</span></header>
-      <p className="tree-where">Part {part.number}</p>
-      <h2>{part.title}</h2>
-      <p className="tree-headline">{part.verdict}</p>
-      <p className="tree-summary">{part.summary}</p>
-      <p className="tree-date"><strong>When:</strong> {part.dates}. {part.leaves.length} tests below.</p>
-    </article>;
-  }
-  const { part, leaf } = node;
-  const known = new Set(data.experiments.map(e => e.id));
-  const pages = leaf.experiments.filter(id => known.has(id));
-  const dateLabel = leaf.dateBasis === 'runs' ? 'Runs recorded' : leaf.dateBasis === 'part' ? `Part ${part.number} ran` : 'Date';
-  return <article className={`${cls} tree-${leaf.status}`} aria-live="polite">
-    <header><span className="tree-verdict"><Icon status={leaf.status}/>{statusInfo[leaf.status].name}</span></header>
-    <p className="tree-where">Part {part.number} · {part.title}</p>
-    <h2>{leaf.title}</h2>
-    <p className="tree-headline">{leaf.result}</p>
-    <p className="tree-summary">{leaf.summary}</p>
-    <p className="tree-date"><strong>{dateLabel}:</strong> {leaf.date}</p>
-    {pages.length > 0 && <div className="tree-links">
-      <Link className="button primary" to={`/experiments/${pages[0]}`}>Open the test page · {pages[0]}<ArrowUpRight size={16}/></Link>
-      {pages.length > 1 && <span className="tree-more">Also: {pages.slice(1).map((id, i) => <span key={id}>{i > 0 && ', '}<Link to={`/experiments/${id}`}>{id}</Link></span>)}</span>}
-    </div>}
-  </article>;
+  const pageIds = useMemo(() => new Set(data.experiments.map(e => e.id)), [data]);
+  return <TreeDetail node={node} inline={inline} pageIds={pageIds} testLink={siteLink}/>;
 }
 
 export function IdeaTree() {
