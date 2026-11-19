@@ -1,10 +1,30 @@
 import { Link } from 'react-router-dom';
-import { ArrowUpRight, BookOpen, Braces, FlaskConical, Images, Terminal, Download } from 'lucide-react';
+import { ArrowRight, ArrowUpRight, BookOpen, Braces, CalendarRange, FlaskConical, Images, Terminal, Download } from 'lucide-react';
 import { useResearch } from '../data';
 import { compactDate, correctedCount, methodCheckCount, outcomeCounts, outcomeLabels, outcomeOrder } from '../lib/research';
 import { areaOutcomeCounts, recentNotebookUpdates } from '../lib/overview';
 import { ArtifactDates, SnapshotDate } from '../components/ArtifactDates';
-import { SectionTitle } from '../components/common';
+import { PageHeading } from '../components/common';
+import { Inline } from '../components/NotebookParts';
+import { groups } from '../lib/navigation';
+import { stamp, useWeekIndex } from '../lib/private-pages';
+import '../components/Notebook.css';
+
+/** The newest week of the Weekly record, read at runtime from the private index; nothing shows if it cannot load. */
+function LatestWeek() {
+  const { weeks } = useWeekIndex();
+  const w = weeks[0];
+  if (!w) return null;
+  return <section className="home-latest" aria-labelledby="home-latest-title">
+    <div className="section-title"><h2 id="home-latest-title">Latest week</h2><Link className="text-link" to="/weekly">All weeks<ArrowRight size={16}/></Link></div>
+    <Link to={`/weekly/${w.id}`} className="nb-week-card">
+      <strong><CalendarRange size={17}/> {w.title}</strong>
+      <span className="nb-week-range"><Inline text={w.range}/></span>
+      <span className="nb-week-line"><Inline text={w.oneline}/></span>
+      <span className="nb-week-meta"><span>{w.questions} direction {w.questions === 1 ? 'question' : 'questions'} · {w.achievements} {w.achievements === 1 ? 'achievement' : 'achievements'}</span><span className={w.open ? 'nb-open' : ''}>{w.open ? `Open, covers up to ${stamp(w.updated)}` : `Closed ${stamp(w.updated)}`}</span></span>
+    </Link>
+  </section>;
+}
 
 export function Overview() {
   const data = useResearch();
@@ -16,9 +36,20 @@ export function Overview() {
   const updates = recentNotebookUpdates(data.activity, 2);
 
   return <div className="overview-notebook">
+    <PageHeading title="Overview" description="The research notebook of the MetaOptimize project: what we found, how we got there, and the record behind it. Pick a part below, or use Search everything at the top."/>
+    <nav className="home-start" aria-label="Parts of the notebook">
+      {groups.map(g => <section className="home-start-card" key={g.id} aria-labelledby={`home-start-${g.id}`}>
+        <h2 id={`home-start-${g.id}`}>{g.label}</h2>
+        <p>{g.blurb}</p>
+        <ul>{g.entries.filter(e => e.to !== '/').map(e => <li key={e.to}><Link to={e.to}>{e.label}<ArrowRight size={15}/></Link></li>)}</ul>
+      </section>)}
+    </nav>
+    <LatestWeek/>
+
+    <section className="home-record" aria-labelledby="home-record-title">
     <header className="notebook-header">
       <div>
-        <h1>Research notebook</h1>
+        <h2 id="home-record-title">The experiment record</h2>
         <SnapshotDate/>
       </div>
       <div className="notebook-actions">
@@ -72,8 +103,9 @@ export function Overview() {
       </div>
     </section>
 
+    <details className="home-fold">
+    <summary>Research areas <span className="home-section-meta">{areas.length} areas</span></summary>
     <section className="home-area-review">
-      <SectionTitle title="Research areas" aside={<span className="home-section-meta">{areas.length} areas</span>}/>
       <p className="home-table-scroll-hint" id="home-area-scroll-hint">Scroll the table sideways for all four outcomes and method checks.</p>
       <div className="home-area-table-wrap" tabIndex={0} role="region" aria-label="Research area outcome counts" aria-describedby="home-area-scroll-hint">
         <table className="home-area-table">
@@ -88,15 +120,20 @@ export function Overview() {
         </table>
       </div>
     </section>
+    </details>
 
+    <details className="home-fold">
+    <summary>Latest notebook updates</summary>
     <section className="home-updates">
-      <SectionTitle title="Notebook updates" to="/activity" label="All updates"/>
+      <p className="home-section-note"><Link className="text-link" to="/activity">The full research log<ArrowRight size={16}/></Link></p>
       {updates.length ? <ul className="home-update-list">{updates.map(event => <li key={event.id}>
         <Link to={`/activity?q=${encodeURIComponent(event.id)}`}>
           <div className="home-update-meta"><time dateTime={event.date}>{compactDate(event.date)}</time><span>{event.kind}</span></div>
           <strong>{event.title}</strong><ArrowUpRight size={17}/>
         </Link>
       </li>)}</ul> : <p className="home-section-note">No dated notebook updates are recorded.</p>}
+    </section>
+    </details>
     </section>
   </div>;
 }

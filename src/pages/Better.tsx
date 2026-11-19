@@ -39,7 +39,6 @@ export function BetterPage() {
   const { data, ready } = useBetter();
   return <div className="nb">
     <PageHeading
-      eyebrow="Results"
       title="Making it better"
       description="What each round of improving MetaOptimize tried and why, what it found, where it missed, and where things stand."
     />

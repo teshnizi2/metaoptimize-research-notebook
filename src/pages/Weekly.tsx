@@ -15,7 +15,6 @@ export function WeeklyIndexPage() {
   const { weeks, ready } = useWeekIndex();
   return <div className="nb">
     <PageHeading
-      eyebrow="Weekly record"
       title="Weekly record"
       description="One page for each week, Friday 09:00 to Friday 09:00 (Amsterdam time): where the project stands and the week's achievements, then each question that set or ruled out a direction for the research or the paper, with the answer, the evidence and the reason. The details fold out."
     />

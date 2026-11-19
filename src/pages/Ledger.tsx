@@ -68,7 +68,7 @@ export function RunsPage() {
   const filtered = useMemo(() => filterRunLedger(runs || [], filters), [runs, ...Object.values(filters)]);
   const page = ledgerPage(filtered, f.get('page') || 1);
   const options = (key: 'status' | 'architecture' | 'dataset' | 'batch') => [...new Set((runs || []).map(r => r[key]).filter(Boolean))].sort().map(v => ({ value: v, label: v }));
-  return <><PageHeading eyebrow="Execution evidence" title="Run ledger" description={`${data.meta.stats.runs.toLocaleString()} recorded jobs, with parameters and connections to the questions they inform.`} actions={<CopyLink/>}/>
+  return <><PageHeading title="Run ledger" description={`${data.meta.stats.runs.toLocaleString()} recorded jobs, with parameters and connections to the questions they inform.`} actions={<CopyLink/>}/>
     <p className="notice"><Terminal size={17}/>Execution states describe jobs. Scientific outcomes belong to the linked experiments. This is a published snapshot.</p>
     {!runs ? <RunLoading error={error} retry={retry}/> : <><div className="filter-bar">
       <Query value={filters.q} onChange={v => f.set('q', v)} placeholder="Search run, batch, model or parameter…"/>
@@ -132,7 +132,7 @@ export function WarningsPage() {
   const filtered = entries.filter(w => (!severity || w.severity === severity) && (!state || w.status === state)
     && (!experiment || w.experimentIds.includes(experiment)) && matches(q, [w.id, w.title, w.detail, w.date, ...w.experimentIds]));
   const page = ledgerPage(filtered, f.get('page') || 1);
-  return <><PageHeading eyebrow="Interpretation boundaries" title="Warnings & limits" description="Read corrections, unresolved questions, and limits alongside the evidence they qualify." actions={<CopyLink/>}/>
+  return <><PageHeading title="Warnings & limits" description="Read corrections, unresolved questions, and limits alongside the evidence they qualify." actions={<CopyLink/>}/>
     <div className="filter-bar"><Query value={q} onChange={v => f.set('q', v)} placeholder="Search warnings, scope or experiment IDs…"/>
       <Select label="Severities" value={severity} values={[...new Set(entries.map(w => w.severity))].sort().map(v => ({ value: v, label: v === 'journal' ? 'Journal warning' : pretty(v) }))} onChange={v => f.set('severity', v)}/>
       <Select label="States" value={state} values={[...new Set(entries.map(w => w.status))].sort().map(v => ({ value: v, label: v === 'journal' ? 'Maintainer entry' : pretty(v) }))} onChange={v => f.set('status', v)}/>
@@ -153,7 +153,7 @@ export function ActivityPage() {
   const page = ledgerPage(filtered, f.get('page') || 1);
   const phase = resolvePhaseDetail(researchTimeline(data.activity, data.experiments), filtered, q, f.get('view'));
   if (phase) return <ResearchPhaseDetail phase={phase}/>;
-  return <><PageHeading eyebrow="The research record" title="Research log" description="Dated findings, corrections, and maintainer notes connected to their experiments." actions={<CopyLink/>}/>
+  return <><PageHeading title="Research log" description="Dated findings, corrections, and maintainer notes connected to their experiments." actions={<CopyLink/>}/>
     <p className="notice"><History size={18}/>Versioned research log · Updates published by the maintainer.</p>
     <div className="filter-bar"><Query value={q} onChange={v => f.set('q', v)} placeholder="Search entries, dates or experiment IDs…"/>
       <Select label="Types" value={kind} values={[...new Set(entries.map(e => e.kind))].sort().map(v => ({ value: v, label: pretty(v) }))} onChange={v => f.set('kind', v)}/>
