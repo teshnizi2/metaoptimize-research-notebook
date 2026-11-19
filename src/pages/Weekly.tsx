@@ -17,7 +17,7 @@ export function WeeklyIndexPage() {
     <PageHeading
       eyebrow="Weekly record"
       title="Weekly record"
-      description="One page for each week, Friday 06:00 to Friday 06:00 (Amsterdam time): what we did, then each question that set or ruled out a direction for the research or the paper, with the options, what we chose, and the evidence."
+      description="One page for each week, Friday 09:00 to Friday 09:00 (Amsterdam time): where the project stands and the week's achievements, then each question that set or ruled out a direction for the research or the paper, with the answer, the evidence and the reason. The details fold out."
     />
     <p className="nb-links"><Link className="text-link" to="/better">Making it better<ArrowRight size={16}/></Link></p>
     {weeks.length === 0 ? <PrivateEmpty ready={ready} what="The weekly record"/> : <ol className="nb-weeks">
@@ -27,7 +27,7 @@ export function WeeklyIndexPage() {
           <span className="nb-week-range"><Inline text={w.range}/></span>
           <span className="nb-week-line"><Inline text={w.oneline}/></span>
           <span className="nb-week-meta">
-            <span>{w.questions} direction {w.questions === 1 ? 'question' : 'questions'} · {w.tasks} other {w.tasks === 1 ? 'item' : 'items'}</span>
+            <span>{w.questions} direction {w.questions === 1 ? 'question' : 'questions'} · {w.achievements} {w.achievements === 1 ? 'achievement' : 'achievements'}</span>
             <span className={w.open ? 'nb-open' : ''}>{w.open ? `Open, covers up to ${stamp(w.updated)}` : `Closed ${stamp(w.updated)}`}</span>
           </span>
         </Link>
@@ -40,22 +40,29 @@ function Field({ label, text, answer }: { label: string; text: string; answer?: 
   return text ? <div className={answer ? 'nb-field nb-answer' : 'nb-field'}><h4>{label}</h4><RichText text={text}/></div> : null;
 }
 
-/** One direction question: whose question, the options, what we chose, the evidence, why it wins, and what it changed. */
+/** One direction question, always in this order: the question, the answer, the evidence (charts, then tables), why, then the closed details. */
 function Item({ item }: { item: WeekItem }) {
+  const hasDetails = Boolean(item.decisions || item.outcome || item.details || item.detailTables.length || item.detailCharts.length);
   return <article className="nb-item" id={item.id}>
     <h3>{item.title}</h3>
     {item.said.length > 0 && <div className="nb-said">{item.said.map((s, i) => <blockquote key={i}>
       <MessageSquareQuote size={15} aria-hidden="true"/><p>{s.text}</p>{s.when && <footer>Reza, {s.when}</footer>}
     </blockquote>)}</div>}
     <Field label="The question" text={item.question}/>
-    <Field label="The options on the table" text={item.decisions}/>
-    <Field label="What we chose or found" text={item.answer} answer/>
+    <Field label="The answer" text={item.answer} answer/>
     {(item.tables.length > 0 || item.charts.length > 0) && <div className="nb-field"><h4>The evidence</h4>
-      {item.tables.map((t, i) => <DataTable key={i} table={t}/>)}
       {item.charts.map(c => <ChartImage key={c.name} name={c.name} caption={c.caption}/>)}
+      {item.tables.map((t, i) => <DataTable key={i} table={t}/>)}
     </div>}
-    <Field label="Why: what the evidence shows" text={item.why} answer/>
-    <Field label="What it changed next" text={item.outcome}/>
+    <Field label="Why" text={item.why} answer/>
+    {hasDetails && <details className="nb-more">
+      <summary>Details</summary>
+      <Field label="The options on the table" text={item.decisions}/>
+      <Field label="What it changed next" text={item.outcome}/>
+      <Field label="More detail" text={item.details}/>
+      {item.detailTables.map((t, i) => <DataTable key={i} table={t}/>)}
+      {item.detailCharts.map(c => <ChartImage key={c.name} name={c.name} caption={c.caption}/>)}
+    </details>}
   </article>;
 }
 
@@ -74,19 +81,23 @@ export function WeekPage() {
       {week.open
         ? <p className="nb-openbar" role="note">This week is still open. It covers up to {stamp(week.updated)}; later work is added when the week closes.</p>
         : week.updated && <p className="nb-updated">Closed {stamp(week.updated)}.</p>}
-      <nav className="nb-glance" aria-label="On this page"><ol>
-        <li><a href="#did">What we did this week</a></li>
-        <li><a href="#asked">Questions that set the direction ({week.questions.length})</a></li>
-        {week.tasks.length > 0 && <li><a href="#along">The other work this week ({week.tasks.length})</a></li>}
-      </ol></nav>
-      <section className="nb-section" id="did" aria-labelledby="did-h">
-        <h2 id="did-h">What we did this week</h2>
+      <section className="nb-section" id="summary" aria-labelledby="summary-h">
+        <h2 id="summary-h">Week summary</h2>
         <ul className="nb-list">{week.summary.map((s, i) => <li key={i}><RichText text={s}/></li>)}</ul>
+        {week.achievements.length > 0 && <>
+          <h3>Achievements this week ({week.achievements.length})</h3>
+          <ul className="nb-list">{week.achievements.map((a, i) => <li key={i}><RichText text={a}/></li>)}</ul>
+        </>}
       </section>
       <section className="nb-section" id="asked" aria-labelledby="asked-h">
-        <h2 id="asked-h">Questions that set the direction</h2>
+        <h2 id="asked-h">Questions that set the direction ({week.questions.length})</h2>
         {week.questions.length > 0
-          ? week.questions.map(q => <Item key={q.id} item={q}/>)
+          ? <>
+            <nav className="nb-glance" aria-label="The questions"><ol>
+              {week.questions.map(q => <li key={q.id}><a href={`#${q.id}`}>{q.title}</a></li>)}
+            </ol></nav>
+            {week.questions.map(q => <Item key={q.id} item={q}/>)}
+          </>
           : <p>No question this week set or ruled out a direction for the research or the paper.</p>}
       </section>
       {week.tasks.length > 0 && <section className="nb-section" id="along" aria-label="The other work this week">

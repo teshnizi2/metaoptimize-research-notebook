@@ -7,13 +7,15 @@ Writes <out-folder>/<week id>.json (week id = the file name's date), refreshes <
 written into the repository: the output is uploaded to the private Blob store (see docs/MAINTENANCE.md, "Weekly record").
 
 The data file format is the one used for the local weekly pages:
-  header lines   title: range: oneline: updated:  and  summary:  followed by three "- " lines
-                 other:  followed by "- " lines, one per other piece of work (exported as the week's tasks, titles only)
+  header lines   title: range: oneline: updated:  and  summary:  followed by 1 to 4 "- " lines (where the project stands)
+                 achievements:  followed by "- " lines, one per achievement of the week
+                 other:  followed by "- " lines, one per other piece of work (optional; exported as the week's tasks, titles only)
   blocks         ## Q | <title>  (a direction question)   or   ## T | <title>  (a task a chat did; older files)
   block fields   said: <when> | <words>  (Q, may repeat; may be absent for a question from the work)
                  asked: options: chosen: because: next:  (the direction-question names, exported as
                  question, decisions, answer, why and outcome; the old names still work)
                  table: (caption line, then a markdown table; may repeat)   chart: <name> | <caption>  (may repeat)
+                 details: dtable: dchart:  (the closed "Details" part: longer text, tables and charts; dtable and dchart may repeat)
                  sources: <paths>  (read, never copied: file paths stay out of the site)
 
 Privacy filter: sentences and table rows about money, usage limits and budgets, file paths and a few internal
@@ -23,9 +25,10 @@ The patterns below are the whole list; the report prints every dropped line so a
 import json, os, re, sys
 
 ALIAS = {"asked": "question", "options": "decisions", "chosen": "answer", "because": "why", "next": "outcome"}
-KEYS = ("said", "question", "answer", "why", "decisions", "outcome", "table", "chart", "sources") + tuple(ALIAS)
-REPEAT = ("said", "table", "chart")
-HEAD_KEYS = ("title", "range", "oneline", "updated", "summary", "other")
+KEYS = ("said", "question", "answer", "why", "decisions", "outcome", "table", "chart", "details", "dtable", "dchart",
+        "sources") + tuple(ALIAS)
+REPEAT = ("said", "table", "chart", "dtable", "dchart")
+HEAD_KEYS = ("title", "range", "oneline", "updated", "summary", "achievements", "other")
 
 # A sentence, bullet or table row matching this is dropped.
 DROP_LINE = re.compile(
@@ -91,7 +94,7 @@ def parse(path):
             target[field][-1] += "\n" + line
         else:
             target[field] += "\n" + line
-    for k in ("title", "range", "oneline", "summary"):
+    for k in ("title", "range", "oneline", "summary", "achievements"):
         if k not in head:
             raise ExportError(f"{path}: header field '{k}:' missing")
     return head, blocks
@@ -168,24 +171,26 @@ def convert_block(b, idx, dropped):
                 continue
             said.append({"when": when.strip(), "text": words})
         out["said"] = said
-    for key in ("question", "answer", "why", "decisions", "outcome"):
+    for key in ("question", "answer", "why", "decisions", "outcome", "details"):
         if key in b:
             t = clean_text(b[key], dropped, where)
             if t:
                 out[key] = t
-    tables = [t for t in (parse_table(x, dropped, where) for x in b.get("table", [])) if t]
-    if tables:
-        out["tables"] = tables
-    charts = []
-    for c in b.get("chart", []):
-        name, _, cap = c.partition("|")
-        name = name.strip()
-        if name in DROP_CHARTS:
-            dropped.append(f"{where}: chart {name}")
-            continue
-        charts.append({"name": name, "caption": clean_text(cap.strip(), dropped, where) if cap.strip() else ""})
-    if charts:
-        out["charts"] = charts
+    for src, dst in (("table", "tables"), ("dtable", "detailTables")):
+        tables = [t for t in (parse_table(x, dropped, where) for x in b.get(src, [])) if t]
+        if tables:
+            out[dst] = tables
+    for src, dst in (("chart", "charts"), ("dchart", "detailCharts")):
+        charts = []
+        for c in b.get(src, []):
+            name, _, cap = c.partition("|")
+            name = name.strip()
+            if name in DROP_CHARTS:
+                dropped.append(f"{where}: chart {name}")
+                continue
+            charts.append({"name": name, "caption": clean_text(cap.strip(), dropped, where) if cap.strip() else ""})
+        if charts:
+            out[dst] = charts
     return out
 
 
@@ -196,7 +201,8 @@ def write_index(outdir):
         if re.match(r"^\d{4}-\d{2}-\d{2}\.json$", name):
             w = json.load(open(os.path.join(outdir, name), encoding="utf-8"))
             weeks.append({k: w[k] for k in ("id", "title", "range", "oneline", "updated", "open")}
-                         | {"questions": len(w["questions"]), "tasks": len(w["tasks"])})
+                         | {"questions": len(w["questions"]), "tasks": len(w["tasks"]),
+                            "achievements": len(w.get("achievements", []))})
     with open(os.path.join(outdir, "index.json"), "w", encoding="utf-8") as f:
         json.dump({"weeks": weeks}, f, ensure_ascii=False, indent=1)
 
@@ -207,8 +213,11 @@ def export(path, outdir, is_open):
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", week):
         raise ExportError("the file name must be the week's Friday date, like 2026-11-13.md")
     summary = [l.strip()[2:] for l in head["summary"].splitlines() if l.strip().startswith("- ")]
-    if len(summary) != 3:
-        raise ExportError(f"'summary:' needs exactly 3 '- ' lines (found {len(summary)})")
+    if not 1 <= len(summary) <= 4:
+        raise ExportError(f"'summary:' needs 1 to 4 '- ' lines (found {len(summary)})")
+    achievements = [l.strip()[2:] for l in head["achievements"].splitlines() if l.strip().startswith("- ")]
+    if not achievements:
+        raise ExportError("'achievements:' needs at least one '- ' line")
     dropped = []
     questions, tasks = [], []
     for line in head.get("other", "").splitlines():
@@ -230,6 +239,7 @@ def export(path, outdir, is_open):
         "updated": head.get("updated", "").strip(),
         "open": bool(is_open),
         "summary": [clean_text(s, dropped, "summary") for s in summary],
+        "achievements": [a for a in (clean_text(a, dropped, "achievements") for a in achievements) if a],
         "questions": questions,
         "tasks": tasks,
     }
@@ -239,7 +249,8 @@ def export(path, outdir, is_open):
     with open(target, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=1)
     write_index(outdir)
-    print(f"{target}: {len(questions)} questions, {len(tasks)} tasks, {len(dropped)} dropped pieces")
+    print(f"{target}: {len(questions)} questions, {len(doc['achievements'])} achievements, {len(tasks)} tasks, "
+          f"{len(dropped)} dropped pieces")
     for d in dropped:
         print("  dropped:", d)
 
