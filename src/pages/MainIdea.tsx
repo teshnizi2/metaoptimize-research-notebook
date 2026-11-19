@@ -28,7 +28,6 @@ export function MainIdeaPage() {
   ];
   return <div className="mi">
     <PageHeading
-      eyebrow="Research map"
       title="The main idea: why it lost"
       description="The proposal that pulls each layer’s step size toward one shared master step size, how it failed in the tests, and our best reading of why."
     />
@@ -53,9 +52,12 @@ export function MainIdeaPage() {
 
     <section className="mi-section" aria-labelledby="mi-tests">
       <h2 id="mi-tests">The tests behind it</h2>
-      <div className="mi-tests">
-        {mainIdeaTests.map(id => <TreeDetail key={id} node={findNode(ideaTree, id)} inline pageIds={pageIds} testLink={siteLink}/>)}
-      </div>
+      <details className="fold">
+        <summary>Show the {mainIdeaTests.length} test cards</summary>
+        <div className="mi-tests">
+          {mainIdeaTests.map(id => <TreeDetail key={id} node={findNode(ideaTree, id)} inline pageIds={pageIds} testLink={siteLink}/>)}
+        </div>
+      </details>
     </section>
 
     <section className="mi-section mi-why" aria-labelledby="mi-why">

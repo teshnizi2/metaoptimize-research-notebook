@@ -1,5 +1,6 @@
 import { ArrowUpRight, Check, Copy, Download, ArrowRight, SearchX, FileCode2, Image as ImageIcon } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
+import { groupOf, sectionTabs } from '../lib/navigation';
 import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { Experiment, Figure, Outcome } from '../types';
@@ -11,7 +12,10 @@ export function Status({outcome,label}:{outcome:string;label?:string}){return <s
 export function CorrectedBadge({experiment}:{experiment:Pick<Experiment,'corrected'|'correction'>}){return experiment.corrected?<span className="badge-corrected" title={experiment.correction?.note||'A historical claim for this record was corrected'}><span className="status-dot" aria-hidden="true"/>Corrected</span>:null}
 /** Research questions show one of four outcomes; method checks show their kind. */
 export function ExperimentStatus({experiment}:{experiment:Pick<Experiment,'kind'|'outcome'|'corrected'|'correction'>}){return <span className="experiment-status">{experiment.kind==='method-check'||!experiment.outcome?<Status outcome="method-check" label={kindLabels['method-check']}/>:<Status outcome={experiment.outcome}/>}<CorrectedBadge experiment={experiment}/></span>}
-export function PageHeading({eyebrow,title,description,actions}:{eyebrow:string;title:string;description?:string;actions?:ReactNode}){return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1>{description&&<p>{description}</p>}</div>{actions&&<div className="heading-actions">{actions}</div>}</div>}
+/** The sub-tabs of a sidebar entry (e.g. Evidence: Figures & tables | Run ledger | Source code), shown on each tab's index page. */
+export function SectionTabs(){const {pathname}=useLocation();const found=sectionTabs(pathname);if(!found)return null;const path=pathname.replace(/\/+$/,'')||'/';return <nav className="section-tabs" aria-label={`${found.entry.label} pages`}>{found.tabs.map(t=><Link key={t.to} to={t.to} aria-current={t.to===path?'page':undefined}>{t.label}</Link>)}</nav>}
+/** The one page top used on every page: eyebrow (the sidebar group unless given), title, a short summary, then the section's sub-tabs. */
+export function PageHeading({eyebrow,title,description,actions}:{eyebrow?:string;title:string;description?:ReactNode;actions?:ReactNode}){const {pathname}=useLocation();const label=eyebrow??groupOf(pathname)?.label;return <><div className="page-heading"><div>{label&&<div className="eyebrow">{label}</div>}<h1>{title}</h1>{description&&<p>{description}</p>}</div>{actions&&<div className="heading-actions">{actions}</div>}</div><SectionTabs/></>}
 export function Empty({title='No matching records',detail='Try another search or remove a filter.',action}:{title?:string;detail?:string;action?:ReactNode}){return <div className="empty-state"><SearchX size={32}/><h3>{title}</h3><p>{detail}</p>{action}</div>}
 export function CopyLink({label='Copy link'}:{label?:string}){const [done,setDone]=useState(false),[error,setError]=useState(false);useEffect(()=>{if(done){const t=setTimeout(()=>setDone(false),2000);return()=>clearTimeout(t)}},[done]);return <button className="button" onClick={async()=>{try{await navigator.clipboard.writeText(location.href);setDone(true);setError(false)}catch{setError(true)}}}>{done?<Check size={16}/>:<Copy size={16}/>} {done?'Copied':error?'Select the address bar':label}</button>}
 export function DownloadLink({href,label,primary=false}:{href:string;label:string;primary?:boolean}){return <a className={`button ${primary?'primary':''}`} href={href} download><Download size={16}/>{label}</a>}

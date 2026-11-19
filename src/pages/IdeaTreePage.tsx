@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { PageHeading } from '../components/common';
+import { groupOf } from '../lib/navigation';
 import { IdeaTree } from '../components/IdeaTree';
 import { IdeaGraph } from '../components/IdeaGraph';
 import { IdeaChanged } from '../components/IdeaChanged';
@@ -43,14 +44,13 @@ export function IdeaTreePage() {
       window.scrollTo(0, 0);
     };
     return <div className="ig-page-list">
-      <div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div>
+      <div className="ig-titlebar"><div><div className="eyebrow">{groupOf('/idea-tree')?.label}</div><h1>Idea tree</h1></div>{modes}</div>
       <IdeaChanged onOpen={open} testLink={siteLink} ideas={ideas} showIdeas={showIdeas} onShowIdeasChange={setShowIdeas}/>
     </div>;
   }
   if (list) {
     return <div className="ig-page-list">
       <PageHeading
-        eyebrow="Research map"
         title="Idea tree"
         description="Every main idea the project tested, in the order it happened, coloured by whether it worked. Select a box for a short summary, then open that test’s page."
       />
@@ -58,11 +58,11 @@ export function IdeaTreePage() {
       {waiting ? null : <IdeaTree ideas={ideas} showIdeas={showIdeas} onShowIdeasChange={setShowIdeas}/>}
     </div>;
   }
-  if (waiting) return <div className="ig-page"><div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div></div>;
+  if (waiting) return <div className="ig-page"><div className="ig-titlebar"><div><div className="eyebrow">{groupOf('/idea-tree')?.label}</div><h1>Idea tree</h1></div>{modes}</div></div>;
   return <div className="ig-page">
     <IdeaGraph
       key={view} mode={view}
-      header={<div className="ig-titlebar"><h1>Idea tree</h1>{modes}</div>}
+      header={<div className="ig-titlebar"><div><div className="eyebrow">{groupOf('/idea-tree')?.label}</div><h1>Idea tree</h1></div>{modes}</div>}
       pageIds={pageIds} testLink={siteLink} initialNode={params.get('node')} initialKeys={params.get('keys') === '1'} onSelectChange={onSelectChange} ideas={ideas} showIdeas={showIdeas} onShowIdeasChange={setShowIdeas}/>
   </div>;
 }

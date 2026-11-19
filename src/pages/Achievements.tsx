@@ -95,7 +95,6 @@ export function AchievementsPage() {
   const glance = achievements.filter(c => c.glance).sort((a, b) => Number(isKeyAchievement(b)) - Number(isKeyAchievement(a)));
   return <div className="ach">
     <PageHeading
-      eyebrow="Results"
       title="What we achieved"
       description="Results the project can stand behind, each with the condition it holds under. For what didn’t work, see the Idea tree."
     />

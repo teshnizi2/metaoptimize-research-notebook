@@ -168,6 +168,16 @@ The existing Vercel project is connected to the notebook GitHub repository with 
 
 The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.
 
+## Site structure: sidebar groups, sub-tabs and the page frame
+
+The sidebar, the breadcrumb, page eyebrows and section sub-tabs all come from one table, `src/lib/navigation.ts`:
+
+- `sections` lists every top-level route with its label (the breadcrumb and browser-tab title) and its group (`start`, `results`, `progress`, `record`).
+- `groups` is the sidebar: 4 groups (Start, Results, Progress, Research record) and 9 entries. An entry with `tabs` (Weekly record: Weeks | Research log; Experiments: Questions | Warnings & limits; Evidence: Figures & tables | Run ledger | Source code) stays highlighted on each tab's route, and `PageHeading` shows the tab row on each tab's index page.
+- `PageHeading` (in `src/components/common.tsx`) is the one page top: eyebrow = the group name unless a page passes its own (detail pages do), title = the sidebar name, a short summary, then the sub-tabs.
+
+To add a page: add its `<Route>` in `src/main.tsx`, add it to `sections`, and put it in a group as an entry or as a tab of an entry. `tests/navigation.test.ts` fails if a route is missing from the table or not reachable from the sidebar. Never rename or remove a route; if a page moves, keep the old path working (as `/evidence` redirects to `/figures`). Reading pages share one 880 px column (`src/components/Structure.css`); long detail goes in a `<details className="fold">`.
+
 ## Weekly record and Making it better
 
 Two pages show text, tables and chart images that are **not in this repository**: `/better` ("Making it better") and `/weekly` with one page per week (`/weekly/<Friday date>`). Their content lives in the private Vercel Blob store `learn-files`, behind the same Vercel sign-in as the videos, and is fetched when a page opens. The repository holds only the code, the empty-state handling, the export script and the tests (which use made-up placeholder data). Never commit a week file, `better.json` or a chart image, and never put results or dates of real weeks in a test or in these docs.

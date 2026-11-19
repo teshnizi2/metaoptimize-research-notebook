@@ -25,7 +25,7 @@ export function ExperimentsPage(){
  const [limit,setLimit]=useState(30);
  function update(changes:Record<string,string>){const next=applySearchParamChanges(params,changes);setParams(next.params,{replace:next.replace});setLimit(30)}
  const selected=registerFilterSelection({outcome,kind});
- return <div className="page-enter"><PageHeading eyebrow="The complete experiment register" title="Every question has a record." description="Search the goal, compare the result, and follow the evidence."/>
+ return <div className="page-enter"><PageHeading title="Experiments" description="Every question has a record. Search the goal, compare the result, and follow the evidence."/>
   <p className="register-model-note">Research questions have one of four outcomes. Method checks audit the campaign’s own methods and are listed separately. The Corrected badge marks records whose earlier claim was corrected.</p>
   <div className="outcome-filters">
    <button className={selected.all?'selected':''} aria-pressed={selected.all} onClick={()=>update({outcome:'',kind:''})}>{phase==='unlinked'?'All unlinked records':phase?'All phase records':'All records'} <span>{phaseRecords.length}</span></button>
