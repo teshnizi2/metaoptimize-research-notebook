@@ -99,7 +99,7 @@ export function AchievementsPage() {
       title="What we achieved"
       description="Results the project can stand behind, each with the condition it holds under. For what didn’t work, see the Idea tree."
     />
-    <p className="ach-links"><Link className="text-link" to="/idea-tree">Idea tree<ArrowRight size={16}/></Link><Link className="text-link" to="/main-idea">The main idea<ArrowRight size={16}/></Link></p>
+    <p className="ach-links"><Link className="text-link" to="/idea-tree">Idea tree<ArrowRight size={16}/></Link><Link className="text-link" to="/main-idea">The main idea<ArrowRight size={16}/></Link><Link className="text-link" to="/better">Making it better<ArrowRight size={16}/></Link></p>
     <nav className="ach-glance" aria-labelledby="ach-glance-title">
       <h2 id="ach-glance-title">At a glance</h2>
       <ul>

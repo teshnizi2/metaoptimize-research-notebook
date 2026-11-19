@@ -10,6 +10,10 @@ const ALLOWED: { pattern: RegExp; type: string; cache?: string }[] = [
   { pattern: /^pdf\/(?:guide|glossary)\.pdf$/, type: 'application/pdf' },
   // The Idea tree's future ideas (unpublished research): one JSON file, never cached for long, never public.
   { pattern: /^ideas\/ideas\.json$/, type: 'application/json; charset=utf-8', cache: 'private, no-cache' },
+  // The "Making it better" page and the Weekly record (unpublished research): JSON that is never cached for long, and chart images.
+  { pattern: /^better\/better\.json$/, type: 'application/json; charset=utf-8', cache: 'private, no-cache' },
+  { pattern: /^weekly\/(?:index|\d{4}-\d{2}-\d{2})\.json$/, type: 'application/json; charset=utf-8', cache: 'private, no-cache' },
+  { pattern: /^weekly\/charts\/[a-z0-9-]+\.png$/, type: 'image/png' },
 ];
 
 export function learnFileType(path: string): string | null {

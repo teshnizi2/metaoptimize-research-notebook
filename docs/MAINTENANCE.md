@@ -168,6 +168,45 @@ The existing Vercel project is connected to the notebook GitHub repository with 
 
 The research group uses one revocable Vercel shareable link attached to the stable production alias. It is stored separately from this repository. Both professors can use the same link without a Vercel account. Anyone holding it can read the notebook; distribute it only within the group. The link remains valid until revoked, and its continued access must be checked after a production update. Access protection stays enabled for every deployment.
 
+## Weekly record and Making it better
+
+Two pages show text, tables and chart images that are **not in this repository**: `/better` ("Making it better") and `/weekly` with one page per week (`/weekly/<Friday date>`). Their content lives in the private Vercel Blob store `learn-files`, behind the same Vercel sign-in as the videos, and is fetched when a page opens. The repository holds only the code, the empty-state handling, the export script and the tests (which use made-up placeholder data). Never commit a week file, `better.json` or a chart image, and never put results or dates of real weeks in a test or in these docs.
+
+What the store holds (all through `api/learn-file.ts`, which allows exactly these paths and nothing else):
+
+| Blob path | Content type | Page |
+| --- | --- | --- |
+| `better/better.json` | JSON | `/better` |
+| `weekly/index.json` | JSON, built by the export script | `/weekly` |
+| `weekly/<YYYY-MM-DD>.json` | JSON, one per week, named by the Friday the week starts on | `/weekly/<YYYY-MM-DD>` |
+| `weekly/charts/<name>.png` | PNG; `<name>` uses only `a-z`, `0-9` and `-` | charts inside a week page |
+
+A week runs Friday 06:00 to the next Friday 06:00, Amsterdam time. Each week page shows, in order: what we did this week; the main questions and changes asked for at the start, each with its answer (`## Q` blocks); the questions that came up along the way, each with the solution and the tests, with tables and charts (`## T` blocks).
+
+**Add a week, or add results to the open week** (a data-only change; no code, no deploy):
+
+1. Write or update the week's data file, `<Friday date>.md`, in the format described at the top of `scripts/weekly-export.py` (header lines `title`, `range`, `oneline`, `updated`, `summary`; then `## Q | …` and `## T | …` blocks with `said`, `question`, `answer`, `why`, `decisions`, `outcome`, `table`, `chart`). Keep it outside the repository.
+2. Render each chart as a PNG named with `a-z`, `0-9`, `-` only, and refer to it in the block as `chart: <name> | <caption>`. Look at every image before uploading it: charts must not show money, usage limits, file paths or personal details.
+3. Run `python3 scripts/weekly-export.py <data.md> <out-folder>`; add `--open` while the week is still running, so the page says "covers up to <the `updated` time>". The script writes `<week>.json`, refreshes `index.json` from every week file already in `<out-folder>` and prints each dropped line and block. Read that report. Keep earlier weeks' JSON in the same folder so the index lists them all.
+4. Upload `<week>.json`, `index.json` and any new or changed chart to the private store. Take the token with `vercel env pull --environment production` into a temporary file outside the repository, never print it, delete it afterwards. For each file:
+
+```sh
+vercel blob put <file> --access private --pathname weekly/<file name> --allow-overwrite true
+```
+
+   (`--pathname weekly/charts/<name>.png` for a chart; `better/better.json` for the "Making it better" page.)
+5. Check the result as an anonymous visitor (`curl -s -o /dev/null -w '%{http_code}' https://<site>/learn-files/weekly/index.json` must answer `302`, the Vercel sign-in) and as a signed-in one (`vercel curl /learn-files/weekly/<week>.json` shows the new text).
+
+The pages are cached `private, no-cache`, so an upload shows on the next page load. The site's JavaScript caches a fetched file for the open tab only.
+
+**Privacy filter.** The export script drops, from everything it writes: sentences and table rows about money, prices, usage limits, budgets and disk space, file paths and file names; whole blocks listed in `DROP_BLOCKS`; charts listed in `DROP_CHARTS`. It rewords a few internal names (`REWORD`). These lists are the whole filter; when a new week mentions something that should stay private, add the pattern to the list in the script (with a placeholder test), then export again and read the dropped-lines report. Nothing in a week file is copied word for word to the site without passing the filter, and Reza's own quoted words are kept as written.
+
+**Empty state.** When a file is missing, or the request is redirected to the sign-in, the pages show "has no content to show" instead of breaking (for example on a preview copy or a local build). `/weekly/<id>` with an id that is not a date shows "No such week".
+
+**"Making it better" page.** `better/better.json` is written by hand from the result and verdict sections of the improvement rounds' own records. Every number on the page must come from those records; recheck the page against them whenever a round is added. A round has `what we tried and why`, a main-result chart (dot = mean, line = 95 % interval, on one shared axis) or table, verdicts (including the misses) and a short reading. A new round is a new entry in `rounds`; no code change is needed.
+
+Run `npm test` and `npm run build` before any code change to these pages. The tests cover the route allowlist, defensive parsing of the JSON, the markdown subset (no raw HTML is ever rendered), the chart geometry, the empty states, and that no private content file sits in `content/`, `public/`, `src/`, `api/`, `scripts/` or `docs/`.
+
 ## Artifact dates
 
 The UI reads `public/data/artifact-dates.json`; its maintained source is `content/artifact-dates.json`. The build validates complete artifact coverage, date precision, links, snapshot hashes and current evidence bytes before synchronizing the reader copy. `npm run dates:check` verifies both copies without changing them.

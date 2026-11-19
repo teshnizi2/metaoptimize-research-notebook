@@ -6,6 +6,8 @@ export const sections = [
   { to: '/main-idea', label: 'The main idea', detail: false },
   { to: '/learn', label: 'Learn', detail: false },
   { to: '/achievements', label: 'What we achieved', detail: false },
+  { to: '/better', label: 'Making it better', detail: false },
+  { to: '/weekly', label: 'Weekly record', detail: true },
   { to: '/figures', label: 'Figures & tables', detail: true },
   { to: '/code', label: 'Source code', detail: true },
   { to: '/runs', label: 'Run ledger', detail: true },
