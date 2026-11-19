@@ -47,7 +47,7 @@ function Item({ item }: { item: WeekItem }) {
     {item.said.length > 0 && <div className="nb-said">{item.said.map((s, i) => <blockquote key={i}>
       <MessageSquareQuote size={15} aria-hidden="true"/><p>{s.text}</p>{s.when && <footer>Reza, {s.when}</footer>}
     </blockquote>)}</div>}
-    <Field label={item.said.length > 0 ? 'The question' : 'The question, from the work itself'} text={item.question}/>
+    <Field label="The question" text={item.question}/>
     <Field label="The options on the table" text={item.decisions}/>
     <Field label="What we chose or found" text={item.answer} answer/>
     {(item.tables.length > 0 || item.charts.length > 0) && <div className="nb-field"><h4>The evidence</h4>
