@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -153,7 +153,9 @@ test('both pages show an empty state when the private content cannot be fetched'
   assert.doesNotMatch(read('src/pages/Weekly.tsx') + read('src/pages/Better.tsx'), /dangerouslySetInnerHTML/);
 });
 
-test('the weekly export reads a data file, keeps the index current and leaves out money, limits and file paths', () => {
+// The hosted build leaves out scripts/*.py (see .vercelignore), so this check runs where the script exists and says so where it does not.
+const exportScript = path.join(root, 'scripts/weekly-export.py');
+test('the weekly export reads a data file, keeps the index current and leaves out money, limits and file paths', { skip: existsSync(exportScript) ? false : 'scripts/weekly-export.py is not in this copy (excluded from the hosted build)' }, () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'weekly-export-'));
   const src = path.join(dir, '2099-01-02.md');
   writeFileSync(src, [
