@@ -8,8 +8,11 @@ written into the repository: the output is uploaded to the private Blob store (s
 
 The data file format is the one used for the local weekly pages:
   header lines   title: range: oneline: updated:  and  summary:  followed by three "- " lines
-  blocks         ## Q | <title>  (a question Reza asked)   or   ## T | <title>  (a task a chat did)
-  block fields   said: <when> | <words>  (Q, may repeat)   question:  answer:  why:  decisions:  outcome:
+                 other:  followed by "- " lines, one per other piece of work (exported as the week's tasks, titles only)
+  blocks         ## Q | <title>  (a direction question)   or   ## T | <title>  (a task a chat did; older files)
+  block fields   said: <when> | <words>  (Q, may repeat; may be absent for a question from the work)
+                 asked: options: chosen: because: next:  (the direction-question names, exported as
+                 question, decisions, answer, why and outcome; the old names still work)
                  table: (caption line, then a markdown table; may repeat)   chart: <name> | <caption>  (may repeat)
                  sources: <paths>  (read, never copied: file paths stay out of the site)
 
@@ -19,9 +22,10 @@ The patterns below are the whole list; the report prints every dropped line so a
 """
 import json, os, re, sys
 
-KEYS = ("said", "question", "answer", "why", "decisions", "outcome", "table", "chart", "sources")
+ALIAS = {"asked": "question", "options": "decisions", "chosen": "answer", "because": "why", "next": "outcome"}
+KEYS = ("said", "question", "answer", "why", "decisions", "outcome", "table", "chart", "sources") + tuple(ALIAS)
 REPEAT = ("said", "table", "chart")
-HEAD_KEYS = ("title", "range", "oneline", "updated", "summary")
+HEAD_KEYS = ("title", "range", "oneline", "updated", "summary", "other")
 
 # A sentence, bullet or table row matching this is dropped.
 DROP_LINE = re.compile(
@@ -39,7 +43,7 @@ DROP_BLOCKS = {
 }
 # Charts left out (money, usage and compute caps, disk, labels of unpublished videos).
 DROP_CHARTS = {"w1-spend", "w2-spend", "w3-spend", "w1-voice-prices", "w1-disk", "w2-disk", "w3-disk",
-                "w3-gpu", "w3-t55-gpu", "w3-imagenet-cost", "w2-beginner-plan", "w2-v2-lengths"}
+                "w3-gpu", "w3-t55-gpu", "w2-beginner-plan", "w2-v2-lengths"}
 # Wording fixes for internal names (applied outside Reza's own quotes).
 REWORD = [(r"\bThe mother's\b", "The lead chat's"), (r"\bThe mother\b", "The lead chat"), (r"\bMother's\b", "The lead chat's"),
           (r"\bthe mother's\b", "the lead chat's"), (r"\bmother's\b", "the lead chat's"), (r"\bthe mother\b", "the lead chat"),
@@ -69,6 +73,8 @@ def parse(path):
         m = re.match(r"^([a-z]+):\s?(.*)$", line)
         if m and (m.group(1) in KEYS or (cur is None and m.group(1) in HEAD_KEYS)):
             key, val = m.group(1), m.group(2)
+            if cur is not None:
+                key = ALIAS.get(key, key)
             if key in REPEAT:
                 target.setdefault(key, []).append(val)
             else:
@@ -205,6 +211,11 @@ def export(path, outdir, is_open):
         raise ExportError(f"'summary:' needs exactly 3 '- ' lines (found {len(summary)})")
     dropped = []
     questions, tasks = [], []
+    for line in head.get("other", "").splitlines():
+        if line.strip().startswith("- "):
+            t = clean_text(line.strip()[2:], dropped, "other")
+            if t:
+                tasks.append({"id": f"o{len(tasks) + 1}", "title": t})
     for b in blocks:
         if b["title"] in DROP_BLOCKS:
             dropped.append(f"whole block: {b['kind']} {b['title']}")
