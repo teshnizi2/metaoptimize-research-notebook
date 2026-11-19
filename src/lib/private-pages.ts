@@ -28,12 +28,15 @@ export interface Better {
   title: string; updated: string; intro: string[]; words: { term: string; meaning: string }[]; rounds: Round[];
   standing: { headline: string; bullets: string[]; next: string[]; note: string } | null;
 }
+export interface WeekChart { name: string; caption: string }
 export interface WeekItem {
   id: string; title: string; said: { when: string; text: string }[];
-  question: string; answer: string; why: string; decisions: string; outcome: string; tables: Table[]; charts: { name: string; caption: string }[];
+  question: string; answer: string; why: string; decisions: string; outcome: string; tables: Table[]; charts: WeekChart[];
+  /** The closed "Details" part: longer text, tables and charts. */
+  details: string; detailTables: Table[]; detailCharts: WeekChart[];
 }
-export interface WeekSummary { id: string; title: string; range: string; oneline: string; updated: string; open: boolean; questions: number; tasks: number }
-export interface Week extends Omit<WeekSummary, 'questions' | 'tasks'> { summary: string[]; questions: WeekItem[]; tasks: WeekItem[] }
+export interface WeekSummary { id: string; title: string; range: string; oneline: string; updated: string; open: boolean; questions: number; tasks: number; achievements: number }
+export interface Week extends Omit<WeekSummary, 'questions' | 'tasks' | 'achievements'> { summary: string[]; achievements: string[]; questions: WeekItem[]; tasks: WeekItem[] }
 
 /* ---------- defensive reading: anything malformed is skipped, never thrown ---------- */
 
@@ -86,6 +89,9 @@ export function parseBetter(raw: unknown): Better | null {
   };
 }
 
+const tables = (v: unknown): Table[] => (Array.isArray(v) ? v.map(table).filter((t): t is Table => t !== null) : []);
+const weekCharts = (v: unknown): WeekChart[] => each(v, c => (CHART_NAME.test(str(c.name)) ? { name: str(c.name), caption: str(c.caption) } : null));
+
 function weekItem(x: Record<string, unknown>, i: number, prefix: string): WeekItem | null {
   const title = str(x.title);
   if (!title) return null;
@@ -93,8 +99,8 @@ function weekItem(x: Record<string, unknown>, i: number, prefix: string): WeekIt
     id: str(x.id) || `${prefix}${i + 1}`, title,
     said: each(x.said, s => (str(s.text) ? { when: str(s.when), text: str(s.text) } : null)),
     question: str(x.question), answer: str(x.answer), why: str(x.why), decisions: str(x.decisions), outcome: str(x.outcome),
-    tables: Array.isArray(x.tables) ? x.tables.map(table).filter((t): t is Table => t !== null) : [],
-    charts: each(x.charts, c => (CHART_NAME.test(str(c.name)) ? { name: str(c.name), caption: str(c.caption) } : null)),
+    tables: tables(x.tables), charts: weekCharts(x.charts),
+    details: str(x.details), detailTables: tables(x.detailTables), detailCharts: weekCharts(x.detailCharts),
   };
 }
 
@@ -105,7 +111,7 @@ export function parseWeek(raw: unknown): Week | null {
   const items = (v: unknown, prefix: string) => (Array.isArray(v) ? v.flatMap((x, i) => (isObj(x) ? [weekItem(x, i, prefix)] : [])).filter((x): x is WeekItem => x !== null) : []);
   return {
     id, title, range: str(raw.range), oneline: str(raw.oneline), updated: str(raw.updated), open: raw.open === true,
-    summary: strs(raw.summary), questions: items(raw.questions, 'q'), tasks: items(raw.tasks, 't'),
+    summary: strs(raw.summary), achievements: strs(raw.achievements), questions: items(raw.questions, 'q'), tasks: items(raw.tasks, 't'),
   };
 }
 
@@ -113,7 +119,7 @@ export function parseWeekIndex(raw: unknown): WeekSummary[] {
   const list = isObj(raw) ? raw.weeks : raw;
   return each(list, w => {
     const id = str(w.id), title = str(w.title);
-    return WEEK_ID.test(id) && title ? { id, title, range: str(w.range), oneline: str(w.oneline), updated: str(w.updated), open: w.open === true, questions: num(w.questions) ?? 0, tasks: num(w.tasks) ?? 0 } : null;
+    return WEEK_ID.test(id) && title ? { id, title, range: str(w.range), oneline: str(w.oneline), updated: str(w.updated), open: w.open === true, questions: num(w.questions) ?? 0, tasks: num(w.tasks) ?? 0, achievements: num(w.achievements) ?? 0 } : null;
   }).sort((a, b) => (a.id < b.id ? 1 : -1));
 }
 

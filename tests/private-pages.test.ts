@@ -55,8 +55,9 @@ test('nothing usable gives null, never an error', () => {
 
 const week = {
   id: '2099-01-02', title: 'Placeholder week', range: 'Range', oneline: 'One line', updated: 'Day 3 10:00 (week still open)', open: true,
-  summary: ['First', 'Second', ''],
-  questions: [{ id: 'q1', title: 'Placeholder question', said: [{ when: 'Day 1', text: 'Placeholder words' }, { when: 'x', text: '' }], answer: 'Placeholder answer', tables: [{ columns: ['A'], rows: [['1']] }, { columns: [], rows: [] }], charts: [{ name: 'a-chart', caption: 'Cap' }, { name: '../../secret', caption: 'Bad' }, { name: 'A Chart' }] }, { title: '' }, 5],
+  summary: ['First', 'Second', ''], achievements: ['Placeholder result', 7, ''],
+  questions: [{ id: 'q1', title: 'Placeholder question', said: [{ when: 'Day 1', text: 'Placeholder words' }, { when: 'x', text: '' }], answer: 'Placeholder answer', tables: [{ columns: ['A'], rows: [['1']] }, { columns: [], rows: [] }], charts: [{ name: 'a-chart', caption: 'Cap' }, { name: '../../secret', caption: 'Bad' }, { name: 'A Chart' }],
+    details: 'Placeholder detail', detailTables: [{ columns: ['B'], rows: [['2']] }, 'x'], detailCharts: [{ name: 'b-chart', caption: 'More' }, { name: 'b.png' }] }, { title: '' }, 5],
   tasks: [{ title: 'Placeholder task', question: 'Q?', why: 'Why', decisions: '- one\n- two', outcome: 'Done' }],
 };
 
@@ -69,15 +70,20 @@ test('a week is read defensively, with chart names limited to safe file names', 
   assert.deepEqual(q.said, [{ when: 'Day 1', text: 'Placeholder words' }]);
   assert.equal(q.tables.length, 1);
   assert.deepEqual(q.charts, [{ name: 'a-chart', caption: 'Cap' }]);
+  assert.equal(q.details, 'Placeholder detail');
+  assert.equal(q.detailTables.length, 1);
+  assert.deepEqual(q.detailCharts, [{ name: 'b-chart', caption: 'More' }]);
+  assert.deepEqual(w.achievements, ['Placeholder result', '7']);
   assert.equal(w.tasks[0].id, 't1');
+  assert.deepEqual([w.tasks[0].details, w.tasks[0].detailTables, w.tasks[0].detailCharts], ['', [], []]);
   assert.equal(stamp(w.updated), 'Day 3 10:00');
   assert.equal(stamp('Day 3 10:00'), 'Day 3 10:00');
   assert.ok(CHART_NAME.test('w3-t55-finals') && !CHART_NAME.test('../x') && !CHART_NAME.test('a.png') && !CHART_NAME.test('A'));
 });
 
 test('the index lists the newest week first and drops entries without a date id', () => {
-  const idx = parseWeekIndex({ weeks: [{ id: '2099-01-02', title: 'B', questions: 2, tasks: 3 }, { id: '2099-01-09', title: 'C', open: true }, { id: 'x', title: 'No' }, { id: '2098-12-26', title: 'A' }] });
-  assert.deepEqual(idx.map(w => [w.id, w.questions, w.tasks, w.open]), [['2099-01-09', 0, 0, true], ['2099-01-02', 2, 3, false], ['2098-12-26', 0, 0, false]]);
+  const idx = parseWeekIndex({ weeks: [{ id: '2099-01-02', title: 'B', questions: 2, tasks: 3, achievements: 4 }, { id: '2099-01-09', title: 'C', open: true }, { id: 'x', title: 'No' }, { id: '2098-12-26', title: 'A' }] });
+  assert.deepEqual(idx.map(w => [w.id, w.questions, w.tasks, w.achievements, w.open]), [['2099-01-09', 0, 0, 0, true], ['2099-01-02', 2, 3, 4, false], ['2098-12-26', 0, 0, 0, false]]);
   assert.deepEqual(parseWeekIndex([{ id: '2099-01-02', title: 'Bare list' }]).map(w => w.id), ['2099-01-02']);
 });
 
@@ -159,10 +165,13 @@ test('the weekly export reads a data file, keeps the index current and leaves ou
   const dir = mkdtempSync(path.join(tmpdir(), 'weekly-export-'));
   const src = path.join(dir, '2099-01-02.md');
   writeFileSync(src, [
-    'title: Placeholder week', 'range: Day 1 to Day 8.', 'oneline: Placeholder line.', 'updated: Day 8 06:00 (week closed)',
-    'summary:', '- First thing.', '- Second thing. The plan cost 3% of the usage limit.', '- Third thing.', '',
+    'title: Placeholder week', 'range: Day 1 to Day 8.', 'oneline: Placeholder line.', 'updated: Day 8 09:00 (week closed)',
+    'summary:', '- First thing.', '- Second thing. The plan cost 3% of the usage limit.', '- Third thing.',
+    'achievements:', '- Placeholder result.', '- Paid $5 for it.', '',
     '## Q | Placeholder question', 'said: Day 1 | Placeholder words', 'answer: A real answer. The notes are in ~/secret/notes.md. Another real sentence.',
-    'table: Placeholder table', '| Name | Value |', '|---|---|', '| keep | 1 |', '| price | $5 |', '',
+    'table: Placeholder table', '| Name | Value |', '|---|---|', '| keep | 1 |', '| price | $5 |',
+    'details: Placeholder detail. The budget was 10 hours.', 'dtable: Placeholder detail table', '| Name | Value |', '|---|---|', '| keep | 2 |',
+    'dchart: w3-spend | Spend chart', 'dchart: ok-detail | Fine detail chart', '',
     '## T | Placeholder task', 'question: Q?', 'outcome: - Kept line', '- The budget was 10 hours', '- The mother said yes', 'chart: w3-gpu | Cap chart', 'chart: ok-chart | Fine chart',
   ].join('\n'));
   const out = path.join(dir, 'out');
@@ -172,10 +181,14 @@ test('the weekly export reads a data file, keeps the index current and leaves ou
   assert.deepEqual(w.summary, ['First thing.', 'Second thing.', 'Third thing.']);
   assert.equal(w.questions[0].answer, 'A real answer. Another real sentence.');
   assert.deepEqual(w.questions[0].tables[0].rows, [['keep', '1']]);
+  assert.deepEqual(w.achievements, ['Placeholder result.']);
+  assert.equal(w.questions[0].details, 'Placeholder detail.');
+  assert.deepEqual(w.questions[0].detailTables[0].rows, [['keep', '2']]);
+  assert.deepEqual(w.questions[0].detailCharts.map((c: { name: string }) => c.name), ['ok-detail']);
   assert.equal(w.tasks[0].outcome, '- Kept line\n- The lead chat said yes');
   assert.deepEqual(w.tasks[0].charts.map((c: { name: string }) => c.name), ['ok-chart']);
   assert.doesNotMatch(JSON.stringify(w), /usage limit|~\/|\$5|budget|mother/i);
   const idx = JSON.parse(readFileSync(path.join(out, 'index.json'), 'utf8'));
-  assert.deepEqual(idx.weeks.map((x: { id: string; questions: number; tasks: number }) => [x.id, x.questions, x.tasks]), [['2099-01-02', 1, 1]]);
+  assert.deepEqual(idx.weeks.map((x: { id: string; questions: number; tasks: number; achievements: number }) => [x.id, x.questions, x.tasks, x.achievements]), [['2099-01-02', 1, 1, 1]]);
   assert.ok(parseWeek(w) && parseWeekIndex(idx).length === 1, 'the site reads what the script writes');
 });
