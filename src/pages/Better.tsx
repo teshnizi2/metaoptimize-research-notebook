@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import { ArrowRight, CalendarDays } from 'lucide-react';
 import { PageHeading } from '../components/common';
-import { DataTable, IntervalChart, RichText } from '../components/NotebookParts';
+import { ChartImage, DataTable, IntervalChart, RichText } from '../components/NotebookParts';
 import { PrivateEmpty } from './Weekly';
 import { useBetter, type Round, type Tone } from '../lib/private-pages';
 import '../components/Notebook.css';
@@ -50,12 +50,20 @@ export function BetterPage() {
       {data.updated && <p className="nb-updated">Written {data.updated}. Points are points of test accuracy; every number comes from the round’s own record.</p>}
       {data.intro.length > 0 && <section className="nb-section">{data.intro.map((p, i) => <RichText key={i} text={p}/>)}</section>}
       <nav className="nb-glance" aria-label="Rounds">
-        <ol>{data.rounds.map(r => <li key={r.id}><a href={`#${r.id}`}>{r.name}</a></li>)}<li><a href="#standing">Where things stand now</a></li></ol>
+        <ol>{data.figures && <li><a href="#figures">{data.figures.headline}</a></li>}{data.rounds.map(r => <li key={r.id}><a href={`#${r.id}`}>{r.name}</a></li>)}<li><a href="#standing">Where things stand now</a></li></ol>
       </nav>
       {data.words.length > 0 && <details className="nb-words">
         <summary>Words used on this page</summary>
         <dl>{data.words.map(w => <div key={w.term}><dt>{w.term}</dt><dd>{w.meaning}</dd></div>)}</dl>
       </details>}
+      {data.figures && <section className="nb-section" id="figures" aria-labelledby="figures-h">
+        <h2 id="figures-h">{data.figures.headline}</h2>
+        {data.figures.items.map(f => <div key={f.image}>
+          <h3>{f.title}</h3>
+          <ChartImage name={f.image} caption={f.caption}/>
+          {f.text && <RichText text={f.text}/>}
+        </div>)}
+      </section>}
       {data.rounds.map(r => <RoundSection key={r.id} round={r}/>)}
       {data.standing && <section className="nb-section nb-standing" id="standing" aria-labelledby="standing-h">
         <h2 id="standing-h">{data.standing.headline}</h2>
