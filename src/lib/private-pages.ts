@@ -24,8 +24,13 @@ export interface Round {
   id: string; name: string; dates: string; tried: string[]; why: string;
   chart: IntervalChartData | null; table: Table | null; verdicts: Verdict[]; misses: string[]; reading: string;
 }
+/** One picture with a short text, from the private chart store (the same images the weekly pages use). */
+export interface Figure { title: string; text: string; image: string; caption: string }
 export interface Better {
-  title: string; updated: string; intro: string[]; words: { term: string; meaning: string }[]; rounds: Round[];
+  title: string; updated: string; intro: string[]; words: { term: string; meaning: string }[];
+  /** Optional section of pictures shown before the rounds; files without it read exactly as before. */
+  figures: { headline: string; items: Figure[] } | null;
+  rounds: Round[];
   standing: { headline: string; bullets: string[]; next: string[]; note: string } | null;
 }
 export interface WeekChart { name: string; caption: string }
@@ -82,8 +87,12 @@ export function parseBetter(raw: unknown): Better | null {
   });
   if (!rounds.length) return null;
   const s = raw.standing;
+  const f = raw.figures;
+  const items = isObj(f) ? each(f.items, x => (str(x.title) && CHART_NAME.test(str(x.image))
+    ? { title: str(x.title), text: str(x.text), image: str(x.image), caption: str(x.caption) } : null)) : [];
   return {
     title: str(raw.title) || 'Making it better', updated: str(raw.updated), intro: strs(raw.intro), rounds,
+    figures: isObj(f) && items.length ? { headline: str(f.headline) || 'Pictures', items } : null,
     words: each(raw.words, w => (str(w.term) && str(w.meaning) ? { term: str(w.term), meaning: str(w.meaning) } : null)),
     standing: isObj(s) ? { headline: str(s.headline) || 'Where things stand now', bullets: strs(s.bullets), next: strs(s.next), note: str(s.note) } : null,
   };

@@ -46,6 +46,20 @@ test('the "Making it better" file is read defensively', () => {
   assert.equal(b.standing!.headline, 'Where things stand now');
 });
 
+test('the optional figures section is read defensively and old files are unchanged', () => {
+  assert.equal(parseBetter(better)!.figures, null);
+  const withFigures = parseBetter({
+    ...better,
+    figures: { headline: 'Placeholder pictures', items: [
+      { title: 'One', text: 'Placeholder text', image: 'a-chart-1', caption: 'Placeholder caption' },
+      { title: 'Bad name', image: 'a/b.png' }, { title: '', image: 'ok' }, { image: 'ok' }, 'junk',
+    ] },
+  })!;
+  assert.deepEqual(withFigures.figures, { headline: 'Placeholder pictures', items: [{ title: 'One', text: 'Placeholder text', image: 'a-chart-1', caption: 'Placeholder caption' }] });
+  assert.equal(parseBetter({ ...better, figures: { items: [] } })!.figures, null);
+  assert.equal(parseBetter({ ...better, figures: 'x' })!.figures, null);
+});
+
 test('nothing usable gives null, never an error', () => {
   for (const bad of [null, undefined, 'text', 3, [], {}, { rounds: [] }, { rounds: [{ id: 'x' }] }]) assert.equal(parseBetter(bad), null);
   for (const bad of [null, 'x', [], {}, { id: 'not-a-date', title: 'T' }, { id: '2099-01-02' }]) assert.equal(parseWeek(bad), null);
